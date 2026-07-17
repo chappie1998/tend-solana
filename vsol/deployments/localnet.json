@@ -1,0 +1,27 @@
+{
+  "cluster": "localnet",
+  "rpcUrl": "http://127.0.0.1:8899",
+  "programId": "2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v",
+  "config": "688RQvX2SEpnSuEndbjvRivFQpMzGjaz8hhGvAPGj1bY",
+  "admin": "3V3LA5R2YW8oVtfMEnQsDCTgQTUkz4N3JDFKEsoFFx9d",
+  "maker": "B6rpSQxYVbHeGaFCuBqKKu9wFfrzWWqzQ74Qx5PAe5Np",
+  "buyer": "Cib57uHexrVHkFkipruk6JVye9Ax2jFXXa84Zvo5rvqR",
+  "settlementMint": "wXbYZi3XFZzKxp2aEnAhbSjduapvTn12b391PmokQKQ",
+  "underlyingMint": "3mfZJoGJuv38hx6QDXePad9ZTJvpenmNV4JK2tkw9Vw2",
+  "writerVault": "Fe2RXRTx5F76294K64B1WcXRoob8Gy8FqqhCE9ntGBwg",
+  "writerToken": "2HgwKYkHNMTHjx9og6SYHmdnnCBmeotQvM51NBCu47RG",
+  "uiMarket": "29E5HCdMKXttK4Trg4D1s8iRH9u1mRAiJSx5iN9G5ur8",
+  "uiOracle": "ENHhu5cPrB8JAnRzU4iniJiZsPYQuBKJWkHBwSJLQdAG",
+  "uiExpiry": 1784388351,
+  "smoke": {
+    "successFillSignature": "2EeQt8RiPvcmRfzc8EV4cuJ8HPxrsaqn1MxmB4Po6t27mRLuSRKnQLmMQnLgGjxVeuxY5qV2BPABTdUaCCdC28VU",
+    "refundFillSignature": "3SAhNQNctmBh6fqUiDaZas1sC6TrSDCnzUCxu714oQh4xwZ8PnfN1TQ5r7cNQSUKSckHWTkRkLEYCth9M9eoGBUr",
+    "publishSignature": "3WRZ9GSgaSJ3PAeUScPC2WgzGcEYQtSWu6ztooWvw22uo8G7ahgeuXqDA6ZocqWwgYKdPcutqsLpB9XYPBbx3pkv",
+    "settleSignature": "5vfCDiJbwRKNv4SKFhtDSXV7sY436a6Wc3Fw5NTcc5BqWC1c7z45X9MXgD8gv8jFHojSEAfaGaJ4D1vCS3zzQGrJ",
+    "refundSignature": "5UBfjYQ1Tb8f7qycbe8gYgaGrfqw8BcnA8UDaotCHvnE23jYBiZE8Ew7kAaibtAuwKGjtw8cEyhwkoSNdChoKbbV",
+    "replayRejected": true,
+    "successPositionClosed": true,
+    "refundPositionClosed": true
+  },
+  "generatedAt": "2026-07-17T15:26:45.375Z"
+}

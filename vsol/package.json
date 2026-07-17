@@ -1,0 +1,27 @@
+{
+  "name": "@vsol/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:program": "anchor build",
+    "test:rust": "cargo test --workspace --all-targets",
+    "test:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "test:sdk": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run test:rust && npm run test:lint && npm run test:sdk && npm run build:program",
+    "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
+    "devnet:verify": "node --import tsx scripts/verify-deployment.ts"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "1.0.2",
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/bn.js": "5.2.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}
