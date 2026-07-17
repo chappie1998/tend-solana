@@ -34,7 +34,7 @@ VSOL protects buyer premium, writer maximum-payout collateral, maker quote autho
 - No permissionless maker onboarding or on-chain risk limits beyond full collateralization.
 - No automated rolling-market or settlement keeper in the production web deployment.
 - No corporate-action adapter for real tokenized securities.
-- The legacy Solana 1.x JavaScript client dependency graph currently carries upstream `bigint-buffer` and `uuid` advisories. The independently patchable `bn.js` and `ws` packages are pinned; npm's remaining proposed fixes are incompatible major downgrades and were rejected.
+- The legacy Solana 1.x JavaScript client dependency graph currently carries an upstream `bigint-buffer` advisory. The independently patchable `bn.js`, `postcss`, `uuid`, and `ws` packages are pinned; npm's remaining proposed fix is an incompatible SPL Token downgrade and was rejected.
 
 ## Mainnet gate
 
