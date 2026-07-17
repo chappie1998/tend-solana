@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `positions_quote_unique_idx` ON `positions` (`quote_id`);

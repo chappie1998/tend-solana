@@ -58,6 +58,8 @@ contract TendMarket {
 
     mapping(address => bool) public approvedMakers;
     mapping(address => bool) public approvedOracles;
+    mapping(address => bool) public approvedUnderlyings;
+    mapping(address => bool) public approvedCollateralTokens;
     mapping(address => mapping(uint64 => bool)) public cancelledNonces;
     mapping(bytes32 => bool) public filledQuotes;
     mapping(uint256 => Position) public positions;
@@ -84,6 +86,8 @@ contract TendMarket {
     event PositionSettled(uint256 indexed positionId, uint256 settlementPrice, uint256 payout);
     event MakerApprovalSet(address indexed maker, bool approved);
     event OracleApprovalSet(address indexed oracle, bool approved);
+    event UnderlyingApprovalSet(address indexed underlying, bool approved);
+    event CollateralApprovalSet(address indexed collateralToken, bool approved);
     event PauseSet(bool paused);
 
     modifier onlyOwner() {
@@ -141,13 +145,17 @@ contract TendMarket {
         returns (uint256 positionId)
     {
         if (paused) revert Paused();
-        if (!approvedMakers[quote.maker] || !approvedOracles[quote.oracle]) revert NotApproved();
+        if (
+            !approvedMakers[quote.maker] || !approvedOracles[quote.oracle] ||
+            !approvedUnderlyings[quote.underlying] || !approvedCollateralTokens[quote.collateralToken]
+        ) revert NotApproved();
         if (quote.buyer != address(0) && quote.buyer != msg.sender) revert InvalidQuote();
         if (
             quote.maker == address(0) || quote.underlying == address(0) ||
             quote.collateralToken == address(0) || quote.premium == 0 ||
             quote.maxPayout == 0 || quote.strike == 0 ||
-            quote.expiry <= block.timestamp || quote.deadline < block.timestamp
+            quote.expiry <= block.timestamp || quote.deadline < block.timestamp ||
+            quote.deadline > quote.expiry || quote.maker == msg.sender
         ) revert InvalidQuote();
         if (quote.direction == Direction.Up && quote.capPrice <= quote.strike) revert BadDirectionRange();
         if (quote.direction == Direction.Down && quote.capPrice >= quote.strike) revert BadDirectionRange();
@@ -179,8 +187,8 @@ contract TendMarket {
             settled: false
         });
 
-        _safeTransferFrom(quote.collateralToken, quote.maker, address(this), quote.maxPayout);
-        _safeTransferFrom(quote.collateralToken, msg.sender, quote.maker, quote.premium);
+        _safeTransferFromExact(quote.collateralToken, quote.maker, address(this), quote.maxPayout);
+        _safeTransferFromExact(quote.collateralToken, msg.sender, quote.maker, quote.premium);
         emit QuoteFilled(digest, positionId, msg.sender, quote.maker);
     }
 
@@ -244,6 +252,16 @@ contract TendMarket {
         emit OracleApprovalSet(oracle, approved);
     }
 
+    function setUnderlying(address underlying, bool approved) external onlyOwner {
+        approvedUnderlyings[underlying] = approved;
+        emit UnderlyingApprovalSet(underlying, approved);
+    }
+
+    function setCollateralToken(address collateralToken, bool approved) external onlyOwner {
+        approvedCollateralTokens[collateralToken] = approved;
+        emit CollateralApprovalSet(collateralToken, approved);
+    }
+
     function setEligibility(ITendEligibility nextEligibility) external onlyOwner { eligibility = nextEligibility; }
 
     function setPaused(bool nextPaused) external {
@@ -276,6 +294,19 @@ contract TendMarket {
     function _safeTransferFrom(address token, address from, address to, uint256 amount) private {
         (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TokenTransferFailed();
+    }
+
+    function _safeTransferFromExact(address token, address from, address to, uint256 amount) private {
+        uint256 balanceBefore = _balanceOf(token, to);
+        _safeTransferFrom(token, from, to, amount);
+        uint256 balanceAfter = _balanceOf(token, to);
+        if (balanceAfter < balanceBefore || balanceAfter - balanceBefore != amount) revert TokenTransferFailed();
+    }
+
+    function _balanceOf(address token, address account) private view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(0x70a08231, account));
+        if (!ok || data.length < 32) revert TokenTransferFailed();
+        balance = abi.decode(data, (uint256));
     }
 
     function _safeTransfer(address token, address to, uint256 amount) private {

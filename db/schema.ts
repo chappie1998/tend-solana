@@ -1,4 +1,53 @@
-// Intentionally empty by default.
-// Add Drizzle tables here when the site actually needs a database.
-// See examples/d1/db/schema.ts for an opt-in example.
-export {};
+import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+
+export const positions = sqliteTable(
+  "positions",
+  {
+    id: text("id").primaryKey(),
+    userEmail: text("user_email").notNull(),
+    walletAddress: text("wallet_address").notNull(),
+    quoteId: text("quote_id").notNull(),
+    maker: text("maker").notNull(),
+    symbol: text("symbol").notNull(),
+    direction: text("direction", { enum: ["up", "down"] }).notNull(),
+    amount: real("amount").notNull(),
+    premium: real("premium").notNull(),
+    strike: real("strike").notNull(),
+    capPrice: real("cap_price").notNull(),
+    expiryDays: integer("expiry_days").notNull(),
+    status: text("status", { enum: ["preview_confirmed", "settled"] }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    index("positions_user_created_idx").on(table.userEmail, table.createdAt),
+    index("positions_wallet_idx").on(table.walletAddress),
+    uniqueIndex("positions_quote_unique_idx").on(table.quoteId),
+  ],
+);
+
+export const rfqQuotes = sqliteTable(
+  "rfq_quotes",
+  {
+    id: text("id").primaryKey(),
+    requestId: text("request_id").notNull(),
+    maker: text("maker").notNull(),
+    symbol: text("symbol").notNull(),
+    direction: text("direction", { enum: ["up", "down"] }).notNull(),
+    amount: real("amount").notNull(),
+    premium: real("premium").notNull(),
+    maxPayout: real("max_payout").notNull(),
+    strike: real("strike").notNull(),
+    capPrice: real("cap_price").notNull(),
+    breakeven: real("breakeven").notNull(),
+    impliedVolatility: real("implied_volatility").notNull(),
+    effectiveLeverage: real("effective_leverage").notNull(),
+    latencyMs: integer("latency_ms").notNull(),
+    badge: text("badge").notNull(),
+    expiryDays: integer("expiry_days").notNull(),
+    payoff: integer("payoff").notNull(),
+    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+    consumedAt: integer("consumed_at", { mode: "timestamp_ms" }),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [index("rfq_quotes_expiry_idx").on(table.expiresAt)],
+);

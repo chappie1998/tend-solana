@@ -1,98 +1,101 @@
-# vinext-starter
+# Tend
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Defined-risk markets for tokenized assets on Robinhood Chain.
 
-## Prerequisites
+Tend gives traders an UP/DOWN interface while exposing the option economics that matter: premium, implied volatility, target price, maximum loss, and potential payout. Market makers compete through signed RFQs and lock the maximum possible payout before a position opens.
 
-- Node.js `>=22.13.0`
+> Preview status: the product runs end to end with server-generated RFQs and durable position records, but it intentionally sends no wallet transactions. The Solidity contracts are unaudited and undeployed. Do not use with real funds.
 
-## Quick Start
+## Why Robinhood Chain first
+
+- Canonical stock tokens and their users already live there.
+- It is EVM-compatible, so Tend uses standard Solidity tooling.
+- Robinhood publishes the canonical token contract registry.
+- Chainlink is the documented oracle partner.
+- The protocol remains portable to Monad because the core contract has no chain-specific opcodes.
+
+Network configuration:
+
+| Network | Chain ID | RPC |
+| --- | ---: | --- |
+| Robinhood Chain | 4663 | `https://rpc.mainnet.chain.robinhood.com` |
+| Robinhood Chain Testnet | 46630 | `https://rpc.testnet.chain.robinhood.com` |
+
+## Product surface
+
+- Simple UP/DOWN trade builder with 2×, 5×, and 10× capped payoff profiles
+- Competitive three-maker RFQs generated and stored by the server, with 30-second expiry and single-use execution
+- Transparent maximum loss, IV, premium, and payout
+- Durable D1-backed portfolio records, replay protection, and CSV export
+- Writer desk with locked collateral, obligations, utilization, and stress P&L
+- Injected-wallet connection and Robinhood Chain testnet switching
+- Responsive mobile navigation and keyboard-accessible controls
+- Canonical NVDA, TSLA, QQQ, and SPCX token addresses
+
+The application never trusts quote economics supplied by the browser. A preview position can only consume a live, server-owned RFQ, and the quote ID is unique so retries cannot create duplicate fills.
+
+## Contract prototype
+
+[`contracts/TendMarket.sol`](contracts/TendMarket.sol) implements:
+
+- EIP-712 maker-signed quotes
+- maker, oracle, underlying-token, and collateral-token allowlists
+- optional per-market eligibility checks
+- quote deadlines, maker nonces, cancellation, and replay protection
+- exact maximum-payout collateral locking
+- capped linear UP/DOWN settlement
+- separate owner and emergency pause authority
+- settlement while new fills are paused
+- conservative ERC-20 transfer handling and reentrancy protection
+- exact-balance collateral checks that reject fee-on-transfer or underfunded deposits
+
+The settlement oracle is an adapter interface, not a client-provided price. A production adapter must finalize a documented expiry observation window, reject stale/deviating data, and handle corporate-action adjustments.
+
+## Local development
+
+Requires Node.js 22.13 or newer.
 
 ```bash
 npm install
 npm run dev
+```
+
+Verification:
+
+```bash
+npm run lint
+npm run test
 npm run build
+npm run test:contracts
 ```
 
-This starter does not use `wrangler.jsonc`.
+The test suite covers the product surface, server-owned RFQs, D1 persistence, quote replay protection, contract safety gates, deterministic UP/DOWN payouts, and 256 fuzz runs asserting that payouts cannot exceed locked collateral.
 
-## Included Shape
+## Preview architecture
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+1. The browser submits a validated trade intent to `/api/quotes`.
+2. The server calculates and persists three normalized RFQs.
+3. The user selects a live quote and reviews the complete economics.
+4. `/api/positions` reads the quote from D1, atomically records the position, and consumes the quote.
+5. The Portfolio screen reloads the owner-scoped record from D1.
 
-## Workspace Auth Headers
+State-changing preview requests are same-origin checked. Production reads and writes are scoped to the private-site identity forwarded by the hosting runtime; localhost uses an explicit development fallback.
 
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
+## Before testnet deployment
 
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
+Tend still needs:
 
-Treat the full name as optional and fall back to email when it is absent:
+1. A throwaway Robinhood Chain testnet deployer funded with test ETH.
+2. Testnet USDG/mock collateral and settlement-oracle adapter addresses.
+3. The exact first-market settlement window and corporate-action policy.
+4. At least two committed market-maker test wallets.
+5. Jurisdiction and eligibility rules reviewed by qualified counsel.
 
-```tsx
-import { headers } from "next/headers";
+Before mainnet, require an independent contract audit, multisig ownership, timelocked parameter changes, adversarial oracle tests, transfer-restriction tests, and a documented incident response plan.
 
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
+## Official references
 
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+- [Robinhood Chain overview](https://docs.robinhood.com/chain/)
+- [Network configuration](https://docs.robinhood.com/chain/connecting/)
+- [Canonical token contracts](https://docs.robinhood.com/chain/contracts/)
+- [Contract deployment guide](https://docs.robinhood.com/chain/deploy-smart-contracts/)

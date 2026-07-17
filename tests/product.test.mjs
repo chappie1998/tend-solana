@@ -26,7 +26,24 @@ test("contract guards collateral, signatures, replay, pause, and eligibility", a
   assert.match(source, /filledQuotes\[digest\]/);
   assert.match(source, /cancelledNonces/);
   assert.match(source, /eligibility\.canTrade/);
-  assert.match(source, /_safeTransferFrom\(quote\.collateralToken, quote\.maker, address\(this\), quote\.maxPayout\)/);
+  assert.match(source, /approvedUnderlyings\[quote\.underlying\]/);
+  assert.match(source, /approvedCollateralTokens\[quote\.collateralToken\]/);
+  assert.match(source, /_safeTransferFromExact\(quote\.collateralToken, quote\.maker, address\(this\), quote\.maxPayout\)/);
   assert.match(source, /function settle/);
   assert.doesNotMatch(source, /function settle[\s\S]{0,100}if \(paused\)/);
+});
+
+test("server owns executable RFQs and persists consumed positions", async () => {
+  const [quotesRoute, positionsRoute, schema, hosting] = await Promise.all([
+    readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
+    readFile(new URL("app/api/positions/route.ts", root), "utf8"),
+    readFile(new URL("db/schema.ts", root), "utf8"),
+    readFile(new URL(".openai/hosting.json", root), "utf8"),
+  ]);
+
+  assert.match(quotesRoute, /insert\(rfqQuotes\)/);
+  assert.match(positionsRoute, /quote\.consumedAt/);
+  assert.match(positionsRoute, /db\.batch/);
+  assert.match(schema, /uniqueIndex\("positions_quote_unique_idx"\)/);
+  assert.match(hosting, /"d1": "DB"/);
 });

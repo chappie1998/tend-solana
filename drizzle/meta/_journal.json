@@ -1,5 +1,27 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "entries": []
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1784255200394,
+      "tag": "0000_safe_talkback",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784255515139,
+      "tag": "0001_colossal_swarm",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784255748292,
+      "tag": "0002_striped_sir_ram",
+      "breakpoints": true
+    }
+  ]
 }
