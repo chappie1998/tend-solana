@@ -11,6 +11,6 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["sdk/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "target/types/**/*.ts"]
+  "include": ["sdk/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "target/types/**/*.ts"],
+  "exclude": ["scripts/dev-rpc-proxy.ts", "scripts/http-flow-smoke.ts", "scripts/web-execution-smoke.ts"]
 }
-

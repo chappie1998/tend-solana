@@ -2,6 +2,7 @@ import { and, desc, eq, isNull } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../db";
 import { positions, rfqQuotes } from "../../../db/schema";
+import { parsePublicKey, verifyVsolFill } from "../../lib/vsol-server";
 
 function json(body: unknown, status = 200) {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
@@ -57,14 +58,22 @@ export async function POST(request: Request) {
 
   const walletAddress = typeof input.walletAddress === "string" ? input.walletAddress : "";
   const quoteId = typeof input.quoteId === "string" ? input.quoteId : "";
-  if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return json({ error: "Connect a valid EVM wallet first." }, 422);
+  const transactionSignature = typeof input.transactionSignature === "string" ? input.transactionSignature : "";
+  const buyer = parsePublicKey(walletAddress);
+  const positionAddress = parsePublicKey(quoteId);
+  if (!buyer) return json({ error: "Connect a valid Solana wallet first." }, 422);
   if (!quoteId) return json({ error: "Select an executable quote first." }, 422);
+  if (!positionAddress || !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(transactionSignature)) {
+    return json({ error: "A valid VSOL devnet fill signature is required." }, 422);
+  }
 
   const db = getDb();
   const [quote] = await db.select().from(rfqQuotes).where(eq(rfqQuotes.id, quoteId)).limit(1);
   if (!quote) return json({ error: "The quote does not exist. Request a fresh price." }, 404);
   if (quote.consumedAt) return json({ error: "This quote has already been used." }, 409);
-  if (quote.expiresAt.getTime() < Date.now()) return json({ error: "The quote has expired. Request a fresh price." }, 409);
+  if (!(await verifyVsolFill(transactionSignature, buyer, positionAddress))) {
+    return json({ error: "The transaction is not a confirmed VSOL fill for this wallet and position." }, 422);
+  }
 
   const consumedAt = new Date();
   const row = {
@@ -97,5 +106,5 @@ export async function POST(request: Request) {
     if (isUniqueConstraint(error)) return json({ error: "This quote has already been used." }, 409);
     throw error;
   }
-  return json({ position: row }, 201);
+  return json({ position: { ...row, transactionSignature } }, 201);
 }

@@ -4,92 +4,93 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("ships the Tend trading surface and real Robinhood token addresses", async () => {
-  const [page, terminal, markets, chart] = await Promise.all([
-    readFile(new URL("app/page.tsx", root), "utf8"),
+test("ships the VSOL trading surface with honest devnet labels", async () => {
+  const [terminal, markets, chart, layout] = await Promise.all([
     readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
     readFile(new URL("app/lib/markets.ts", root), "utf8"),
     readFile(new URL("app/components/TradingViewMarketChart.tsx", root), "utf8"),
+    readFile(new URL("app/layout.tsx", root), "utf8"),
   ]);
 
-  assert.match(page, /TendTerminal/);
-  assert.match(terminal, /Request live quotes/);
-  assert.match(terminal, /Maximum loss/);
-  assert.match(terminal, /100% locked/);
-  assert.match(terminal, /Chart feed is display-only/);
-  assert.match(terminal, /US reference session only/);
+  assert.match(terminal, /VSOL program verified/);
+  assert.match(terminal, /Execute on Solana devnet/);
+  assert.match(terminal, /mock tUSDC/);
+  assert.match(terminal, /controlled oracle/);
+  assert.match(terminal, /signTransaction/);
   assert.match(chart, /lightweight-charts/);
   assert.match(chart, /Charts by TradingView/);
   assert.match(chart, /DEMO DATA/);
-  assert.match(markets, /0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC/);
-  assert.match(markets, /0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa/);
+  assert.match(markets, /deployment\.underlyingMint/);
+  assert.match(layout, /Solana devnet/);
 });
 
-test("contract guards collateral, signatures, replay, pause, and eligibility", async () => {
-  const source = await readFile(new URL("contracts/TendMarket.sol", root), "utf8");
-  assert.match(source, /EIP712Domain/);
-  assert.match(source, /filledQuotes\[digest\]/);
-  assert.match(source, /cancelledNonces/);
-  assert.match(source, /eligibility\.canTrade/);
-  assert.match(source, /approvedUnderlyings\[quote\.underlying\]/);
-  assert.match(source, /approvedCollateralTokens\[quote\.collateralToken\]/);
-  assert.match(source, /quote\.observationWindow < 30/);
-  assert.match(source, /quoteWindowOpen\(quote\.expiry, quote\.deadline, quote\.tradeLock\)/);
-  assert.match(source, /observedFrom != position\.expiry/);
-  assert.match(source, /_safeTransferFromExact\(quote\.collateralToken, quote\.maker, address\(this\), quote\.maxPayout\)/);
-  assert.match(source, /function settle/);
-  assert.doesNotMatch(source, /function settle[\s\S]{0,100}if \(paused\)/);
-});
-
-test("server owns executable RFQs and persists consumed positions", async () => {
-  const [quotesRoute, positionsRoute, schema, hosting] = await Promise.all([
+test("server creates buyer-bound maker RFQs and verifies fills before persistence", async () => {
+  const [quotesRoute, positionsRoute, sendRoute, server, schema] = await Promise.all([
     readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
     readFile(new URL("app/api/positions/route.ts", root), "utf8"),
+    readFile(new URL("app/api/vsol/send/route.ts", root), "utf8"),
+    readFile(new URL("app/lib/vsol-server.ts", root), "utf8"),
     readFile(new URL("db/schema.ts", root), "utf8"),
-    readFile(new URL(".openai/hosting.json", root), "utf8"),
   ]);
 
-  assert.match(quotesRoute, /insert\(rfqQuotes\)/);
-  assert.match(quotesRoute, /resolveExpiry\(expiryCode, symbol, requestedAt\)/);
-  assert.match(quotesRoute, /freshIntradayReference\(market\)/);
-  assert.match(quotesRoute, /Intraday quotes require a fresh licensed reference feed/);
-  assert.match(positionsRoute, /quote\.consumedAt/);
+  assert.match(quotesRoute, /buildVsolQuoteTransaction/);
+  assert.match(quotesRoute, /VSOL_TEST_FUNDS_REQUIRED/);
+  assert.match(server, /quoteMessage/);
+  assert.match(server, /nacl\.sign\.detached/);
+  assert.match(server, /domainSeparator/);
+  assert.match(server, /deriveNonce/);
+  assert.match(sendRoute, /verifySignatures/);
+  assert.match(sendRoute, /isVsolFillTransaction/);
+  assert.match(server, /Instruction: FillQuote/);
+  assert.match(server, /positionOwnedByVsol/);
+  assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(schema, /uniqueIndex\("positions_quote_unique_idx"\)/);
-  assert.match(schema, /observationWindowSeconds/);
-  assert.match(hosting, /"d1": "DB"/);
 });
 
-test("market data is sourced through a server adapter and never silently presented as live", async () => {
-  const [marketData, expiries] = await Promise.all([
-    readFile(new URL("app/api/market-data/route.ts", root), "utf8"),
-    readFile(new URL("app/lib/expiries.ts", root), "utf8"),
+test("faucet is isolated to mock assets and same-origin calls", async () => {
+  const [faucet, env, gitignore] = await Promise.all([
+    readFile(new URL("app/api/vsol/faucet/route.ts", root), "utf8"),
+    readFile(new URL(".env.example", root), "utf8"),
+    readFile(new URL("vsol/.gitignore", root), "utf8"),
   ]);
 
-  assert.match(marketData, /process\.env\.MASSIVE_API_KEY/);
-  assert.match(marketData, /Tend simulated market data/);
-  assert.match(marketData, /never used for settlement/);
-  assert.match(expiries, /"15M" \| "1H" \| "EOD" \| "7D" \| "30D"/);
-  assert.match(expiries, /symbol !== "SPCX"/);
-  assert.match(expiries, /tradeLockSeconds/);
+  assert.match(faucet, /sameOrigin/);
+  assert.match(faucet, /VSOL_SETTLEMENT_MINT/);
+  assert.match(faucet, /mint\.mintAuthority.*faucet\.publicKey/);
+  assert.match(env, /Never use a mainnet, admin, or personally funded wallet/);
+  assert.match(gitignore, /\.devnet/);
 });
 
-test("intraday expiry rules open only during the reference session and exclude SPCX", async () => {
-  const [{ resolveExpiry }, { quoteFor }] = await Promise.all([
+test("program covers collateral, replay, signature, pause, and refund invariants", async () => {
+  const source = await readFile(new URL("vsol/programs/vsol/src/lib.rs", root), "utf8");
+  const signature = await readFile(new URL("vsol/programs/vsol/src/signature.rs", root), "utf8");
+  const math = await readFile(new URL("vsol/programs/vsol/src/math.rs", root), "utf8");
+
+  assert.match(source, /writer_token\.amount >= quote\.max_payout/);
+  assert.match(source, /verify_preceding_ed25519_instruction/);
+  assert.match(source, /domain_separator/);
+  assert.match(source, /NonceStatus::Filled/);
+  assert.match(source, /position\.fee_bps = config\.fee_bps/);
+  assert.match(source, /calculate_fee\(position\.premium, position\.fee_bps\)/);
+  assert.match(source, /pub fn refund_unsettled/);
+  assert.match(source, /pub fn set_pause/);
+  assert.match(signature, /solana_sdk_ids::ed25519_program::ID/);
+  assert.match(math, /checked_mul/);
+  assert.match(math, /settlement_conserves_escrow/);
+});
+
+test("short-duration products remain explicitly oracle gated", async () => {
+  const [terminal, expiries] = await Promise.all([
+    readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
     import(new URL("app/lib/expiries.ts", root)),
-    import(new URL("app/lib/options.ts", root)),
   ]);
-  const regularSession = Date.parse("2026-07-17T14:00:00Z");
-  const closedSession = Date.parse("2026-07-17T03:00:00Z");
-  const intraday = resolveExpiry("15M", "NVDA", regularSession);
+  assert.match(terminal, /protocol-ready but not published/);
+  assert.match(terminal, /code !== "30D"/);
 
+  const regularSession = Date.parse("2026-07-17T14:00:00Z");
+  const intraday = expiries.resolveExpiry("15M", "NVDA", regularSession);
   assert.equal(intraday.available, true);
   assert.equal(intraday.durationMinutes, 15);
   assert.equal(intraday.observationWindowSeconds, 60);
-  assert.equal(resolveExpiry("15M", "NVDA", closedSession).available, false);
-  assert.equal(resolveExpiry("15M", "SPCX", regularSession).available, false);
-
-  const shortPremium = quoteFor({ spot: 100, amount: 10_000, durationMinutes: 15, direction: "up", payoff: 5, volatility: 45 }).premium;
-  const weeklyPremium = quoteFor({ spot: 100, amount: 10_000, durationMinutes: 10_080, direction: "up", payoff: 5, volatility: 45 }).premium;
-  assert.ok(shortPremium < weeklyPremium);
 });

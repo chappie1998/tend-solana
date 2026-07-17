@@ -6,25 +6,29 @@ use crate::{QuoteArgs, VsolError, QUOTE_DOMAIN};
 const ED25519_HEADER_LEN: usize = solana_ed25519_program::DATA_START;
 const CURRENT_INSTRUCTION: u16 = u16::MAX;
 
+pub struct QuoteMessageContext<'a> {
+    pub program_id: &'a Pubkey,
+    pub config: &'a Pubkey,
+    pub market: &'a Pubkey,
+    pub buyer: &'a Pubkey,
+    pub maker: &'a Pubkey,
+}
+
 pub fn quote_message(
-    program_id: &Pubkey,
     domain_separator: &[u8; 32],
     domain_version: u16,
-    config: &Pubkey,
-    market: &Pubkey,
-    buyer: &Pubkey,
-    maker: &Pubkey,
+    context: &QuoteMessageContext<'_>,
     quote: &QuoteArgs,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(251);
     message.extend_from_slice(QUOTE_DOMAIN);
     message.extend_from_slice(domain_separator);
     message.extend_from_slice(&domain_version.to_le_bytes());
-    message.extend_from_slice(program_id.as_ref());
-    message.extend_from_slice(config.as_ref());
-    message.extend_from_slice(market.as_ref());
-    message.extend_from_slice(buyer.as_ref());
-    message.extend_from_slice(maker.as_ref());
+    message.extend_from_slice(context.program_id.as_ref());
+    message.extend_from_slice(context.config.as_ref());
+    message.extend_from_slice(context.market.as_ref());
+    message.extend_from_slice(context.buyer.as_ref());
+    message.extend_from_slice(context.maker.as_ref());
     message.extend_from_slice(&quote.nonce.to_le_bytes());
     message.push(quote.direction);
     message.extend_from_slice(&quote.strike.to_le_bytes());
@@ -137,16 +141,14 @@ mod tests {
             max_payout: 5_000_000,
             quote_expiry: 1_900_000_000,
         };
-        let message = quote_message(
-            &crate::ID,
-            &[9u8; 32],
-            1,
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
-            &quote,
-        );
+        let context = QuoteMessageContext {
+            program_id: &crate::ID,
+            config: &Pubkey::new_unique(),
+            market: &Pubkey::new_unique(),
+            buyer: &Pubkey::new_unique(),
+            maker: &Pubkey::new_unique(),
+        };
+        let message = quote_message(&[9u8; 32], 1, &context, &quote);
         assert_eq!(&message[..QUOTE_DOMAIN.len()], QUOTE_DOMAIN);
         assert_eq!(message.len(), 251);
     }

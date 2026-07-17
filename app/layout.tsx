@@ -3,16 +3,23 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: {
-    default: "Tend — Defined-risk markets",
-    template: "%s · Tend",
+    default: "VSOL by Tend — Defined-risk markets on Solana",
+    template: "%s · VSOL",
   },
   description:
-    "A transparent, fully collateralized options market for tokenized assets.",
+    "A fully collateralized, signed-RFQ options sandbox deployed on Solana devnet.",
   icons: { icon: "/favicon.svg" },
   openGraph: {
-    title: "Tend — Options, without the trapdoors",
-    description: "Defined-risk markets for tokenized assets on Robinhood Chain.",
+    title: "VSOL by Tend — Options, without the trapdoors",
+    description: "Defined-risk markets for tokenized assets on Solana devnet.",
     type: "website",
+    images: [{ url: "/og-vsol.png", width: 1731, height: 909, alt: "A secured VSOL payoff curve passing through fully collateralized escrow" }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "VSOL by Tend — Options, without the trapdoors",
+    description: "Defined-risk markets for tokenized assets on Solana devnet.",
+    images: ["/og-vsol.png"],
   },
 };
 

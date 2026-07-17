@@ -115,8 +115,8 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
   let expiryDays = 0;
   let observationWindowSeconds = 60;
   let tradeLockSeconds = 60;
-  let label = code;
-  let shortLabel = code;
+  let label: string = code;
+  let shortLabel: string = code;
   let detail = "";
 
   if (code === "15M") {

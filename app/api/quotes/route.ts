@@ -5,18 +5,31 @@ import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import type { Market } from "../../lib/markets";
-
-const makers = [
-  { name: "Aster", multiplier: 1, latencyMs: 780, badge: "Best price" },
-  { name: "Northstar", multiplier: 1.018, latencyMs: 1_080, badge: "Deepest" },
-  { name: "Maverick", multiplier: 1.043, latencyMs: 610, badge: "Fastest" },
-] as const;
+import { buildVsolQuoteTransaction, parsePublicKey } from "../../lib/vsol-server";
+import { solanaExplorerUrl } from "../../lib/vsol";
+import { getChatGPTUser } from "../../chatgpt-auth";
 
 function json(body: unknown, status = 200) {
   return Response.json(body, {
     status,
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+function sameOrigin(request: Request) {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === new URL(request.url).host;
+  } catch {
+    return false;
+  }
+}
+
+async function authorized(request: Request) {
+  if (await getChatGPTUser()) return true;
+  const hostname = new URL(request.url).hostname;
+  return hostname === "localhost" || hostname === "127.0.0.1";
 }
 
 async function freshIntradayReference(market: Market) {
@@ -37,6 +50,8 @@ async function freshIntradayReference(market: Market) {
 }
 
 export async function POST(request: Request) {
+  if (!sameOrigin(request)) return json({ error: "Cross-site quote requests are not allowed." }, 403);
+  if (!(await authorized(request))) return json({ error: "Sign in to request executable quotes." }, 401);
   await ensureDb();
   let input: Record<string, unknown>;
   try {
@@ -54,11 +69,14 @@ export async function POST(request: Request) {
     ? requestedExpiry
     : legacyDays === 14 ? "7D" : legacyDays === 30 ? "30D" : "7D") as ExpiryCode;
   const payoff = Number(input.payoff);
+  const buyer = parsePublicKey(input.walletAddress);
   const market = markets.find((item) => item.symbol === symbol);
 
   if (!market || !direction) return json({ error: "Choose a supported market and direction." }, 422);
-  if (!Number.isFinite(amount) || amount < 100 || amount > 50_000) return json({ error: "Order size must be between $100 and $50,000." }, 422);
+  if (!buyer) return json({ error: "Connect a valid Solana wallet before requesting an executable quote." }, 422);
+  if (!Number.isFinite(amount) || amount < 100 || amount > 5_000) return json({ error: "Devnet order size must be between $100 and $5,000." }, 422);
   if (requestedExpiry && !expiryCodes.includes(requestedExpiry as ExpiryCode)) return json({ error: "Choose a supported expiry." }, 422);
+  if (expiryCode !== "30D") return json({ error: "The live devnet sandbox currently quotes the rolling 30-day market. Shorter series remain gated until the production oracle is connected." }, 422);
   if (![2, 5, 10].includes(payoff)) return json({ error: "Target payoff must be 2×, 5×, or 10×." }, 422);
 
   const requestedAt = Date.now();
@@ -82,22 +100,39 @@ export async function POST(request: Request) {
     volatility: market.iv,
   });
   const requestId = crypto.randomUUID();
-  const quoteRows = makers.map((maker, index) => ({
-    id: `${symbol}-${requestedAt}-${index + 1}`,
+  const startedAt = Date.now();
+  let vsol;
+  try {
+    vsol = await buildVsolQuoteTransaction({
+      buyer,
+      direction,
+      strike: economics.strike,
+      cap: economics.cap,
+      premium: economics.premium,
+      maxPayout: economics.maxPayout,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "VsolTestFundsRequired") {
+      return json({ error: error.message, code: "VSOL_TEST_FUNDS_REQUIRED" }, 409);
+    }
+    return json({ error: error instanceof Error ? error.message : "The VSOL maker did not return an executable quote." }, 503);
+  }
+  const quoteRows = [{
+    id: vsol.positionAddress,
     requestId,
-    maker: maker.name,
+    maker: "VSOL Devnet MM",
     symbol,
     direction,
     amount,
-    premium: Number((economics.premium * maker.multiplier).toFixed(2)),
+    premium: Number(economics.premium.toFixed(2)),
     maxPayout: Number(economics.maxPayout.toFixed(2)),
     strike: Number(economics.strike.toFixed(2)),
     capPrice: Number(economics.cap.toFixed(2)),
     breakeven: Number(economics.breakeven.toFixed(2)),
     impliedVolatility: market.iv,
-    effectiveLeverage: Number((economics.maxPayout / (economics.premium * maker.multiplier)).toFixed(2)),
-    latencyMs: maker.latencyMs,
-    badge: maker.badge,
+    effectiveLeverage: Number((economics.maxPayout / economics.premium).toFixed(2)),
+    latencyMs: Date.now() - startedAt,
+    badge: "Onchain escrow",
     expiryDays: expiry.expiryDays,
     expiryCode: expiry.code,
     optionExpiryAt: new Date(expiry.expiryAt),
@@ -107,7 +142,7 @@ export async function POST(request: Request) {
     expiresAt: new Date(requestedAt + 30_000),
     consumedAt: null,
     createdAt: new Date(requestedAt),
-  }));
+  }];
   try {
     const db = getDb();
     await db.delete(rfqQuotes).where(lt(rfqQuotes.expiresAt, new Date(requestedAt - 86_400_000)));
@@ -146,5 +181,9 @@ export async function POST(request: Request) {
       tradeLockSeconds: expiry.tradeLockSeconds,
     },
     quotes,
+    vsol: {
+      ...vsol,
+      explorerUrl: solanaExplorerUrl("address", vsol.positionAddress),
+    },
   });
 }

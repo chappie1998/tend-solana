@@ -1,114 +1,87 @@
-# Tend
+# VSOL by Tend
 
-Defined-risk markets for tokenized assets on Robinhood Chain.
+VSOL is Tend’s Solana-native defined-risk options protocol. This `sol` branch contains the production web application, Anchor program, TypeScript SDK, deployment tools, and verified Solana devnet deployment. The `main` branch remains the Robinhood Chain product.
 
-Tend gives traders an UP/DOWN interface while exposing the option economics that matter: premium, implied volatility, target price, maximum loss, and potential payout. Market makers compete through signed RFQs and lock the maximum possible payout before a position opens.
+> Status: devnet sandbox. The assets are mock tokens, the settlement oracle is controlled by the devnet operator, and the code has not received an independent security audit. Do not use real funds or deploy this configuration to mainnet.
 
-> Preview status: the product runs end to end with server-generated RFQs and durable position records, but it intentionally sends no wallet transactions. The Solidity contracts are unaudited and undeployed. Do not use with real funds.
+## Live devnet deployment
 
-## Why Robinhood Chain first
+| Component | Address |
+| --- | --- |
+| Program | `2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v` |
+| Config | `688RQvX2SEpnSuEndbjvRivFQpMzGjaz8hhGvAPGj1bY` |
+| Rolling market | See `vsol/deployments/devnet.json` |
+| Settlement mint | `EaU6Yus9b7SWz3gzRNMuerpn1U9mYpfm996CQd2Lzhh4` |
 
-- Canonical stock tokens and their users already live there.
-- It is EVM-compatible, so Tend uses standard Solidity tooling.
-- Robinhood publishes the canonical token contract registry.
-- Chainlink is the documented oracle partner.
-- The protocol remains portable to Monad because the core contract has no chain-specific opcodes.
+The checked-in deployment manifest includes the executable program, market, oracle, writer vault, public smoke-test transaction signatures, and the cluster-bound RFQ domain.
 
-Network configuration:
+## Product flow
 
-| Network | Chain ID | RPC |
-| --- | ---: | --- |
-| Robinhood Chain | 4663 | `https://rpc.mainnet.chain.robinhood.com` |
-| Robinhood Chain Testnet | 46630 | `https://rpc.testnet.chain.robinhood.com` |
+1. Connect an injected Solana wallet such as Phantom.
+2. The private devnet faucet funds that wallet with mock tUSDC and a small amount of devnet SOL.
+3. Request an RFQ. The server signs the exact buyer, maker, market, economics, nonce, program, cluster, and configuration version.
+4. Review the defined payoff and sign the serialized transaction in the wallet.
+5. The app submits only a valid signed VSOL transaction to devnet.
+6. The portfolio record is created only after the backend independently verifies the confirmed on-chain fill.
 
-## Product surface
+Charts use TradingView Lightweight Charts. Their feed is display-only and never used for settlement. Short-duration series (15m, 1h, and end-of-day) are represented in the product but intentionally gated until a production settlement oracle and rolling-market operator are available. The live sandbox publishes a 30-day series.
 
-- Simple UP/DOWN trade builder with 2×, 5×, and 10× capped payoff profiles
-- Session-aware 15-minute, 1-hour, market-close, 7-day, and 30-day expiries
-- TradingView Lightweight Charts with 1m, 5m, 15m, 1h, and daily candles
-- Licensed Massive market-data adapter with explicit live, delayed, error, and demo states
-- Competitive three-maker RFQs generated and stored by the server, with 30-second expiry and single-use execution
-- Transparent maximum loss, IV, premium, and payout
-- Durable D1-backed portfolio records, replay protection, and CSV export
-- Writer desk with locked collateral, obligations, utilization, and stress P&L
-- Injected-wallet connection and Robinhood Chain testnet switching
-- Responsive mobile navigation and keyboard-accessible controls
-- Canonical NVDA, TSLA, QQQ, and SPCX token addresses
+## Protocol design
 
-Intraday expiries are restricted to the US reference session and are unavailable for SPCX. Every short-duration quote carries a no-trade buffer before expiry and an explicit post-expiry oracle observation window. The chart is display-only and is never a settlement oracle.
-
-Without `MASSIVE_API_KEY`, Tend deliberately renders deterministic candles under a prominent **DEMO DATA** watermark. It never substitutes simulated values while claiming that a feed is live. Even with the licensed feed configured, the UI exposes its source, timestamp, and freshness state.
-
-The application never trusts quote economics supplied by the browser. A preview position can only consume a live, server-owned RFQ, and the quote ID is unique so retries cannot create duplicate fills.
-
-## Contract prototype
-
-[`contracts/TendMarket.sol`](contracts/TendMarket.sol) implements:
-
-- EIP-712 maker-signed quotes
-- maker, oracle, underlying-token, and collateral-token allowlists
-- optional per-market eligibility checks
-- quote deadlines, maker nonces, cancellation, and replay protection
-- exact maximum-payout collateral locking
-- capped linear UP/DOWN settlement
-- separate owner and emergency pause authority
-- settlement while new fills are paused
-- conservative ERC-20 transfer handling and reentrancy protection
-- exact-balance collateral checks that reject fee-on-transfer or underfunded deposits
-- signed per-position observation windows and pre-expiry trade locks
-- settlement rejection unless the oracle finalizes the complete requested window
-
-The settlement oracle is an adapter interface, not a chart or client-provided price. A production adapter must finalize the exact signed expiry observation window, reject stale/deviating data, and handle corporate-action adjustments.
+- Program-owned PDA writer vaults and per-position escrow vaults
+- Fully collateralized maximum payout before every fill
+- Buyer-paid premium with no liquidation path
+- Immediate-preceding Ed25519 maker-signature verification
+- One-shot maker nonce PDAs for replay prevention
+- Genesis-hash and config-version domain separation
+- Fill-time fee snapshots so later governance updates cannot alter open-position fees
+- Linear capped UP/DOWN settlement using checked `u128` arithmetic
+- Separate admin, pause, oracle, and eligibility authorities
+- Optional wallet eligibility records
+- Settlement remains available while new fills are paused
+- Deterministic refund if the oracle misses its settlement deadline
+- SPL Token classic only in v1 to avoid transfer-fee ambiguity
 
 ## Local development
 
-Requires Node.js 22.13 or newer.
+Requirements: Node.js 22+, Rust 1.89, Solana CLI 3.1.10, and Anchor CLI 1.0.2.
 
 ```bash
 npm install
+npm --prefix vsol install
 npm run dev
 ```
 
-To enable licensed public-equity display data, set `MASSIVE_API_KEY`. SPCX remains indicative until an approved issuer/oracle feed is integrated.
+The app needs two isolated devnet-only server secrets:
 
-Verification:
-
-```bash
-npm run lint
-npm run test
-npm run build
-npm run test:contracts
+```text
+VSOL_MAKER_SECRET_KEY=<JSON byte array or base64-encoded JSON>
+VSOL_FAUCET_SECRET_KEY=<JSON byte array or base64-encoded JSON>
+VSOL_RPC_URL=<private Solana devnet RPC URL>
 ```
 
-The test suite covers the product surface, server-owned RFQs, D1 persistence, quote replay protection, contract safety gates, deterministic UP/DOWN payouts, and 256 fuzz runs asserting that payouts cannot exceed locked collateral.
+Never use the program admin, upgrade authority, mainnet wallet, or personally funded key for these roles.
+Solana’s public endpoints are suitable for development but may block or throttle hosted server traffic. Use a private devnet RPC for the deployed app.
 
-## Preview architecture
+## Verification
 
-1. The browser loads display candles from `/api/market-data`, which surfaces source and freshness and falls back to clearly marked demo data.
-2. The browser submits a validated trade intent and expiry code to `/api/quotes`.
-3. The server enforces market-session eligibility, calculates, and persists three normalized RFQs.
-4. The user selects a live quote and reviews the economics, trade lock, and settlement window.
-5. `/api/positions` reads the quote from D1, atomically records the position, and consumes the quote.
-6. The Portfolio screen reloads the owner-scoped record from D1.
+```bash
+npm run check
+npm --prefix vsol run devnet:verify
+```
 
-State-changing preview requests are same-origin checked. Production reads and writes are scoped to the private-site identity forwarded by the hosting runtime; localhost uses an explicit development fallback.
+The protocol suite tests payout bounds, fee rounding, escrow conservation, signature message format, cluster-domain separation, deterministic PDAs, and replay behavior. The deployment harness additionally executes successful fill/settlement and oracle-timeout/refund lifecycles, then checks that both position vaults close.
 
-## Before testnet deployment
+## Before mainnet
 
-Tend still needs:
+Mainnet deployment is blocked until all of the following are complete:
 
-1. A throwaway Robinhood Chain testnet deployer funded with test ETH.
-2. Testnet USDG/mock collateral and settlement-oracle adapter addresses.
-3. The exact first-market settlement window and corporate-action policy.
-4. At least two committed market-maker test wallets.
-5. Jurisdiction and eligibility rules reviewed by qualified counsel.
-6. A licensed market-data plan and production-grade market-calendar service for holiday and halt handling.
+- replace the controlled devnet oracle with a reviewed production adapter;
+- independent smart-contract and infrastructure audits;
+- fuzz/property tests across all instruction account substitutions;
+- multisig upgrade/admin authorities and timelocked governance;
+- production market-calendar, halt, and corporate-action policy;
+- external market makers, monitoring, incident response, and legal review;
+- audited custody, token eligibility, and jurisdiction controls.
 
-Before mainnet, require an independent contract audit, multisig ownership, timelocked parameter changes, adversarial oracle tests, transfer-restriction tests, and a documented incident response plan.
-
-## Official references
-
-- [Robinhood Chain overview](https://docs.robinhood.com/chain/)
-- [Network configuration](https://docs.robinhood.com/chain/connecting/)
-- [Canonical token contracts](https://docs.robinhood.com/chain/contracts/)
-- [Contract deployment guide](https://docs.robinhood.com/chain/deploy-smart-contracts/)
+See `vsol/SECURITY.md` for the threat model and `vsol/deployments/devnet.json` for reproducible on-chain evidence.

@@ -71,7 +71,6 @@ export function TradingViewMarketChart({
       const color = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
       const chart = createChart(containerRef.current, {
         autoSize: true,
-        attributionLogo: true,
         layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: color("--ink-faint", "#7a858e"), fontFamily: "Inter, system-ui, sans-serif", fontSize: 11 },
         grid: { vertLines: { color: color("--line", "#d9d9d2") }, horzLines: { color: color("--line", "#d9d9d2") } },
         rightPriceScale: { borderColor: color("--line-strong", "#bfc2bd") },

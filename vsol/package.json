@@ -16,12 +16,16 @@
     "@anchor-lang/core": "1.0.2",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.98.4",
-    "bn.js": "5.2.2"
+    "bn.js": "5.2.5"
   },
   "devDependencies": {
     "@types/node": "22.19.19",
     "@types/bn.js": "5.2.0",
     "tsx": "4.20.6",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "bn.js": "5.2.5",
+    "ws": "8.21.0"
   }
 }

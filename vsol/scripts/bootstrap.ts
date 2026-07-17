@@ -57,6 +57,7 @@ type Deployment = {
   cluster: string;
   rpcUrl: string;
   programId: string;
+  programUpgradeSignature?: string;
   config: string;
   admin: string;
   maker: string;
@@ -65,6 +66,9 @@ type Deployment = {
   underlyingMint: string;
   writerVault: string;
   writerToken: string;
+  treasuryToken: string;
+  domainSeparator: number[];
+  domainVersion: number;
   uiMarket: string;
   uiOracle: string;
   uiExpiry: number;
@@ -128,10 +132,16 @@ async function ensureMint(admin: Keypair, mint: Keypair, decimals: number): Prom
   }
 }
 
-async function ensureTokenBalance(admin: Keypair, mint: PublicKey, owner: PublicKey, minimum: bigint) {
+async function ensureTokenBalance(
+  payer: Keypair,
+  mintAuthority: Keypair,
+  mint: PublicKey,
+  owner: PublicKey,
+  minimum: bigint,
+) {
   const account = await getOrCreateAssociatedTokenAccount(
     connection,
-    admin,
+    payer,
     mint,
     owner,
     false,
@@ -141,7 +151,17 @@ async function ensureTokenBalance(admin: Keypair, mint: PublicKey, owner: Public
   );
   const current = (await getAccount(connection, account.address, commitment, TOKEN_PROGRAM_ID)).amount;
   if (current < minimum) {
-    await mintTo(connection, admin, mint, account.address, admin, minimum - current, [], { commitment }, TOKEN_PROGRAM_ID);
+    await mintTo(
+      connection,
+      payer,
+      mint,
+      account.address,
+      mintAuthority,
+      minimum - current,
+      [],
+      { commitment },
+      TOKEN_PROGRAM_ID,
+    );
   }
   return account.address;
 }
@@ -261,6 +281,9 @@ async function waitUntil(timestamp: number, label: string): Promise<void> {
 
 async function main(): Promise<void> {
   console.log(`VSOL bootstrap on ${cluster}: ${rpcUrl}`);
+  const previousDeployment = existsSync(deploymentPath)
+    ? JSON.parse(await readFile(deploymentPath, "utf8")) as Partial<Deployment>
+    : {};
   const admin = await loadKeypair(walletPath);
   const maker = await loadOrCreateKeypair(`${cluster}-maker`);
   const buyer = await loadOrCreateKeypair(`${cluster}-buyer`);
@@ -298,9 +321,27 @@ async function main(): Promise<void> {
 
   const settlementMint = await ensureMint(admin, settlementMintKeypair, 6);
   const underlyingMint = await ensureMint(admin, underlyingMintKeypair, 6);
-  const makerToken = await ensureTokenBalance(admin, settlementMint, maker.publicKey, 100_000n * 1_000_000n);
-  const buyerToken = await ensureTokenBalance(admin, settlementMint, buyer.publicKey, 100_000n * 1_000_000n);
-  const treasuryToken = await ensureTokenBalance(admin, settlementMint, admin.publicKey, 0n);
+  const faucetPath = resolve(devnetDir, `${cluster}-faucet.json`);
+  const settlementMintAuthority = existsSync(faucetPath) ? await loadKeypair(faucetPath) : admin;
+  const settlementMintAccount = await getMint(connection, settlementMint, commitment, TOKEN_PROGRAM_ID);
+  if (!settlementMintAccount.mintAuthority?.equals(settlementMintAuthority.publicKey)) {
+    throw new Error(`Configured mock-USDC authority ${settlementMintAuthority.publicKey.toBase58()} does not control ${settlementMint.toBase58()}`);
+  }
+  const makerToken = await ensureTokenBalance(
+    admin,
+    settlementMintAuthority,
+    settlementMint,
+    maker.publicKey,
+    100_000n * 1_000_000n,
+  );
+  const buyerToken = await ensureTokenBalance(
+    admin,
+    settlementMintAuthority,
+    settlementMint,
+    buyer.publicKey,
+    100_000n * 1_000_000n,
+  );
+  const treasuryToken = await ensureTokenBalance(admin, settlementMintAuthority, settlementMint, admin.publicKey, 0n);
 
   const writerVault = deriveWriterVault(config, maker.publicKey, settlementMint);
   const writerToken = deriveWriterToken(writerVault);
@@ -336,18 +377,18 @@ async function main(): Promise<void> {
   }
 
   const now = await clusterUnixTime();
-  const uiExpiry = now + 86_400;
+  const uiExpiry = now + 30 * 86_400;
   const ui = await createMarket({
     adminProgram,
     admin,
     config,
     settlementMint,
     underlyingMint,
-    label: `${cluster}:VSOL-RWA:1D:${Math.floor(now / 3_600)}`,
+    label: `${cluster}:VSOL-RWA:30D:${Math.floor(now / 86_400)}`,
     symbol: "VSOL-RWA",
     expiry: uiExpiry,
-    observationWindowSeconds: 300,
-    settlementGraceSeconds: 3_600,
+    observationWindowSeconds: 900,
+    settlementGraceSeconds: 86_400,
   });
 
   const smokeExpiry = (await clusterUnixTime()) + (cluster === "localnet" ? 30 : 75);
@@ -492,6 +533,7 @@ async function main(): Promise<void> {
     cluster,
     rpcUrl,
     programId: VSOL_PROGRAM_ID.toBase58(),
+    programUpgradeSignature: previousDeployment.programUpgradeSignature,
     config: config.toBase58(),
     admin: admin.publicKey.toBase58(),
     maker: maker.publicKey.toBase58(),
@@ -500,10 +542,14 @@ async function main(): Promise<void> {
     underlyingMint: underlyingMint.toBase58(),
     writerVault: writerVault.toBase58(),
     writerToken: writerToken.toBase58(),
+    treasuryToken: treasuryToken.toBase58(),
+    domainSeparator: [...domainSeparator],
+    domainVersion,
     uiMarket: ui.market.toBase58(),
     uiOracle: ui.oracle.toBase58(),
     uiExpiry,
     smoke: {
+      ...(previousDeployment.smoke ?? {}),
       successFillSignature,
       refundFillSignature,
       publishSignature,

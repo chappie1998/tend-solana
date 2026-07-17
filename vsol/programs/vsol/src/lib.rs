@@ -5,7 +5,7 @@ mod math;
 mod signature;
 
 use math::{calculate_fee, calculate_payout};
-use signature::{quote_message, verify_preceding_ed25519_instruction};
+use signature::{quote_message, verify_preceding_ed25519_instruction, QuoteMessageContext};
 
 declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
 
@@ -166,6 +166,11 @@ pub mod vsol {
         require!(
             args.symbol.iter().any(|byte| *byte != 0),
             VsolError::InvalidSymbol
+        );
+        require!(args.price_scale > 0, VsolError::InvalidPriceScale);
+        require!(
+            args.underlying_mint != Pubkey::default(),
+            VsolError::InvalidUnderlyingMint
         );
 
         let market = &mut ctx.accounts.market;
@@ -358,14 +363,21 @@ pub mod vsol {
             );
         }
 
+        let config_key = config.key();
+        let market_key = market.key();
+        let buyer_key = ctx.accounts.buyer.key();
+        let maker_key = ctx.accounts.maker.key();
+        let quote_context = QuoteMessageContext {
+            program_id: &crate::ID,
+            config: &config_key,
+            market: &market_key,
+            buyer: &buyer_key,
+            maker: &maker_key,
+        };
         let message = quote_message(
-            &crate::ID,
             &config.domain_separator,
             config.domain_version,
-            &config.key(),
-            &market.key(),
-            &ctx.accounts.buyer.key(),
-            &ctx.accounts.maker.key(),
+            &quote_context,
             &quote,
         );
         verify_preceding_ed25519_instruction(
@@ -443,6 +455,7 @@ pub mod vsol {
         position.width = quote.width;
         position.premium = quote.premium;
         position.max_payout = quote.max_payout;
+        position.fee_bps = config.fee_bps;
         position.opened_at = now;
         position.quote_expiry = quote.quote_expiry;
 
@@ -533,7 +546,9 @@ pub mod vsol {
             oracle.price,
             position.max_payout,
         )?;
-        let fee = calculate_fee(position.premium, ctx.accounts.config.fee_bps)?;
+        // A filled quote must not become more expensive if governance updates
+        // the protocol fee before expiry.
+        let fee = calculate_fee(position.premium, position.fee_bps)?;
         let maker_amount = position
             .max_payout
             .checked_sub(payout)
@@ -1027,6 +1042,7 @@ pub struct Position {
     pub width: u64,
     pub premium: u64,
     pub max_payout: u64,
+    pub fee_bps: u16,
     pub opened_at: i64,
     pub quote_expiry: i64,
 }
@@ -1183,6 +1199,10 @@ pub enum VsolError {
     InvalidConfidence,
     #[msg("The symbol is empty.")]
     InvalidSymbol,
+    #[msg("The market price scale must be positive.")]
+    InvalidPriceScale,
+    #[msg("The underlying mint cannot be the default public key.")]
+    InvalidUnderlyingMint,
     #[msg("The amount must be positive.")]
     InvalidAmount,
     #[msg("The payout width must be positive.")]

@@ -1,9 +1,10 @@
 /.anchor/
 /.devnet/
 /node_modules/
-/target/
+/target/*
 !/target/idl/
+!/target/idl/vsol.json
 !/target/types/
+!/target/types/vsol.ts
 !/target/deploy/.gitkeep
 *.log
-

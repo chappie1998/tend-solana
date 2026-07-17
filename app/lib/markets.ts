@@ -4,9 +4,9 @@ export type Market = {
   price: number;
   change: number;
   iv: number;
-  tokenAddress: `0x${string}`;
+  tokenAddress: string;
   tone: string;
-  oracleStatus: "Configured" | "Indicative";
+  oracleStatus: "Devnet" | "Indicative";
   marketDataSymbol: string | null;
   intradayEligible: boolean;
 };
@@ -18,9 +18,9 @@ export const markets: Market[] = [
     price: 171.86,
     change: 2.41,
     iv: 46.2,
-    tokenAddress: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+    tokenAddress: deployment.underlyingMint,
     tone: "#83e0ba",
-    oracleStatus: "Configured",
+    oracleStatus: "Devnet",
     marketDataSymbol: "NVDA",
     intradayEligible: true,
   },
@@ -30,9 +30,9 @@ export const markets: Market[] = [
     price: 446.73,
     change: -1.18,
     iv: 57.8,
-    tokenAddress: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d",
+    tokenAddress: deployment.underlyingMint,
     tone: "#ff8e79",
-    oracleStatus: "Configured",
+    oracleStatus: "Devnet",
     marketDataSymbol: "TSLA",
     intradayEligible: true,
   },
@@ -42,7 +42,7 @@ export const markets: Market[] = [
     price: 288.14,
     change: 0.82,
     iv: 68.9,
-    tokenAddress: "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa",
+    tokenAddress: deployment.underlyingMint,
     tone: "#9aaeff",
     oracleStatus: "Indicative",
     marketDataSymbol: null,
@@ -54,10 +54,11 @@ export const markets: Market[] = [
     price: 638.27,
     change: 0.37,
     iv: 24.6,
-    tokenAddress: "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68",
+    tokenAddress: deployment.underlyingMint,
     tone: "#ffd275",
-    oracleStatus: "Configured",
+    oracleStatus: "Devnet",
     marketDataSymbol: "QQQ",
     intradayEligible: true,
   },
 ];
+import deployment from "../../vsol/deployments/devnet.json";

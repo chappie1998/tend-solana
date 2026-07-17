@@ -2,20 +2,26 @@ import { env } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "./schema";
 
+function bindings() {
+  return env as unknown as { DB?: D1Database };
+}
+
 export function getDb() {
-  if (!env.DB) {
+  const { DB } = bindings();
+  if (!DB) {
     throw new Error(
       "Cloudflare D1 binding `DB` is unavailable. Set the `d1` field in .openai/hosting.json to `DB` or let your control plane inject the real binding values before using the database."
     );
   }
 
-  return drizzle(env.DB, { schema });
+  return drizzle(DB, { schema });
 }
 
 export async function ensureDb() {
-  if (!env.DB) throw new Error("Cloudflare D1 binding `DB` is unavailable.");
-  await env.DB.batch([
-    env.DB.prepare(`CREATE TABLE IF NOT EXISTS positions (
+  const { DB } = bindings();
+  if (!DB) throw new Error("Cloudflare D1 binding `DB` is unavailable.");
+  await DB.batch([
+    DB.prepare(`CREATE TABLE IF NOT EXISTS positions (
       id text PRIMARY KEY NOT NULL,
       user_email text NOT NULL,
       wallet_address text NOT NULL,
@@ -35,10 +41,10 @@ export async function ensureDb() {
       status text NOT NULL,
       created_at integer NOT NULL
     )`),
-    env.DB.prepare("CREATE INDEX IF NOT EXISTS positions_user_created_idx ON positions (user_email, created_at)"),
-    env.DB.prepare("CREATE INDEX IF NOT EXISTS positions_wallet_idx ON positions (wallet_address)"),
-    env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS positions_quote_unique_idx ON positions (quote_id)"),
-    env.DB.prepare(`CREATE TABLE IF NOT EXISTS rfq_quotes (
+    DB.prepare("CREATE INDEX IF NOT EXISTS positions_user_created_idx ON positions (user_email, created_at)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS positions_wallet_idx ON positions (wallet_address)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS positions_quote_unique_idx ON positions (quote_id)"),
+    DB.prepare(`CREATE TABLE IF NOT EXISTS rfq_quotes (
       id text PRIMARY KEY NOT NULL,
       request_id text NOT NULL,
       maker text NOT NULL,
@@ -64,13 +70,13 @@ export async function ensureDb() {
       consumed_at integer,
       created_at integer NOT NULL
     )`),
-    env.DB.prepare("CREATE INDEX IF NOT EXISTS rfq_quotes_expiry_idx ON rfq_quotes (expires_at)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS rfq_quotes_expiry_idx ON rfq_quotes (expires_at)"),
   ]);
 
   const ensureColumn = async (table: "positions" | "rfq_quotes", name: string, definition: string) => {
-    const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+    const info = await DB.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
     if (!info.results.some((column) => column.name === name)) {
-      await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
+      await DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
     }
   };
   for (const table of ["positions", "rfq_quotes"] as const) {

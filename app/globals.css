@@ -72,6 +72,15 @@ h1, h2, h3, p { margin: 0; }
 .product-intro { margin-bottom: 27px; max-width: 660px; }
 .product-intro h1 { margin-top: 7px; font-size: clamp(31px, 4vw, 46px); line-height: 1.03; letter-spacing: -.055em; }
 .product-intro p { margin-top: 9px; max-width: 590px; color: var(--ink-soft); font-size: 13px; line-height: 1.55; }
+.protocol-strip { margin: -12px 0 24px; min-height: 58px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.protocol-strip > div { display: flex; align-items: center; gap: 10px; }
+.protocol-strip > div > span:last-child { display: grid; gap: 3px; }
+.protocol-strip strong { font-size: 11px; }
+.protocol-strip small { color: var(--ink-faint); font-size: 9px; }
+.protocol-strip a { min-height: 38px; padding: 0 8px; border-radius: 7px; display: inline-flex; align-items: center; gap: 5px; color: var(--ink-soft); font-size: 10px; font-weight: 800; white-space: nowrap; }
+.protocol-strip a:hover { color: var(--ink); background: var(--surface-soft); }
+.protocol-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-faint); box-shadow: 0 0 0 4px var(--surface-soft); }
+.protocol-strip.verified .protocol-pulse { background: var(--positive); box-shadow: 0 0 0 4px var(--positive-soft); }
 .market-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
 .asset-heading { display: flex; align-items: center; gap: 13px; }
 .asset-logo { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 800; font-size: 15px; color: var(--surface-raised); background: var(--ink); }
