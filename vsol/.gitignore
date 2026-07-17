@@ -1,9 +1,0 @@
-/.anchor/
-/.devnet/
-/node_modules/
-/target/
-!/target/idl/
-!/target/types/
-!/target/deploy/.gitkeep
-*.log
-
