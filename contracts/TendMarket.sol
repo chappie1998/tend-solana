@@ -23,6 +23,8 @@ contract TendMarket {
         uint64 expiry;
         uint64 deadline;
         uint64 nonce;
+        uint32 observationWindow;
+        uint32 tradeLock;
         Direction direction;
     }
 
@@ -37,12 +39,14 @@ contract TendMarket {
         uint128 strike;
         uint128 capPrice;
         uint64 expiry;
+        uint32 observationWindow;
+        uint32 tradeLock;
         Direction direction;
         bool settled;
     }
 
     bytes32 public constant QUOTE_TYPEHASH = keccak256(
-        "Quote(address maker,address buyer,address underlying,address collateralToken,address oracle,uint128 premium,uint128 maxPayout,uint128 strike,uint128 capPrice,uint64 expiry,uint64 deadline,uint64 nonce,uint8 direction)"
+        "Quote(address maker,address buyer,address underlying,address collateralToken,address oracle,uint128 premium,uint128 maxPayout,uint128 strike,uint128 capPrice,uint64 expiry,uint64 deadline,uint64 nonce,uint32 observationWindow,uint32 tradeLock,uint8 direction)"
     );
     bytes32 private constant DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -120,22 +124,9 @@ contract TendMarket {
     }
 
     function hashQuote(Quote calldata quote) public view returns (bytes32) {
-        bytes32 structHash = keccak256(abi.encode(
-            QUOTE_TYPEHASH,
-            quote.maker,
-            quote.buyer,
-            quote.underlying,
-            quote.collateralToken,
-            quote.oracle,
-            quote.premium,
-            quote.maxPayout,
-            quote.strike,
-            quote.capPrice,
-            quote.expiry,
-            quote.deadline,
-            quote.nonce,
-            quote.direction
-        ));
+        // Quote contains only static ABI types, so tuple encoding is identical to
+        // encoding each member after the type hash and avoids a stack-heavy call.
+        bytes32 structHash = keccak256(abi.encode(QUOTE_TYPEHASH, quote));
         return keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
     }
 
@@ -154,8 +145,8 @@ contract TendMarket {
             quote.maker == address(0) || quote.underlying == address(0) ||
             quote.collateralToken == address(0) || quote.premium == 0 ||
             quote.maxPayout == 0 || quote.strike == 0 ||
-            quote.expiry <= block.timestamp || quote.deadline < block.timestamp ||
-            quote.deadline > quote.expiry || quote.maker == msg.sender
+            quote.maker == msg.sender || quote.observationWindow < 30 ||
+            quote.observationWindow > 3_600 || !quoteWindowOpen(quote.expiry, quote.deadline, quote.tradeLock)
         ) revert InvalidQuote();
         if (quote.direction == Direction.Up && quote.capPrice <= quote.strike) revert BadDirectionRange();
         if (quote.direction == Direction.Down && quote.capPrice >= quote.strike) revert BadDirectionRange();
@@ -183,6 +174,8 @@ contract TendMarket {
             strike: quote.strike,
             capPrice: quote.capPrice,
             expiry: quote.expiry,
+            observationWindow: quote.observationWindow,
+            tradeLock: quote.tradeLock,
             direction: quote.direction,
             settled: false
         });
@@ -199,9 +192,17 @@ contract TendMarket {
         if (position.settled) revert AlreadySettled();
         if (block.timestamp < position.expiry) revert NotReady();
 
-        (uint256 settlementValue, uint64 observedAt, bool finalized) =
-            ITendSettlementOracle(position.oracle).settlementPrice(position.underlying, position.expiry);
-        if (!finalized || observedAt < position.expiry || settlementValue == 0) revert NotFinalized();
+        (uint256 settlementValue, uint64 observedFrom, uint64 observedTo, bool finalized) =
+            ITendSettlementOracle(position.oracle).settlementPrice(
+                position.underlying,
+                position.expiry,
+                position.observationWindow
+            );
+        if (
+            !finalized || settlementValue == 0 || observedFrom != position.expiry ||
+            observedTo < uint256(position.expiry) + position.observationWindow ||
+            observedTo - observedFrom < position.observationWindow
+        ) revert NotFinalized();
 
         payout = payoutAt(
             position.direction,
@@ -235,6 +236,13 @@ contract TendMarket {
         if (settlementValue >= strike) return 0;
         uint256 boundedDown = settlementValue < capPrice ? capPrice : settlementValue;
         return maxPayout * (strike - boundedDown) / (strike - capPrice);
+    }
+
+    /// @notice Checks the RFQ deadline and the no-trade buffer before an expiry.
+    function quoteWindowOpen(uint64 expiry, uint64 deadline, uint32 tradeLock) public view returns (bool) {
+        if (tradeLock < 30 || tradeLock > 900) return false;
+        if (deadline < block.timestamp || expiry <= block.timestamp + tradeLock) return false;
+        return uint256(deadline) + tradeLock <= expiry;
     }
 
     function cancelNonce(uint64 nonce) external {

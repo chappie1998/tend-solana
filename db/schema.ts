@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const positions = sqliteTable(
@@ -15,6 +16,10 @@ export const positions = sqliteTable(
     strike: real("strike").notNull(),
     capPrice: real("cap_price").notNull(),
     expiryDays: integer("expiry_days").notNull(),
+    expiryCode: text("expiry_code").notNull().default("7D"),
+    optionExpiryAt: integer("option_expiry_at", { mode: "timestamp_ms" }).notNull().default(sql`0`),
+    observationWindowSeconds: integer("observation_window_seconds").notNull().default(900),
+    tradeLockSeconds: integer("trade_lock_seconds").notNull().default(300),
     status: text("status", { enum: ["preview_confirmed", "settled"] }).notNull(),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   },
@@ -44,6 +49,10 @@ export const rfqQuotes = sqliteTable(
     latencyMs: integer("latency_ms").notNull(),
     badge: text("badge").notNull(),
     expiryDays: integer("expiry_days").notNull(),
+    expiryCode: text("expiry_code").notNull().default("7D"),
+    optionExpiryAt: integer("option_expiry_at", { mode: "timestamp_ms" }).notNull().default(sql`0`),
+    observationWindowSeconds: integer("observation_window_seconds").notNull().default(900),
+    tradeLockSeconds: integer("trade_lock_seconds").notNull().default(300),
     payoff: integer("payoff").notNull(),
     expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
     consumedAt: integer("consumed_at", { mode: "timestamp_ms" }),

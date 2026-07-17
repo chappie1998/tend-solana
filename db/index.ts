@@ -28,6 +28,10 @@ export async function ensureDb() {
       strike real NOT NULL,
       cap_price real NOT NULL,
       expiry_days integer NOT NULL,
+      expiry_code text NOT NULL DEFAULT '7D',
+      option_expiry_at integer NOT NULL DEFAULT 0,
+      observation_window_seconds integer NOT NULL DEFAULT 900,
+      trade_lock_seconds integer NOT NULL DEFAULT 300,
       status text NOT NULL,
       created_at integer NOT NULL
     )`),
@@ -51,6 +55,10 @@ export async function ensureDb() {
       latency_ms integer NOT NULL,
       badge text NOT NULL,
       expiry_days integer NOT NULL,
+      expiry_code text NOT NULL DEFAULT '7D',
+      option_expiry_at integer NOT NULL DEFAULT 0,
+      observation_window_seconds integer NOT NULL DEFAULT 900,
+      trade_lock_seconds integer NOT NULL DEFAULT 300,
       payoff integer NOT NULL,
       expires_at integer NOT NULL,
       consumed_at integer,
@@ -58,4 +66,17 @@ export async function ensureDb() {
     )`),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS rfq_quotes_expiry_idx ON rfq_quotes (expires_at)"),
   ]);
+
+  const ensureColumn = async (table: "positions" | "rfq_quotes", name: string, definition: string) => {
+    const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+    if (!info.results.some((column) => column.name === name)) {
+      await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`).run();
+    }
+  };
+  for (const table of ["positions", "rfq_quotes"] as const) {
+    await ensureColumn(table, "expiry_code", "text NOT NULL DEFAULT '7D'");
+    await ensureColumn(table, "option_expiry_at", "integer NOT NULL DEFAULT 0");
+    await ensureColumn(table, "observation_window_seconds", "integer NOT NULL DEFAULT 900");
+    await ensureColumn(table, "trade_lock_seconds", "integer NOT NULL DEFAULT 300");
+  }
 }

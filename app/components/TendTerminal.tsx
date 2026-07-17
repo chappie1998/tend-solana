@@ -27,6 +27,8 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { quoteFor } from "../lib/options";
 import { markets } from "../lib/markets";
+import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
+import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
 type Tab = "market" | "portfolio" | "earn";
 type Direction = "up" | "down";
@@ -63,6 +65,10 @@ type SavedPosition = {
   strike: number;
   capPrice: number;
   expiryDays: number;
+  expiryCode: ExpiryCode;
+  optionExpiryAt: string;
+  observationWindowSeconds: number;
+  tradeLockSeconds: number;
   status: "preview_confirmed" | "settled";
   createdAt: string;
 };
@@ -74,6 +80,8 @@ const assets = markets.map((market) => ({
   move: market.change,
   iv: market.iv,
   token: market.tokenAddress,
+  oracleStatus: market.oracleStatus,
+  intradayEligible: market.intradayEligible,
 }));
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
@@ -111,26 +119,6 @@ function ProductNav({ active, onChange }: { active: Tab; onChange: (tab: Tab) =>
         </button>
       ))}
     </nav>
-  );
-}
-
-function MarketChart({ direction, spot, target, ticker }: { direction: Direction; spot: number; target: number; ticker: string }) {
-  return (
-    <div className="chart-wrap" aria-label={`Thirty day ${ticker} token price chart`}>
-      <div className="chart-axis">
-        <span>${(spot * 1.08).toFixed(0)}</span><span>${(spot * 1.02).toFixed(0)}</span><span>${(spot * .96).toFixed(0)}</span><span>${(spot * .9).toFixed(0)}</span>
-      </div>
-      <div className="chart-stage">
-        <div className="chart-grid" />
-        <div className="chart-area" />
-        <div className="chart-line" />
-        <div className={direction === "up" ? "strike-line up" : "strike-line down"}>
-          <span>${target.toFixed(2)} strike</span>
-        </div>
-        <div className="spot-dot"><span>${spot.toFixed(2)}</span></div>
-        <div className="chart-labels"><span>Jun 17</span><span>Jun 27</span><span>Jul 7</span><span>Today</span></div>
-      </div>
-    </div>
   );
 }
 
@@ -212,7 +200,7 @@ function TradeView({
 }) {
   const [assetTicker, setAssetTicker] = useState("NVDA");
   const [direction, setDirection] = useState<Direction>("up");
-  const [expiry, setExpiry] = useState("7D");
+  const [expiry, setExpiry] = useState<ExpiryCode>("7D");
   const [payoff, setPayoff] = useState(5);
   const [amount, setAmount] = useState("10000");
   const [quoteState, setQuoteState] = useState<QuoteState>("idle");
@@ -224,13 +212,29 @@ function TradeView({
   const [showPricing, setShowPricing] = useState(false);
   const [executionState, setExecutionState] = useState<"idle" | "loading" | "error">("idle");
   const [executionError, setExecutionError] = useState("");
+  const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const asset = assets.find((item) => item.ticker === assetTicker) ?? assets[0];
   const notional = Number(amount) || 0;
-  const days = Number.parseInt(expiry, 10);
-  const estimate = quoteFor({ spot: asset.price, amount: notional, days, direction, payoff, volatility: asset.iv });
+  const expiryOptions = expiryCodes.map((code) => {
+    const definition = resolveExpiry(code, asset.ticker, now);
+    if (definition.group === "intraday" && definition.available && marketSnapshot?.mode !== "live") {
+      return { ...definition, available: false, availabilityReason: "Intraday quotes require a fresh licensed display feed." };
+    }
+    return definition;
+  });
+  const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
+  const estimate = quoteFor({ spot: asset.price, amount: notional, durationMinutes: expiryDefinition.durationMinutes, direction, payoff, volatility: asset.iv });
   const bestQuote = quotes.find((quote) => quote.id === selectedQuoteId) ?? quotes[0];
   const premium = bestQuote?.premium ?? estimate.premium;
   const target = bestQuote?.strike ?? estimate.strike;
+  const displayedPrice = marketSnapshot?.price ?? asset.price;
+  const displayedMove = marketSnapshot?.changePercent ?? asset.move;
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!complete) return;
@@ -268,13 +272,18 @@ function TradeView({
       setQuoteState("error");
       return;
     }
+    if (!expiryDefinition.available) {
+      setQuoteError(expiryDefinition.availabilityReason);
+      setQuoteState("error");
+      return;
+    }
     setQuoteState("loading");
     setQuotes([]);
     try {
       const response = await fetch("/api/quotes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: asset.ticker, direction, amount: notional, days, payoff }),
+        body: JSON.stringify({ symbol: asset.ticker, direction, amount: notional, expiryCode: expiry, payoff }),
       });
       const result = await response.json() as { quotes?: MakerQuote[]; error?: string };
       if (!response.ok || !result.quotes?.length) {
@@ -309,7 +318,7 @@ function TradeView({
           premium: bestQuote.premium,
           strike: bestQuote.strike,
           cap: bestQuote.cap,
-          expiryDays: days,
+          expiryCode: expiry,
           payoff,
         }),
       });
@@ -339,7 +348,7 @@ function TradeView({
 
         <div className="asset-strip" role="group" aria-label="Available markets">
           {assets.map((item) => (
-            <button key={item.ticker} type="button" onClick={() => { setAssetTicker(item.ticker); invalidateQuote(); }} className={asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
+            <button key={item.ticker} type="button" onClick={() => { setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
               <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>${item.price.toFixed(2)}</small></span><em className={item.move > 0 ? "positive" : "negative"}>{item.move > 0 ? "+" : ""}{item.move}%</em>
             </button>
           ))}
@@ -347,11 +356,11 @@ function TradeView({
 
         <div className="market-card">
           <div className="price-row">
-            <div><span className="eyebrow">Robinhood Chain · 24/7</span><div className="spot-price"><strong>${asset.price.toFixed(2)}</strong><span className={asset.move > 0 ? "positive-box" : "negative-box"}>{asset.move > 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{Math.abs(asset.move)}%</span></div></div>
-            <div className="market-stats"><div><span>24h volume</span><strong>$4.84M</strong></div><div><span>Open interest</span><strong>$1.26M</strong></div><div><span>ATM IV</span><strong>{asset.iv}%</strong></div></div>
+            <div><span className="eyebrow">Reference market · session-aware</span><div className="spot-price"><strong>${displayedPrice.toFixed(2)}</strong><span className={displayedMove > 0 ? "positive-box" : "negative-box"}>{displayedMove > 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{Math.abs(displayedMove).toFixed(2)}%</span><span className={`price-mode ${marketSnapshot?.mode ?? "demo"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "delayed" ? "Delayed" : "Demo"}</span></div></div>
+            <div className="market-stats"><div><span>Display volume</span><strong>{marketSnapshot?.sessionVolume ? marketSnapshot.sessionVolume.toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 1 }) : "—"}</strong></div><div><span>Protocol OI</span><strong>—</strong></div><div><span>Model IV</span><strong>{asset.iv}%</strong></div></div>
           </div>
-          <MarketChart direction={direction} spot={asset.price} target={target} ticker={asset.ticker} />
-          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> Preview mark · not live</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Canonical token verified</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
+          <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
+          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> Chart feed is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Canonical token verified</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
         </div>
 
         <div className="transparency-card">
@@ -370,7 +379,13 @@ function TradeView({
             <button type="button" className={direction === "down" ? "segment active down" : "segment"} onClick={() => { setDirection("down"); invalidateQuote(); }}><ArrowDownRight size={17} aria-hidden="true" /> Down</button>
           </div></fieldset>
 
-          <fieldset className="field-group"><legend>Expires</legend><div className="choice-row">{["7D", "14D", "30D"].map((item) => <button type="button" key={item} className={expiry === item ? "choice active" : "choice"} onClick={() => { setExpiry(item); invalidateQuote(); }}>{item}<small>{item === "7D" ? "Jul 24" : item === "14D" ? "Jul 31" : "Aug 16"}</small></button>)}</div></fieldset>
+          <fieldset className="field-group expiry-field"><legend>Expires</legend>
+            <div className="expiry-group-head"><span>Intraday</span><small>US reference session only</small></div>
+            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : !asset.intradayEligible ? "Unavailable" : item.availabilityReason.includes("feed") ? "Live feed required" : "Market closed"}</small></button>)}</div>
+            <div className="expiry-group-head standard"><span>Standard</span><small>Longer observation window</small></div>
+            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.detail}</small></button>)}</div>
+            <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {expiryDefinition.available ? `${expiryDefinition.tradeLockSeconds}s trade lock · ${expiryDefinition.observationWindowSeconds}s oracle window` : expiryDefinition.availabilityReason}</p>
+          </fieldset>
 
           <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{[2, 5, 10].map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { setPayoff(item); invalidateQuote(); }}>{item}×<small>{item === 2 ? "Balanced" : item === 5 ? "Popular" : "Aggressive"}</small></button>)}</div></fieldset>
 
@@ -396,7 +411,7 @@ function TradeView({
             <div className="success-mark"><ShieldCheck size={25} aria-hidden="true" /></div>
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote is locked for 30 seconds. Your maximum loss is fixed before you sign.</p>
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>${target.toFixed(2)}</strong></div><div><span>Expiry</span><strong>{expiry}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>${target.toFixed(2)}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading"} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Confirming…" : "Confirm testnet preview"}</button>
@@ -427,11 +442,14 @@ function PortfolioView({
 }) {
   const premiumAtRisk = positions.reduce((sum, position) => sum + position.premium, 0);
   const totalNotional = positions.reduce((sum, position) => sum + position.amount, 0);
-  const nextExpiry = positions.length ? Math.min(...positions.map((position) => position.expiryDays)) : 0;
+  const nextPosition = positions
+    .filter((position) => position.optionExpiryAt && new Date(position.optionExpiryAt).getTime() > 0)
+    .sort((left, right) => new Date(left.optionExpiryAt).getTime() - new Date(right.optionExpiryAt).getTime())[0];
+  const expiryLabel = (position: SavedPosition) => position.expiryCode || (position.expiryDays ? `${position.expiryDays}D` : "—");
   function exportPositions() {
     if (!positions.length) return;
-    const header = "symbol,direction,strike,premium,notional,expiry_days,status";
-    const rows = positions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, position.expiryDays, position.status].join(","));
+    const header = "symbol,direction,strike,premium,notional,expiry_code,option_expiry_at,observation_window_seconds,status";
+    const rows = positions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status].join(","));
     const url = URL.createObjectURL(new Blob([[header, ...rows].join("\n")], { type: "text/csv" }));
     const link = document.createElement("a");
     link.href = url;
@@ -442,10 +460,10 @@ function PortfolioView({
   return (
     <main className="dashboard-view">
       <div className="view-heading"><div><span className="eyebrow">Portfolio</span><h1>Know exactly what can happen.</h1><p>Defined-risk positions, marked honestly.</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} aria-hidden="true" /> Refresh marks</button></div>
-      <div className="metric-grid"><div className="metric-card"><span>Preview notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Testnet preview only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Open positions</span><strong>{positions.length}</strong><small>Fully defined outcomes</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextExpiry ? `${nextExpiry}d` : "—"}</strong><small>{positions[0]?.symbol ?? "No positions"}</small></div></div>
+      <div className="metric-grid"><div className="metric-card"><span>Preview notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Testnet preview only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Open positions</span><strong>{positions.length}</strong><small>Fully defined outcomes</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextPosition ? expiryLabel(nextPosition) : "—"}</strong><small>{nextPosition?.symbol ?? "No positions"}</small></div></div>
       <section className="positions-card"><div className="section-head"><div><h2>Open positions</h2><p>Live value and defined outcomes.</p></div><button type="button" className="text-button" onClick={exportPositions} disabled={!positions.length}>Export history <ArrowUpRight size={14} /></button></div>
         {isLoading ? <div className="portfolio-loading" role="status" aria-label="Loading positions">{[0, 1].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}</div> : error ? <div className="quote-error" role="alert"><div><strong>Couldn’t load positions</strong><p>{error}</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} /> Retry</button></div> : positions.length ? <div className="position-table" role="table" aria-label="Open positions"><div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Notional</span><span>Status</span><span>Expires</span></div>
-          {positions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">Preview confirmed</span><span>{position.expiryDays}d</span></div>)}
+          {positions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">Preview confirmed</span><span>{expiryLabel(position)}</span></div>)}
         </div> : <div className="empty-position"><Target size={20} aria-hidden="true" /><div><strong>No positions yet</strong><p>Request a quote and confirm a testnet preview to see it here.</p></div><button type="button" className="button secondary" onClick={onTrade}>Build a position</button></div>}
       </section>
     </main>

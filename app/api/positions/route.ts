@@ -80,6 +80,10 @@ export async function POST(request: Request) {
     strike: quote.strike,
     capPrice: quote.capPrice,
     expiryDays: quote.expiryDays,
+    expiryCode: quote.expiryCode,
+    optionExpiryAt: quote.optionExpiryAt,
+    observationWindowSeconds: quote.observationWindowSeconds,
+    tradeLockSeconds: quote.tradeLockSeconds,
     status: "preview_confirmed" as const,
     createdAt: consumedAt,
   };
