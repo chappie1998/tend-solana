@@ -26,12 +26,13 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
 });
 
 test("server creates buyer-bound maker RFQs and verifies fills before persistence", async () => {
-  const [quotesRoute, positionsRoute, sendRoute, server, schema] = await Promise.all([
+  const [quotesRoute, positionsRoute, sendRoute, server, schema, runtimeEnv] = await Promise.all([
     readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
     readFile(new URL("app/api/positions/route.ts", root), "utf8"),
     readFile(new URL("app/api/vsol/send/route.ts", root), "utf8"),
     readFile(new URL("app/lib/vsol-server.ts", root), "utf8"),
     readFile(new URL("db/schema.ts", root), "utf8"),
+    readFile(new URL("app/lib/runtime-env.ts", root), "utf8"),
   ]);
 
   assert.match(quotesRoute, /buildVsolQuoteTransaction/);
@@ -45,6 +46,8 @@ test("server creates buyer-bound maker RFQs and verifies fills before persistenc
   assert.match(sendRoute, /simulateTransaction/);
   assert.match(sendRoute, /sigVerify: true/);
   assert.match(sendRoute, /transactionSimulations/);
+  assert.match(server, /runtimeEnv\("VSOL_RPC_URL"\)/);
+  assert.match(runtimeEnv, /cloudflare:workers/);
   assert.match(server, /Instruction: FillQuote/);
   assert.match(server, /positionOwnedByVsol/);
   assert.match(positionsRoute, /verifyVsolFill/);

@@ -27,8 +27,9 @@ import {
   VSOL_WRITER_TOKEN,
   VSOL_WRITER_VAULT,
 } from "./vsol";
+import { runtimeEnv } from "./runtime-env";
 
-const runtimeRpcUrl = process.env.VSOL_RPC_URL?.trim() || VSOL_RPC_URL;
+const runtimeRpcUrl = runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL;
 export const VSOL_CONNECTION = new Connection(runtimeRpcUrl, "confirmed");
 const TOKEN_SCALE = 1_000_000n;
 const PRICE_SCALE = 1_000_000n;
@@ -142,7 +143,7 @@ function fillQuoteInstruction(params: {
 }
 
 function loadSecret(name: "VSOL_MAKER_SECRET_KEY" | "VSOL_FAUCET_SECRET_KEY") {
-  const encoded = process.env[name]?.trim();
+  const encoded = runtimeEnv(name);
   if (!encoded) throw new Error(`${name} is not configured`);
   let values: number[];
   try {

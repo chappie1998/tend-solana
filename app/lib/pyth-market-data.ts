@@ -1,5 +1,6 @@
 import { isReferenceMarketOpen, previousReferenceMarketCloses } from "./expiries";
 import type { Market } from "./markets";
+import { runtimeEnv } from "./runtime-env";
 
 type HermesPrice = {
   price: string;
@@ -40,13 +41,13 @@ export type RealizedVolatility = {
 const volatilityCache = new Map<string, { expiresAt: number; value: RealizedVolatility }>();
 
 function hermesUrl(path: string) {
-  const base = process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network";
+  const base = runtimeEnv("PYTH_HERMES_URL") || "https://hermes.pyth.network";
   return new URL(path, base.endsWith("/") ? base : `${base}/`);
 }
 
 function hermesHeaders() {
   const headers: Record<string, string> = { Accept: "application/json" };
-  const apiKey = process.env.PYTH_API_KEY?.trim();
+  const apiKey = runtimeEnv("PYTH_API_KEY");
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   return headers;
 }
