@@ -284,6 +284,7 @@ h1, h2, h3, p { margin: 0; }
 .empty-position p { margin-top: 3px; font-size: 10px; }
 .writer-grid { display: grid; grid-template-columns: 1.65fr .75fr; gap: 14px; }
 .verified { padding: 6px 8px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px; color: var(--positive); background: var(--positive-soft); font-size: 9px; font-weight: 800; }
+.verification-error { padding: 6px 8px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px; color: var(--negative); background: var(--negative-soft); font-size: 9px; font-weight: 800; }
 .stress-chart { display: grid; gap: 13px; }
 .stress-row { display: grid; grid-template-columns: 45px 1fr 70px; align-items: center; gap: 10px; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .stress-row strong { text-align: right; }

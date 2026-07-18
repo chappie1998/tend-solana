@@ -8,7 +8,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { LAMPORTS_PER_SOL, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
-import { VSOL_CONNECTION, parsePublicKey, vsolFaucet } from "../../../lib/vsol-server";
+import { getVsolConnection, parsePublicKey, vsolFaucet } from "../../../lib/vsol-server";
 import { VSOL_SETTLEMENT_MINT } from "../../../lib/vsol";
 import { getChatGPTUser } from "../../../chatgpt-auth";
 
@@ -39,22 +39,23 @@ export async function POST(request: Request) {
   if (!wallet) return Response.json({ error: "Connect a valid Solana wallet first." }, { status: 422 });
 
   try {
+    const connection = getVsolConnection();
     const faucet = vsolFaucet();
-    const mint = await getMint(VSOL_CONNECTION, VSOL_SETTLEMENT_MINT, "confirmed", TOKEN_PROGRAM_ID);
+    const mint = await getMint(connection, VSOL_SETTLEMENT_MINT, "confirmed", TOKEN_PROGRAM_ID);
     if (!mint.mintAuthority?.equals(faucet.publicKey)) throw new Error("Faucet is not the mock mint authority");
     const tokenAccount = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, wallet);
     const transaction = new Transaction();
-    const existing = await VSOL_CONNECTION.getAccountInfo(tokenAccount, "confirmed");
+    const existing = await connection.getAccountInfo(tokenAccount, "confirmed");
     let tokenBalance = 0n;
     if (!existing) {
       transaction.add(createAssociatedTokenAccountInstruction(faucet.publicKey, tokenAccount, wallet, VSOL_SETTLEMENT_MINT));
     } else {
-      tokenBalance = (await getAccount(VSOL_CONNECTION, tokenAccount, "confirmed", TOKEN_PROGRAM_ID)).amount;
+      tokenBalance = (await getAccount(connection, tokenAccount, "confirmed", TOKEN_PROGRAM_ID)).amount;
     }
     if (tokenBalance < TARGET_TOKENS) {
       transaction.add(createMintToInstruction(VSOL_SETTLEMENT_MINT, tokenAccount, faucet.publicKey, TARGET_TOKENS - tokenBalance));
     }
-    const solBalance = await VSOL_CONNECTION.getBalance(wallet, "confirmed");
+    const solBalance = await connection.getBalance(wallet, "confirmed");
     if (solBalance < TARGET_LAMPORTS) {
       transaction.add(SystemProgram.transfer({
         fromPubkey: faucet.publicKey,
@@ -63,7 +64,7 @@ export async function POST(request: Request) {
       }));
     }
     const signature = transaction.instructions.length
-      ? await sendAndConfirmTransaction(VSOL_CONNECTION, transaction, [faucet], { commitment: "confirmed" })
+      ? await sendAndConfirmTransaction(connection, transaction, [faucet], { commitment: "confirmed" })
       : null;
     return Response.json({
       ok: true,

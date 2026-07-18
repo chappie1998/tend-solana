@@ -44,6 +44,12 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    resolve: {
+      // Solana web3's browser build imports the npm `buffer` package. Vite
+      // otherwise treats it as a Node builtin and externalizes it, which only
+      // fails when a wallet deserializes or signs a transaction.
+      alias: { buffer: "buffer/" },
+    },
     server: isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,

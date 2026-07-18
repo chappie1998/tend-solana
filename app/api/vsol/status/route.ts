@@ -1,6 +1,6 @@
 import "../../../lib/runtime-env-worker";
 import { getAccount } from "@solana/spl-token";
-import { VSOL_CONNECTION } from "../../../lib/vsol-server";
+import { getVsolConnection } from "../../../lib/vsol-server";
 import {
   VSOL_CONFIG,
   VSOL_MARKET,
@@ -29,13 +29,14 @@ export async function GET() {
     }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
   try {
+    const connection = getVsolConnection();
     const [program, pythReceiver, config, market, oracle, writer] = await Promise.all([
-      VSOL_CONNECTION.getAccountInfo(VSOL_PROGRAM_ID, "confirmed"),
-      VSOL_CONNECTION.getAccountInfo(VSOL_PYTH_RECEIVER_PROGRAM_ID, "confirmed"),
-      VSOL_CONNECTION.getAccountInfo(VSOL_CONFIG, "confirmed"),
-      VSOL_CONNECTION.getAccountInfo(VSOL_MARKET, "confirmed"),
-      VSOL_CONNECTION.getAccountInfo(VSOL_ORACLE, "confirmed"),
-      getAccount(VSOL_CONNECTION, VSOL_WRITER_TOKEN, "confirmed"),
+      connection.getAccountInfo(VSOL_PROGRAM_ID, "confirmed"),
+      connection.getAccountInfo(VSOL_PYTH_RECEIVER_PROGRAM_ID, "confirmed"),
+      connection.getAccountInfo(VSOL_CONFIG, "confirmed"),
+      connection.getAccountInfo(VSOL_MARKET, "confirmed"),
+      connection.getAccountInfo(VSOL_ORACLE, "confirmed"),
+      getAccount(connection, VSOL_WRITER_TOKEN, "confirmed"),
     ]);
     const marketFeed = market?.data.length && market.data.length >= 243 ? Buffer.from(market.data.subarray(211, 243)).toString("hex") : "";
     const oracleFeed = oracle?.data.length && oracle.data.length >= 137 ? Buffer.from(oracle.data.subarray(105, 137)).toString("hex") : "";

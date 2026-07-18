@@ -29,8 +29,12 @@ import {
 } from "./vsol";
 import { runtimeEnv } from "./runtime-env";
 
-const runtimeRpcUrl = runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL;
-export const VSOL_CONNECTION = new Connection(runtimeRpcUrl, "confirmed");
+export function getVsolConnection() {
+  // Resolve this after the request route has installed Cloudflare bindings.
+  // A module-level Connection captures the fallback RPC before Sites runtime
+  // environment variables are available.
+  return new Connection(runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL, "confirmed");
+}
 const TOKEN_SCALE = 1_000_000n;
 const PRICE_SCALE = 1_000_000n;
 const QUOTE_DOMAIN = Buffer.from("VSOLRFQ1", "ascii");
@@ -166,9 +170,9 @@ export function vsolFaucet() {
   return loadSecret("VSOL_FAUCET_SECRET_KEY");
 }
 
-async function clusterTime() {
-  const slot = await VSOL_CONNECTION.getSlot("confirmed");
-  const timestamp = await VSOL_CONNECTION.getBlockTime(slot);
+async function clusterTime(connection: Connection) {
+  const slot = await connection.getSlot("confirmed");
+  const timestamp = await connection.getBlockTime(slot);
   if (timestamp === null) throw new Error("Devnet clock is unavailable");
   return timestamp;
 }
@@ -190,22 +194,23 @@ export async function buildVsolQuoteTransaction(params: {
   if (!VSOL_PYTH_UPGRADE_DEPLOYED) {
     throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
   }
+  const connection = getVsolConnection();
   const maker = vsolMaker();
   const [configAccount, marketAccount, writerAccount] = await Promise.all([
-    VSOL_CONNECTION.getAccountInfo(VSOL_CONFIG, "confirmed"),
-    VSOL_CONNECTION.getAccountInfo(VSOL_MARKET, "confirmed"),
-    getAccount(VSOL_CONNECTION, VSOL_WRITER_TOKEN, "confirmed", TOKEN_PROGRAM_ID),
+    connection.getAccountInfo(VSOL_CONFIG, "confirmed"),
+    connection.getAccountInfo(VSOL_MARKET, "confirmed"),
+    getAccount(connection, VSOL_WRITER_TOKEN, "confirmed", TOKEN_PROGRAM_ID),
   ]);
   if (!configAccount || !marketAccount) throw new Error("VSOL devnet configuration is unavailable");
 
   const buyerSource = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, params.buyer);
-  if (!(await VSOL_CONNECTION.getAccountInfo(buyerSource, "confirmed"))) {
+  if (!(await connection.getAccountInfo(buyerSource, "confirmed"))) {
     const error = new Error("Claim devnet test USDC before requesting an executable quote");
     error.name = "VsolTestFundsRequired";
     throw error;
   }
 
-  const now = await clusterTime();
+  const now = await clusterTime(connection);
   const marketExpiry = BigInt(deployment.uiExpiry);
   const quoteExpiry = BigInt(Math.min(now + 30, Number(marketExpiry - 1n)));
   if (quoteExpiry <= BigInt(now + 5)) throw new Error("The current devnet market is too close to expiry");
@@ -241,7 +246,7 @@ export async function buildVsolQuoteTransaction(params: {
     positionVault,
     quote,
   });
-  const latest = await VSOL_CONNECTION.getLatestBlockhash("confirmed");
+  const latest = await connection.getLatestBlockhash("confirmed");
   const transaction = new Transaction({
     feePayer: params.buyer,
     blockhash: latest.blockhash,
@@ -257,9 +262,10 @@ export async function buildVsolQuoteTransaction(params: {
 }
 
 export async function verifyVsolFill(signature: string, buyer: PublicKey, position: PublicKey) {
+  const connection = getVsolConnection();
   let result = null;
   for (let attempt = 0; attempt < 6 && !result; attempt += 1) {
-    result = await VSOL_CONNECTION.getParsedTransaction(signature, {
+    result = await connection.getParsedTransaction(signature, {
       commitment: "confirmed",
       maxSupportedTransactionVersion: 0,
     });
@@ -271,7 +277,7 @@ export async function verifyVsolFill(signature: string, buyer: PublicKey, positi
   const invokesProgram = keys.some((key) => key.pubkey.equals(VSOL_PROGRAM_ID));
   const createsPosition = keys.some((key) => key.pubkey.equals(position));
   const fillLogged = result.meta?.logMessages?.some((line) => line.includes("Instruction: FillQuote")) ?? false;
-  const positionAccount = await VSOL_CONNECTION.getAccountInfo(position, "confirmed");
+  const positionAccount = await connection.getAccountInfo(position, "confirmed");
   const positionOwnedByVsol = positionAccount?.owner.equals(VSOL_PROGRAM_ID) ?? false;
   return buyerSigned && invokesProgram && createsPosition && fillLogged && positionOwnedByVsol;
 }

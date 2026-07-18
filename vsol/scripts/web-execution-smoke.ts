@@ -15,8 +15,8 @@ import { getPythRealizedVolatility, getPythSnapshot } from "../../app/lib/pyth-m
 import deployment from "../deployments/devnet.json" with { type: "json" };
 import {
   buildVsolQuoteTransaction,
+  getVsolConnection,
   verifyVsolFill,
-  VSOL_CONNECTION,
 } from "../../app/lib/vsol-server.ts";
 import { VSOL_SETTLEMENT_MINT } from "../../app/lib/vsol.ts";
 
@@ -40,22 +40,23 @@ async function main() {
   if (deployment.pythUpgradeDeployed !== true) {
     throw new Error("The Pyth-bound devnet deployment has not passed bootstrap verification");
   }
+  const connection = getVsolConnection();
   const faucet = await loadKeypair(resolve(secretDir, "devnet-faucet.json"));
   const buyer = await loadOrCreateBuyer();
   const buyerToken = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, buyer.publicKey);
   const instructions = new Transaction();
-  if ((await VSOL_CONNECTION.getBalance(buyer.publicKey, "confirmed")) < 10_000_000) {
+  if ((await connection.getBalance(buyer.publicKey, "confirmed")) < 10_000_000) {
     instructions.add(SystemProgram.transfer({ fromPubkey: faucet.publicKey, toPubkey: buyer.publicKey, lamports: 20_000_000 }));
   }
   if (instructions.instructions.length) {
-    await sendAndConfirmTransaction(VSOL_CONNECTION, instructions, [faucet], { commitment: "confirmed" });
+    await sendAndConfirmTransaction(connection, instructions, [faucet], { commitment: "confirmed" });
   }
-  if (!(await VSOL_CONNECTION.getAccountInfo(buyerToken, "confirmed"))) {
-    await createAssociatedTokenAccount(VSOL_CONNECTION, faucet, VSOL_SETTLEMENT_MINT, buyer.publicKey, {}, TOKEN_PROGRAM_ID);
+  if (!(await connection.getAccountInfo(buyerToken, "confirmed"))) {
+    await createAssociatedTokenAccount(connection, faucet, VSOL_SETTLEMENT_MINT, buyer.publicKey, {}, TOKEN_PROGRAM_ID);
   }
-  const balance = (await getAccount(VSOL_CONNECTION, buyerToken, "confirmed", TOKEN_PROGRAM_ID)).amount;
+  const balance = (await getAccount(connection, buyerToken, "confirmed", TOKEN_PROGRAM_ID)).amount;
   if (balance < 1_000n * 1_000_000n) {
-    await mintTo(VSOL_CONNECTION, faucet, VSOL_SETTLEMENT_MINT, buyerToken, faucet, 1_000n * 1_000_000n, [], {}, TOKEN_PROGRAM_ID);
+    await mintTo(connection, faucet, VSOL_SETTLEMENT_MINT, buyerToken, faucet, 1_000n * 1_000_000n, [], {}, TOKEN_PROGRAM_ID);
   }
 
   const market = marketBySymbol("NVDA");
@@ -75,8 +76,8 @@ async function main() {
   const transaction = Transaction.from(Buffer.from(quote.transaction, "base64"));
   transaction.partialSign(buyer);
   const raw = transaction.serialize();
-  const signature = await VSOL_CONNECTION.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
-  await VSOL_CONNECTION.confirmTransaction(signature, "confirmed");
+  const signature = await connection.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
+  await connection.confirmTransaction(signature, "confirmed");
   const verified = await verifyVsolFill(signature, buyer.publicKey, new PublicKey(quote.positionAddress));
   if (!verified) throw new Error("Web execution fill did not verify");
   console.log(JSON.stringify({ ok: true, buyer: buyer.publicKey, position: quote.positionAddress, signature }, null, 2));

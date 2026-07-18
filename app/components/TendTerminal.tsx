@@ -87,6 +87,13 @@ type SavedPosition = {
   };
 };
 
+function isVerifiedPosition(position: SavedPosition) {
+  return position.simulationStatus === "passed"
+    && Boolean(position.transactionSignature)
+    && Boolean(position.simulationId)
+    && Boolean(position.simulationLogsHash);
+}
+
 function injectedSolanaWallet() {
   const target = window as typeof window & {
     phantom?: { solana?: SolanaWalletProvider };
@@ -519,16 +526,17 @@ function PortfolioView({
   onRetry: () => void;
   onTrade: () => void;
 }) {
-  const premiumAtRisk = positions.reduce((sum, position) => sum + position.premium, 0);
-  const totalNotional = positions.reduce((sum, position) => sum + position.amount, 0);
-  const nextPosition = positions
+  const verifiedPositions = positions.filter(isVerifiedPosition);
+  const premiumAtRisk = verifiedPositions.reduce((sum, position) => sum + position.premium, 0);
+  const totalNotional = verifiedPositions.reduce((sum, position) => sum + position.amount, 0);
+  const nextPosition = verifiedPositions
     .filter((position) => position.optionExpiryAt && new Date(position.optionExpiryAt).getTime() > 0)
     .sort((left, right) => new Date(left.optionExpiryAt).getTime() - new Date(right.optionExpiryAt).getTime())[0];
   const expiryLabel = (position: SavedPosition) => position.expiryCode || (position.expiryDays ? `${position.expiryDays}D` : "—");
   function exportPositions() {
-    if (!positions.length) return;
+    if (!verifiedPositions.length) return;
     const header = "symbol,direction,strike,premium,notional,expiry_code,option_expiry_at,observation_window_seconds,status,transaction_signature,simulation_id,simulation_slot,simulation_units_consumed,simulation_logs_hash";
-    const rows = positions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status, position.transactionSignature ?? "", position.simulationId ?? "", position.simulationSlot ?? "", position.simulationUnitsConsumed ?? "", position.simulationLogsHash ?? ""].join(","));
+    const rows = verifiedPositions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status, position.transactionSignature ?? "", position.simulationId ?? "", position.simulationSlot ?? "", position.simulationUnitsConsumed ?? "", position.simulationLogsHash ?? ""].join(","));
     const url = URL.createObjectURL(new Blob([[header, ...rows].join("\n")], { type: "text/csv" }));
     const link = document.createElement("a");
     link.href = url;
@@ -539,11 +547,11 @@ function PortfolioView({
   return (
     <main className="dashboard-view">
       <div className="view-heading"><div><span className="eyebrow">Portfolio</span><h1>Know exactly what can happen.</h1><p>Defined-risk positions, marked honestly.</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} aria-hidden="true" /> Refresh marks</button></div>
-      <div className="metric-grid"><div className="metric-card"><span>Devnet notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Mock tUSDC only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Confirmed fills</span><strong>{positions.length}</strong><small>Verified before recording</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextPosition ? expiryLabel(nextPosition) : "—"}</strong><small>{nextPosition?.symbol ?? "No positions"}</small></div></div>
-      <section className="positions-card"><div className="section-head"><div><h2>Open positions</h2><p>Live value and defined outcomes.</p></div><button type="button" className="text-button" onClick={exportPositions} disabled={!positions.length}>Export history <ArrowUpRight size={14} /></button></div>
-        {isLoading ? <div className="portfolio-loading" role="status" aria-label="Loading positions">{[0, 1].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}</div> : error ? <div className="quote-error" role="alert"><div><strong>Couldn’t load positions</strong><p>{error}</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} /> Retry</button></div> : positions.length ? <div className="position-table" role="table" aria-label="Open positions"><div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Notional</span><span>Status</span><span>Expires</span></div>
-          {positions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">{position.simulationStatus === "passed" ? `Simulated · ${position.simulationUnitsConsumed?.toLocaleString() ?? "—"} CU` : "Devnet confirmed"}</span><span>{position.transactionSignature ? <><a href={solanaExplorerUrl("tx", position.transactionSignature)} target="_blank" rel="noreferrer">Tx</a>{position.simulationId ? <> · <a href={`/api/vsol/simulations?id=${encodeURIComponent(position.simulationId)}`} target="_blank" rel="noreferrer">Sim</a></> : null}</> : expiryLabel(position)}</span></div>)}
-        </div> : <div className="empty-position"><Target size={20} aria-hidden="true" /><div><strong>No positions yet</strong><p>Connect a Solana wallet and execute a devnet quote to see it here.</p></div><button type="button" className="button secondary" onClick={onTrade}>Build a position</button></div>}
+      <div className="metric-grid"><div className="metric-card"><span>Devnet notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Mock tUSDC only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Confirmed fills</span><strong>{verifiedPositions.length}</strong><small>Transaction + simulation verified</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextPosition ? expiryLabel(nextPosition) : "—"}</strong><small>{nextPosition?.symbol ?? "No positions"}</small></div></div>
+      <section className="positions-card"><div className="section-head"><div><h2>Open positions</h2><p>Live value and defined outcomes.</p></div><button type="button" className="text-button" onClick={exportPositions} disabled={!verifiedPositions.length}>Export history <ArrowUpRight size={14} /></button></div>
+        {isLoading ? <div className="portfolio-loading" role="status" aria-label="Loading positions">{[0, 1].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}</div> : error ? <div className="quote-error" role="alert"><div><strong>Couldn’t load positions</strong><p>{error}</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} /> Retry</button></div> : verifiedPositions.length ? <div className="position-table" role="table" aria-label="Open positions"><div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Notional</span><span>Status</span><span>Expires</span></div>
+          {verifiedPositions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">Verified · {position.simulationUnitsConsumed?.toLocaleString() ?? "—"} CU</span><span><a href={solanaExplorerUrl("tx", position.transactionSignature!)} target="_blank" rel="noreferrer">Tx</a> · <a href={`/api/vsol/simulations?id=${encodeURIComponent(position.simulationId!)}`} target="_blank" rel="noreferrer">Sim</a></span></div>)}
+        </div> : <div className="empty-position"><Target size={20} aria-hidden="true" /><div><strong>No verified positions yet</strong><p>Connect a Solana wallet and execute a confirmed devnet quote to see it here.</p></div><button type="button" className="button secondary" onClick={onTrade}>Build a position</button></div>}
       </section>
     </main>
   );
@@ -571,7 +579,7 @@ function EarnView() {
       <div className="view-heading"><div><span className="eyebrow">Writer desk</span><h1>Earn premium. See the obligation.</h1><p>No disguised APY. Every outcome stays visible.</p></div><a className="button primary" href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer"><CircleDollarSign size={16} aria-hidden="true" /> Inspect VSOL vault</a></div>
       <div className="metric-grid"><div className="metric-card"><span>Writer escrow</span><strong>{status?.ok ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC` : "—"}</strong><small>Read from the SPL token vault</small></div><div className="metric-card"><span>Premium earned</span><strong>—</strong><small>No indexed realized-P&amp;L ledger yet</small></div><div className="metric-card"><span>Open obligation</span><strong>—</strong><small>Protocol-wide position index pending</small></div><div className="metric-card"><span>Oracle</span><strong>{status?.pythFeedId ? "Pyth Core" : "—"}</strong><small>{status?.pythFeedId ? `${status.pythFeedId.slice(0, 10)}…` : "Checking devnet"}</small></div></div>
       <div className="writer-grid">
-        <section className="positions-card"><div className="section-head"><div><h2>Verifiable accounts</h2><p>Only confirmed devnet state is shown.</p></div><span className="verified"><BadgeCheck size={14} /> RPC verified</span></div><div className="stress-note"><Info size={16} aria-hidden="true" /><p>Tend will not invent writer P&amp;L, utilization, uptime, or exposure. Those panels stay unavailable until an onchain indexer can reconcile every fill and settlement.</p></div></section>
+        <section className="positions-card"><div className="section-head"><div><h2>Verifiable accounts</h2><p>Only confirmed devnet state is shown.</p></div><span className={status?.ok ? "verified" : "verification-error"}>{status?.ok ? <><BadgeCheck size={14} /> RPC verified</> : status === null ? <><LoaderCircle size={14} className="spin" /> Checking RPC</> : <><Info size={14} /> RPC unavailable</>}</span></div><div className="stress-note"><Info size={16} aria-hidden="true" /><p>Tend will not invent writer P&amp;L, utilization, uptime, or exposure. Those panels stay unavailable until an onchain indexer can reconcile every fill and settlement.</p></div></section>
         <section className="positions-card risk-composition"><div className="section-head"><div><h2>Devnet links</h2><p>Inspect ownership and balances directly.</p></div></div><div className="legend"><div><span>Writer vault</span><strong>{status?.writerVault ? <a href={solanaExplorerUrl("address", status.writerVault)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Market</span><strong>{status?.market ? <a href={solanaExplorerUrl("address", status.market)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Settlement record</span><strong>{status?.oracle ? <a href={solanaExplorerUrl("address", status.oracle)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div></div></section>
       </div>
     </main>

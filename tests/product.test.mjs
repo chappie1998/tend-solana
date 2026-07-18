@@ -17,6 +17,7 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
   assert.match(terminal, /signTransaction/);
+  assert.doesNotMatch(terminal, /"Devnet confirmed"/);
   assert.match(chart, /embed-widget-advanced-chart\.js/);
   assert.match(chart, /TradingView market display/);
   assert.doesNotMatch(chart, /DEMO DATA|demoCandles|lightweight-charts/);
@@ -47,12 +48,15 @@ test("server creates buyer-bound maker RFQs and verifies fills before persistenc
   assert.match(sendRoute, /sigVerify: true/);
   assert.match(sendRoute, /transactionSimulations/);
   assert.match(server, /runtimeEnv\("VSOL_RPC_URL"\)/);
+  assert.match(server, /export function getVsolConnection/);
   assert.match(runtimeEnv, /configureRuntimeEnv/);
   assert.match(server, /Instruction: FillQuote/);
   assert.match(server, /positionOwnedByVsol/);
   assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(positionsRoute, /persisted, passing simulation/);
+  assert.match(positionsRoute, /innerJoin\(transactionSimulations/);
+  assert.match(positionsRoute, /submissionStatus, "confirmed"/);
   assert.match(schema, /uniqueIndex\("positions_quote_unique_idx"\)/);
   assert.match(schema, /transaction_simulations/);
 });
@@ -68,6 +72,7 @@ test("faucet is isolated to mock assets and same-origin calls", async () => {
   assert.match(faucet, /VSOL_SETTLEMENT_MINT/);
   assert.match(faucet, /mint\.mintAuthority.*faucet\.publicKey/);
   assert.match(env, /Never use a mainnet, admin, or personally funded wallet/);
+  assert.doesNotMatch(env, /api-key=/);
   assert.match(gitignore, /\.devnet/);
 });
 

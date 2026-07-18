@@ -1,5 +1,5 @@
 import "../../lib/runtime-env-worker";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../db";
 import { positions, rfqQuotes, transactionSimulations } from "../../../db/schema";
@@ -41,8 +41,25 @@ export async function GET(request: Request) {
   const owner = await userKey(request);
   if (!owner) return json({ error: "Sign in to view positions." }, 401);
   const db = getDb();
-  const rows = await db.select().from(positions).where(eq(positions.userEmail, owner)).orderBy(desc(positions.createdAt));
-  return json({ positions: rows });
+  const rows = await db
+    .select({ position: positions })
+    .from(positions)
+    .innerJoin(transactionSimulations, eq(positions.simulationId, transactionSimulations.id))
+    .where(and(
+      eq(positions.userEmail, owner),
+      eq(transactionSimulations.userEmail, owner),
+      eq(positions.walletAddress, transactionSimulations.walletAddress),
+      eq(positions.quoteId, transactionSimulations.quoteId),
+      eq(transactionSimulations.status, "passed"),
+      eq(transactionSimulations.submissionStatus, "confirmed"),
+      eq(positions.transactionSignature, transactionSimulations.transactionSignature),
+      eq(positions.simulationLogsHash, transactionSimulations.logsHash),
+      isNotNull(positions.transactionSignature),
+      isNotNull(positions.simulationId),
+      isNotNull(positions.simulationLogsHash),
+    ))
+    .orderBy(desc(positions.createdAt));
+  return json({ positions: rows.map(({ position }) => position) });
 }
 
 export async function POST(request: Request) {

@@ -1,7 +1,7 @@
 import "../../../lib/runtime-env-worker";
 import { and, eq } from "drizzle-orm";
 import { Transaction, VersionedTransaction } from "@solana/web3.js";
-import { decodeSignedTransaction, inspectVsolFillTransaction, VSOL_CONNECTION } from "../../../lib/vsol-server";
+import { decodeSignedTransaction, getVsolConnection, inspectVsolFillTransaction } from "../../../lib/vsol-server";
 import { getChatGPTUser } from "../../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../../db";
 import { rfqQuotes, transactionSimulations } from "../../../../db/schema";
@@ -61,6 +61,7 @@ export async function POST(request: Request) {
   }
 
   const db = getDb();
+  const connection = getVsolConnection();
   let simulationId = "";
   try {
     const raw = decodeSignedTransaction(input.transaction);
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
     if (!quote || quote.consumedAt) return Response.json({ error: "The quote is missing or already consumed." }, { status: 409 });
 
     const transactionHash = await hashHex(raw);
-    const result = await VSOL_CONNECTION.simulateTransaction(VersionedTransaction.deserialize(raw), {
+    const result = await connection.simulateTransaction(VersionedTransaction.deserialize(raw), {
       sigVerify: true,
       commitment: "confirmed",
     });
@@ -115,8 +116,8 @@ export async function POST(request: Request) {
       return Response.json({ error: "Devnet simulation rejected the transaction.", simulation }, { status: 422 });
     }
 
-    const signature = await VSOL_CONNECTION.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 3 });
-    const confirmation = await VSOL_CONNECTION.confirmTransaction(signature, "confirmed");
+    const signature = await connection.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 3 });
+    const confirmation = await connection.confirmTransaction(signature, "confirmed");
     if (confirmation.value.err) throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
     await db.update(transactionSimulations).set({
       transactionSignature: signature,
