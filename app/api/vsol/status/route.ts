@@ -69,6 +69,10 @@ export async function GET() {
       ok: false,
       cluster: "devnet",
       deploymentReady: VSOL_PYTH_UPGRADE_DEPLOYED,
+      diagnostic: {
+        name: error instanceof Error ? error.name : "UnknownError",
+        message: safeMessage,
+      },
       error: VSOL_PYTH_UPGRADE_DEPLOYED
         ? "Devnet RPC is temporarily unavailable."
         : "The Pyth-bound VSOL deployment is pending verification.",
