@@ -58,7 +58,13 @@ export async function GET() {
       explorerUrl: solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58()),
       checkedAt: new Date().toISOString(),
     }, { headers: { "Cache-Control": "public, max-age=10, stale-while-revalidate=30" } });
-  } catch {
+  } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const safeMessage = rawMessage.replace(/https?:\/\/\S+/gi, "[redacted-url]").slice(0, 300);
+    console.error("VSOL status RPC check failed", {
+      name: error instanceof Error ? error.name : "UnknownError",
+      message: safeMessage,
+    });
     return Response.json({
       ok: false,
       cluster: "devnet",
