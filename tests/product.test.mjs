@@ -47,7 +47,7 @@ test("server creates buyer-bound maker RFQs and verifies fills before persistenc
   assert.match(sendRoute, /sigVerify: true/);
   assert.match(sendRoute, /transactionSimulations/);
   assert.match(server, /runtimeEnv\("VSOL_RPC_URL"\)/);
-  assert.match(runtimeEnv, /cloudflare:workers/);
+  assert.match(runtimeEnv, /configureRuntimeEnv/);
   assert.match(server, /Instruction: FillQuote/);
   assert.match(server, /positionOwnedByVsol/);
   assert.match(positionsRoute, /verifyVsolFill/);

@@ -2,14 +2,8 @@ type RuntimeBindings = Record<string, unknown>;
 
 let workerBindings: RuntimeBindings = {};
 
-try {
-  // Sites/Cloudflare runtime values live on the Workers env binding. Keeping the
-  // module name dynamic lets protocol scripts continue to run under plain Node.
-  const moduleName = "cloudflare:workers";
-  const workers = await import(moduleName) as { env?: RuntimeBindings };
-  workerBindings = workers.env ?? {};
-} catch {
-  // Plain Node and local protocol scripts have no cloudflare: URL loader.
+export function configureRuntimeEnv(bindings: RuntimeBindings) {
+  workerBindings = bindings;
 }
 
 export function runtimeEnv(name: string) {

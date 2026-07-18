@@ -1,3 +1,4 @@
+import "../../lib/runtime-env-worker";
 import deployment from "../../../vsol/deployments/devnet.json";
 import { marketBySymbol } from "../../lib/markets";
 import { quoteFor, type Direction } from "../../lib/options";

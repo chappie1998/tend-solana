@@ -1,3 +1,4 @@
+import "../../../lib/runtime-env-worker";
 import { getAccount } from "@solana/spl-token";
 import { VSOL_CONNECTION } from "../../../lib/vsol-server";
 import {

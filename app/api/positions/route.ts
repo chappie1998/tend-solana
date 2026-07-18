@@ -1,3 +1,4 @@
+import "../../lib/runtime-env-worker";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../db";

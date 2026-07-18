@@ -1,3 +1,4 @@
+import "../../lib/runtime-env-worker";
 import { marketBySymbol } from "../../lib/markets";
 import { getPythSnapshot } from "../../lib/pyth-market-data";
 

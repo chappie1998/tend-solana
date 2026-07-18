@@ -1,3 +1,4 @@
+import "../../../lib/runtime-env-worker";
 import { and, eq } from "drizzle-orm";
 import { Transaction, VersionedTransaction } from "@solana/web3.js";
 import { decodeSignedTransaction, inspectVsolFillTransaction, VSOL_CONNECTION } from "../../../lib/vsol-server";

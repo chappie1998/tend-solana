@@ -1,3 +1,4 @@
+import "../../../lib/runtime-env-worker";
 import {
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
