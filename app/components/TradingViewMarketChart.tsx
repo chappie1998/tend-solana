@@ -128,7 +128,12 @@ export function TradingViewMarketChart({
       <div className="chart-canvas-wrap">
         {state === "loading" && <div className="chart-state" role="status"><LoaderCircle className="spin" size={20} aria-hidden="true" /><strong>Loading TradingView</strong><span>Connecting the official advanced chart…</span></div>}
         {state === "error" && <div className="chart-state error" role="alert"><AlertTriangle size={20} aria-hidden="true" /><strong>Couldn’t load TradingView</strong><span>{error}</span><button type="button" className="button secondary" onClick={() => { setError(""); setRequestVersion((value) => value + 1); }}><RefreshCw size={14} aria-hidden="true" /> Retry</button></div>}
-        <div ref={containerRef} className={state === "error" ? "chart-canvas" : "chart-canvas visible"} />
+        <div
+          ref={containerRef}
+          className={state === "error"
+            ? "chart-canvas tradingview-widget-container"
+            : "chart-canvas tradingview-widget-container visible"}
+        />
       </div>
       <div className="chart-source" aria-live="polite">
         <span className={`data-mode ${snapshot?.mode ?? "loading"}`}>{snapshot?.mode === "live" ? "Pyth live" : snapshot?.mode === "closed" ? "Market closed" : snapshot?.mode === "stale" ? "Pyth stale" : "Checking Pyth"}</span>

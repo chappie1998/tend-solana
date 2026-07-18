@@ -20,6 +20,7 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.doesNotMatch(terminal, /"Devnet confirmed"/);
   assert.match(chart, /embed-widget-advanced-chart\.js/);
   assert.match(chart, /TradingView market display/);
+  assert.match(chart, /chart-canvas tradingview-widget-container/);
   assert.doesNotMatch(chart, /DEMO DATA|demoCandles|lightweight-charts/);
   assert.match(markets, /deployment\.underlyingMint/);
   assert.match(markets, /b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593/);
