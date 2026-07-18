@@ -10,6 +10,9 @@ import {
 } from "@solana/spl-token";
 import { Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { quoteFor } from "../../app/lib/options.ts";
+import { marketBySymbol } from "../../app/lib/markets.ts";
+import { getPythRealizedVolatility, getPythSnapshot } from "../../app/lib/pyth-market-data.ts";
+import deployment from "../deployments/devnet.json" with { type: "json" };
 import {
   buildVsolQuoteTransaction,
   verifyVsolFill,
@@ -34,6 +37,9 @@ async function loadOrCreateBuyer() {
 }
 
 async function main() {
+  if (deployment.pythUpgradeDeployed !== true) {
+    throw new Error("The Pyth-bound devnet deployment has not passed bootstrap verification");
+  }
   const faucet = await loadKeypair(resolve(secretDir, "devnet-faucet.json"));
   const buyer = await loadOrCreateBuyer();
   const buyerToken = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, buyer.publicKey);
@@ -52,7 +58,12 @@ async function main() {
     await mintTo(VSOL_CONNECTION, faucet, VSOL_SETTLEMENT_MINT, buyerToken, faucet, 1_000n * 1_000_000n, [], {}, TOKEN_PROGRAM_ID);
   }
 
-  const economics = quoteFor({ spot: 171.86, amount: 250, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 46.2 });
+  const market = marketBySymbol("NVDA");
+  if (!market) throw new Error("NVDA market metadata is missing");
+  const [snapshot, volatility] = await Promise.all([getPythSnapshot(market), getPythRealizedVolatility(market)]);
+  if (snapshot.mode !== "live") throw new Error(`Pyth NVDA feed is not fresh: ${snapshot.mode}`);
+  const durationMinutes = Math.max(1, Math.floor((deployment.uiExpiry * 1_000 - Date.now()) / 60_000));
+  const economics = quoteFor({ spot: snapshot.price, amount: 250, durationMinutes, direction: "up", payoff: 5, volatility: volatility.value });
   const quote = await buildVsolQuoteTransaction({
     buyer: buyer.publicKey,
     direction: "up",

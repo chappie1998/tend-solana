@@ -89,6 +89,25 @@ export function nextReferenceMarketClose(now = Date.now()) {
   return newYorkTimeToUtc(next.year, next.month, next.day, 16);
 }
 
+export function previousReferenceMarketCloses(count: number, now = Date.now()) {
+  if (!Number.isInteger(count) || count < 1 || count > 60) {
+    throw new Error("Reference close count must be between 1 and 60");
+  }
+  const parts = newYorkParts(now);
+  const todayClose = newYorkTimeToUtc(parts.year, parts.month, parts.day, 16);
+  let calendarOffset = now >= todayClose + 5 * 60_000 ? 0 : 1;
+  const closes: number[] = [];
+  while (closes.length < count) {
+    const candidate = addCalendarDays(parts.year, parts.month, parts.day, -calendarOffset);
+    const dayOfWeek = weekday(candidate.year, candidate.month, candidate.day);
+    if (dayOfWeek >= 1 && dayOfWeek <= 5) {
+      closes.push(newYorkTimeToUtc(candidate.year, candidate.month, candidate.day, 16));
+    }
+    calendarOffset += 1;
+  }
+  return closes.reverse();
+}
+
 function formatExpiryTime(timestamp: number) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: NEW_YORK,
@@ -107,7 +126,7 @@ function formatExpiryDate(timestamp: number) {
 }
 
 export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()): ExpiryDefinition {
-  const intradayEligible = symbol !== "SPCX";
+  const intradayEligible = symbol === "NVDA";
   const marketOpen = isReferenceMarketOpen(now);
   const close = nextReferenceMarketClose(now);
   let expiryAt = now;
@@ -151,7 +170,7 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
   const afterReferenceClose = INTRADAY_CODES.has(code) && expiryAt > close;
   const available = !INTRADAY_CODES.has(code) || (intradayEligible && marketOpen && !afterReferenceClose && expiryAt - now > tradeLockSeconds * 1000);
   let availabilityReason = "Available";
-  if (INTRADAY_CODES.has(code) && !intradayEligible) availabilityReason = "Intraday markets are unavailable for indicative private-asset pricing.";
+  if (INTRADAY_CODES.has(code) && !intradayEligible) availabilityReason = "This symbol has no published intraday Pyth market.";
   else if (INTRADAY_CODES.has(code) && !marketOpen) availabilityReason = "Intraday markets open with the US reference session at 9:30 AM ET.";
   else if (afterReferenceClose) availabilityReason = "This expiry falls after the reference market closes.";
 

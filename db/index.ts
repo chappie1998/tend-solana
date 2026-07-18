@@ -39,6 +39,12 @@ export async function ensureDb() {
       observation_window_seconds integer NOT NULL DEFAULT 900,
       trade_lock_seconds integer NOT NULL DEFAULT 300,
       status text NOT NULL,
+      transaction_signature text,
+      simulation_id text,
+      simulation_status text,
+      simulation_slot integer,
+      simulation_units_consumed integer,
+      simulation_logs_hash text,
       created_at integer NOT NULL
     )`),
     DB.prepare("CREATE INDEX IF NOT EXISTS positions_user_created_idx ON positions (user_email, created_at)"),
@@ -57,6 +63,7 @@ export async function ensureDb() {
       cap_price real NOT NULL,
       breakeven real NOT NULL,
       implied_volatility real NOT NULL,
+      volatility_source text NOT NULL DEFAULT 'legacy',
       effective_leverage real NOT NULL,
       latency_ms integer NOT NULL,
       badge text NOT NULL,
@@ -71,6 +78,28 @@ export async function ensureDb() {
       created_at integer NOT NULL
     )`),
     DB.prepare("CREATE INDEX IF NOT EXISTS rfq_quotes_expiry_idx ON rfq_quotes (expires_at)"),
+    DB.prepare(`CREATE TABLE IF NOT EXISTS transaction_simulations (
+      id text PRIMARY KEY NOT NULL,
+      user_email text NOT NULL,
+      wallet_address text NOT NULL,
+      quote_id text NOT NULL,
+      position_address text NOT NULL,
+      transaction_hash text NOT NULL,
+      status text NOT NULL,
+      slot integer,
+      units_consumed integer,
+      logs_json text NOT NULL,
+      logs_hash text NOT NULL,
+      error_json text,
+      transaction_signature text,
+      submission_status text NOT NULL,
+      submission_error text,
+      created_at integer NOT NULL,
+      confirmed_at integer
+    )`),
+    DB.prepare("CREATE INDEX IF NOT EXISTS transaction_simulations_user_created_idx ON transaction_simulations (user_email, created_at)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS transaction_simulations_quote_idx ON transaction_simulations (quote_id)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS transaction_simulations_hash_unique_idx ON transaction_simulations (transaction_hash)"),
   ]);
 
   const ensureColumn = async (table: "positions" | "rfq_quotes", name: string, definition: string) => {
@@ -85,4 +114,11 @@ export async function ensureDb() {
     await ensureColumn(table, "observation_window_seconds", "integer NOT NULL DEFAULT 900");
     await ensureColumn(table, "trade_lock_seconds", "integer NOT NULL DEFAULT 300");
   }
+  await ensureColumn("positions", "transaction_signature", "text");
+  await ensureColumn("positions", "simulation_id", "text");
+  await ensureColumn("positions", "simulation_status", "text");
+  await ensureColumn("positions", "simulation_slot", "integer");
+  await ensureColumn("positions", "simulation_units_consumed", "integer");
+  await ensureColumn("positions", "simulation_logs_hash", "text");
+  await ensureColumn("rfq_quotes", "volatility_source", "text NOT NULL DEFAULT 'legacy'");
 }

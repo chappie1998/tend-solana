@@ -20,6 +20,7 @@ import {
   VSOL_CONFIG,
   VSOL_MAKER,
   VSOL_MARKET,
+  VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RPC_URL,
   VSOL_SETTLEMENT_MINT,
@@ -185,6 +186,9 @@ export async function buildVsolQuoteTransaction(params: {
   premium: number;
   maxPayout: number;
 }) {
+  if (!VSOL_PYTH_UPGRADE_DEPLOYED) {
+    throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
+  }
   const maker = vsolMaker();
   const [configAccount, marketAccount, writerAccount] = await Promise.all([
     VSOL_CONNECTION.getAccountInfo(VSOL_CONFIG, "confirmed"),
@@ -277,6 +281,17 @@ export function isVsolFillTransaction(transaction: Transaction) {
   return signatureInstruction.programId.equals(Ed25519Program.programId)
     && fillInstruction.programId.equals(VSOL_PROGRAM_ID)
     && Buffer.from(fillInstruction.data).subarray(0, FILL_QUOTE_DISCRIMINATOR.length).equals(FILL_QUOTE_DISCRIMINATOR);
+}
+
+export function inspectVsolFillTransaction(transaction: Transaction) {
+  if (!isVsolFillTransaction(transaction)) return null;
+  const fillInstruction = transaction.instructions[1];
+  if (fillInstruction.keys.length < 10) return null;
+  const buyer = fillInstruction.keys[0];
+  const market = fillInstruction.keys[3];
+  const position = fillInstruction.keys[9];
+  if (!buyer.isSigner || !buyer.isWritable || !market.pubkey.equals(VSOL_MARKET) || !position.isWritable) return null;
+  return { buyer: buyer.pubkey, market: market.pubkey, position: position.pubkey };
 }
 
 export function parsePublicKey(value: unknown) {

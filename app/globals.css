@@ -118,8 +118,8 @@ h1, h2, h3, p { margin: 0; }
 .negative-box { color: var(--negative); background: var(--negative-soft); }
 .price-mode { padding: 4px 6px; border-radius: 5px; font-size: 9px; font-weight: 850; letter-spacing: .06em; text-transform: uppercase; }
 .price-mode.live { color: var(--positive); background: var(--positive-soft); }
-.price-mode.delayed { color: var(--accent-dark); background: var(--accent-soft); }
-.price-mode.demo { color: var(--negative); background: var(--negative-soft); }
+.price-mode.closed { color: var(--accent-dark); background: var(--accent-soft); }
+.price-mode.stale, .price-mode.loading { color: var(--negative); background: var(--negative-soft); }
 .market-stats { display: flex; gap: 26px; }
 .market-stats > div { display: grid; gap: 5px; }
 .market-stats span { color: var(--ink-faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -137,20 +137,25 @@ h1, h2, h3, p { margin: 0; }
 .chart-canvas-wrap { position: relative; min-height: 322px; }
 .chart-canvas { height: 322px; opacity: 0; transition: opacity 160ms ease; }
 .chart-canvas.visible { opacity: 1; }
+.chart-canvas .tradingview-widget-container__widget { height: calc(100% - 24px) !important; }
+.chart-canvas .tradingview-widget-copyright { height: 24px; padding: 4px 10px; color: var(--ink-faint); font-size: 9px; text-align: right; }
+.chart-canvas .tradingview-widget-copyright a { color: var(--ink-soft); }
+.chart-target { margin: 8px 18px 0; padding: 6px 9px; border: 1px dashed var(--line-strong); border-radius: 7px; display: inline-flex; align-items: center; gap: 7px; color: var(--ink-soft); font-size: 9px; }
+.chart-target strong { color: var(--accent); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.chart-target.down strong { color: var(--negative); }
 .chart-state { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ink-soft); background: var(--surface-raised); text-align: center; }
 .chart-state strong { color: var(--ink); font-size: 12px; }
 .chart-state span { max-width: 310px; font-size: 10px; line-height: 1.45; }
 .chart-state.error svg { color: var(--negative); }
 .chart-state .button { margin-top: 5px; }
-.demo-watermark { position: absolute; left: 50%; top: 48%; z-index: 2; transform: translate(-50%, -50%) rotate(-9deg); color: color-mix(in srgb, var(--negative) 26%, transparent); font-size: clamp(28px, 5vw, 52px); font-weight: 900; letter-spacing: .16em; pointer-events: none; white-space: nowrap; }
 .chart-source { min-height: 42px; padding: 7px 18px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; color: var(--ink-faint); font-size: 9px; }
 .chart-source > span:nth-child(3) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chart-source a { min-height: 32px; display: inline-flex; align-items: center; color: var(--ink-soft); font-weight: 700; white-space: nowrap; }
 .chart-source a:hover { color: var(--ink); }
 .data-mode { padding: 4px 6px; border-radius: 5px; font-weight: 850; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
 .data-mode.live { color: var(--positive); background: var(--positive-soft); }
-.data-mode.delayed { color: var(--accent-dark); background: var(--accent-soft); }
-.data-mode.demo, .data-mode.loading { color: var(--negative); background: var(--negative-soft); }
+.data-mode.closed { color: var(--accent-dark); background: var(--accent-soft); }
+.data-mode.stale, .data-mode.loading { color: var(--negative); background: var(--negative-soft); }
 .market-footer { min-height: 46px; padding: 0 22px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 20px; color: var(--ink-soft); font-size: 11px; }
 .market-footer span { display: flex; align-items: center; gap: 6px; }
 .transparency-card { margin-top: 12px; padding: 15px 17px; border: 1px solid var(--line); border-radius: 12px; display: flex; justify-content: space-between; align-items: center; background: var(--blue-soft); }

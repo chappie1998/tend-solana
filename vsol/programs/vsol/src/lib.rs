@@ -2,9 +2,11 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, TransferChecked};
 
 mod math;
+mod pyth;
 mod signature;
 
 use math::{calculate_fee, calculate_payout};
+use pyth::{parse_fully_verified_price_update, PythPrice};
 use signature::{quote_message, verify_preceding_ed25519_instruction, QuoteMessageContext};
 
 declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
@@ -24,6 +26,7 @@ pub const MAX_FEE_BPS: u16 = 1_000;
 pub const MIN_MARKET_LEAD_SECONDS: i64 = 15;
 pub const MAX_OBSERVATION_WINDOW_SECONDS: u32 = 3_600;
 pub const MAX_SETTLEMENT_GRACE_SECONDS: u32 = 604_800;
+pub const MAX_PYTH_EXPONENT_ABS: u32 = 18;
 
 #[program]
 pub mod vsol {
@@ -169,6 +172,10 @@ pub mod vsol {
         );
         require!(args.price_scale > 0, VsolError::InvalidPriceScale);
         require!(
+            args.pyth_feed_id.iter().any(|byte| *byte != 0),
+            VsolError::InvalidPythFeed
+        );
+        require!(
             args.underlying_mint != Pubkey::default(),
             VsolError::InvalidUnderlyingMint
         );
@@ -186,6 +193,7 @@ pub mod vsol {
         market.observation_window_seconds = args.observation_window_seconds;
         market.settlement_grace_seconds = args.settlement_grace_seconds;
         market.max_confidence_bps = args.max_confidence_bps;
+        market.pyth_feed_id = args.pyth_feed_id;
         market.settlement_decimals = ctx.accounts.settlement_mint.decimals;
         market.enabled = true;
 
@@ -196,6 +204,9 @@ pub mod vsol {
         oracle.confidence = 0;
         oracle.observed_at = 0;
         oracle.published_at = 0;
+        oracle.price_update = Pubkey::default();
+        oracle.feed_id = args.pyth_feed_id;
+        oracle.exponent = 0;
         oracle.finalized = false;
 
         emit!(MarketCreated {
@@ -471,17 +482,12 @@ pub mod vsol {
         Ok(())
     }
 
-    pub fn publish_settlement(
-        ctx: Context<PublishSettlement>,
-        price: u64,
-        confidence: u64,
-        observed_at: i64,
-    ) -> Result<()> {
-        let now = Clock::get()?.unix_timestamp;
+    pub fn publish_pyth_settlement(ctx: Context<PublishPythSettlement>) -> Result<()> {
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
         let market = &ctx.accounts.market;
         let oracle = &mut ctx.accounts.oracle;
         require!(!oracle.finalized, VsolError::OracleAlreadyFinalized);
-        require!(price > 0, VsolError::InvalidOraclePrice);
         require!(now >= market.expiry, VsolError::MarketNotExpired);
 
         let observation_end = market
@@ -492,13 +498,28 @@ pub mod vsol {
             .checked_add(i64::from(market.settlement_grace_seconds))
             .ok_or(VsolError::MathOverflow)?;
         require!(
-            observed_at >= market.expiry && observed_at <= observation_end && observed_at <= now,
-            VsolError::InvalidObservationTime
-        );
-        require!(
             now <= settlement_deadline,
             VsolError::SettlementWindowClosed
         );
+
+        let maximum_age = i64::from(market.observation_window_seconds)
+            .checked_add(i64::from(market.settlement_grace_seconds))
+            .ok_or(VsolError::MathOverflow)?;
+        let pyth_price = parse_fully_verified_price_update(
+            &ctx.accounts.price_update.to_account_info(),
+            market.pyth_feed_id,
+        )?;
+        require!(
+            pyth_price.publish_time.saturating_add(maximum_age) >= now,
+            VsolError::InvalidPythPriceUpdate
+        );
+        require!(
+            pyth_price.publish_time >= market.expiry
+                && pyth_price.publish_time <= observation_end
+                && pyth_price.publish_time <= now,
+            VsolError::InvalidObservationTime
+        );
+        let (price, confidence) = normalize_pyth_price(pyth_price, market.price_scale)?;
 
         let confidence_bps = (confidence as u128)
             .checked_mul(BPS_DENOMINATOR as u128)
@@ -513,14 +534,19 @@ pub mod vsol {
 
         oracle.price = price;
         oracle.confidence = confidence;
-        oracle.observed_at = observed_at;
+        oracle.observed_at = pyth_price.publish_time;
         oracle.published_at = now;
+        oracle.price_update = ctx.accounts.price_update.key();
+        oracle.feed_id = market.pyth_feed_id;
+        oracle.exponent = pyth_price.exponent;
         oracle.finalized = true;
         emit!(SettlementPublished {
             market: market.key(),
             price,
             confidence,
-            observed_at
+            observed_at: pyth_price.publish_time,
+            price_update: ctx.accounts.price_update.key(),
+            feed_id: market.pyth_feed_id,
         });
         Ok(())
     }
@@ -723,6 +749,7 @@ pub struct CreateMarketArgs {
     pub observation_window_seconds: u32,
     pub settlement_grace_seconds: u32,
     pub max_confidence_bps: u16,
+    pub pyth_feed_id: [u8; 32],
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -894,14 +921,16 @@ pub struct FillQuote<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PublishSettlement<'info> {
-    pub oracle_authority: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle_authority @ VsolError::Unauthorized)]
+pub struct PublishPythSettlement<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle)]
     pub market: Account<'info, Market>,
     #[account(mut, seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Account<'info, SettlementOracle>,
+    /// CHECK: The parser verifies the upgraded Pyth receiver owner, account discriminator,
+    /// full guardian verification, exact feed id, and serialized account length.
+    pub price_update: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -988,6 +1017,7 @@ pub struct Market {
     pub observation_window_seconds: u32,
     pub settlement_grace_seconds: u32,
     pub max_confidence_bps: u16,
+    pub pyth_feed_id: [u8; 32],
     pub settlement_decimals: u8,
     pub enabled: bool,
 }
@@ -1001,6 +1031,9 @@ pub struct SettlementOracle {
     pub confidence: u64,
     pub observed_at: i64,
     pub published_at: i64,
+    pub price_update: Pubkey,
+    pub feed_id: [u8; 32],
+    pub exponent: i32,
     pub finalized: bool,
 }
 
@@ -1163,6 +1196,8 @@ pub struct SettlementPublished {
     pub price: u64,
     pub confidence: u64,
     pub observed_at: i64,
+    pub price_update: Pubkey,
+    pub feed_id: [u8; 32],
 }
 #[event]
 pub struct PositionSettled {
@@ -1201,6 +1236,12 @@ pub enum VsolError {
     InvalidSymbol,
     #[msg("The market price scale must be positive.")]
     InvalidPriceScale,
+    #[msg("The Pyth feed identifier is invalid.")]
+    InvalidPythFeed,
+    #[msg("The Pyth price update is invalid, stale, or insufficiently verified.")]
+    InvalidPythPriceUpdate,
+    #[msg("The Pyth exponent cannot be represented safely.")]
+    InvalidPythExponent,
     #[msg("The underlying mint cannot be the default public key.")]
     InvalidUnderlyingMint,
     #[msg("The amount must be positive.")]
@@ -1261,6 +1302,48 @@ pub enum VsolError {
     InvalidNonce,
     #[msg("A settlement destination token account is invalid.")]
     InvalidDestination,
+}
+
+fn normalize_pyth_price(price: PythPrice, target_scale: u64) -> Result<(u64, u64)> {
+    require!(price.price > 0, VsolError::InvalidOraclePrice);
+    require!(target_scale > 0, VsolError::InvalidPriceScale);
+
+    let exponent_abs = price.exponent.unsigned_abs();
+    require!(
+        exponent_abs <= MAX_PYTH_EXPONENT_ABS,
+        VsolError::InvalidPythExponent
+    );
+    let power = 10_u128
+        .checked_pow(exponent_abs)
+        .ok_or(VsolError::MathOverflow)?;
+    let scale = u128::from(target_scale);
+    let normalize = |value: u128, round_up: bool| -> Result<u64> {
+        let scaled = if price.exponent >= 0 {
+            value
+                .checked_mul(scale)
+                .and_then(|candidate| candidate.checked_mul(power))
+                .ok_or(VsolError::MathOverflow)?
+        } else {
+            let numerator = value.checked_mul(scale).ok_or(VsolError::MathOverflow)?;
+            if round_up && numerator > 0 {
+                numerator
+                    .checked_add(power.checked_sub(1).ok_or(VsolError::MathOverflow)?)
+                    .ok_or(VsolError::MathOverflow)?
+                    .checked_div(power)
+                    .ok_or(VsolError::MathOverflow)?
+            } else {
+                numerator
+                    .checked_div(power)
+                    .ok_or(VsolError::MathOverflow)?
+            }
+        };
+        u64::try_from(scaled).map_err(|_| error!(VsolError::MathOverflow))
+    };
+
+    Ok((
+        normalize(price.price as u128, false)?,
+        normalize(price.conf as u128, true)?,
+    ))
 }
 
 fn transfer_checked<'info>(
@@ -1330,4 +1413,48 @@ fn close_token_account<'info>(
         },
         &[signer_seeds],
     ))
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    fn price(price: i64, conf: u64, exponent: i32) -> PythPrice {
+        PythPrice {
+            price,
+            conf,
+            exponent,
+            publish_time: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn normalizes_negative_pyth_exponent_to_market_scale() {
+        let (value, confidence) =
+            normalize_pyth_price(price(20_405_953, 10_209, -5), 1_000_000).unwrap();
+        assert_eq!(value, 204_059_530);
+        assert_eq!(confidence, 102_090);
+    }
+
+    #[test]
+    fn confidence_rounds_up_when_market_scale_is_coarser() {
+        let (normalized_price, normalized_confidence) =
+            normalize_pyth_price(price(12_345, 1, -4), 100).unwrap();
+        assert_eq!(normalized_price, 123);
+        assert_eq!(normalized_confidence, 1);
+    }
+
+    #[test]
+    fn normalizes_positive_pyth_exponent() {
+        let (value, confidence) = normalize_pyth_price(price(123, 2, 2), 1_000).unwrap();
+        assert_eq!(value, 12_300_000);
+        assert_eq!(confidence, 200_000);
+    }
+
+    #[test]
+    fn rejects_non_positive_and_unbounded_values() {
+        assert!(normalize_pyth_price(price(0, 1, -5), 1_000_000).is_err());
+        assert!(normalize_pyth_price(price(1, 1, -19), 1_000_000).is_err());
+        assert!(normalize_pyth_price(price(i64::MAX, 1, 18), u64::MAX).is_err());
+    }
 }

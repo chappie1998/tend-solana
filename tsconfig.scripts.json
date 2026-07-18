@@ -5,9 +5,13 @@
     "noEmit": true
   },
   "include": [
+    "vsol/scripts/bootstrap.ts",
     "vsol/scripts/dev-rpc-proxy.ts",
     "vsol/scripts/http-flow-smoke.ts",
-    "vsol/scripts/web-execution-smoke.ts"
+    "vsol/scripts/verify-deployment.ts",
+    "vsol/scripts/web-execution-smoke.ts",
+    "vsol/sdk/**/*.ts",
+    "vsol/tests/**/*.ts"
   ],
   "exclude": ["node_modules"]
 }

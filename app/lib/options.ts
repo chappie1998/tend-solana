@@ -3,25 +3,32 @@ export type Direction = "up" | "down";
 export function quoteFor(params: {
   spot: number;
   amount: number;
-  days?: number;
-  durationMinutes?: number;
+  durationMinutes: number;
   direction: Direction;
-  payoff?: number;
-  volatility?: number;
+  payoff: number;
+  volatility: number;
 }) {
-  const { spot, amount, direction } = params;
-  const durationMinutes = params.durationMinutes ?? Math.max(1, params.days ?? 7) * 1_440;
-  const payoff = Math.min(10, Math.max(2, params.payoff ?? 5));
-  const volatility = Math.min(2, Math.max(0.05, (params.volatility ?? 45) / 100));
-  const timeFactor = Math.sqrt(Math.max(durationMinutes, 15) / 10_080);
+  const { spot, amount, direction, durationMinutes } = params;
+  if (!Number.isFinite(spot) || spot <= 0 || !Number.isFinite(amount) || amount <= 0) {
+    throw new RangeError("Spot and amount must be positive finite values");
+  }
+  if (!Number.isFinite(durationMinutes) || durationMinutes < 1) throw new RangeError("Duration must be positive");
+  if (![2, 5, 10].includes(params.payoff)) throw new RangeError("Payoff must be 2×, 5×, or 10×");
+  if (!Number.isFinite(params.volatility) || params.volatility < 1 || params.volatility > 400) {
+    throw new RangeError("Volatility is outside maker risk bounds");
+  }
+  const payoff = params.payoff;
+  const volatility = params.volatility / 100;
+  const timeYears = Math.max(durationMinutes, 15) / 525_600;
+  const expectedMove = volatility * Math.sqrt(timeYears);
   const directionFactor = direction === "up" ? 1 : 1.06;
-  const riskFactor = 0.18 + volatility * 2 * timeFactor;
-  const premium = Math.max(1, (amount / payoff) * riskFactor * directionFactor);
+  const riskFactor = Math.min(1.5, Math.max(0.65, 0.8 + expectedMove * 1.2));
+  const premium = Math.min(amount * 0.95, Math.max(1, (amount / payoff) * riskFactor * directionFactor));
   const maxPayout = amount;
   const leverage = maxPayout / premium;
-  const moveScale = Math.min(2, Math.max(0.08, timeFactor));
-  const width = spot * (direction === "up" ? 0.12 : 0.1) * moveScale;
-  const strikeOffset = 0.025 * moveScale;
+  const moveScale = Math.min(0.4, Math.max(0.03, expectedMove * 1.25));
+  const width = spot * moveScale;
+  const strikeOffset = Math.min(0.12, Math.max(0.005, expectedMove * 0.15));
   const strike = spot * (direction === "up" ? 1 + strikeOffset : 1 - strikeOffset);
   const cap = direction === "up" ? strike + width : strike - width;
   const breakeven = direction === "up"

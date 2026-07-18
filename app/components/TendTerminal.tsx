@@ -5,7 +5,6 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BadgeCheck,
-  BarChart3,
   BookOpen,
   ChevronDown,
   CircleDollarSign,
@@ -26,7 +25,6 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Transaction } from "@solana/web3.js";
-import { quoteFor } from "../lib/options";
 import { markets } from "../lib/markets";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
 import {
@@ -49,7 +47,8 @@ type MakerQuote = {
   strike: number;
   cap: number;
   breakeven: number;
-  impliedVolatility: number;
+  pricingVolatility: number;
+  volatilitySource: string;
   effectiveLeverage: number;
   latencyMs: number;
   badge: string;
@@ -75,6 +74,17 @@ type SavedPosition = {
   status: "preview_confirmed" | "settled";
   createdAt: string;
   transactionSignature?: string;
+  simulationId?: string;
+  simulationStatus?: "passed" | "failed";
+  simulationSlot?: number | null;
+  simulationUnitsConsumed?: number | null;
+  simulationLogsHash?: string;
+  simulation?: {
+    status: "passed" | "failed";
+    slot: number | null;
+    unitsConsumed: number | null;
+    logsHash: string;
+  };
 };
 
 function injectedSolanaWallet() {
@@ -88,9 +98,6 @@ function injectedSolanaWallet() {
 const assets = markets.map((market) => ({
   ticker: market.symbol,
   name: market.name,
-  price: market.price,
-  move: market.change,
-  iv: market.iv,
   token: market.tokenAddress,
   oracleStatus: market.oracleStatus,
   intradayEligible: market.intradayEligible,
@@ -204,9 +211,12 @@ function QuotePanel({
 function VsolStatus() {
   const [status, setStatus] = useState<{
     ok: boolean;
+    deploymentReady?: boolean;
     executable?: boolean;
     writerLiquidity?: number;
     explorerUrl?: string;
+    pythFeedId?: string;
+    oracleProgram?: string;
   } | null>(null);
 
   useEffect(() => {
@@ -221,7 +231,7 @@ function VsolStatus() {
   const explorer = status?.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
   return (
     <div className={status?.ok ? "protocol-strip verified" : "protocol-strip"}>
-      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL program verified" : "Devnet RPC unavailable"}</strong><small>{status?.executable ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC in writer escrow` : "Mock assets · controlled settlement oracle"}</small></span></div>
+      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL program + Pyth market verified" : status.deploymentReady === false ? "Pyth deployment pending" : "Devnet RPC unavailable"}</strong><small>{status?.ok ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC escrow · feed ${status.pythFeedId?.slice(0, 8) ?? "pending"}…` : "Executable quotes stay paused until every proof passes"}</small></span></div>
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
@@ -258,7 +268,7 @@ function TradeView({
   const expiryOptions = expiryCodes.map((code) => {
     const definition = resolveExpiry(code, asset.ticker, now);
     if (code !== "30D") {
-      return { ...definition, available: false, availabilityReason: "This series is protocol-ready but not published in the devnet sandbox until a production oracle is connected." };
+      return { ...definition, available: false, availabilityReason: "The Pyth oracle path is ready, but this exact expiry series has not been published on devnet." };
     }
     if (definition.group === "intraday" && definition.available && marketSnapshot?.mode !== "live") {
       return { ...definition, available: false, availabilityReason: "Intraday quotes require a fresh licensed display feed." };
@@ -266,12 +276,10 @@ function TradeView({
     return definition;
   });
   const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
-  const estimate = quoteFor({ spot: asset.price, amount: notional, durationMinutes: expiryDefinition.durationMinutes, direction, payoff, volatility: asset.iv });
   const bestQuote = quotes.find((quote) => quote.id === selectedQuoteId) ?? quotes[0];
-  const premium = bestQuote?.premium ?? estimate.premium;
-  const target = bestQuote?.strike ?? estimate.strike;
-  const displayedPrice = marketSnapshot?.price ?? asset.price;
-  const displayedMove = marketSnapshot?.changePercent ?? asset.move;
+  const premium = bestQuote?.premium ?? 0;
+  const target = bestQuote?.strike ?? null;
+  const displayedPrice = marketSnapshot?.price ?? null;
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15_000);
@@ -365,9 +373,13 @@ function TradeView({
       const sendResponse = await fetch("/api/vsol/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transaction: btoa(signedBinary) }),
+        body: JSON.stringify({
+          transaction: btoa(signedBinary),
+          quoteId: bestQuote.id,
+          walletAddress,
+        }),
       });
-      const sent = await sendResponse.json() as { signature?: string; error?: string };
+      const sent = await sendResponse.json() as { signature?: string; simulation?: { id: string; status: "passed" | "failed"; slot: number | null; unitsConsumed: number | null; logsHash: string }; error?: string };
       if (!sendResponse.ok || !sent.signature) throw new Error(sent.error ?? "Devnet did not confirm the fill.");
       const response = await fetch("/api/positions", {
         method: "POST",
@@ -385,6 +397,7 @@ function TradeView({
           expiryCode: expiry,
           payoff,
           transactionSignature: sent.signature,
+          simulationId: sent.simulation?.id,
         }),
       });
       const result = await response.json() as { position?: SavedPosition; error?: string };
@@ -415,18 +428,18 @@ function TradeView({
         <div className="asset-strip" role="group" aria-label="Available markets">
           {assets.map((item) => (
             <button key={item.ticker} type="button" onClick={() => { setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-              <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>${item.price.toFixed(2)}</small></span><em className={item.move > 0 ? "positive" : "negative"}>{item.move > 0 ? "+" : ""}{item.move}%</em>
+              <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : "Pyth pending"}</small></span><em className={item.ticker === asset.ticker && marketSnapshot?.mode === "live" ? "positive" : ""}>{item.ticker === asset.ticker ? marketSnapshot?.mode ?? "—" : "—"}</em>
             </button>
           ))}
         </div>
 
         <div className="market-card">
           <div className="price-row">
-            <div><span className="eyebrow">Reference market · session-aware</span><div className="spot-price"><strong>${displayedPrice.toFixed(2)}</strong><span className={displayedMove > 0 ? "positive-box" : "negative-box"}>{displayedMove > 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{Math.abs(displayedMove).toFixed(2)}%</span><span className={`price-mode ${marketSnapshot?.mode ?? "demo"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "delayed" ? "Delayed" : "Demo"}</span></div></div>
-            <div className="market-stats"><div><span>Display volume</span><strong>{marketSnapshot?.sessionVolume ? marketSnapshot.sessionVolume.toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 1 }) : "—"}</strong></div><div><span>Protocol OI</span><strong>—</strong></div><div><span>Model IV</span><strong>{asset.iv}%</strong></div></div>
+            <div><span className="eyebrow">Pyth settlement reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "closed" ? "Closed" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div></div>
+            <div className="market-stats"><div><span>Pyth confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div><div><span>Oracle slot</span><strong>{marketSnapshot?.slot?.toLocaleString() ?? "—"}</strong></div><div><span>Pricing vol</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
-          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> Chart feed is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Mock RWA on devnet</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
+          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> TradingView is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Pyth feed · mock RWA mint</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
         </div>
 
         <div className="transparency-card">
@@ -458,16 +471,16 @@ function TradeView({
           <div className="field-group"><label htmlFor="amount">Position size</label><div className="amount-input"><span>$</span><input id="amount" type="number" inputMode="decimal" min="100" max="5000" step="100" value={amount} onChange={(event) => { setAmount(event.target.value); invalidateQuote(); }} autoComplete="off" aria-describedby="amount-note" /><span>tUSDC</span></div><div id="amount-note" className="input-note"><span>Min $100</span><span>Devnet max $5,000</span></div></div>
 
           <div className="economics">
-            <div><span>Target price <Info size={13} aria-hidden="true" /></span><strong>${target.toFixed(2)}</strong></div>
-            <div><span>Estimated premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div>
-            <div><span>Maximum loss</span><strong className="risk">${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div>
-            <div><span>Implied volatility</span><strong>{(bestQuote?.impliedVolatility ?? asset.iv).toFixed(1)}%</strong></div>
+            <div><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
+            <div><span>Signed premium</span><strong>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div><span>Maximum loss</span><strong className="risk">{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
             <div className="economics-total"><span>Maximum payout</span><strong>${notional.toLocaleString()}</strong></div>
           </div>
 
           <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} />
         </form>
-        <p className="risk-note" id="risk">Devnet only: mock assets, controlled oracle, no real value. Options can lose their full premium.</p>
+        <p className="risk-note" id="risk">Devnet only: mock tokens, real Pyth reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
 
       {complete && (
@@ -477,14 +490,14 @@ function TradeView({
             <div className="success-mark"><ShieldCheck size={25} aria-hidden="true" /></div>
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote is locked for 30 seconds. Your maximum loss is fixed before you sign.</p>
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>${target.toFixed(2)}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading"} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. VSOL is unaudited and its demo oracle is controlled; never use mainnet funds.</p>
+            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement accepts only a fully verified Pyth update for the market feed; VSOL remains unaudited and must not receive mainnet funds.</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>
@@ -514,8 +527,8 @@ function PortfolioView({
   const expiryLabel = (position: SavedPosition) => position.expiryCode || (position.expiryDays ? `${position.expiryDays}D` : "—");
   function exportPositions() {
     if (!positions.length) return;
-    const header = "symbol,direction,strike,premium,notional,expiry_code,option_expiry_at,observation_window_seconds,status";
-    const rows = positions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status].join(","));
+    const header = "symbol,direction,strike,premium,notional,expiry_code,option_expiry_at,observation_window_seconds,status,transaction_signature,simulation_id,simulation_slot,simulation_units_consumed,simulation_logs_hash";
+    const rows = positions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status, position.transactionSignature ?? "", position.simulationId ?? "", position.simulationSlot ?? "", position.simulationUnitsConsumed ?? "", position.simulationLogsHash ?? ""].join(","));
     const url = URL.createObjectURL(new Blob([[header, ...rows].join("\n")], { type: "text/csv" }));
     const link = document.createElement("a");
     link.href = url;
@@ -529,7 +542,7 @@ function PortfolioView({
       <div className="metric-grid"><div className="metric-card"><span>Devnet notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Mock tUSDC only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Confirmed fills</span><strong>{positions.length}</strong><small>Verified before recording</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextPosition ? expiryLabel(nextPosition) : "—"}</strong><small>{nextPosition?.symbol ?? "No positions"}</small></div></div>
       <section className="positions-card"><div className="section-head"><div><h2>Open positions</h2><p>Live value and defined outcomes.</p></div><button type="button" className="text-button" onClick={exportPositions} disabled={!positions.length}>Export history <ArrowUpRight size={14} /></button></div>
         {isLoading ? <div className="portfolio-loading" role="status" aria-label="Loading positions">{[0, 1].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}</div> : error ? <div className="quote-error" role="alert"><div><strong>Couldn’t load positions</strong><p>{error}</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} /> Retry</button></div> : positions.length ? <div className="position-table" role="table" aria-label="Open positions"><div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Notional</span><span>Status</span><span>Expires</span></div>
-          {positions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">Devnet confirmed</span><span>{position.transactionSignature ? <a href={solanaExplorerUrl("tx", position.transactionSignature)} target="_blank" rel="noreferrer">Explorer</a> : expiryLabel(position)}</span></div>)}
+          {positions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">{position.simulationStatus === "passed" ? `Simulated · ${position.simulationUnitsConsumed?.toLocaleString() ?? "—"} CU` : "Devnet confirmed"}</span><span>{position.transactionSignature ? <><a href={solanaExplorerUrl("tx", position.transactionSignature)} target="_blank" rel="noreferrer">Tx</a>{position.simulationId ? <> · <a href={`/api/vsol/simulations?id=${encodeURIComponent(position.simulationId)}`} target="_blank" rel="noreferrer">Sim</a></> : null}</> : expiryLabel(position)}</span></div>)}
         </div> : <div className="empty-position"><Target size={20} aria-hidden="true" /><div><strong>No positions yet</strong><p>Connect a Solana wallet and execute a devnet quote to see it here.</p></div><button type="button" className="button secondary" onClick={onTrade}>Build a position</button></div>}
       </section>
     </main>
@@ -537,14 +550,29 @@ function PortfolioView({
 }
 
 function EarnView() {
-  const stress = [{ label: "−20%", value: "−$3,840", tone: "loss", width: 86 }, { label: "−10%", value: "−$1,140", tone: "loss", width: 52 }, { label: "Flat", value: "+$684", tone: "gain", width: 31 }, { label: "+10%", value: "+$684", tone: "gain", width: 31 }, { label: "+20%", value: "−$1,905", tone: "loss", width: 61 }];
+  const [status, setStatus] = useState<{
+    ok?: boolean;
+    writerLiquidity?: number;
+    writerVault?: string;
+    market?: string;
+    oracle?: string;
+    pythFeedId?: string;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/vsol/status", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((value) => { if (!cancelled) setStatus(value as typeof status); })
+      .catch(() => { if (!cancelled) setStatus({ ok: false }); });
+    return () => { cancelled = true; };
+  }, []);
   return (
     <main className="dashboard-view">
       <div className="view-heading"><div><span className="eyebrow">Writer desk</span><h1>Earn premium. See the obligation.</h1><p>No disguised APY. Every outcome stays visible.</p></div><a className="button primary" href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer"><CircleDollarSign size={16} aria-hidden="true" /> Inspect VSOL vault</a></div>
-      <div className="metric-grid"><div className="metric-card"><span>Locked collateral</span><strong>$18,420.00</strong><small>74.7% utilization</small></div><div className="metric-card"><span>Premium earned</span><strong>$2,184.40</strong><small className="positive">+$684.00 this cycle</small></div><div className="metric-card"><span>Max obligation</span><strong>$12,600.00</strong><small>Fully reserved</small></div><div className="metric-card"><span>Quote uptime</span><strong>97.8%</strong><small>Top 18% of makers</small></div></div>
+      <div className="metric-grid"><div className="metric-card"><span>Writer escrow</span><strong>{status?.ok ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC` : "—"}</strong><small>Read from the SPL token vault</small></div><div className="metric-card"><span>Premium earned</span><strong>—</strong><small>No indexed realized-P&amp;L ledger yet</small></div><div className="metric-card"><span>Open obligation</span><strong>—</strong><small>Protocol-wide position index pending</small></div><div className="metric-card"><span>Oracle</span><strong>{status?.pythFeedId ? "Pyth Core" : "—"}</strong><small>{status?.pythFeedId ? `${status.pythFeedId.slice(0, 10)}…` : "Checking devnet"}</small></div></div>
       <div className="writer-grid">
-        <section className="positions-card"><div className="section-head"><div><h2>Scenario P&amp;L</h2><p>Estimated result at Jul 24 expiry.</p></div><span className="verified"><BadgeCheck size={14} /> Collateral verified</span></div><div className="stress-chart">{stress.map((item) => <div className="stress-row" key={item.label}><span>{item.label}</span><div className="stress-track"><i className={item.tone} style={{ width: `${item.width}%` }} /></div><strong className={item.tone === "gain" ? "positive" : "negative"}>{item.value}</strong></div>)}</div><div className="stress-note"><Info size={16} aria-hidden="true" /><p>Your largest modeled loss comes from a 20% downside move while writing puts. Collateral already covers the full obligation.</p></div></section>
-        <section className="positions-card risk-composition"><div className="section-head"><div><h2>Exposure</h2><p>By market and direction.</p></div><button type="button" className="icon-button" aria-label="Open exposure analytics"><BarChart3 size={18} /></button></div><div className="donut" aria-label="Exposure: 58 percent NVIDIA, 27 percent Apple, 15 percent Tesla"><div><strong>$12.6K</strong><span>at risk</span></div></div><div className="legend"><div><i className="nvda" /><span>NVDA</span><strong>58%</strong></div><div><i className="aapl" /><span>AAPL</span><strong>27%</strong></div><div><i className="tsla" /><span>TSLA</span><strong>15%</strong></div></div></section>
+        <section className="positions-card"><div className="section-head"><div><h2>Verifiable accounts</h2><p>Only confirmed devnet state is shown.</p></div><span className="verified"><BadgeCheck size={14} /> RPC verified</span></div><div className="stress-note"><Info size={16} aria-hidden="true" /><p>Tend will not invent writer P&amp;L, utilization, uptime, or exposure. Those panels stay unavailable until an onchain indexer can reconcile every fill and settlement.</p></div></section>
+        <section className="positions-card risk-composition"><div className="section-head"><div><h2>Devnet links</h2><p>Inspect ownership and balances directly.</p></div></div><div className="legend"><div><span>Writer vault</span><strong>{status?.writerVault ? <a href={solanaExplorerUrl("address", status.writerVault)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Market</span><strong>{status?.market ? <a href={solanaExplorerUrl("address", status.market)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Settlement record</span><strong>{status?.oracle ? <a href={solanaExplorerUrl("address", status.oracle)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div></div></section>
       </div>
     </main>
   );

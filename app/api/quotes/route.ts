@@ -1,10 +1,11 @@
-import { markets } from "../../lib/markets";
+import deployment from "../../../vsol/deployments/devnet.json";
+import { marketBySymbol } from "../../lib/markets";
 import { quoteFor, type Direction } from "../../lib/options";
 import { ensureDb, getDb } from "../../../db";
 import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
-import type { Market } from "../../lib/markets";
+import { getPythRealizedVolatility, getPythSnapshot } from "../../lib/pyth-market-data";
 import { buildVsolQuoteTransaction, parsePublicKey } from "../../lib/vsol-server";
 import { solanaExplorerUrl } from "../../lib/vsol";
 import { getChatGPTUser } from "../../chatgpt-auth";
@@ -32,26 +33,15 @@ async function authorized(request: Request) {
   return hostname === "localhost" || hostname === "127.0.0.1";
 }
 
-async function freshIntradayReference(market: Market) {
-  const apiKey = process.env.MASSIVE_API_KEY?.trim();
-  if (!apiKey || !market.marketDataSymbol) throw new Error("missing-feed");
-  const endpoint = new URL(`https://api.massive.com/v2/last/trade/${market.marketDataSymbol}`);
-  endpoint.searchParams.set("apiKey", apiKey);
-  const response = await fetch(endpoint, { headers: { Accept: "application/json" }, cache: "no-store" });
-  if (!response.ok) throw new Error("provider-error");
-  const result = await response.json() as { results?: { p?: number; t?: number } };
-  const price = Number(result.results?.p);
-  const rawTimestamp = Number(result.results?.t);
-  const timestampMs = rawTimestamp > 1e15 ? rawTimestamp / 1e6 : rawTimestamp > 1e12 ? rawTimestamp : rawTimestamp * 1000;
-  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(timestampMs) || Date.now() - timestampMs > 120_000) {
-    throw new Error("stale-feed");
-  }
-  return price;
-}
-
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return json({ error: "Cross-site quote requests are not allowed." }, 403);
   if (!(await authorized(request))) return json({ error: "Sign in to request executable quotes." }, 401);
+  if (!deployment.pythUpgradeDeployed) {
+    return json({
+      error: "Executable quotes are paused: the Pyth-bound VSOL program and market have not yet been verified on devnet.",
+      code: "VSOL_PYTH_DEPLOYMENT_PENDING",
+    }, 503);
+  }
   await ensureDb();
   let input: Record<string, unknown>;
   try {
@@ -70,7 +60,7 @@ export async function POST(request: Request) {
     : legacyDays === 14 ? "7D" : legacyDays === 30 ? "30D" : "7D") as ExpiryCode;
   const payoff = Number(input.payoff);
   const buyer = parsePublicKey(input.walletAddress);
-  const market = markets.find((item) => item.symbol === symbol);
+  const market = marketBySymbol(symbol);
 
   if (!market || !direction) return json({ error: "Choose a supported market and direction." }, 422);
   if (!buyer) return json({ error: "Connect a valid Solana wallet before requesting an executable quote." }, 422);
@@ -82,22 +72,31 @@ export async function POST(request: Request) {
   const requestedAt = Date.now();
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
   if (!expiry.available) return json({ error: expiry.availabilityReason }, 422);
-  let referencePrice = market.price;
-  if (expiry.group === "intraday") {
-    try {
-      referencePrice = await freshIntradayReference(market);
-    } catch {
-      return json({ error: "Intraday quotes require a fresh licensed reference feed. Try again when the feed is live." }, 503);
-    }
+  const onchainExpiryAt = Number(deployment.uiExpiry) * 1_000;
+  const durationMinutes = Math.ceil((onchainExpiryAt - requestedAt) / 60_000);
+  if (durationMinutes <= 5) return json({ error: "The published devnet series is too close to expiry. A new series must be deployed." }, 503);
+  let snapshot;
+  let volatility;
+  try {
+    [snapshot, volatility] = await Promise.all([
+      getPythSnapshot(market),
+      getPythRealizedVolatility(market),
+    ]);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Pyth pricing is unavailable";
+    return json({ error: `Executable pricing requires fresh Pyth spot and historical observations: ${reason}` }, 503);
+  }
+  if (snapshot.mode !== "live") {
+    return json({ error: "Executable quotes pause unless the Pyth equity feed is fresh during the US reference session." }, 503);
   }
 
   const economics = quoteFor({
-    spot: referencePrice,
+    spot: snapshot.price,
     amount,
-    durationMinutes: expiry.durationMinutes,
+    durationMinutes,
     direction,
     payoff,
-    volatility: market.iv,
+    volatility: volatility.value,
   });
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
@@ -129,13 +128,14 @@ export async function POST(request: Request) {
     strike: Number(economics.strike.toFixed(2)),
     capPrice: Number(economics.cap.toFixed(2)),
     breakeven: Number(economics.breakeven.toFixed(2)),
-    impliedVolatility: market.iv,
+    pricingVolatility: volatility.value,
+    volatilitySource: volatility.source,
     effectiveLeverage: Number((economics.maxPayout / economics.premium).toFixed(2)),
     latencyMs: Date.now() - startedAt,
     badge: "Onchain escrow",
     expiryDays: expiry.expiryDays,
     expiryCode: expiry.code,
-    optionExpiryAt: new Date(expiry.expiryAt),
+    optionExpiryAt: new Date(onchainExpiryAt),
     observationWindowSeconds: expiry.observationWindowSeconds,
     tradeLockSeconds: expiry.tradeLockSeconds,
     payoff,
@@ -158,7 +158,8 @@ export async function POST(request: Request) {
     strike: quote.strike,
     cap: quote.capPrice,
     breakeven: quote.breakeven,
-    impliedVolatility: quote.impliedVolatility,
+    pricingVolatility: quote.pricingVolatility,
+    volatilitySource: quote.volatilitySource,
     effectiveLeverage: quote.effectiveLeverage,
     latencyMs: quote.latencyMs,
     badge: quote.badge,
@@ -170,13 +171,15 @@ export async function POST(request: Request) {
     symbol,
     tokenAddress: market.tokenAddress,
     oracleStatus: market.oracleStatus,
-    referencePrice,
-    referenceSource: expiry.group === "intraday" ? "Massive latest eligible trade" : "Tend preview reference",
-    settlement: "European cash-settled · observation-window oracle",
+    referencePrice: snapshot.price,
+    referenceConfidence: snapshot.confidence,
+    referencePublishTime: snapshot.publishTime,
+    referenceSource: "Pyth Core Hermes · exact onchain feed id",
+    settlement: "European cash-settled · fully verified Pyth PriceUpdateV2",
     expiry: {
       code: expiry.code,
       label: expiry.label,
-      optionExpiryAt: expiry.expiryAt,
+      optionExpiryAt: onchainExpiryAt,
       observationWindowSeconds: expiry.observationWindowSeconds,
       tradeLockSeconds: expiry.tradeLockSeconds,
     },

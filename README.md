@@ -1,19 +1,19 @@
 # VSOL by Tend
 
-VSOL is Tend’s Solana-native defined-risk options protocol. This `sol` branch contains the production web application, Anchor program, TypeScript SDK, deployment tools, and verified Solana devnet deployment. The `main` branch remains the Robinhood Chain product.
+VSOL is Tend’s Solana-native defined-risk options protocol. This `sol` branch contains the web application, Anchor program, TypeScript SDK, database migrations, and devnet deployment tools. The `main` branch remains the Robinhood Chain product.
 
-> Status: devnet sandbox. The assets are mock tokens, the settlement oracle is controlled by the devnet operator, and the code has not received an independent security audit. Do not use real funds or deploy this configuration to mainnet.
+> Status: the Pyth-enabled program is deployed and lifecycle-verified on Solana devnet. The checked-in manifest is marked `pythUpgradeDeployed: true` only after real fill, replay-rejection, Pyth settlement, escrow-close, timeout, and refund proofs passed. Assets remain valueless mock tokens. The code has not received an independent audit. Never use real funds.
 
-## Live devnet deployment
+## Existing devnet deployment
 
 | Component | Address |
 | --- | --- |
 | Program | `2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v` |
 | Config | `688RQvX2SEpnSuEndbjvRivFQpMzGjaz8hhGvAPGj1bY` |
-| Rolling market | See `vsol/deployments/devnet.json` |
+| Pyth-bound NVDA market | `FoXzcwgxDqvgEdFEqsne3H14nzWCcu3dnqNPQUS3RnaH` |
 | Settlement mint | `EaU6Yus9b7SWz3gzRNMuerpn1U9mYpfm996CQd2Lzhh4` |
 
-The checked-in deployment manifest includes the executable program, market, oracle, writer vault, public smoke-test transaction signatures, and the cluster-bound RFQ domain.
+The program upgrade transaction and every lifecycle proof are recorded in `vsol/deployments/devnet.json`. The bootstrap changes `pythUpgradeDeployed` to `true` only after all onchain checks pass; the independent verifier then re-reads program ownership, market/feed binding, oracle contents, closed position accounts, and transaction logs.
 
 ## Product flow
 
@@ -21,10 +21,10 @@ The checked-in deployment manifest includes the executable program, market, orac
 2. The private devnet faucet funds that wallet with mock tUSDC and a small amount of devnet SOL.
 3. Request an RFQ. The server signs the exact buyer, maker, market, economics, nonce, program, cluster, and configuration version.
 4. Review the defined payoff and sign the serialized transaction in the wallet.
-5. The app submits only a valid signed VSOL transaction to devnet.
-6. The portfolio record is created only after the backend independently verifies the confirmed on-chain fill.
+5. The server validates the exact instruction/account set, verifies signatures, simulates with signature checks, and persists a content-hashed simulation record before submitting.
+6. The portfolio record is created only after the backend independently verifies the confirmed on-chain fill and its linked passing simulation.
 
-Charts use TradingView Lightweight Charts. Their feed is display-only and never used for settlement. Short-duration series (15m, 1h, and end-of-day) are represented in the product but intentionally gated until a production settlement oracle and rolling-market operator are available. The live sandbox publishes a 30-day series.
+The market panel embeds TradingView’s official Advanced Chart. Its exchange data can be live, delayed, or end-of-day according to TradingView entitlements and is display-only. Pyth Core Hermes supplies the independently displayed reference price and 20-session realized-volatility input. Onchain settlement accepts only a fully verified upgraded Pyth `PriceUpdateV2`, exact feed ID, bounded confidence, expiry observation window, and maximum age. Short-duration series are represented but remain disabled until exact onchain markets are published.
 
 ## Protocol design
 
@@ -36,15 +36,16 @@ Charts use TradingView Lightweight Charts. Their feed is display-only and never 
 - Genesis-hash and config-version domain separation
 - Fill-time fee snapshots so later governance updates cannot alter open-position fees
 - Linear capped UP/DOWN settlement using checked `u128` arithmetic
-- Separate admin, pause, oracle, and eligibility authorities
+- Separate admin, pause, and eligibility authorities
 - Optional wallet eligibility records
+- Permissionless Pyth settlement publication; no administrator-selected price
 - Settlement remains available while new fills are paused
 - Deterministic refund if the oracle misses its settlement deadline
 - SPL Token classic only in v1 to avoid transfer-fee ambiguity
 
 ## Local development
 
-Requirements: Node.js 22+, Rust 1.89, Solana CLI 3.1.10, and Anchor CLI 1.0.2.
+Requirements: Node.js 24+, Rust 1.89, Solana CLI 3.1.10, and Anchor CLI 1.0.2.
 
 ```bash
 npm install
@@ -58,6 +59,8 @@ The app needs two isolated devnet-only server secrets:
 VSOL_MAKER_SECRET_KEY=<JSON byte array or base64-encoded JSON>
 VSOL_FAUCET_SECRET_KEY=<JSON byte array or base64-encoded JSON>
 VSOL_RPC_URL=<private Solana devnet RPC URL>
+PYTH_HERMES_URL=https://hermes.pyth.network
+PYTH_API_KEY=<server-only key>
 ```
 
 Never use the program admin, upgrade authority, mainnet wallet, or personally funded key for these roles.
@@ -70,13 +73,12 @@ npm run check
 npm --prefix vsol run devnet:verify
 ```
 
-The protocol suite tests payout bounds, fee rounding, escrow conservation, signature message format, cluster-domain separation, deterministic PDAs, and replay behavior. The deployment harness additionally executes successful fill/settlement and oracle-timeout/refund lifecycles, then checks that both position vaults close.
+The protocol suite tests payout bounds, fee rounding, escrow conservation, signature message format, cluster-domain separation, deterministic PDAs, replay behavior, Pyth account ownership, full verification, exact feed binding, and exponent normalization. The deployment harness posts a fresh Pyth update through the official receiver transaction builder, executes fill/settlement and oracle-timeout/refund lifecycles, and checks that both position vaults close.
 
 ## Before mainnet
 
 Mainnet deployment is blocked until all of the following are complete:
 
-- replace the controlled devnet oracle with a reviewed production adapter;
 - independent smart-contract and infrastructure audits;
 - fuzz/property tests across all instruction account substitutions;
 - multisig upgrade/admin authorities and timelocked governance;

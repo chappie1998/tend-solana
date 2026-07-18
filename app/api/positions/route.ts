@@ -1,7 +1,7 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../db";
-import { positions, rfqQuotes } from "../../../db/schema";
+import { positions, rfqQuotes, transactionSimulations } from "../../../db/schema";
 import { parsePublicKey, verifyVsolFill } from "../../lib/vsol-server";
 
 function json(body: unknown, status = 200) {
@@ -59,6 +59,7 @@ export async function POST(request: Request) {
   const walletAddress = typeof input.walletAddress === "string" ? input.walletAddress : "";
   const quoteId = typeof input.quoteId === "string" ? input.quoteId : "";
   const transactionSignature = typeof input.transactionSignature === "string" ? input.transactionSignature : "";
+  const simulationId = typeof input.simulationId === "string" ? input.simulationId : "";
   const buyer = parsePublicKey(walletAddress);
   const positionAddress = parsePublicKey(quoteId);
   if (!buyer) return json({ error: "Connect a valid Solana wallet first." }, 422);
@@ -71,6 +72,17 @@ export async function POST(request: Request) {
   const [quote] = await db.select().from(rfqQuotes).where(eq(rfqQuotes.id, quoteId)).limit(1);
   if (!quote) return json({ error: "The quote does not exist. Request a fresh price." }, 404);
   if (quote.consumedAt) return json({ error: "This quote has already been used." }, 409);
+  const [simulation] = simulationId
+    ? await db.select().from(transactionSimulations).where(and(
+      eq(transactionSimulations.id, simulationId),
+      eq(transactionSimulations.userEmail, owner),
+      eq(transactionSimulations.quoteId, quoteId),
+      eq(transactionSimulations.walletAddress, walletAddress),
+    )).limit(1)
+    : [];
+  if (!simulation || simulation.status !== "passed" || simulation.submissionStatus !== "confirmed" || simulation.transactionSignature !== transactionSignature) {
+    return json({ error: "A persisted, passing simulation for this confirmed fill is required." }, 422);
+  }
   if (!(await verifyVsolFill(transactionSignature, buyer, positionAddress))) {
     return json({ error: "The transaction is not a confirmed VSOL fill for this wallet and position." }, 422);
   }
@@ -94,6 +106,12 @@ export async function POST(request: Request) {
     observationWindowSeconds: quote.observationWindowSeconds,
     tradeLockSeconds: quote.tradeLockSeconds,
     status: "preview_confirmed" as const,
+    transactionSignature,
+    simulationId: simulation.id,
+    simulationStatus: simulation.status,
+    simulationSlot: simulation.slot,
+    simulationUnitsConsumed: simulation.unitsConsumed,
+    simulationLogsHash: simulation.logsHash,
     createdAt: consumedAt,
   };
 
@@ -106,5 +124,10 @@ export async function POST(request: Request) {
     if (isUniqueConstraint(error)) return json({ error: "This quote has already been used." }, 409);
     throw error;
   }
-  return json({ position: { ...row, transactionSignature } }, 201);
+  return json({ position: { ...row, simulation: {
+    status: simulation.status,
+    slot: simulation.slot,
+    unitsConsumed: simulation.unitsConsumed,
+    logsHash: simulation.logsHash,
+  } } }, 201);
 }

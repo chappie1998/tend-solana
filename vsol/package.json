@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "build:program": "anchor build",
     "test:rust": "cargo test --workspace --all-targets",
@@ -14,19 +17,28 @@
   },
   "dependencies": {
     "@anchor-lang/core": "1.0.2",
+    "@coral-xyz/anchor": "0.29.0",
+    "@pythnetwork/hermes-client": "^3.1.0",
+    "@pythnetwork/pyth-solana-receiver": "^0.16.0",
+    "@pythnetwork/solana-utils": "0.6.0",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.98.4",
     "bn.js": "5.2.5"
   },
   "devDependencies": {
-    "@types/node": "22.19.19",
     "@types/bn.js": "5.2.0",
+    "@types/node": "22.19.19",
     "tsx": "4.20.6",
     "typescript": "5.9.3"
   },
   "overrides": {
     "bn.js": "5.2.5",
-    "uuid": "11.1.1",
-    "ws": "8.21.0"
+    "jayson": {
+      "uuid": "11.1.1"
+    },
+    "rpc-websockets@^7.5.1": {
+      ".": "7.5.1",
+      "uuid": "11.1.1"
+    }
   }
 }

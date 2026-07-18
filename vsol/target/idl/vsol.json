@@ -793,25 +793,18 @@
       ]
     },
     {
-      "name": "publish_settlement",
+      "name": "publish_pyth_settlement",
       "discriminator": [
-        182,
-        80,
-        96,
-        214,
-        108,
-        107,
-        124,
-        234
+        118,
+        173,
+        113,
+        184,
+        10,
+        0,
+        231,
+        81
       ],
       "accounts": [
-        {
-          "name": "oracle_authority",
-          "signer": true,
-          "relations": [
-            "config"
-          ]
-        },
         {
           "name": "config",
           "pda": {
@@ -864,22 +857,15 @@
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "price_update",
+          "docs": [
+            "full guardian verification, exact feed id, and serialized account length."
+          ]
         }
       ],
-      "args": [
-        {
-          "name": "price",
-          "type": "u64"
-        },
-        {
-          "name": "confidence",
-          "type": "u64"
-        },
-        {
-          "name": "observed_at",
-          "type": "i64"
-        }
-      ]
+      "args": []
     },
     {
       "name": "refund_unsettled",
@@ -1886,151 +1872,166 @@
     },
     {
       "code": 6010,
+      "name": "InvalidPythFeed",
+      "msg": "The Pyth feed identifier is invalid."
+    },
+    {
+      "code": 6011,
+      "name": "InvalidPythPriceUpdate",
+      "msg": "The Pyth price update is invalid, stale, or insufficiently verified."
+    },
+    {
+      "code": 6012,
+      "name": "InvalidPythExponent",
+      "msg": "The Pyth exponent cannot be represented safely."
+    },
+    {
+      "code": 6013,
       "name": "InvalidUnderlyingMint",
       "msg": "The underlying mint cannot be the default public key."
     },
     {
-      "code": 6011,
+      "code": 6014,
       "name": "InvalidAmount",
       "msg": "The amount must be positive."
     },
     {
-      "code": 6012,
+      "code": 6015,
       "name": "InvalidWidth",
       "msg": "The payout width must be positive."
     },
     {
-      "code": 6013,
+      "code": 6016,
       "name": "InvalidDirection",
       "msg": "The direction must be up or down."
     },
     {
-      "code": 6014,
+      "code": 6017,
       "name": "MathOverflow",
       "msg": "A checked arithmetic operation failed."
     },
     {
-      "code": 6015,
+      "code": 6018,
       "name": "MarketDisabled",
       "msg": "The market is disabled."
     },
     {
-      "code": 6016,
+      "code": 6019,
       "name": "MarketExpired",
       "msg": "The market has expired."
     },
     {
-      "code": 6017,
+      "code": 6020,
       "name": "MarketNotExpired",
       "msg": "The market has not expired."
     },
     {
-      "code": 6018,
+      "code": 6021,
       "name": "QuoteExpired",
       "msg": "The maker quote has expired."
     },
     {
-      "code": 6019,
+      "code": 6022,
       "name": "MissingMakerSignature",
       "msg": "The maker signature instruction is missing."
     },
     {
-      "code": 6020,
+      "code": 6023,
       "name": "InvalidMakerSignature",
       "msg": "The maker signature or signed quote message is invalid."
     },
     {
-      "code": 6021,
+      "code": 6024,
       "name": "InvalidWriterVault",
       "msg": "The writer vault is invalid."
     },
     {
-      "code": 6022,
+      "code": 6025,
       "name": "InsufficientWriterLiquidity",
       "msg": "The writer does not have enough available collateral."
     },
     {
-      "code": 6023,
+      "code": 6026,
       "name": "CollateralMismatch",
       "msg": "Escrow does not exactly equal premium plus maximum payout."
     },
     {
-      "code": 6024,
+      "code": 6027,
       "name": "EligibilityRequired",
       "msg": "An eligibility account is required."
     },
     {
-      "code": 6025,
+      "code": 6028,
       "name": "InvalidEligibility",
       "msg": "The eligibility account is invalid."
     },
     {
-      "code": 6026,
+      "code": 6029,
       "name": "IneligibleWallet",
       "msg": "The wallet is not eligible to trade."
     },
     {
-      "code": 6027,
+      "code": 6030,
       "name": "InvalidMarket",
       "msg": "The market account is invalid."
     },
     {
-      "code": 6028,
+      "code": 6031,
       "name": "InvalidOracle",
       "msg": "The oracle account is invalid."
     },
     {
-      "code": 6029,
+      "code": 6032,
       "name": "OracleAlreadyFinalized",
       "msg": "The settlement oracle is already finalized."
     },
     {
-      "code": 6030,
+      "code": 6033,
       "name": "OracleNotFinalized",
       "msg": "The settlement oracle is not finalized."
     },
     {
-      "code": 6031,
+      "code": 6034,
       "name": "InvalidOraclePrice",
       "msg": "The oracle price is invalid."
     },
     {
-      "code": 6032,
+      "code": 6035,
       "name": "InvalidObservationTime",
       "msg": "The oracle observation timestamp is outside the approved window."
     },
     {
-      "code": 6033,
+      "code": 6036,
       "name": "SettlementWindowClosed",
       "msg": "The settlement publication window is closed."
     },
     {
-      "code": 6034,
+      "code": 6037,
       "name": "OracleConfidenceTooWide",
       "msg": "The oracle confidence interval is too wide."
     },
     {
-      "code": 6035,
+      "code": 6038,
       "name": "SettlementWindowOpen",
       "msg": "The settlement fallback window is still open."
     },
     {
-      "code": 6036,
+      "code": 6039,
       "name": "InvalidPosition",
       "msg": "The position is invalid."
     },
     {
-      "code": 6037,
+      "code": 6040,
       "name": "PositionNotOpen",
       "msg": "The position is not open."
     },
     {
-      "code": 6038,
+      "code": 6041,
       "name": "InvalidNonce",
       "msg": "The quote nonce record is invalid."
     },
     {
-      "code": 6039,
+      "code": 6042,
       "name": "InvalidDestination",
       "msg": "A settlement destination token account is invalid."
     }
@@ -2203,6 +2204,15 @@
           {
             "name": "max_confidence_bps",
             "type": "u16"
+          },
+          {
+            "name": "pyth_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
           }
         ]
       }
@@ -2358,6 +2368,15 @@
           {
             "name": "max_confidence_bps",
             "type": "u16"
+          },
+          {
+            "name": "pyth_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
           },
           {
             "name": "settlement_decimals",
@@ -2701,6 +2720,23 @@
             "type": "i64"
           },
           {
+            "name": "price_update",
+            "type": "pubkey"
+          },
+          {
+            "name": "feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "exponent",
+            "type": "i32"
+          },
+          {
             "name": "finalized",
             "type": "bool"
           }
@@ -2727,6 +2763,19 @@
           {
             "name": "observed_at",
             "type": "i64"
+          },
+          {
+            "name": "price_update",
+            "type": "pubkey"
+          },
+          {
+            "name": "feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
           }
         ]
       }

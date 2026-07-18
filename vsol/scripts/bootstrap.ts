@@ -2,7 +2,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { AnchorProvider, Program, Wallet } from "@anchor-lang/core";
+import { createRequire } from "node:module";
+import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
+import { Wallet as CoralWallet } from "@coral-xyz/anchor";
+import { HermesClient } from "@pythnetwork/hermes-client";
 import BN from "bn.js";
 import {
   createMint,
@@ -44,6 +47,13 @@ import {
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
 
+// The official packages publish dual ESM/CJS builds, but solana-utils 0.6.0's
+// ESM entry imports an extensionless jito-ts path that Node 24 rejects. Loading
+// the package's supported CJS export avoids patching vendor code.
+const require = createRequire(import.meta.url);
+const { PythSolanaReceiver } = require("@pythnetwork/pyth-solana-receiver") as typeof import("@pythnetwork/pyth-solana-receiver");
+const { sendTransactions } = require("@pythnetwork/solana-utils") as typeof import("@pythnetwork/solana-utils");
+
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
@@ -52,12 +62,21 @@ const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
 const walletPath = process.env.SOLANA_WALLET?.replace(/^~/, homedir()) ?? resolve(homedir(), ".config/solana/id.json");
+const pythFeedId = "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593";
+const smokePythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+const pythFeedBytes = [...Buffer.from(pythFeedId, "hex")];
+const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
+const pythReceiverProgram = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 
 type Deployment = {
   cluster: string;
   rpcUrl: string;
   programId: string;
+  pythUpgradeDeployed: boolean;
   programUpgradeSignature?: string;
+  pythReceiverProgram: string;
+  pythFeedId: string;
+  smokePythFeedId: string;
   config: string;
   admin: string;
   maker: string;
@@ -115,7 +134,7 @@ async function ensureSignerFunds(admin: Keypair, signer: Keypair): Promise<void>
 }
 
 function programFor(signer: Keypair): Program<Vsol> {
-  const provider = new AnchorProvider(connection, new Wallet(signer), { commitment, preflightCommitment: commitment });
+  const provider = new AnchorProvider(connection, new AnchorWallet(signer), { commitment, preflightCommitment: commitment });
   return new Program<Vsol>(idl, provider);
 }
 
@@ -177,6 +196,7 @@ async function createMarket(params: {
   expiry: number;
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
+  pythFeedId: number[];
 }) {
   const id = marketId(params.label);
   const market = deriveMarket(params.config, id);
@@ -192,6 +212,7 @@ async function createMarket(params: {
         observationWindowSeconds: params.observationWindowSeconds,
         settlementGraceSeconds: params.settlementGraceSeconds,
         maxConfidenceBps: 500,
+        pythFeedId: params.pythFeedId,
       })
       .accountsStrict({
         admin: params.admin.publicKey,
@@ -279,8 +300,73 @@ async function waitUntil(timestamp: number, label: string): Promise<void> {
   process.stdout.write("\n");
 }
 
+async function pythUpdateAtOrAfter(feedId: string, expiry: number) {
+  const client = new HermesClient(process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network", {
+    accessToken: process.env.PYTH_API_KEY?.trim() || undefined,
+    timeout: 20_000,
+    httpRetries: 3,
+  });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const update = await client.getLatestPriceUpdates([feedId], { encoding: "base64", parsed: true });
+    const parsed = update.parsed?.[0];
+    if (parsed && parsed.id.toLowerCase() === feedId && parsed.price.publish_time >= expiry) return { update, parsed };
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
+  }
+  throw new Error(`Pyth did not publish feed ${feedId} inside the settlement observation window`);
+}
+
+async function publishPythSettlement(params: {
+  adminProgram: Program<Vsol>;
+  admin: Keypair;
+  config: PublicKey;
+  market: PublicKey;
+  oracle: PublicKey;
+  feedId: string;
+  expiry: number;
+}) {
+  const { update, parsed } = await pythUpdateAtOrAfter(params.feedId, params.expiry);
+  if (update.binary.encoding !== "base64" || !update.binary.data.length) throw new Error("Hermes returned no base64 Pyth update");
+  const wallet = new CoralWallet(params.admin);
+  const receiver = new PythSolanaReceiver({ connection, wallet });
+  const builder = receiver.newTransactionBuilder({ closeUpdateAccounts: true });
+  await builder.addPostPriceUpdates(update.binary.data);
+  let priceUpdate: PublicKey | undefined;
+  await builder.addPriceConsumerInstructions(async (getPriceUpdateAccount: (feedId: string) => PublicKey) => {
+    // The receiver SDK indexes accumulator updates by canonical 0x-prefixed feed ID.
+    const updateAccount = getPriceUpdateAccount(`0x${params.feedId}`);
+    priceUpdate = updateAccount;
+    return [{
+      instruction: await params.adminProgram.methods
+        .publishPythSettlement()
+        .accountsStrict({
+          config: params.config,
+          market: params.market,
+          oracle: params.oracle,
+          priceUpdate: updateAccount,
+        })
+        .instruction(),
+      signers: [],
+    }];
+  });
+  const signatures = await sendTransactions(
+    await builder.buildVersionedTransactions({ computeUnitPriceMicroLamports: 10_000, tightComputeBudget: true }),
+    connection,
+    wallet,
+    30,
+  );
+  if (!priceUpdate || !signatures.length) throw new Error("Pyth settlement transactions did not complete");
+  return {
+    publishSignature: signatures[signatures.length - 1],
+    pythPriceUpdate: priceUpdate.toBase58(),
+    pythPublishTime: parsed.price.publish_time,
+    pythPrice: parsed.price.price,
+    pythConfidence: parsed.price.conf,
+    pythExponent: parsed.price.expo,
+  };
+}
+
 async function main(): Promise<void> {
-  console.log(`VSOL bootstrap on ${cluster}: ${rpcUrl}`);
+  console.log(`VSOL bootstrap on ${cluster} through the configured RPC`);
   const previousDeployment = existsSync(deploymentPath)
     ? JSON.parse(await readFile(deploymentPath, "utf8")) as Partial<Deployment>
     : {};
@@ -384,11 +470,12 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     underlyingMint,
-    label: `${cluster}:VSOL-RWA:30D:${Math.floor(now / 86_400)}`,
-    symbol: "VSOL-RWA",
+    label: `${cluster}:NVDA-PYTH-V2:30D:${Math.floor(now / 86_400)}`,
+    symbol: "NVDA",
     expiry: uiExpiry,
     observationWindowSeconds: 900,
     settlementGraceSeconds: 86_400,
+    pythFeedId: pythFeedBytes,
   });
 
   const smokeExpiry = (await clusterUnixTime()) + (cluster === "localnet" ? 30 : 75);
@@ -402,8 +489,9 @@ async function main(): Promise<void> {
     label: `${cluster}:success:${runId}`,
     symbol: "VSOL-TEST",
     expiry: smokeExpiry,
-    observationWindowSeconds: 5,
-    settlementGraceSeconds: 15,
+    observationWindowSeconds: 120,
+    settlementGraceSeconds: 600,
+    pythFeedId: smokePythFeedBytes,
   });
   const refundMarket = await createMarket({
     adminProgram,
@@ -416,6 +504,7 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
     observationWindowSeconds: 5,
     settlementGraceSeconds: 15,
+    pythFeedId: smokePythFeedBytes,
   });
 
   const quoteExpiry = BigInt(smokeExpiry - 5);
@@ -478,14 +567,15 @@ async function main(): Promise<void> {
   if (!replayRejected) throw new Error("A filled maker nonce was replayable");
 
   await waitUntil(smokeExpiry, "Waiting for settlement observation");
-  // Use the market boundary itself as the observation timestamp. Client wall clocks can
-  // run slightly ahead of validator Clock and must never be trusted as oracle time.
-  const observedAt = smokeExpiry;
-  const settlementPrice = 105n * PRICE_SCALE;
-  const publishSignature = await adminProgram.methods
-    .publishSettlement(new BN(settlementPrice.toString()), new BN((100_000n).toString()), new BN(observedAt))
-    .accountsStrict({ oracleAuthority: admin.publicKey, config, market: successMarket.market, oracle: successMarket.oracle })
-    .rpc();
+  const pythSettlement = await publishPythSettlement({
+    adminProgram,
+    admin,
+    config,
+    market: successMarket.market,
+    oracle: successMarket.oracle,
+    feedId: smokePythFeedId,
+    expiry: smokeExpiry,
+  });
 
   const settleSignature = await adminProgram.methods
     .settle()
@@ -531,9 +621,13 @@ async function main(): Promise<void> {
 
   const deployment: Deployment = {
     cluster,
-    rpcUrl,
+    rpcUrl: cluster === "devnet" ? "https://api.devnet.solana.com" : rpcUrl,
     programId: VSOL_PROGRAM_ID.toBase58(),
+    pythUpgradeDeployed: true,
     programUpgradeSignature: previousDeployment.programUpgradeSignature,
+    pythReceiverProgram,
+    pythFeedId,
+    smokePythFeedId,
     config: config.toBase58(),
     admin: admin.publicKey.toBase58(),
     maker: maker.publicKey.toBase58(),
@@ -552,7 +646,16 @@ async function main(): Promise<void> {
       ...(previousDeployment.smoke ?? {}),
       successFillSignature,
       refundFillSignature,
-      publishSignature,
+      successMarket: successMarket.market.toBase58(),
+      successOracle: successMarket.oracle.toBase58(),
+      refundMarket: refundMarket.market.toBase58(),
+      refundOracle: refundMarket.oracle.toBase58(),
+      publishSignature: pythSettlement.publishSignature,
+      pythPriceUpdate: pythSettlement.pythPriceUpdate,
+      pythPublishTime: pythSettlement.pythPublishTime,
+      pythPrice: pythSettlement.pythPrice,
+      pythConfidence: pythSettlement.pythConfidence,
+      pythExponent: pythSettlement.pythExponent,
       settleSignature,
       refundSignature,
       replayRejected,

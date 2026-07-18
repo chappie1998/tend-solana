@@ -13,26 +13,66 @@ async function post(path: string, body: object) {
   return result;
 }
 
-const statusResponse = await fetch(`${appUrl}/api/vsol/status`);
-const status = await statusResponse.json() as { ok?: boolean };
-if (!statusResponse.ok || !status.ok) throw new Error("VSOL status endpoint did not verify devnet");
+async function postResponse(path: string, body: object) {
+  const response = await fetch(`${appUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+  return { response, result: await response.json() as Record<string, unknown> };
+}
+
+async function get(path: string) {
+  const response = await fetch(`${appUrl}${path}`, { headers: { origin: appUrl } });
+  const result = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw new Error(`${path}: ${String(result.error ?? response.status)}`);
+  return result;
+}
+
+const status = await get("/api/vsol/status") as { ok?: boolean };
+if (!status.ok) throw new Error("VSOL status endpoint did not verify devnet");
+const marketData = await get("/api/market-data?symbol=NVDA") as { snapshot?: { mode?: string } };
+const markets = await get("/api/markets");
 await post("/api/vsol/faucet", { walletAddress: buyer.publicKey.toBase58() });
-const quote = await post("/api/quotes", {
+const quoteRequest = {
   symbol: "NVDA",
   direction: "up",
   amount: 200,
   expiryCode: "30D",
   payoff: 5,
   walletAddress: buyer.publicKey.toBase58(),
-});
+};
+if (marketData.snapshot?.mode !== "live") {
+  const { response, result } = await postResponse("/api/quotes", quoteRequest);
+  if (response.status !== 503 || !String(result.error ?? "").includes("pause")) {
+    throw new Error(`/api/quotes: expected a fail-closed market-session pause, received ${response.status}`);
+  }
+  console.log(JSON.stringify({ ok: true, status, marketData, markets, quotePaused: result.error }, null, 2));
+  process.exit(0);
+}
+const quote = await post("/api/quotes", quoteRequest);
 const vsol = quote.vsol as { transaction: string; positionAddress: string };
 const transaction = Transaction.from(Buffer.from(vsol.transaction, "base64"));
 transaction.partialSign(buyer);
-const sent = await post("/api/vsol/send", { transaction: transaction.serialize().toString("base64") });
+const sent = await post("/api/vsol/send", {
+  transaction: transaction.serialize().toString("base64"),
+  quoteId: vsol.positionAddress,
+  walletAddress: buyer.publicKey.toBase58(),
+});
+const simulation = sent.simulation as { id: string; status: string };
+if (!simulation?.id || simulation.status !== "passed") throw new Error("Fill simulation was not persisted as passing");
 const position = await post("/api/positions", {
   walletAddress: buyer.publicKey.toBase58(),
   quoteId: vsol.positionAddress,
   transactionSignature: sent.signature,
+  simulationId: simulation.id,
 });
+const savedSimulation = await get(`/api/vsol/simulations?id=${encodeURIComponent(simulation.id)}`);
+const savedPositions = await get("/api/positions");
 
-console.log(JSON.stringify({ ok: true, status, position: position.position, signature: sent.signature }, null, 2));
+console.log(JSON.stringify({
+  ok: true,
+  status,
+  marketData,
+  markets,
+  position: position.position,
+  simulation: savedSimulation.simulation,
+  positions: savedPositions.positions,
+  signature: sent.signature,
+}, null, 2));

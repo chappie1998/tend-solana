@@ -8,7 +8,7 @@ VSOL protects buyer premium, writer maximum-payout collateral, maker quote autho
 
 - Solana runtime and SPL Token classic behave as specified.
 - The program upgrade authority can change code and is therefore trusted on devnet.
-- The configured oracle authority can choose settlement prices in the current sandbox. This is unacceptable for mainnet.
+- Pyth Core and its upgraded Solana receiver are trusted for the selected feed’s verified price update.
 - The maker controls its off-chain signing key; compromise permits quotes only against capital already deposited in that maker’s writer vault.
 - The isolated faucet controls only the valueless mock settlement mint and a limited devnet SOL balance.
 
@@ -25,16 +25,18 @@ VSOL protects buyer premium, writer maximum-payout collateral, maker quote autho
 - Missed oracle finalization returns buyer premium and writer collateral after the configured deadline.
 - Authorities are separated and admin transfer is two-step.
 - Fee-on-transfer and Token-2022 assets are out of scope for v1.
+- Settlement rejects the wrong receiver owner, partial verification, wrong feed ID, excessive confidence, stale updates, and publications outside the expiry observation window.
 
 ## Known limitations
 
 - No independent audit has been completed.
-- The devnet oracle is controlled and is not a price-security boundary.
+- The Pyth-integrated binary and lifecycle are verified on devnet, but devnet verification is not a substitute for an independent audit.
+- Market disruption, exchange halt, holiday, and corporate-action policies are not implemented.
 - Upgrade and administrative authorities are not yet multisigs or timelocked.
 - No permissionless maker onboarding or on-chain risk limits beyond full collateralization.
 - No automated rolling-market or settlement keeper in the production web deployment.
 - No corporate-action adapter for real tokenized securities.
-- The legacy Solana 1.x JavaScript client dependency graph currently carries an upstream `bigint-buffer` advisory. The independently patchable `bn.js`, `postcss`, `uuid`, and `ws` packages are pinned; npm's remaining proposed fix is an incompatible SPL Token downgrade and was rejected.
+- The web dependency graph reports three high-severity advisories and the isolated devnet bootstrap graph reports seven, all through the upstream `bigint-buffer` package. npm's proposed force-fix downgrades SPL Token and Pyth packages to incompatible releases, so it has not been applied. The application does not call the vulnerable `toBigIntLE` helper, but this is still a mainnet release blocker until the upstream Solana dependencies remove or patch it. Independently patchable `bn.js`, `postcss`, and `uuid` packages are narrowly pinned without forcing incompatible versions into newer transitive branches.
 
 ## Mainnet gate
 
