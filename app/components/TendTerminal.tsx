@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { markets } from "../lib/markets";
-import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
+import { expiryCodes, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
 import {
@@ -226,6 +226,18 @@ function VsolStatus() {
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
+}
+
+const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
+  [/cutoff/i, "Cutoff passed"],
+  [/already settled/i, "Settled"],
+  [/session/i, "Session closed"],
+];
+
+// Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
+function expiryChipNote(item: Pick<ExpiryDefinition, "available" | "detail" | "availabilityReason">): string {
+  if (item.available) return item.detail;
+  return EXPIRY_NOTE_RULES.find(([test]) => test.test(item.availabilityReason))?.[1] ?? "Unavailable";
 }
 
 function TradeView({
@@ -521,9 +533,9 @@ function TradeView({
 
           <fieldset className="field-group expiry-field"><legend>Expires</legend>
             <div className="expiry-group-head"><span>Intraday</span><small>Protocol-ready · oracle gated</small></div>
-            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : item.availabilityReason}</small></button>)}</div>
+            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
             <div className="expiry-group-head standard"><span>Standard</span><small>Longer observation window</small></div>
-            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : item.availabilityReason}</small></button>)}</div>
+            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
             <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {expiryDefinition.available ? `${expiryDefinition.tradeLockSeconds}s trade lock · ${expiryDefinition.observationWindowSeconds}s oracle window` : expiryDefinition.availabilityReason}</p>
           </fieldset>
 
