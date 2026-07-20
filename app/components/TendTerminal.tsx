@@ -6,8 +6,6 @@ import {
   ArrowUpRight,
   BadgeCheck,
   BookOpen,
-  ChevronDown,
-  CircleDollarSign,
   Clock3,
   Info,
   LayoutDashboard,
@@ -15,27 +13,30 @@ import {
   LockKeyhole,
   Menu,
   RefreshCw,
+  Rocket,
   ShieldCheck,
   Sparkles,
-  Target,
   TrendingUp,
   Wallet,
   X,
   Zap,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Transaction } from "@solana/web3.js";
 import { markets } from "../lib/markets";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
+import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
+import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
 import {
   VSOL_PROGRAM_ID,
   solanaExplorerUrl,
-  type SolanaWalletProvider,
   type VsolQuotePayload,
 } from "../lib/vsol";
+import { EarnView } from "./EarnView";
+import { LaunchView } from "./LaunchView";
+import { PortfolioView, type SavedPosition } from "./PortfolioView";
 import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
-type Tab = "market" | "portfolio" | "earn";
+type Tab = "market" | "portfolio" | "earn" | "launch";
 type Direction = "up" | "down";
 type QuoteState = "idle" | "loading" | "success" | "error";
 
@@ -55,52 +56,24 @@ type MakerQuote = {
   expiresAt: number;
 };
 
-type SavedPosition = {
-  id: string;
-  walletAddress: string;
-  quoteId: string;
-  maker: string;
+type SeriesState = {
   symbol: string;
-  direction: Direction;
-  amount: number;
-  premium: number;
-  strike: number;
-  capPrice: number;
-  expiryDays: number;
-  expiryCode: ExpiryCode;
-  optionExpiryAt: string;
+  code: ExpiryCode;
+  market: string;
+  oracle: string;
+  expiry: number;
   observationWindowSeconds: number;
-  tradeLockSeconds: number;
-  status: "preview_confirmed" | "settled";
-  createdAt: string;
-  transactionSignature?: string;
-  simulationId?: string;
-  simulationStatus?: "passed" | "failed";
-  simulationSlot?: number | null;
-  simulationUnitsConsumed?: number | null;
-  simulationLogsHash?: string;
-  simulation?: {
-    status: "passed" | "failed";
-    slot: number | null;
-    unitsConsumed: number | null;
-    logsHash: string;
-  };
+  lastTradeAt: number;
+  available: boolean;
+  availabilityReason: string;
 };
 
-function isVerifiedPosition(position: SavedPosition) {
-  return position.simulationStatus === "passed"
-    && Boolean(position.transactionSignature)
-    && Boolean(position.simulationId)
-    && Boolean(position.simulationLogsHash);
-}
-
-function injectedSolanaWallet() {
-  const target = window as typeof window & {
-    phantom?: { solana?: SolanaWalletProvider };
-    solana?: SolanaWalletProvider;
-  };
-  return target.phantom?.solana ?? target.solana;
-}
+type CatalogPoolState = {
+  address: string;
+  label: string;
+  quotable: boolean;
+  authorizedMarkets: string[];
+};
 
 const assets = markets.map((market) => ({
   ticker: market.symbol,
@@ -114,6 +87,7 @@ const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
   { id: "market", label: "Trade", icon: Activity },
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
   { id: "earn", label: "Write & earn", icon: TrendingUp },
+  { id: "launch", label: "Launch", icon: Rocket },
 ];
 
 function Logo() {
@@ -173,7 +147,7 @@ function QuotePanel({
     return (
       <div className="quote-empty">
         <div className="empty-icon"><Sparkles size={20} aria-hidden="true" /></div>
-        <div><strong>Ready for an executable quote</strong><p>The deployed devnet maker signs a one-shot RFQ.</p></div>
+        <div><strong>Ready for an executable quote</strong><p>The deployed V2 pool authority signs a one-shot RFQ.</p></div>
         <button type="button" className="button primary" onClick={onQuote}>Request live quotes <Zap size={16} aria-hidden="true" /></button>
       </div>
     );
@@ -182,8 +156,8 @@ function QuotePanel({
   if (state === "loading") {
     return (
       <div className="quote-loading" role="status" aria-live="polite">
-        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Requesting executable quotes</div>
-        {[0, 1, 2].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}
+        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Requesting an executable quote</div>
+        <div className="quote-skeleton"><span /><span /><span /></div>
       </div>
     );
   }
@@ -220,7 +194,9 @@ function VsolStatus() {
     ok: boolean;
     deploymentReady?: boolean;
     executable?: boolean;
-    writerLiquidity?: number;
+    poolLiquidity?: string;
+    seriesCount?: number;
+    error?: string;
     explorerUrl?: string;
     pythFeedId?: string;
     oracleProgram?: string;
@@ -228,17 +204,25 @@ function VsolStatus() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/vsol/status", { cache: "no-store" })
+    const load = () => fetch("/api/vsol/status", { cache: "no-store" })
       .then((response) => response.json())
       .then((result) => { if (!cancelled) setStatus(result as typeof status); })
       .catch(() => { if (!cancelled) setStatus({ ok: false }); });
-    return () => { cancelled = true; };
+    void load();
+    const poll = () => { if (document.visibilityState === "visible") void load(); };
+    const timer = window.setInterval(poll, 15_000);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
   }, []);
 
   const explorer = status?.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
   return (
     <div className={status?.ok ? "protocol-strip verified" : "protocol-strip"}>
-      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL program + Pyth market verified" : status.deploymentReady === false ? "Pyth deployment pending" : "Devnet RPC unavailable"}</strong><small>{status?.ok ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC escrow · feed ${status.pythFeedId?.slice(0, 8) ?? "pending"}…` : "Executable quotes stay paused until every proof passes"}</small></span></div>
+      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL V2 pool + Pyth series verified" : status.deploymentReady === false ? "Pyth deployment pending" : "Execution unavailable"}</strong><small>{status?.ok ? `${status.poolLiquidity ?? "0"} tUSDC available · ${status.seriesCount ?? 0} verified series` : status?.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
@@ -261,36 +245,89 @@ function TradeView({
   const [quoteState, setQuoteState] = useState<QuoteState>("idle");
   const [quotes, setQuotes] = useState<MakerQuote[]>([]);
   const [selectedQuoteId, setSelectedQuoteId] = useState("");
-  const [quoteError, setQuoteError] = useState("Use an amount between $100 and $50,000, then retry.");
+  const [quoteError, setQuoteError] = useState("Use an amount between $100 and $5,000, then retry.");
   const [secondsLeft, setSecondsLeft] = useState(30);
   const [complete, setComplete] = useState(false);
   const [showPricing, setShowPricing] = useState(false);
   const [executionState, setExecutionState] = useState<"idle" | "loading" | "error">("idle");
   const [executionError, setExecutionError] = useState("");
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
+  const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
+  const [seriesError, setSeriesError] = useState("Checking verified onchain series…");
+  const [pools, setPools] = useState<CatalogPoolState[]>([]);
+  const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const asset = assets.find((item) => item.ticker === assetTicker) ?? assets[0];
   const notional = Number(amount) || 0;
   const expiryOptions = expiryCodes.map((code) => {
     const definition = resolveExpiry(code, asset.ticker, now);
-    if (code !== "30D") {
-      return { ...definition, available: false, availabilityReason: "The Pyth oracle path is ready, but this exact expiry series has not been published on devnet." };
+    const series = seriesStates.find((item) => item.symbol === asset.ticker && item.code === code);
+    if (!definition.available) return definition;
+    if (!series) return { ...definition, available: false, availabilityReason: seriesError || `No verified ${code} onchain series is published.` };
+    const expiryAt = series.expiry * 1_000;
+    const exact = {
+      ...definition,
+      expiryAt,
+      durationMinutes: Math.max(1, Math.ceil((expiryAt - now) / 60_000)),
+      observationWindowSeconds: series.observationWindowSeconds,
+      tradeLockSeconds: Math.max(0, series.expiry - series.lastTradeAt),
+      detail: new Intl.DateTimeFormat("en-US", code === "15M" || code === "1H" || code === "EOD"
+        ? { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
+        : { timeZone: "America/New_York", month: "short", day: "numeric" }).format(new Date(expiryAt)),
+      available: series.available,
+      availabilityReason: series.availabilityReason,
+    };
+    if (definition.group === "intraday" && marketSnapshot?.mode !== "live") {
+      return { ...exact, available: false, availabilityReason: "Intraday execution requires a fresh Pyth reference update during the US session." };
     }
-    if (definition.group === "intraday" && definition.available && marketSnapshot?.mode !== "live") {
-      return { ...definition, available: false, availabilityReason: "Intraday quotes require a fresh licensed display feed." };
-    }
-    return definition;
+    return exact;
   });
   const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
   const bestQuote = quotes.find((quote) => quote.id === selectedQuoteId) ?? quotes[0];
   const premium = bestQuote?.premium ?? 0;
   const target = bestQuote?.strike ?? null;
   const displayedPrice = marketSnapshot?.price ?? null;
+  const currentSeries = seriesStates.find((item) => item.symbol === asset.ticker && item.code === expiry);
+  const authorizedPools = currentSeries
+    ? pools.filter((pool) => pool.authorizedMarkets.includes(currentSeries.market))
+    : [];
+  const defaultPool = authorizedPools.find((pool) => pool.quotable) ?? authorizedPools[0] ?? null;
+  const activePool = authorizedPools.find((pool) => pool.address === selectedPool) ?? defaultPool;
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const response = await fetch("/api/markets", { cache: "no-store" });
+        const result = await response.json() as { series?: SeriesState[]; seriesError?: string | null; pools?: CatalogPoolState[]; error?: string };
+        if (!response.ok) throw new Error(result.error ?? "Onchain market catalog is unavailable.");
+        if (!cancelled) {
+          setSeriesStates(result.series ?? []);
+          setSeriesError(result.seriesError ?? (result.series?.length ? "" : "No verified onchain series is published."));
+          setPools(result.pools ?? []);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSeriesStates([]);
+          setSeriesError(error instanceof Error ? error.message : "Onchain market catalog is unavailable.");
+        }
+      }
+    };
+    void load();
+    const poll = () => { if (document.visibilityState === "visible") void load(); };
+    const timer = window.setInterval(poll, 15_000);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
   }, []);
 
   useEffect(() => {
@@ -305,16 +342,34 @@ function TradeView({
     const update = () => {
       const remaining = Math.max(0, Math.ceil((bestQuote.expiresAt - Date.now()) / 1000));
       setSecondsLeft(remaining);
-      if (remaining === 0) {
-        setQuoteState("idle");
+      if (remaining === 0 && executionState !== "loading") {
+        setComplete(false);
+        setExecutionState("idle");
+        setExecutionError("");
         setQuotes([]);
         setSelectedQuoteId("");
+        setVsolQuote(null);
+        setQuoteError("The signed quote expired. Request a fresh executable price.");
+        setQuoteState("error");
       }
     };
     update();
     const timer = window.setInterval(update, 250);
     return () => window.clearInterval(timer);
-  }, [quoteState, bestQuote]);
+  }, [quoteState, bestQuote, executionState]);
+
+  // Signed quotes bind the exact buyer, so switching wallets invalidates them mid-render.
+  const [quotedWallet, setQuotedWallet] = useState(walletAddress);
+  if (quotedWallet !== walletAddress) {
+    setQuotedWallet(walletAddress);
+    setQuoteState("idle");
+    setQuotes([]);
+    setSelectedQuoteId("");
+    setVsolQuote(null);
+    setComplete(false);
+    setExecutionState("idle");
+    setExecutionError("");
+  }
 
   function invalidateQuote() {
     setQuoteState("idle");
@@ -337,6 +392,11 @@ function TradeView({
     }
     if (!expiryDefinition.available) {
       setQuoteError(expiryDefinition.availabilityReason);
+      setQuoteState("error");
+      return;
+    }
+    if (activePool && !activePool.quotable) {
+      setQuoteError("Executable quotes come from the Tend pool today. Other authorized pools are listed honestly, but no quote service is integrated for them yet.");
       setQuoteState("error");
       return;
     }
@@ -369,19 +429,12 @@ function TradeView({
     setExecutionState("loading");
     setExecutionError("");
     try {
-      const provider = injectedSolanaWallet();
-      if (!provider) throw new Error("Solana wallet unavailable");
-      const bytes = Uint8Array.from(atob(vsolQuote.transaction), (character) => character.charCodeAt(0));
-      const transaction = Transaction.from(bytes);
-      const signed = await provider.signTransaction(transaction);
-      const signedBytes = signed.serialize();
-      let signedBinary = "";
-      for (const byte of signedBytes) signedBinary += String.fromCharCode(byte);
+      const signedTransaction = await signSerializedSolanaTransaction(vsolQuote.transaction);
       const sendResponse = await fetch("/api/vsol/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          transaction: btoa(signedBinary),
+          transaction: signedTransaction,
           quoteId: bestQuote.id,
           walletAddress,
         }),
@@ -415,6 +468,7 @@ function TradeView({
       }
       setComplete(false);
       setExecutionState("idle");
+      invalidateQuote();
       onPositionSaved(result.position);
     } catch (error) {
       setExecutionError(error instanceof Error ? error.message : "The wallet transaction was not executed.");
@@ -429,7 +483,7 @@ function TradeView({
         <VsolStatus />
         <div className="market-header">
           <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2><span>Stock Token</span></div><p>{asset.name} economic exposure</p></div></div>
-          <span className="asset-picker">Devnet sandbox <ChevronDown size={16} aria-hidden="true" /></span>
+          <span className="asset-picker">Devnet sandbox</span>
         </div>
 
         <div className="asset-strip" role="group" aria-label="Available markets">
@@ -467,11 +521,32 @@ function TradeView({
 
           <fieldset className="field-group expiry-field"><legend>Expires</legend>
             <div className="expiry-group-head"><span>Intraday</span><small>Protocol-ready · oracle gated</small></div>
-            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : !asset.intradayEligible ? "Unavailable" : item.availabilityReason.includes("feed") ? "Live feed required" : "Market closed"}</small></button>)}</div>
+            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : item.availabilityReason}</small></button>)}</div>
             <div className="expiry-group-head standard"><span>Standard</span><small>Longer observation window</small></div>
-            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : "Oracle gated"}</small></button>)}</div>
+            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{item.available ? item.detail : item.availabilityReason}</small></button>)}</div>
             <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {expiryDefinition.available ? `${expiryDefinition.tradeLockSeconds}s trade lock · ${expiryDefinition.observationWindowSeconds}s oracle window` : expiryDefinition.availabilityReason}</p>
           </fieldset>
+
+          {authorizedPools.length > 1 && (
+            <fieldset className="field-group"><legend>Liquidity pool</legend>
+              <div className="choice-row">
+                {authorizedPools.map((pool) => (
+                  <button
+                    type="button"
+                    key={pool.address}
+                    className={activePool?.address === pool.address ? "choice active" : "choice"}
+                    title={pool.quotable ? "Quotes are signed by this pool's authority." : "Visible on-chain, but no quote service is integrated for this pool yet."}
+                    onClick={() => { setSelectedPool(pool.address); invalidateQuote(); }}
+                  >
+                    {pool.label}<small>{pool.quotable ? "Executable quotes" : "Read-only"}</small>
+                  </button>
+                ))}
+              </div>
+              <p className="expiry-policy"><Info size={13} aria-hidden="true" /> {activePool?.quotable
+                ? "The selected pool's authority signs your one-shot quote."
+                : "This pool authorized the series on-chain, but Tend has no quote integration for it yet."}</p>
+            </fieldset>
+          )}
 
           <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{[2, 5, 10].map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { setPayoff(item); invalidateQuote(); }}>{item}×<small>{item === 2 ? "Balanced" : item === 5 ? "Popular" : "Aggressive"}</small></button>)}</div></fieldset>
 
@@ -496,11 +571,11 @@ function TradeView({
             <button type="button" className="icon-button close" aria-label="Close review" onClick={() => setComplete(false)}><X size={20} /></button>
             <div className="success-mark"><ShieldCheck size={25} aria-hidden="true" /></div>
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
-            <p>{bestQuote?.maker ?? "The best maker"}’s quote is locked for 30 seconds. Your maximum loss is fixed before you sign.</p>
+            <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
-              <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading"} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
+              <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
@@ -513,79 +588,6 @@ function TradeView({
   );
 }
 
-function PortfolioView({
-  positions,
-  isLoading,
-  error,
-  onRetry,
-  onTrade,
-}: {
-  positions: SavedPosition[];
-  isLoading: boolean;
-  error: string;
-  onRetry: () => void;
-  onTrade: () => void;
-}) {
-  const verifiedPositions = positions.filter(isVerifiedPosition);
-  const premiumAtRisk = verifiedPositions.reduce((sum, position) => sum + position.premium, 0);
-  const totalNotional = verifiedPositions.reduce((sum, position) => sum + position.amount, 0);
-  const nextPosition = verifiedPositions
-    .filter((position) => position.optionExpiryAt && new Date(position.optionExpiryAt).getTime() > 0)
-    .sort((left, right) => new Date(left.optionExpiryAt).getTime() - new Date(right.optionExpiryAt).getTime())[0];
-  const expiryLabel = (position: SavedPosition) => position.expiryCode || (position.expiryDays ? `${position.expiryDays}D` : "—");
-  function exportPositions() {
-    if (!verifiedPositions.length) return;
-    const header = "symbol,direction,strike,premium,notional,expiry_code,option_expiry_at,observation_window_seconds,status,transaction_signature,simulation_id,simulation_slot,simulation_units_consumed,simulation_logs_hash";
-    const rows = verifiedPositions.map((position) => [position.symbol, position.direction, position.strike, position.premium, position.amount, expiryLabel(position), position.optionExpiryAt, position.observationWindowSeconds, position.status, position.transactionSignature ?? "", position.simulationId ?? "", position.simulationSlot ?? "", position.simulationUnitsConsumed ?? "", position.simulationLogsHash ?? ""].join(","));
-    const url = URL.createObjectURL(new Blob([[header, ...rows].join("\n")], { type: "text/csv" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "tend-positions.csv";
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-  return (
-    <main className="dashboard-view">
-      <div className="view-heading"><div><span className="eyebrow">Portfolio</span><h1>Know exactly what can happen.</h1><p>Defined-risk positions, marked honestly.</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} aria-hidden="true" /> Refresh marks</button></div>
-      <div className="metric-grid"><div className="metric-card"><span>Devnet notional</span><strong>${totalNotional.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong><small>Mock tUSDC only</small></div><div className="metric-card"><span>Premium at risk</span><strong>${premiumAtRisk.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>Maximum buyer loss</small></div><div className="metric-card"><span>Confirmed fills</span><strong>{verifiedPositions.length}</strong><small>Transaction + simulation verified</small></div><div className="metric-card"><span>Next expiry</span><strong>{nextPosition ? expiryLabel(nextPosition) : "—"}</strong><small>{nextPosition?.symbol ?? "No positions"}</small></div></div>
-      <section className="positions-card"><div className="section-head"><div><h2>Open positions</h2><p>Live value and defined outcomes.</p></div><button type="button" className="text-button" onClick={exportPositions} disabled={!verifiedPositions.length}>Export history <ArrowUpRight size={14} /></button></div>
-        {isLoading ? <div className="portfolio-loading" role="status" aria-label="Loading positions">{[0, 1].map((item) => <div className="quote-skeleton" key={item}><span /><span /><span /></div>)}</div> : error ? <div className="quote-error" role="alert"><div><strong>Couldn’t load positions</strong><p>{error}</p></div><button type="button" className="button secondary" onClick={onRetry}><RefreshCw size={15} /> Retry</button></div> : verifiedPositions.length ? <div className="position-table" role="table" aria-label="Open positions"><div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Notional</span><span>Status</span><span>Expires</span></div>
-          {verifiedPositions.map((position) => <div className="table-row" role="row" key={position.id}><span className="asset-cell"><MiniLogo ticker={position.symbol} /><strong>{position.symbol}</strong></span><span>{position.direction.toUpperCase()} · ${position.strike.toFixed(2)}</span><span>${position.premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span><span>${position.amount.toLocaleString()}</span><span className="positive">Verified · {position.simulationUnitsConsumed?.toLocaleString() ?? "—"} CU</span><span><a href={solanaExplorerUrl("tx", position.transactionSignature!)} target="_blank" rel="noreferrer">Tx</a> · <a href={`/api/vsol/simulations?id=${encodeURIComponent(position.simulationId!)}`} target="_blank" rel="noreferrer">Sim</a></span></div>)}
-        </div> : <div className="empty-position"><Target size={20} aria-hidden="true" /><div><strong>No verified positions yet</strong><p>Connect a Solana wallet and execute a confirmed devnet quote to see it here.</p></div><button type="button" className="button secondary" onClick={onTrade}>Build a position</button></div>}
-      </section>
-    </main>
-  );
-}
-
-function EarnView() {
-  const [status, setStatus] = useState<{
-    ok?: boolean;
-    writerLiquidity?: number;
-    writerVault?: string;
-    market?: string;
-    oracle?: string;
-    pythFeedId?: string;
-  } | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/vsol/status", { cache: "no-store" })
-      .then((response) => response.json())
-      .then((value) => { if (!cancelled) setStatus(value as typeof status); })
-      .catch(() => { if (!cancelled) setStatus({ ok: false }); });
-    return () => { cancelled = true; };
-  }, []);
-  return (
-    <main className="dashboard-view">
-      <div className="view-heading"><div><span className="eyebrow">Writer desk</span><h1>Earn premium. See the obligation.</h1><p>No disguised APY. Every outcome stays visible.</p></div><a className="button primary" href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer"><CircleDollarSign size={16} aria-hidden="true" /> Inspect VSOL vault</a></div>
-      <div className="metric-grid"><div className="metric-card"><span>Writer escrow</span><strong>{status?.ok ? `${(status.writerLiquidity ?? 0).toLocaleString()} tUSDC` : "—"}</strong><small>Read from the SPL token vault</small></div><div className="metric-card"><span>Premium earned</span><strong>—</strong><small>No indexed realized-P&amp;L ledger yet</small></div><div className="metric-card"><span>Open obligation</span><strong>—</strong><small>Protocol-wide position index pending</small></div><div className="metric-card"><span>Oracle</span><strong>{status?.pythFeedId ? "Pyth Core" : "—"}</strong><small>{status?.pythFeedId ? `${status.pythFeedId.slice(0, 10)}…` : "Checking devnet"}</small></div></div>
-      <div className="writer-grid">
-        <section className="positions-card"><div className="section-head"><div><h2>Verifiable accounts</h2><p>Only confirmed devnet state is shown.</p></div><span className={status?.ok ? "verified" : "verification-error"}>{status?.ok ? <><BadgeCheck size={14} /> RPC verified</> : status === null ? <><LoaderCircle size={14} className="spin" /> Checking RPC</> : <><Info size={14} /> RPC unavailable</>}</span></div><div className="stress-note"><Info size={16} aria-hidden="true" /><p>Tend will not invent writer P&amp;L, utilization, uptime, or exposure. Those panels stay unavailable until an onchain indexer can reconcile every fill and settlement.</p></div></section>
-        <section className="positions-card risk-composition"><div className="section-head"><div><h2>Devnet links</h2><p>Inspect ownership and balances directly.</p></div></div><div className="legend"><div><span>Writer vault</span><strong>{status?.writerVault ? <a href={solanaExplorerUrl("address", status.writerVault)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Market</span><strong>{status?.market ? <a href={solanaExplorerUrl("address", status.market)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div><div><span>Settlement record</span><strong>{status?.oracle ? <a href={solanaExplorerUrl("address", status.oracle)} target="_blank" rel="noreferrer">Explorer</a> : "—"}</strong></div></div></section>
-      </div>
-    </main>
-  );
-}
-
 export function TendTerminal() {
   const [activeTab, setActiveTab] = useState<Tab>("market");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -593,10 +595,20 @@ export function TendTerminal() {
   const [walletError, setWalletError] = useState("");
   const [walletConnecting, setWalletConnecting] = useState(false);
   const [walletFunding, setWalletFunding] = useState(false);
+  const [sessionWallet, setSessionWallet] = useState<string | null>(null);
+  const [sessionNotice, setSessionNotice] = useState("");
   const [positions, setPositions] = useState<SavedPosition[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [positionsError, setPositionsError] = useState("");
   const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Trade", [activeTab]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSessionWallet().then((wallet) => {
+      if (!cancelled && wallet) setSessionWallet(wallet);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const loadPositions = useCallback(async () => {
     setPositionsLoading(true);
@@ -635,6 +647,17 @@ export function TendTerminal() {
     }
   }
 
+  const signInWithWallet = useCallback(async (address: string) => {
+    const result = await establishWalletSession(address);
+    if (result.status === "active") {
+      setSessionWallet(address);
+      setSessionNotice("");
+      return;
+    }
+    setSessionWallet((current) => (current === address ? current : null));
+    setSessionNotice(result.reason);
+  }, []);
+
   async function connectWallet() {
     const provider = injectedSolanaWallet();
     if (!provider) {
@@ -647,7 +670,17 @@ export function TendTerminal() {
       const connected = await provider.connect();
       const address = connected.publicKey.toBase58();
       setWalletAddress(address);
-      provider.on?.("accountChanged", (publicKey) => setWalletAddress(publicKey?.toBase58() ?? ""));
+      provider.on?.("accountChanged", (publicKey) => {
+        const next = publicKey?.toBase58() ?? "";
+        setWalletAddress(next);
+        setSessionWallet(null);
+        setSessionNotice("");
+        if (next) void signInWithWallet(next);
+        else void endWalletSession();
+      });
+      // Silent SIWS: proves wallet ownership with a message signature. Wallets
+      // without signMessage keep trading; chain-derived reads stay locked.
+      await signInWithWallet(address);
       await claimDevnetFunds(address);
     } catch {
       setWalletError("Wallet connection was cancelled.");
@@ -669,8 +702,9 @@ export function TendTerminal() {
         </div>
       </header>
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
+      {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} /> : activeTab === "portfolio" ? <PortfolioView positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : <EarnView />}</div>
+      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );

@@ -10,30 +10,14 @@ import {
 import { LAMPORTS_PER_SOL, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { getVsolConnection, parsePublicKey, vsolFaucet } from "../../../lib/vsol-server";
 import { VSOL_SETTLEMENT_MINT } from "../../../lib/vsol";
-import { getChatGPTUser } from "../../../chatgpt-auth";
+import { resolveUserKey, sameOrigin } from "../../../lib/session";
 
 const TARGET_TOKENS = 25_000n * 1_000_000n;
 const TARGET_LAMPORTS = 20_000_000;
 
-function sameOrigin(request: Request) {
-  const origin = request.headers.get("origin");
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === new URL(request.url).host;
-  } catch {
-    return false;
-  }
-}
-
-async function authorized(request: Request) {
-  if (await getChatGPTUser()) return true;
-  const hostname = new URL(request.url).hostname;
-  return hostname === "localhost" || hostname === "127.0.0.1";
-}
-
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return Response.json({ error: "Cross-site faucet requests are not allowed." }, { status: 403 });
-  if (!(await authorized(request))) return Response.json({ error: "Sign in to use the devnet faucet." }, { status: 401 });
+  if (!(await resolveUserKey(request))) return Response.json({ error: "Sign in to use the devnet faucet." }, { status: 401 });
   const input = await request.json().catch(() => null) as { walletAddress?: unknown } | null;
   const wallet = parsePublicKey(input?.walletAddress);
   if (!wallet) return Response.json({ error: "Connect a valid Solana wallet first." }, { status: 422 });

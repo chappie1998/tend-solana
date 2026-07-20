@@ -1,17 +1,10 @@
 import { and, eq } from "drizzle-orm";
-import { getChatGPTUser } from "../../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../../db";
 import { transactionSimulations } from "../../../../db/schema";
-
-async function userKey(request: Request) {
-  const user = await getChatGPTUser();
-  if (user?.email) return user.email;
-  const hostname = new URL(request.url).hostname;
-  return hostname === "localhost" || hostname === "127.0.0.1" ? "local-preview@tend.local" : null;
-}
+import { resolveUserKey } from "../../../lib/session";
 
 export async function GET(request: Request) {
-  const owner = await userKey(request);
+  const owner = await resolveUserKey(request);
   if (!owner) return Response.json({ error: "Sign in to view transaction simulations." }, { status: 401 });
   const id = new URL(request.url).searchParams.get("id") ?? "";
   if (!/^[0-9a-f-]{36}$/i.test(id)) return Response.json({ error: "A valid simulation id is required." }, { status: 422 });

@@ -1,13 +1,9 @@
 import "../../lib/runtime-env-worker";
 import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
-import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../db";
 import { positions, rfqQuotes, transactionSimulations } from "../../../db/schema";
+import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 import { parsePublicKey, verifyVsolFill } from "../../lib/vsol-server";
-
-function json(body: unknown, status = 200) {
-  return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
-}
 
 function isUniqueConstraint(error: unknown) {
   let current: unknown = error;
@@ -19,26 +15,9 @@ function isUniqueConstraint(error: unknown) {
   return false;
 }
 
-async function userKey(request: Request) {
-  const user = await getChatGPTUser();
-  if (user?.email) return user.email;
-  const hostname = new URL(request.url).hostname;
-  return hostname === "localhost" || hostname === "127.0.0.1" ? "local-preview@tend.local" : null;
-}
-
-function isSameOrigin(request: Request) {
-  const origin = request.headers.get("origin");
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === new URL(request.url).host;
-  } catch {
-    return false;
-  }
-}
-
 export async function GET(request: Request) {
   await ensureDb();
-  const owner = await userKey(request);
+  const owner = await resolveUserKey(request);
   if (!owner) return json({ error: "Sign in to view positions." }, 401);
   const db = getDb();
   const rows = await db
@@ -64,8 +43,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   await ensureDb();
-  if (!isSameOrigin(request)) return json({ error: "Cross-site position requests are not allowed." }, 403);
-  const owner = await userKey(request);
+  if (!sameOrigin(request)) return json({ error: "Cross-site position requests are not allowed." }, 403);
+  const owner = await resolveUserKey(request);
   if (!owner) return json({ error: "Sign in to confirm positions." }, 401);
   let input: Record<string, unknown>;
   try {
@@ -101,7 +80,8 @@ export async function POST(request: Request) {
   if (!simulation || simulation.status !== "passed" || simulation.submissionStatus !== "confirmed" || simulation.transactionSignature !== transactionSignature) {
     return json({ error: "A persisted, passing simulation for this confirmed fill is required." }, 422);
   }
-  if (!(await verifyVsolFill(transactionSignature, buyer, positionAddress))) {
+  const expectedMarket = parsePublicKey(quote.marketAddress);
+  if (!expectedMarket || !(await verifyVsolFill(transactionSignature, buyer, positionAddress, expectedMarket))) {
     return json({ error: "The transaction is not a confirmed VSOL fill for this wallet and position." }, 422);
   }
 
@@ -111,6 +91,8 @@ export async function POST(request: Request) {
     userEmail: owner,
     walletAddress,
     quoteId: quote.id,
+    marketAddress: quote.marketAddress,
+    oracleAddress: quote.oracleAddress,
     maker: quote.maker,
     symbol: quote.symbol,
     direction: quote.direction,

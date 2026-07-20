@@ -93,8 +93,7 @@ h1, h2, h3, p { margin: 0; }
 .asset-name h2 { font-size: 24px; letter-spacing: -0.035em; }
 .asset-name span { padding: 4px 7px; border-radius: 5px; color: var(--ink-soft); background: var(--surface-soft); font-size: 10px; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
 .asset-heading p { margin-top: 4px; color: var(--ink-soft); font-size: 13px; }
-.asset-picker { min-height: 40px; padding: 0 12px; border: 0; background: transparent; display: inline-flex; gap: 7px; align-items: center; border-radius: 8px; color: var(--ink-soft); font-size: 13px; font-weight: 650; cursor: pointer; }
-.asset-picker:hover { background: var(--surface-soft); color: var(--ink); }
+.asset-picker { min-height: 40px; padding: 0 12px; border: 0; background: var(--surface-soft); display: inline-flex; gap: 7px; align-items: center; border-radius: 8px; color: var(--ink-soft); font-size: 13px; font-weight: 650; }
 .asset-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
 .asset-chip { min-height: 64px; padding: 10px; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--surface) 70%, transparent); display: grid; grid-template-columns: 31px 1fr auto; align-items: center; gap: 8px; text-align: left; cursor: pointer; transition: border 150ms ease, background 150ms ease, transform 150ms ease; }
 .asset-chip:hover { transform: translateY(-1px); border-color: var(--line-strong); }
@@ -135,12 +134,9 @@ h1, h2, h3, p { margin: 0; }
 .resolution-picker button:hover { color: var(--ink); background: var(--surface-soft); }
 .resolution-picker button.active { color: var(--ink); background: var(--surface-raised); box-shadow: 0 1px 4px rgba(18, 27, 37, .1); }
 .chart-canvas-wrap { position: relative; min-height: 322px; }
-.chart-canvas { width: 100%; height: 322px; overflow: hidden; opacity: 0; transition: opacity 160ms ease; }
+.chart-canvas { width: 100%; height: 322px; overflow: hidden; background: #0d151d; opacity: 0; transition: opacity 160ms ease; }
 .chart-canvas.visible { opacity: 1; }
-.chart-canvas .tradingview-widget-container__widget { height: calc(100% - 24px) !important; }
-.chart-canvas .tradingview-widget-container__widget iframe { display: block; width: 100% !important; height: 100% !important; border: 0; }
-.chart-canvas .tradingview-widget-copyright { height: 24px; padding: 4px 10px; color: var(--ink-faint); font-size: 9px; text-align: right; }
-.chart-canvas .tradingview-widget-copyright a { color: var(--ink-soft); }
+.chart-canvas canvas { display: block; }
 .chart-target { margin: 8px 18px 0; padding: 6px 9px; border: 1px dashed var(--line-strong); border-radius: 7px; display: inline-flex; align-items: center; gap: 7px; color: var(--ink-soft); font-size: 9px; }
 .chart-target strong { color: var(--accent); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .chart-target.down strong { color: var(--negative); }
@@ -153,6 +149,8 @@ h1, h2, h3, p { margin: 0; }
 .chart-source > span:nth-child(3) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chart-source a { min-height: 32px; display: inline-flex; align-items: center; color: var(--ink-soft); font-weight: 700; white-space: nowrap; }
 .chart-source a:hover { color: var(--ink); }
+.chart-source-retry { border: 0; background: none; color: var(--accent); padding: 0; display: inline-flex; align-items: center; gap: 4px; font: inherit; cursor: pointer; white-space: nowrap; }
+.chart-source-retry:hover { color: var(--ink); }
 .data-mode { padding: 4px 6px; border-radius: 5px; font-weight: 850; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
 .data-mode.live { color: var(--positive); background: var(--positive-soft); }
 .data-mode.closed { color: var(--accent-dark); background: var(--accent-soft); }
@@ -416,3 +414,37 @@ footer a:hover { color: var(--ink); }
   .button.primary:hover { background: #ffffff; }
   .modal-backdrop { background: rgba(0, 0, 0, .7); }
 }
+
+/* V2 liquidity surface: appended independently from the market chart rules. */
+.liquidity-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(340px, .85fr); gap: 14px; }
+.liquidity-action-card form { display: grid; gap: 16px; }
+.liquidity-segmented { margin-top: 3px; }
+.liquidity-amount { margin: 0; }
+.liquidity-amount .amount-input { margin-top: 7px; }
+.liquidity-action-note { min-height: 42px; margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; display: flex; align-items: flex-start; gap: 8px; color: var(--ink-soft); background: var(--surface); font-size: 11px; line-height: 1.5; }
+.liquidity-action-note svg { margin-top: 1px; flex: 0 0 auto; color: var(--positive); }
+.liquidity-receipt { margin-top: 16px; padding: 13px; border: 1px solid color-mix(in srgb, var(--positive) 35%, var(--line)); border-radius: 9px; display: flex; align-items: flex-start; gap: 10px; color: var(--positive); background: var(--positive-soft); }
+.liquidity-receipt > div { display: grid; gap: 3px; }
+.liquidity-receipt span { color: var(--ink-soft); font-size: 10px; }
+.liquidity-receipt a { min-height: 30px; display: inline-flex; align-items: center; font-size: 10px; text-decoration: underline; }
+.liquidity-history { display: grid; }
+.liquidity-history-row { min-height: 54px; padding: 9px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 74px 1fr auto auto; align-items: center; gap: 10px; font-size: 11px; }
+.liquidity-history-row:last-child { border-bottom: 0; }
+.liquidity-history-row small { color: var(--ink-faint); }
+.liquidity-history-row a { color: var(--ink-soft); text-decoration: underline; }
+.expiry-row .choice small, .standard-expiry-row .choice small { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 920px) {
+  .liquidity-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 600px) {
+  .liquidity-history-row { grid-template-columns: 68px 1fr auto; }
+  .liquidity-history-row small { grid-column: 1 / -1; }
+}
+
+/* Launch tab */
+.amount-input select { width: 100%; min-width: 0; padding: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace; appearance: none; cursor: pointer; }
+.launch-authorize { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
+.launch-authorize h3 { margin: 0; font-size: 13px; }
+.launch-authorize .section-head { margin-bottom: 0; }

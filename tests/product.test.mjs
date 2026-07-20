@@ -5,29 +5,64 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("ships the VSOL trading surface with honest devnet labels", async () => {
-  const [terminal, markets, chart, layout] = await Promise.all([
+  const [terminal, walletHelper, markets, chart, chartRoute, chartData, layout] = await Promise.all([
     readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+    readFile(new URL("app/lib/solana-wallet.ts", root), "utf8"),
     readFile(new URL("app/lib/markets.ts", root), "utf8"),
     readFile(new URL("app/components/TradingViewMarketChart.tsx", root), "utf8"),
+    readFile(new URL("app/api/market-bars/route.ts", root), "utf8"),
+    readFile(new URL("app/lib/pyth-market-bars.ts", root), "utf8"),
     readFile(new URL("app/layout.tsx", root), "utf8"),
   ]);
 
-  assert.match(terminal, /VSOL program \+ Pyth market verified/);
+  assert.match(terminal, /VSOL V2 pool \+ Pyth series verified/);
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
-  assert.match(terminal, /signTransaction/);
+  assert.match(terminal, /signSerializedSolanaTransaction/);
+  assert.match(walletHelper, /signTransaction/);
   assert.doesNotMatch(terminal, /"Devnet confirmed"/);
-  assert.match(chart, /embed-widget-advanced-chart\.js/);
-  assert.match(chart, /TradingView market display/);
-  assert.match(chart, /chart-canvas tradingview-widget-container/);
-  assert.doesNotMatch(chart, /DEMO DATA|demoCandles|lightweight-charts/);
+  assert.match(chart, /lightweight-charts/);
+  assert.match(chart, /CandlestickSeries/);
+  assert.match(chart, /ResizeObserver/);
+  assert.match(chart, /\/api\/market-bars/);
+  assert.match(chart, /Charts by TradingView/);
+  assert.doesNotMatch(chart, /embed-widget-advanced-chart|document\.createElement\("script"\)|<iframe|DEMO DATA|demoCandles/i);
+  assert.match(chartRoute, /getPythMarketBars/);
+  assert.match(chartData, /benchmarks\.pyth\.network\/v1\/shims\/tradingview\/history/);
+  assert.match(chartData, /runtimeEnv\("PYTH_API_KEY"\)/);
+  assert.match(chartData, /AbortController/);
+  assert.doesNotMatch(chartRoute, /PYTH_API_KEY|Authorization|Bearer/);
   assert.match(markets, /deployment\.underlyingMint/);
   assert.match(markets, /b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593/);
+  assert.match(markets, /Equity\.US\.NVDA\/USD/);
   assert.match(layout, /Solana devnet/);
 });
 
-test("server creates buyer-bound maker RFQs and verifies fills before persistence", async () => {
+test("validates real Pyth UDF candles before they reach the chart", async () => {
+  const bars = await import(new URL("app/lib/market-bars.ts", root));
+  const valid = {
+    s: "ok",
+    t: [1_700_000_000, 1_700_000_300],
+    o: [200, 201],
+    h: [202, 203],
+    l: [199, 200],
+    c: [201, 202],
+  };
+  assert.deepEqual(bars.parsePythUdfBars(valid), [
+    { time: 1_700_000_000, open: 200, high: 202, low: 199, close: 201 },
+    { time: 1_700_000_300, open: 201, high: 203, low: 200, close: 202 },
+  ]);
+  assert.equal(bars.isChartResolution("5"), true);
+  assert.equal(bars.isChartResolution("2"), false);
+  assert.throws(() => bars.parsePythUdfBars({ ...valid, c: [201] }), /mismatched lengths/);
+  assert.throws(() => bars.parsePythUdfBars({ ...valid, t: [1_700_000_300, 1_700_000_000] }), /timestamps are invalid/);
+  assert.throws(() => bars.parsePythUdfBars({ ...valid, h: [198, 203] }), /OHLC bounds are invalid/);
+  assert.throws(() => bars.parsePythUdfBars({ ...valid, o: [true, 201] }), /must be numbers/);
+  assert.throws(() => bars.parsePythUdfBars({ ...valid, s: "no_data" }), /no chart data/);
+});
+
+test("server creates buyer-bound V2 pool RFQs and verifies fills before persistence", async () => {
   const [quotesRoute, positionsRoute, sendRoute, server, schema, runtimeEnv] = await Promise.all([
     readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
     readFile(new URL("app/api/positions/route.ts", root), "utf8"),
@@ -40,10 +75,10 @@ test("server creates buyer-bound maker RFQs and verifies fills before persistenc
   assert.match(quotesRoute, /buildVsolQuoteTransaction/);
   assert.match(quotesRoute, /VSOL_TEST_FUNDS_REQUIRED/);
   assert.match(quotesRoute, /VSOL_PYTH_DEPLOYMENT_PENDING/);
-  assert.match(server, /quoteMessage/);
+  assert.match(server, /poolQuoteMessage/);
   assert.match(server, /nacl\.sign\.detached/);
   assert.match(server, /domainSeparator/);
-  assert.match(server, /deriveNonce/);
+  assert.match(server, /derivePoolNonce/);
   assert.match(sendRoute, /verifySignatures/);
   assert.match(sendRoute, /simulateTransaction/);
   assert.match(sendRoute, /sigVerify: true/);
@@ -51,8 +86,10 @@ test("server creates buyer-bound maker RFQs and verifies fills before persistenc
   assert.match(server, /runtimeEnv\("VSOL_RPC_URL"\)/);
   assert.match(server, /export function getVsolConnection/);
   assert.match(runtimeEnv, /configureRuntimeEnv/);
-  assert.match(server, /Instruction: FillQuote/);
-  assert.match(server, /positionOwnedByVsol/);
+  assert.match(server, /Instruction: FillPoolQuote/);
+  assert.match(server, /POOL_POSITION_ACCOUNT_DISCRIMINATOR/);
+  assert.match(server, /FILL_POOL_QUOTE/);
+  assert.match(server, /VSOL_LIQUIDITY\.authorizedMarketKeys/);
   assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(positionsRoute, /persisted, passing simulation/);
@@ -102,12 +139,13 @@ test("program covers collateral, replay, signature, pause, and refund invariants
 });
 
 test("short-duration products remain explicitly oracle gated", async () => {
-  const [terminal, expiries] = await Promise.all([
+  const [terminal, quotesRoute, expiries] = await Promise.all([
     readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+    readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
     import(new URL("app/lib/expiries.ts", root)),
   ]);
-  assert.match(terminal, /exact expiry series has not been published/);
-  assert.match(terminal, /code !== "30D"/);
+  assert.match(terminal, /No verified.*onchain series is published/);
+  assert.doesNotMatch(quotesRoute, /expiryCode\s*!==\s*["']30D["']/);
 
   const regularSession = Date.parse("2026-07-17T14:00:00Z");
   const intraday = expiries.resolveExpiry("15M", "NVDA", regularSession);
@@ -125,13 +163,51 @@ test("short-duration products remain explicitly oracle gated", async () => {
     "2026-01-08T21:00:00.000Z",
     "2026-01-09T21:00:00.000Z",
   ]);
+
+  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-07-03T15:00:00Z")), false, "observed Independence Day must stay closed");
+  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-11-27T17:59:00Z")), true, "early-close session is open before 1pm ET");
+  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-11-27T18:00:00Z")), false, "early-close session closes at 1pm ET");
+  assert.equal(new Date(expiries.nextReferenceMarketClose(Date.parse("2026-11-26T15:00:00Z"))).toISOString(), "2026-11-27T18:00:00.000Z");
+  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2029-07-02T15:00:00Z")), false, "unpublished calendar years fail closed");
+});
+
+test("liquidity page uses real V2 pool state, wallet signatures, persisted simulation, and post-state reconciliation", async () => {
+  const [terminal, earn, server, prepare, send, history, schema, migration] = await Promise.all([
+    readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+    readFile(new URL("app/components/EarnView.tsx", root), "utf8"),
+    readFile(new URL("app/lib/vsol-server.ts", root), "utf8"),
+    readFile(new URL("app/api/vsol/liquidity/prepare/route.ts", root), "utf8"),
+    readFile(new URL("app/api/vsol/liquidity/send/route.ts", root), "utf8"),
+    readFile(new URL("app/api/vsol/liquidity/history/route.ts", root), "utf8"),
+    readFile(new URL("db/schema.ts", root), "utf8"),
+    readFile(new URL("drizzle/0005_lush_la_nuit.sql", root), "utf8"),
+  ]);
+  assert.match(terminal, /<EarnView walletAddress=/);
+  assert.match(earn, /no invented APY/i);
+  assert.match(earn, /signSerializedSolanaTransaction/);
+  assert.match(earn, /\/api\/vsol\/liquidity\/prepare/);
+  assert.match(server, /deposit_liquidity/);
+  assert.match(server, /withdraw_liquidity/);
+  assert.match(server, /decodePoolAccount/);
+  assert.match(server, /deriveLiquidityProvider/);
+  assert.match(prepare, /transactionMessageHash/);
+  assert.match(prepare, /minimumOutputAtoms/);
+  assert.match(send, /simulateTransaction/);
+  assert.match(send, /sigVerify: true/);
+  assert.match(send, /postWallet/);
+  assert.match(send, /postPool/);
+  assert.match(send, /postShares/);
+  assert.match(history, /simulationStatus, "passed"/);
+  assert.match(schema, /liquidity_actions/);
+  assert.match(migration, /CREATE TABLE `liquidity_actions`/);
+  assert.doesNotMatch(earn, /estimated yield|simulated liquidity/i);
 });
 
 test("market-data stays real and the verified deployment remains fail-closed on invalid state", async () => {
-  const [marketData, pythData, terminal, deployment, bootstrap, verifier] = await Promise.all([
+  const [marketData, pythData, earn, deployment, bootstrap, verifier] = await Promise.all([
     readFile(new URL("app/api/market-data/route.ts", root), "utf8"),
     readFile(new URL("app/lib/pyth-market-data.ts", root), "utf8"),
-    readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+    readFile(new URL("app/components/EarnView.tsx", root), "utf8"),
     readFile(new URL("vsol/deployments/devnet.json", root), "utf8").then(JSON.parse),
     readFile(new URL("vsol/scripts/bootstrap.ts", root), "utf8"),
     readFile(new URL("vsol/scripts/verify-deployment.ts", root), "utf8"),
@@ -141,7 +217,7 @@ test("market-data stays real and the verified deployment remains fail-closed on 
   assert.match(pythData, /historical coverage is insufficient/);
   assert.doesNotMatch(marketData, /demo|simulat/i);
   assert.doesNotMatch(pythData, /Math\.sin|deterministicNoise/);
-  assert.match(terminal, /will not invent writer P&amp;L, utilization, uptime, or exposure/i);
+  assert.match(earn, /no invented APY/i);
   assert.equal(deployment.pythUpgradeDeployed, true);
   assert.equal(deployment.smoke.replayRejected, true);
   assert.equal(deployment.smoke.successPositionClosed, true);

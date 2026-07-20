@@ -1,5 +1,6 @@
-import { isReferenceMarketOpen, previousReferenceMarketCloses } from "./expiries";
+import { isReferenceMarketOpen } from "./expiries";
 import type { Market } from "./markets";
+import { getPythMarketBars } from "./pyth-market-bars";
 import { runtimeEnv } from "./runtime-env";
 
 type HermesPrice = {
@@ -34,11 +35,31 @@ export type PythMarketSnapshot = {
 export type RealizedVolatility = {
   value: number;
   observations: number;
-  source: "Pyth Core 20-session realized volatility";
+  source: "Pyth Benchmarks 20-session realized volatility";
   asOf: number;
 };
 
+const PYTH_AUTH_REQUIRED_AT = Date.UTC(2026, 6, 31);
+const HERMES_TIMEOUT_MS = 8_000;
+const MAX_HERMES_BYTES = 1_000_000;
+const snapshotCache = new Map<string, { expiresAt: number; value: PythMarketSnapshot }>();
+const snapshotInFlight = new Map<string, Promise<PythMarketSnapshot>>();
+const snapshotFailures = new Map<string, { expiresAt: number; error: Error }>();
 const volatilityCache = new Map<string, { expiresAt: number; value: RealizedVolatility }>();
+
+const newYorkTradingDate = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const utcTradingDate = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "UTC",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
 
 function hermesUrl(path: string) {
   const base = runtimeEnv("PYTH_HERMES_URL") || "https://hermes.pyth.network";
@@ -53,9 +74,49 @@ function hermesHeaders() {
 }
 
 async function fetchHermes(url: URL) {
-  const response = await fetch(url, { headers: hermesHeaders(), cache: "no-store" });
-  if (!response.ok) throw new Error(`Pyth Hermes returned ${response.status}`);
-  return response.json() as Promise<HermesResponse>;
+  if (!runtimeEnv("PYTH_API_KEY") && Date.now() >= PYTH_AUTH_REQUIRED_AT) {
+    throw new Error("Pyth API authentication is not configured");
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HERMES_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: hermesHeaders(),
+      cache: "no-store",
+      // workerd rejects redirect: "error"; "manual" still refuses to follow, and
+      // the 3xx response then fails the response.ok check below.
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Pyth Hermes returned ${response.status}`);
+    const declaredBytes = Number(response.headers.get("content-length") ?? 0);
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_HERMES_BYTES) {
+      throw new Error("Pyth Hermes response is too large");
+    }
+    if (!response.body) throw new Error("Pyth Hermes response has no body");
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_HERMES_BYTES) {
+        await reader.cancel();
+        throw new Error("Pyth Hermes response is too large");
+      }
+      chunks.push(value);
+    }
+    const body = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder().decode(body)) as HermesResponse;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function parsePrice(result: HermesParsedPrice, expectedFeedId: string) {
@@ -85,61 +146,64 @@ function latestUrl(feedId: string) {
   return url;
 }
 
-function historicalUrl(feedId: string, publishTime: number) {
-  const url = hermesUrl(`v2/updates/price/${publishTime}`);
-  url.searchParams.append("ids[]", feedId);
-  url.searchParams.set("encoding", "hex");
-  url.searchParams.set("parsed", "true");
-  return url;
-}
-
 export async function getPythSnapshot(market: Market): Promise<PythMarketSnapshot> {
-  const result = await fetchHermes(latestUrl(market.pythFeedId));
-  const parsed = result.parsed?.[0];
-  if (!parsed) throw new Error("Pyth returned no parsed price");
-  const price = parsePrice(parsed, market.pythFeedId);
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const ageSeconds = Math.max(0, nowSeconds - price.publishTime);
-  const marketOpen = isReferenceMarketOpen();
-  const mode = ageSeconds <= 30 ? "live" : marketOpen ? "stale" : "closed";
-  const confidenceBps = (price.confidence / price.price) * 10_000;
-  return {
-    ...price,
-    confidenceBps,
-    slot: Number.isSafeInteger(parsed.metadata?.slot) ? Number(parsed.metadata?.slot) : null,
-    ageSeconds,
-    mode,
-    source: "Pyth Core Hermes",
-    warning: mode === "live"
-      ? "Fresh Pyth reference. TradingView remains display-only."
-      : mode === "closed"
-        ? "The US reference session is closed; this is Pyth's last verified market price."
-        : "Pyth did not publish a fresh update while the reference session is open.",
-  };
+  const now = Date.now();
+  const cached = snapshotCache.get(market.pythFeedId);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const recentFailure = snapshotFailures.get(market.pythFeedId);
+  if (recentFailure && recentFailure.expiresAt > now) throw recentFailure.error;
+  const existing = snapshotInFlight.get(market.pythFeedId);
+  if (existing) return existing;
+
+  const request = (async () => {
+    const result = await fetchHermes(latestUrl(market.pythFeedId));
+    const parsed = result.parsed?.[0];
+    if (!parsed) throw new Error("Pyth returned no parsed price");
+    const price = parsePrice(parsed, market.pythFeedId);
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    const ageSeconds = Math.max(0, nowSeconds - price.publishTime);
+    const marketOpen = isReferenceMarketOpen();
+    const mode = ageSeconds <= 30 ? "live" : marketOpen ? "stale" : "closed";
+    const confidenceBps = (price.confidence / price.price) * 10_000;
+    const value: PythMarketSnapshot = {
+      ...price,
+      confidenceBps,
+      slot: Number.isSafeInteger(parsed.metadata?.slot) ? Number(parsed.metadata?.slot) : null,
+      ageSeconds,
+      mode,
+      source: "Pyth Core Hermes",
+      warning: mode === "live"
+        ? "Fresh Pyth reference; settlement still uses an onchain verified update."
+        : mode === "closed"
+          ? "The US reference session is closed; this is Pyth's last published market price."
+          : "Pyth did not publish a fresh update while the reference session is open.",
+    };
+    snapshotCache.set(market.pythFeedId, { expiresAt: Date.now() + 5_000, value });
+    snapshotFailures.delete(market.pythFeedId);
+    return value;
+  })();
+  snapshotInFlight.set(market.pythFeedId, request);
+  try {
+    return await request;
+  } catch (error) {
+    const normalized = error instanceof Error ? error : new Error("Pyth snapshot request failed");
+    snapshotFailures.set(market.pythFeedId, { expiresAt: Date.now() + 5_000, error: normalized });
+    throw normalized;
+  } finally {
+    snapshotInFlight.delete(market.pythFeedId);
+  }
 }
 
 export async function getPythRealizedVolatility(market: Market): Promise<RealizedVolatility> {
   const cached = volatilityCache.get(market.pythFeedId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-  const observations = await Promise.allSettled(
-    previousReferenceMarketCloses(21).map(async (timestampMs) => {
-      const timestamp = Math.floor(timestampMs / 1_000);
-      const result = await fetchHermes(historicalUrl(market.pythFeedId, timestamp));
-      const parsed = result.parsed?.[0];
-      if (!parsed) throw new Error("Missing historical Pyth price");
-      const price = parsePrice(parsed, market.pythFeedId);
-      if (price.publishTime > timestamp + 60 || timestamp - price.publishTime > 4 * 86_400) {
-        throw new Error("Historical Pyth observation is outside the requested close window");
-      }
-      return { value: price.price, publishTime: price.publishTime };
-    }),
-  );
-  const unique = new Map<number, number>();
-  for (const observation of observations) {
-    if (observation.status === "fulfilled") unique.set(observation.value.publishTime, observation.value.value);
-  }
-  const prices = [...unique.entries()].sort((left, right) => left[0] - right[0]).map((entry) => entry[1]);
+  const history = await getPythMarketBars(market, "D");
+  const asOfDate = newYorkTradingDate.format(new Date(history.asOf));
+  const completedBars = isReferenceMarketOpen(history.asOf)
+    ? history.bars.filter((bar) => utcTradingDate.format(new Date(bar.time * 1_000)) !== asOfDate)
+    : history.bars;
+  const prices = completedBars.slice(-21).map((bar) => bar.close);
   if (prices.length < 10) throw new Error("Pyth historical coverage is insufficient for volatility pricing");
   const returns = prices.slice(1).map((price, index) => Math.log(price / prices[index]));
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
@@ -149,8 +213,8 @@ export async function getPythRealizedVolatility(market: Market): Promise<Realize
   const value = {
     value: annualized,
     observations: prices.length,
-    source: "Pyth Core 20-session realized volatility" as const,
-    asOf: Date.now(),
+    source: "Pyth Benchmarks 20-session realized volatility" as const,
+    asOf: history.asOf,
   };
   volatilityCache.set(market.pythFeedId, { expiresAt: Date.now() + 15 * 60_000, value });
   return value;

@@ -36,6 +36,20 @@
       "when": 1784314776160,
       "tag": "0004_glossy_captain_britain",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1784390363311,
+      "tag": "0005_lush_la_nuit",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1784553939759,
+      "tag": "0006_overconfident_maddog",
+      "breakpoints": true
     }
   ]
 }

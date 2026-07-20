@@ -7,7 +7,7 @@ export type Market = {
   tone: string;
   oracleStatus: "Pyth Core";
   pythFeedId: string;
-  tradingViewSymbol: string;
+  pythSymbol: string;
   intradayEligible: boolean;
 };
 
@@ -19,7 +19,7 @@ export const markets: Market[] = [
     tone: "#83e0ba",
     oracleStatus: "Pyth Core",
     pythFeedId: "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593",
-    tradingViewSymbol: "NASDAQ:NVDA",
+    pythSymbol: "Equity.US.NVDA/USD",
     intradayEligible: true,
   },
 ];

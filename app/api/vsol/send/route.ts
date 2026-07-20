@@ -1,58 +1,14 @@
 import "../../../lib/runtime-env-worker";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { Transaction, VersionedTransaction } from "@solana/web3.js";
 import { decodeSignedTransaction, getVsolConnection, inspectVsolFillTransaction } from "../../../lib/vsol-server";
-import { getChatGPTUser } from "../../../chatgpt-auth";
 import { ensureDb, getDb } from "../../../../db";
 import { rfqQuotes, transactionSimulations } from "../../../../db/schema";
-
-function sameOrigin(request: Request) {
-  const origin = request.headers.get("origin");
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === new URL(request.url).host;
-  } catch {
-    return false;
-  }
-}
-
-async function userKey(request: Request) {
-  const user = await getChatGPTUser();
-  if (user?.email) return user.email;
-  const hostname = new URL(request.url).hostname;
-  return hostname === "localhost" || hostname === "127.0.0.1" ? "local-preview@tend.local" : null;
-}
-
-async function hashHex(value: Uint8Array | string) {
-  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-  const copied = Uint8Array.from(bytes);
-  const digest = await crypto.subtle.digest("SHA-256", copied.buffer);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function boundedLogs(logs: string[] | null | undefined) {
-  const bounded: string[] = [];
-  let size = 2;
-  for (const log of logs?.slice(0, 160) ?? []) {
-    const line = log.slice(0, 800);
-    if (size + line.length > 30_000) break;
-    bounded.push(line);
-    size += line.length;
-  }
-  return bounded;
-}
-
-function safeJson(value: unknown) {
-  try {
-    return JSON.stringify(value)?.slice(0, 4_000) ?? null;
-  } catch {
-    return JSON.stringify({ error: "Unserializable simulation error" });
-  }
-}
+import { boundedLogs, hashHex, resolveUserKey, safeJson, sameOrigin } from "../../../lib/session";
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return Response.json({ error: "Cross-site transaction requests are not allowed." }, { status: 403 });
-  const owner = await userKey(request);
+  const owner = await resolveUserKey(request);
   if (!owner) return Response.json({ error: "Sign in to submit transactions." }, { status: 401 });
   await ensureDb();
   const input = await request.json().catch(() => null) as { transaction?: unknown; quoteId?: unknown; walletAddress?: unknown } | null;
@@ -72,8 +28,11 @@ export async function POST(request: Request) {
     if (inspected.position.toBase58() !== input.quoteId || inspected.buyer.toBase58() !== input.walletAddress) {
       return Response.json({ error: "The signed buyer and position do not match this quote request." }, { status: 422 });
     }
-    const [quote] = await db.select().from(rfqQuotes).where(and(eq(rfqQuotes.id, input.quoteId), eq(rfqQuotes.symbol, "NVDA"))).limit(1);
+    const [quote] = await db.select().from(rfqQuotes).where(eq(rfqQuotes.id, input.quoteId)).limit(1);
     if (!quote || quote.consumedAt) return Response.json({ error: "The quote is missing or already consumed." }, { status: 409 });
+    if (inspected.market.toBase58() !== quote.marketAddress) {
+      return Response.json({ error: "The signed transaction targets a different onchain series." }, { status: 422 });
+    }
 
     const transactionHash = await hashHex(raw);
     const result = await connection.simulateTransaction(VersionedTransaction.deserialize(raw), {

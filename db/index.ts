@@ -26,6 +26,8 @@ export async function ensureDb() {
       user_email text NOT NULL,
       wallet_address text NOT NULL,
       quote_id text NOT NULL,
+      market_address text NOT NULL DEFAULT '',
+      oracle_address text NOT NULL DEFAULT '',
       maker text NOT NULL,
       symbol text NOT NULL,
       direction text NOT NULL,
@@ -53,6 +55,8 @@ export async function ensureDb() {
     DB.prepare(`CREATE TABLE IF NOT EXISTS rfq_quotes (
       id text PRIMARY KEY NOT NULL,
       request_id text NOT NULL,
+      market_address text NOT NULL DEFAULT '',
+      oracle_address text NOT NULL DEFAULT '',
       maker text NOT NULL,
       symbol text NOT NULL,
       direction text NOT NULL,
@@ -100,6 +104,77 @@ export async function ensureDb() {
     DB.prepare("CREATE INDEX IF NOT EXISTS transaction_simulations_user_created_idx ON transaction_simulations (user_email, created_at)"),
     DB.prepare("CREATE INDEX IF NOT EXISTS transaction_simulations_quote_idx ON transaction_simulations (quote_id)"),
     DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS transaction_simulations_hash_unique_idx ON transaction_simulations (transaction_hash)"),
+    DB.prepare(`CREATE TABLE IF NOT EXISTS liquidity_actions (
+      id text PRIMARY KEY NOT NULL,
+      user_email text NOT NULL,
+      wallet_address text NOT NULL,
+      pool_address text NOT NULL,
+      provider_address text NOT NULL,
+      action text NOT NULL,
+      amount_atoms text NOT NULL,
+      minimum_output_atoms text NOT NULL,
+      shares_atoms text,
+      deadline integer NOT NULL,
+      transaction_message_hash text NOT NULL,
+      transaction_hash text,
+      simulation_status text,
+      simulation_slot integer,
+      simulation_units_consumed integer,
+      simulation_logs_json text,
+      simulation_logs_hash text,
+      simulation_error_json text,
+      transaction_signature text,
+      submission_status text NOT NULL,
+      submission_error text,
+      pre_wallet_atoms text NOT NULL,
+      pre_pool_atoms text NOT NULL,
+      pre_shares_atoms text NOT NULL,
+      post_wallet_atoms text,
+      post_pool_atoms text,
+      post_shares_atoms text,
+      created_at integer NOT NULL,
+      confirmed_at integer
+    )`),
+    DB.prepare(`CREATE TABLE IF NOT EXISTS auth_nonces (
+      nonce text PRIMARY KEY NOT NULL,
+      created_at integer NOT NULL,
+      expires_at integer NOT NULL,
+      used_at integer
+    )`),
+    DB.prepare("CREATE INDEX IF NOT EXISTS auth_nonces_expires_idx ON auth_nonces (expires_at)"),
+    DB.prepare(`CREATE TABLE IF NOT EXISTS launch_actions (
+      id text PRIMARY KEY NOT NULL,
+      user_key text NOT NULL,
+      wallet_address text NOT NULL,
+      kind text NOT NULL,
+      params_json text NOT NULL,
+      target_address text NOT NULL,
+      secondary_address text,
+      transaction_message_hash text NOT NULL,
+      transaction_hash text,
+      simulation_status text,
+      simulation_slot integer,
+      simulation_units_consumed integer,
+      simulation_logs_json text,
+      simulation_logs_hash text,
+      simulation_error_json text,
+      transaction_signature text,
+      submission_status text NOT NULL,
+      submission_error text,
+      post_state_verified integer,
+      created_at integer NOT NULL,
+      confirmed_at integer
+    )`),
+    DB.prepare("CREATE INDEX IF NOT EXISTS launch_actions_user_created_idx ON launch_actions (user_key, created_at)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS launch_actions_wallet_created_idx ON launch_actions (wallet_address, created_at)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS launch_actions_message_unique_idx ON launch_actions (transaction_message_hash)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS launch_actions_transaction_hash_unique_idx ON launch_actions (transaction_hash)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS launch_actions_signature_unique_idx ON launch_actions (transaction_signature)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS liquidity_actions_user_created_idx ON liquidity_actions (user_email, created_at)"),
+    DB.prepare("CREATE INDEX IF NOT EXISTS liquidity_actions_wallet_created_idx ON liquidity_actions (wallet_address, created_at)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS liquidity_actions_message_unique_idx ON liquidity_actions (transaction_message_hash)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS liquidity_actions_transaction_hash_unique_idx ON liquidity_actions (transaction_hash)"),
+    DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS liquidity_actions_signature_unique_idx ON liquidity_actions (transaction_signature)"),
   ]);
 
   const ensureColumn = async (table: "positions" | "rfq_quotes", name: string, definition: string) => {
@@ -113,6 +188,8 @@ export async function ensureDb() {
     await ensureColumn(table, "option_expiry_at", "integer NOT NULL DEFAULT 0");
     await ensureColumn(table, "observation_window_seconds", "integer NOT NULL DEFAULT 900");
     await ensureColumn(table, "trade_lock_seconds", "integer NOT NULL DEFAULT 300");
+    await ensureColumn(table, "market_address", "text NOT NULL DEFAULT ''");
+    await ensureColumn(table, "oracle_address", "text NOT NULL DEFAULT ''");
   }
   await ensureColumn("positions", "transaction_signature", "text");
   await ensureColumn("positions", "simulation_id", "text");
