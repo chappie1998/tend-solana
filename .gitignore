@@ -46,3 +46,7 @@ next-env.d.ts
 *.tsbuildinfo
 /.playwright-cli/
 /.superstack/
+
+# Local worker secrets (wrangler). Never commit.
+.dev.vars
+.dev.vars.*
