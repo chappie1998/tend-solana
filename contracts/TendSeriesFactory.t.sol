@@ -168,6 +168,59 @@ contract TendSeriesFactoryTest is Test {
         assertTrue(factory.paused());
     }
 
+    // -- guardian rotation ----------------------------------------------------
+
+    function test_OwnerCanTransferOwnership_NewOwnerControlsOldOwnerLocked() public {
+        bytes32 seriesId = factory.createSeries(_defaultParams());
+        address newOwner = address(0xCAFE1);
+
+        factory.transferOwnership(newOwner);
+        assertEq(factory.owner(), newOwner);
+
+        vm.prank(newOwner);
+        factory.setSeriesEnabled(seriesId, false);
+        assertFalse(factory.isTradable(seriesId));
+
+        vm.expectRevert(TendSeriesFactory.NotOwner.selector);
+        factory.setSeriesEnabled(seriesId, true);
+    }
+
+    function test_NonOwnerCannotTransferOwnership() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(TendSeriesFactory.NotOwner.selector);
+        factory.transferOwnership(address(0xCAFE1));
+    }
+
+    function test_TransferOwnershipToZeroAddressReverts() public {
+        vm.expectRevert(TendSeriesFactory.InvalidAuthority.selector);
+        factory.transferOwnership(address(0));
+    }
+
+    function test_OwnerCanSetEmergencyAdmin_NewAdminControlsOldAdminLocked() public {
+        address newAdmin = address(0xCAFE2);
+        factory.setEmergencyAdmin(newAdmin);
+        assertEq(factory.emergencyAdmin(), newAdmin);
+
+        vm.prank(newAdmin);
+        factory.setPaused(true);
+        assertTrue(factory.paused());
+
+        vm.prank(emergencyAdmin);
+        vm.expectRevert(TendSeriesFactory.NotPauseAuthority.selector);
+        factory.setPaused(false);
+    }
+
+    function test_NonOwnerCannotSetEmergencyAdmin() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(TendSeriesFactory.NotOwner.selector);
+        factory.setEmergencyAdmin(address(0xCAFE2));
+    }
+
+    function test_SetEmergencyAdminToZeroAddressReverts() public {
+        vm.expectRevert(TendSeriesFactory.InvalidAuthority.selector);
+        factory.setEmergencyAdmin(address(0));
+    }
+
     // -- settlement ---------------------------------------------------------
 
     function _updateData(uint64 publishTime, int64 price, uint64 conf, int32 expo)

@@ -522,6 +522,44 @@ contract TendPoolVaultTest is Test {
         new TendPoolVault(address(factory), address(token), quoteAuthority, 5_000, 8_000, FEE_BPS, feeRecipient);
     }
 
+    // -- manager handover -----------------------------------------------------
+
+    function test_ManagerTransfersAndNewManagerControlsOldManagerLocked() public {
+        address newManager = address(0xCAFE3);
+        vault.transferManager(newManager);
+        assertEq(vault.manager(), newManager);
+
+        vm.prank(newManager);
+        vault.updatePool(quoteAuthority, 8_000, 5_000, FEE_BPS, feeRecipient);
+
+        vm.prank(newManager);
+        vault.authorizeSeries(seriesId, true, lastTradeAt);
+
+        vm.expectRevert(TendPoolVault.NotManager.selector);
+        vault.updatePool(quoteAuthority, 8_000, 5_000, FEE_BPS, feeRecipient);
+
+        vm.expectRevert(TendPoolVault.NotManager.selector);
+        vault.authorizeSeries(seriesId, true, lastTradeAt);
+    }
+
+    function test_NonManagerCannotTransferManager() public {
+        vm.prank(address(0xF00));
+        vm.expectRevert(TendPoolVault.NotManager.selector);
+        vault.transferManager(address(0xCAFE3));
+    }
+
+    function test_TransferManagerToZeroAddressReverts() public {
+        vm.expectRevert(TendPoolVault.InvalidAuthority.selector);
+        vault.transferManager(address(0));
+    }
+
+    function test_TransferManagerBlockedWhileObligationsOpen() public {
+        _deposit(10_000e6);
+        _fill(1);
+        vm.expectRevert(TendPoolVault.PoolHasOpenPositions.selector);
+        vault.transferManager(address(0xCAFE3));
+    }
+
     // -- guardian pause: blocks new fills, never settlement/refund -------------
 
     function test_GuardianPauseBlocksNewFillsButNotSettlement() public {

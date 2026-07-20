@@ -123,6 +123,7 @@ contract TendPoolVault {
 
     event SeriesAuthorized(bytes32 indexed seriesId, bool enabled, uint64 lastTradeAt);
     event PoolUpdated(address quoteAuthority, uint16 maxUtilizationBps, uint16 maxPositionBps, uint16 feeBps, address feeRecipient);
+    event ManagerTransferred(address indexed previousManager, address indexed newManager);
     event LiquidityDeposited(address indexed provider, uint256 amount, uint256 shares);
     event LiquidityWithdrawn(address indexed provider, uint256 amount, uint256 shares);
     event PoolQuoteFilled(
@@ -227,6 +228,18 @@ contract TendPoolVault {
         feeBps = nextFeeBps;
         feeRecipient = nextFeeRecipient;
         emit PoolUpdated(nextQuoteAuthority, nextMaxUtilizationBps, nextMaxPositionBps, nextFeeBps, nextFeeRecipient);
+    }
+
+    /// @notice Hands over pool management to a new address. Only when the pool
+    /// has no open positions and no locked collateral, exactly like
+    /// `authorizeSeries` / `updatePool` — handing over control mid-obligation
+    /// would change who governs live risk.
+    function transferManager(address nextManager) external onlyManager {
+        if (openPositions != 0 || lockedCollateral != 0) revert PoolHasOpenPositions();
+        if (nextManager == address(0)) revert InvalidAuthority();
+        address previousManager = manager;
+        manager = nextManager;
+        emit ManagerTransferred(previousManager, nextManager);
     }
 
     // ---------------------------------------------------------------------
