@@ -136,6 +136,9 @@ type Deployment = {
 const NEW_YORK = "America/New_York";
 const USER_MARKET_OBSERVATION_SECONDS = 30;
 const USER_MARKET_SETTLEMENT_GRACE_SECONDS = 900;
+// 8-byte discriminator + Market::INIT_SPACE under the upgraded factory layout;
+// accounts of any other size predate the upgrade and no longer deserialize.
+const MARKET_ACCOUNT_SIZE = 277;
 
 function newYorkParts(timestampMs: number) {
   const values: Record<string, string> = {};
@@ -778,12 +781,19 @@ async function main(): Promise<void> {
 
   if (previousDeployment.uiMarket && previousDeployment.uiMarket !== ui.market.toBase58()) {
     const unsafeMarket = new PublicKey(previousDeployment.uiMarket);
-    const unsafeAccount = await adminProgram.account.market.fetchNullable(unsafeMarket);
-    if (unsafeAccount?.enabled) {
-      await adminProgram.methods
-        .setMarketEnabled(false)
-        .accountsStrict({ admin: admin.publicKey, config, market: unsafeMarket })
-        .rpc();
+    const unsafeInfo = await connection.getAccountInfo(unsafeMarket, commitment);
+    if (unsafeInfo && unsafeInfo.data.length !== MARKET_ACCOUNT_SIZE) {
+      // Pre-upgrade layout: the upgraded program rejects it at deserialization,
+      // so the account is inert (untradeable) and cannot and need not be disabled.
+      console.log(`Skipping legacy UI market ${unsafeMarket.toBase58()}: stale pre-upgrade account layout is inert`);
+    } else if (unsafeInfo) {
+      const unsafeAccount = await adminProgram.account.market.fetchNullable(unsafeMarket);
+      if (unsafeAccount?.enabled) {
+        await adminProgram.methods
+          .setMarketEnabled(false)
+          .accountsStrict({ admin: admin.publicKey, config, market: unsafeMarket })
+          .rpc();
+      }
     }
   }
 

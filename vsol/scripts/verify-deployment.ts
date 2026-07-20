@@ -53,6 +53,30 @@ async function expectFactoryMarket(label: string, data: Buffer, expectedCreator?
   }
 }
 
+async function fetchTransactionWithRetry(connection: Connection, signature: string, attempts = 5) {
+  let lastResult: Awaited<ReturnType<Connection["getTransaction"]>> = null;
+  let delay = 1_000;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const transaction = await connection.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (transaction) {
+        lastResult = transaction;
+        if (transaction.meta?.logMessages?.length) return transaction;
+      }
+    } catch {
+      // rate-limited or transient RPC failure; retry with backoff below
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, delay));
+      delay = Math.min(delay * 2, 8_000);
+    }
+  }
+  return lastResult;
+}
+
 // Read the entire public deployment state in one RPC batch. Public devnet endpoints
 // aggressively rate-limit sequential account lookups, and verification should not
 // fail merely because the manifest contains a complete rolling series catalog.
@@ -282,11 +306,24 @@ const transactionFields = [
   "poolWithdrawSignature",
 ] as const;
 const transactionSignatures = transactionFields.map((field) => String(smoke[field]));
-const transactionResults = await connection.getTransactions(transactionSignatures, {
-  commitment: "confirmed",
-  maxSupportedTransactionVersion: 0,
-});
+// Public devnet rate-limits batched getTransactions (429) and can return entries without
+// logs, so unusable entries are re-fetched individually with backoff below.
+let transactionResults: Array<Awaited<ReturnType<Connection["getTransaction"]>>> = transactionFields.map(() => null);
+try {
+  transactionResults = await connection.getTransactions(transactionSignatures, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+} catch {
+  // batch throws under rate limiting; fall through to per-signature recovery
+}
 const transactions = new Map(transactionFields.map((field, index) => [field, transactionResults[index]]));
+for (const field of transactionFields) {
+  const transaction = transactions.get(field);
+  if (transaction && transaction.meta?.logMessages?.length) continue;
+  transactions.set(field, await fetchTransactionWithRetry(connection, String(smoke[field])));
+  await new Promise((resolveSleep) => setTimeout(resolveSleep, 250));
+}
 for (const field of transactionFields) {
   const signature = String(smoke[field]);
   const transaction = transactions.get(field);
