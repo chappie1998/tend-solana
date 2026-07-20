@@ -24,7 +24,7 @@ The program upgrade transaction and every lifecycle proof are recorded in `vsol/
 5. The server validates the exact instruction/account set, verifies signatures, simulates with signature checks, and persists a content-hashed simulation record before submitting.
 6. The portfolio record is created only after the backend independently verifies the confirmed on-chain fill and its linked passing simulation.
 
-The market panel embeds TradingView’s official Advanced Chart. Its exchange data can be live, delayed, or end-of-day according to TradingView entitlements and is display-only. Pyth Core Hermes supplies the independently displayed reference price and 20-session realized-volatility input. Onchain settlement accepts only a fully verified upgraded Pyth `PriceUpdateV2`, exact feed ID, bounded confidence, expiry observation window, and maximum age. Short-duration series are represented but remain disabled until exact onchain markets are published.
+The market panel renders real Pyth Benchmarks OHLC history locally with TradingView Lightweight Charts and is display-only. Pyth Core Hermes supplies the independently displayed reference price and 20-session realized-volatility input. Onchain settlement accepts only a fully verified upgraded Pyth `PriceUpdateV2`, exact feed ID, bounded confidence, expiry observation window, and maximum age. Short-duration series are represented but remain disabled until exact onchain markets are published.
 
 ## Protocol design
 

@@ -3,14 +3,41 @@ import test from "node:test";
 import { PublicKey } from "@solana/web3.js";
 import {
   calculatePayout,
+  calculateDepositShares,
+  calculateWithdrawAmount,
   deriveConfig,
+  deriveLiquidityPool,
+  deriveLiquidityPoolMarket,
+  deriveLiquidityPoolToken,
+  deriveLiquidityProvider,
+  deriveMarket,
+  deriveMarketId,
   deriveNonce,
+  derivePoolNonce,
+  derivePoolPosition,
+  derivePoolPositionVault,
   derivePosition,
   derivePositionVault,
+  liquidityPoolId,
+  MARKET_SEED,
+  poolQuoteMessage,
   quoteMessage,
+  symbolBytes,
   type Quote,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
+
+const MARKET_ID_FIXTURE = {
+  pythFeedId: new Uint8Array(32).fill(0x11),
+  settlementMint: new PublicKey(Buffer.alloc(32, 0x22)),
+  expiry: 1_800_000_000n,
+  observationWindowSeconds: 30,
+  settlementGraceSeconds: 900,
+  priceScale: 1_000_000n,
+  maxConfidenceBps: 100,
+  symbol: symbolBytes("NVDA"),
+};
+const MARKET_ID_KNOWN_ANSWER = "454b66775586fcd0389db454f7c7d4950405060ecc5a6fc9761fda8413aad3e1";
 
 const quote: Quote = {
   nonce: 7n,
@@ -49,4 +76,80 @@ test("buyer payout is directional, linear, and capped", () => {
   assert.equal(calculatePayout(quote, 90_000_000n), 0n);
   assert.equal(calculatePayout(quote, 110_000_000n), 2_500_000n);
   assert.equal(calculatePayout(quote, 150_000_000n), quote.maxPayout);
+});
+
+test("pool quote serialization binds pool, market, buyer, and quote authority", () => {
+  const config = deriveConfig();
+  const pool = deriveLiquidityPool(config, VSOL_PROGRAM_ID, liquidityPoolId("test"));
+  const message = poolQuoteMessage({
+    domainSeparator: new Uint8Array(32).fill(4),
+    domainVersion: 2,
+    config,
+    pool,
+    market: new PublicKey("SysvarC1ock11111111111111111111111111111111"),
+    buyer: new PublicKey("SysvarRent111111111111111111111111111111111"),
+    quoteAuthority: VSOL_PROGRAM_ID,
+    quote,
+  });
+  assert.equal(message.length, 283);
+  assert.equal(message.subarray(0, 8).toString("ascii"), "VSOLPLP1");
+});
+
+test("pool PDAs are deterministic and use isolated namespaces", () => {
+  const config = deriveConfig();
+  const id = liquidityPoolId("devnet:tUSDC:main");
+  const pool = deriveLiquidityPool(config, VSOL_PROGRAM_ID, id);
+  const token = deriveLiquidityPoolToken(pool);
+  const provider = new PublicKey("SysvarRent111111111111111111111111111111111");
+  const providerPosition = deriveLiquidityProvider(pool, provider);
+  const market = new PublicKey("SysvarC1ock11111111111111111111111111111111");
+  const poolMarket = deriveLiquidityPoolMarket(pool, market);
+  const nonce = derivePoolNonce(pool, VSOL_PROGRAM_ID, 99n);
+  const position = derivePoolPosition(nonce);
+  assert.notEqual(pool.toBase58(), token.toBase58());
+  assert.notEqual(providerPosition.toBase58(), poolMarket.toBase58());
+  assert.notEqual(position.toBase58(), derivePoolPositionVault(position).toBase58());
+});
+
+test("deriveMarketId matches the Rust known-answer vector byte for byte", async () => {
+  const id = await deriveMarketId(MARKET_ID_FIXTURE);
+  assert.equal(id.length, 32);
+  assert.equal(id.toString("hex"), MARKET_ID_KNOWN_ANSWER);
+});
+
+test("deriveMarketId binds every series parameter", async () => {
+  const baseline = await deriveMarketId(MARKET_ID_FIXTURE);
+  const variants: Array<Partial<typeof MARKET_ID_FIXTURE>> = [
+    { pythFeedId: new Uint8Array(32).fill(0x12) },
+    { settlementMint: new PublicKey(Buffer.alloc(32, 0x23)) },
+    { expiry: MARKET_ID_FIXTURE.expiry + 1n },
+    { observationWindowSeconds: 31 },
+    { settlementGraceSeconds: 901 },
+    { priceScale: MARKET_ID_FIXTURE.priceScale + 1n },
+    { maxConfidenceBps: 101 },
+    { symbol: symbolBytes("NVDA2") },
+  ];
+  for (const variant of variants) {
+    const changed = await deriveMarketId({ ...MARKET_ID_FIXTURE, ...variant });
+    assert.notEqual(changed.toString("hex"), baseline.toString("hex"));
+  }
+});
+
+test("factory market PDA derives from the deterministic market id", async () => {
+  const config = deriveConfig();
+  const id = await deriveMarketId(MARKET_ID_FIXTURE);
+  const market = deriveMarket(config, id);
+  const expected = PublicKey.findProgramAddressSync(
+    [MARKET_SEED, config.toBuffer(), id],
+    VSOL_PROGRAM_ID,
+  )[0];
+  assert.equal(market.toBase58(), expected.toBase58());
+});
+
+test("pool share math rounds down and rejects insolvent or dust operations", () => {
+  assert.equal(calculateDepositShares(1_000n, 0n, 0n), 1_000n);
+  assert.equal(calculateDepositShares(333n, 1_000n, 3_000n), 111n);
+  assert.equal(calculateWithdrawAmount(111n, 1_000n, 3_001n), 333n);
+  assert.throws(() => calculateDepositShares(1n, 1n, 0n), /insolvent/);
+  assert.throws(() => calculateDepositShares(1n, 1n, 10n), /too small/);
 });

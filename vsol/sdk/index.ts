@@ -12,7 +12,16 @@ export const NONCE_SEED = Buffer.from("nonce");
 export const POSITION_SEED = Buffer.from("position");
 export const POSITION_VAULT_SEED = Buffer.from("position-vault");
 export const ELIGIBILITY_SEED = Buffer.from("eligibility");
+export const POOL_SEED = Buffer.from("pool");
+export const POOL_TOKEN_SEED = Buffer.from("pool-token");
+export const PROVIDER_SEED = Buffer.from("provider");
+export const POOL_MARKET_SEED = Buffer.from("pool-market");
+export const POOL_NONCE_SEED = Buffer.from("pool-nonce");
+export const POOL_POSITION_SEED = Buffer.from("pool-position");
+export const POOL_POSITION_VAULT_SEED = Buffer.from("pool-position-vault");
 export const QUOTE_DOMAIN = Buffer.from("VSOLRFQ1", "ascii");
+export const POOL_QUOTE_DOMAIN = Buffer.from("VSOLPLP1", "ascii");
+export const MARKET_ID_DOMAIN = Buffer.from("VSOLMKT1", "ascii");
 export const PRICE_SCALE = 1_000_000n;
 
 export type Quote = {
@@ -25,6 +34,8 @@ export type Quote = {
   quoteExpiry: bigint;
 };
 
+export type PoolQuote = Quote;
+
 function u64(value: bigint): Buffer {
   if (value < 0n || value > 0xffff_ffff_ffff_ffffn) throw new RangeError("u64 out of range");
   const result = Buffer.alloc(8);
@@ -36,6 +47,20 @@ function i64(value: bigint): Buffer {
   if (value < -0x8000_0000_0000_0000n || value > 0x7fff_ffff_ffff_ffffn) throw new RangeError("i64 out of range");
   const result = Buffer.alloc(8);
   result.writeBigInt64LE(value);
+  return result;
+}
+
+function u32(value: number): Buffer {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) throw new RangeError("u32 out of range");
+  const result = Buffer.alloc(4);
+  result.writeUInt32LE(value);
+  return result;
+}
+
+function u16(value: number): Buffer {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff) throw new RangeError("u16 out of range");
+  const result = Buffer.alloc(2);
+  result.writeUInt16LE(value);
   return result;
 }
 
@@ -76,6 +101,45 @@ export function quoteMessage(params: {
   ]);
 }
 
+export function poolQuoteMessage(params: {
+  domainSeparator: Uint8Array;
+  domainVersion: number;
+  config: PublicKey;
+  pool: PublicKey;
+  market: PublicKey;
+  buyer: PublicKey;
+  quoteAuthority: PublicKey;
+  quote: PoolQuote;
+  programId?: PublicKey;
+}): Buffer {
+  const programId = params.programId ?? VSOL_PROGRAM_ID;
+  const { quote } = params;
+  if (params.domainSeparator.length !== 32) throw new RangeError("domain separator must be 32 bytes");
+  if (!Number.isInteger(params.domainVersion) || params.domainVersion < 0 || params.domainVersion > 65_535) {
+    throw new RangeError("domain version must be a u16");
+  }
+  const domainVersion = Buffer.alloc(2);
+  domainVersion.writeUInt16LE(params.domainVersion);
+  return Buffer.concat([
+    POOL_QUOTE_DOMAIN,
+    Buffer.from(params.domainSeparator),
+    domainVersion,
+    programId.toBuffer(),
+    params.config.toBuffer(),
+    params.pool.toBuffer(),
+    params.market.toBuffer(),
+    params.buyer.toBuffer(),
+    params.quoteAuthority.toBuffer(),
+    u64(quote.nonce),
+    Buffer.from([quote.direction]),
+    u64(quote.strike),
+    u64(quote.width),
+    u64(quote.premium),
+    u64(quote.maxPayout),
+    i64(quote.quoteExpiry),
+  ]);
+}
+
 export function toAnchorQuote(quote: Quote) {
   return {
     nonce: new BN(quote.nonce.toString()),
@@ -90,6 +154,43 @@ export function toAnchorQuote(quote: Quote) {
 
 export function marketId(label: string): Buffer {
   return createHash("sha256").update(`vsol-market:${label}`).digest();
+}
+
+export type MarketIdParams = {
+  pythFeedId: Uint8Array | number[];
+  settlementMint: PublicKey;
+  expiry: bigint;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+  priceScale: bigint;
+  maxConfidenceBps: number;
+  symbol: Uint8Array | number[];
+};
+
+// Mirrors the on-chain `expected_market_id` check byte-for-byte, so identical
+// series parameters always bind to the same permissionless factory PDA.
+export async function deriveMarketId(params: MarketIdParams): Promise<Buffer> {
+  const pythFeedId = Buffer.from(params.pythFeedId);
+  const symbol = Buffer.from(params.symbol);
+  if (pythFeedId.length !== 32) throw new RangeError("pythFeedId must be 32 bytes");
+  if (symbol.length !== 16) throw new RangeError("symbol must be 16 bytes");
+  const message = Buffer.concat([
+    MARKET_ID_DOMAIN,
+    pythFeedId,
+    params.settlementMint.toBuffer(),
+    i64(params.expiry),
+    u32(params.observationWindowSeconds),
+    u32(params.settlementGraceSeconds),
+    u64(params.priceScale),
+    u16(params.maxConfidenceBps),
+    symbol,
+  ]);
+  const digest = await crypto.subtle.digest("SHA-256", message);
+  return Buffer.from(digest);
+}
+
+export function liquidityPoolId(label: string): Buffer {
+  return createHash("sha256").update(`vsol-pool:${label}`).digest();
 }
 
 export function symbolBytes(symbol: string): number[] {
@@ -132,6 +233,68 @@ export function derivePositionVault(position: PublicKey, programId = VSOL_PROGRA
 
 export function deriveEligibility(config: PublicKey, wallet: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
   return PublicKey.findProgramAddressSync([ELIGIBILITY_SEED, config.toBuffer(), wallet.toBuffer()], programId)[0];
+}
+
+export function deriveLiquidityPool(
+  config: PublicKey,
+  mint: PublicKey,
+  id: Uint8Array,
+  programId = VSOL_PROGRAM_ID,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [POOL_SEED, config.toBuffer(), mint.toBuffer(), Buffer.from(id)],
+    programId,
+  )[0];
+}
+
+export function deriveLiquidityPoolToken(pool: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([POOL_TOKEN_SEED, pool.toBuffer()], programId)[0];
+}
+
+export function deriveLiquidityProvider(pool: PublicKey, owner: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([PROVIDER_SEED, pool.toBuffer(), owner.toBuffer()], programId)[0];
+}
+
+export function deriveLiquidityPoolMarket(pool: PublicKey, market: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([POOL_MARKET_SEED, pool.toBuffer(), market.toBuffer()], programId)[0];
+}
+
+export function derivePoolNonce(
+  pool: PublicKey,
+  quoteAuthority: PublicKey,
+  nonce: bigint,
+  programId = VSOL_PROGRAM_ID,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [POOL_NONCE_SEED, pool.toBuffer(), quoteAuthority.toBuffer(), u64(nonce)],
+    programId,
+  )[0];
+}
+
+export function derivePoolPosition(nonceRecord: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([POOL_POSITION_SEED, nonceRecord.toBuffer()], programId)[0];
+}
+
+export function derivePoolPositionVault(position: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([POOL_POSITION_VAULT_SEED, position.toBuffer()], programId)[0];
+}
+
+export function calculateDepositShares(amount: bigint, totalShares: bigint, totalAssets: bigint): bigint {
+  if (amount <= 0n || totalShares < 0n || totalAssets < 0n) throw new RangeError("invalid pool share parameters");
+  if (totalShares === 0n) return amount;
+  if (totalAssets === 0n) throw new RangeError("pool is insolvent");
+  const shares = (amount * totalShares) / totalAssets;
+  if (shares === 0n) throw new RangeError("deposit is too small");
+  return shares;
+}
+
+export function calculateWithdrawAmount(shares: bigint, totalShares: bigint, totalAssets: bigint): bigint {
+  if (shares <= 0n || totalShares <= 0n || shares > totalShares || totalAssets < 0n) {
+    throw new RangeError("invalid pool share parameters");
+  }
+  const amount = (shares * totalAssets) / totalShares;
+  if (amount === 0n) throw new RangeError("withdrawal is too small");
+  return amount;
 }
 
 export function calculatePayout(quote: Pick<Quote, "direction" | "strike" | "width" | "maxPayout">, price: bigint): bigint {

@@ -5,9 +5,15 @@ mod math;
 mod pyth;
 mod signature;
 
-use math::{calculate_fee, calculate_payout};
+use math::{
+    calculate_bps_limit, calculate_deposit_shares, calculate_fee, calculate_payout,
+    calculate_withdraw_amount,
+};
 use pyth::{parse_fully_verified_price_update, PythPrice};
-use signature::{quote_message, verify_preceding_ed25519_instruction, QuoteMessageContext};
+use signature::{
+    pool_quote_message, quote_message, verify_preceding_ed25519_instruction,
+    PoolQuoteMessageContext, QuoteMessageContext,
+};
 
 declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
 
@@ -20,7 +26,16 @@ pub const NONCE_SEED: &[u8] = b"nonce";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const POSITION_VAULT_SEED: &[u8] = b"position-vault";
 pub const ELIGIBILITY_SEED: &[u8] = b"eligibility";
+pub const POOL_SEED: &[u8] = b"pool";
+pub const POOL_TOKEN_SEED: &[u8] = b"pool-token";
+pub const PROVIDER_SEED: &[u8] = b"provider";
+pub const POOL_MARKET_SEED: &[u8] = b"pool-market";
+pub const POOL_NONCE_SEED: &[u8] = b"pool-nonce";
+pub const POOL_POSITION_SEED: &[u8] = b"pool-position";
+pub const POOL_POSITION_VAULT_SEED: &[u8] = b"pool-position-vault";
 pub const QUOTE_DOMAIN: &[u8; 8] = b"VSOLRFQ1";
+pub const POOL_QUOTE_DOMAIN: &[u8; 8] = b"VSOLPLP1";
+pub const MARKET_ID_DOMAIN: &[u8; 8] = b"VSOLMKT1";
 pub const BPS_DENOMINATOR: u64 = 10_000;
 pub const MAX_FEE_BPS: u16 = 1_000;
 pub const MIN_MARKET_LEAD_SECONDS: i64 = 15;
@@ -179,6 +194,10 @@ pub mod vsol {
             args.underlying_mint != Pubkey::default(),
             VsolError::InvalidUnderlyingMint
         );
+        require!(
+            args.market_id == expected_market_id(&args, ctx.accounts.settlement_mint.key()),
+            VsolError::InvalidMarketId
+        );
 
         let market = &mut ctx.accounts.market;
         market.bump = ctx.bumps.market;
@@ -196,6 +215,7 @@ pub mod vsol {
         market.pyth_feed_id = args.pyth_feed_id;
         market.settlement_decimals = ctx.accounts.settlement_mint.decimals;
         market.enabled = true;
+        market.creator = ctx.accounts.creator.key();
 
         let oracle = &mut ctx.accounts.oracle;
         oracle.bump = ctx.bumps.oracle;
@@ -214,6 +234,7 @@ pub mod vsol {
             market_id: market.market_id,
             expiry: market.expiry,
             settlement_mint: market.settlement_mint,
+            creator: market.creator,
         });
         Ok(())
     }
@@ -716,6 +737,637 @@ pub mod vsol {
         });
         Ok(())
     }
+
+    pub fn initialize_liquidity_pool(
+        ctx: Context<InitializeLiquidityPool>,
+        args: InitializeLiquidityPoolArgs,
+    ) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
+        require!(
+            args.quote_authority != Pubkey::default(),
+            VsolError::InvalidAuthority
+        );
+        validate_pool_risk_limits(args.max_utilization_bps, args.max_position_bps)?;
+
+        let pool = &mut ctx.accounts.pool;
+        pool.bump = ctx.bumps.pool;
+        pool.token_bump = ctx.bumps.pool_token;
+        pool.config = ctx.accounts.config.key();
+        pool.settlement_mint = ctx.accounts.settlement_mint.key();
+        pool.quote_authority = args.quote_authority;
+        pool.pool_id = args.pool_id;
+        pool.total_shares = 0;
+        pool.locked_collateral = 0;
+        pool.open_positions = 0;
+        pool.cumulative_premium = 0;
+        pool.cumulative_payout = 0;
+        pool.max_utilization_bps = args.max_utilization_bps;
+        pool.max_position_bps = args.max_position_bps;
+        pool.manager = ctx.accounts.creator.key();
+
+        emit!(LiquidityPoolInitialized {
+            pool: pool.key(),
+            settlement_mint: pool.settlement_mint,
+            quote_authority: pool.quote_authority,
+            manager: pool.manager,
+        });
+        Ok(())
+    }
+
+    pub fn set_liquidity_pool_market(
+        ctx: Context<SetLiquidityPoolMarket>,
+        args: SetLiquidityPoolMarketArgs,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
+            VsolError::PoolHasOpenPositions
+        );
+        require_keys_eq!(
+            ctx.accounts.market.settlement_mint,
+            ctx.accounts.pool.settlement_mint,
+            VsolError::InvalidMarket
+        );
+        if args.enabled {
+            require!(ctx.accounts.market.enabled, VsolError::MarketDisabled);
+            require!(
+                args.last_trade_at >= now.saturating_add(MIN_MARKET_LEAD_SECONDS)
+                    && args.last_trade_at < ctx.accounts.market.expiry,
+                VsolError::InvalidLastTradeCutoff
+            );
+        }
+
+        let pool_market = &mut ctx.accounts.pool_market;
+        pool_market.bump = ctx.bumps.pool_market;
+        pool_market.pool = ctx.accounts.pool.key();
+        pool_market.market = ctx.accounts.market.key();
+        pool_market.last_trade_at = args.last_trade_at;
+        pool_market.enabled = args.enabled;
+        emit!(LiquidityPoolMarketUpdated {
+            pool: pool_market.pool,
+            market: pool_market.market,
+            last_trade_at: pool_market.last_trade_at,
+            enabled: pool_market.enabled,
+        });
+        Ok(())
+    }
+
+    pub fn update_liquidity_pool(
+        ctx: Context<UpdateLiquidityPool>,
+        args: UpdateLiquidityPoolArgs,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
+            VsolError::PoolHasOpenPositions
+        );
+        require!(
+            args.quote_authority != Pubkey::default(),
+            VsolError::InvalidAuthority
+        );
+        validate_pool_risk_limits(args.max_utilization_bps, args.max_position_bps)?;
+        let pool = &mut ctx.accounts.pool;
+        pool.quote_authority = args.quote_authority;
+        pool.max_utilization_bps = args.max_utilization_bps;
+        pool.max_position_bps = args.max_position_bps;
+        emit!(LiquidityPoolUpdated {
+            pool: pool.key(),
+            quote_authority: pool.quote_authority,
+            max_utilization_bps: pool.max_utilization_bps,
+            max_position_bps: pool.max_position_bps,
+        });
+        Ok(())
+    }
+
+    pub fn deposit_liquidity(
+        ctx: Context<DepositLiquidity>,
+        amount: u64,
+        min_shares_out: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
+        require!(now <= deadline, VsolError::DeadlineExpired);
+        require!(
+            ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
+            VsolError::PoolHasOpenPositions
+        );
+        let assets_before = ctx.accounts.pool_token.amount;
+        let shares =
+            calculate_deposit_shares(amount, ctx.accounts.pool.total_shares, assets_before)?;
+        require!(shares >= min_shares_out, VsolError::SlippageExceeded);
+
+        transfer_checked(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.provider_source.to_account_info(),
+            ctx.accounts.pool_token.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.provider.to_account_info(),
+            amount,
+            ctx.accounts.settlement_mint.decimals,
+        )?;
+        ctx.accounts.pool_token.reload()?;
+        require!(
+            ctx.accounts.pool_token.amount
+                == assets_before
+                    .checked_add(amount)
+                    .ok_or(VsolError::MathOverflow)?,
+            VsolError::CollateralMismatch
+        );
+
+        let provider_position = &mut ctx.accounts.provider_position;
+        if provider_position.pool == Pubkey::default() {
+            provider_position.bump = ctx.bumps.provider_position;
+            provider_position.pool = ctx.accounts.pool.key();
+            provider_position.owner = ctx.accounts.provider.key();
+        }
+        provider_position.shares = provider_position
+            .shares
+            .checked_add(shares)
+            .ok_or(VsolError::MathOverflow)?;
+        provider_position.total_deposited = provider_position
+            .total_deposited
+            .checked_add(amount)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.total_shares = ctx
+            .accounts
+            .pool
+            .total_shares
+            .checked_add(shares)
+            .ok_or(VsolError::MathOverflow)?;
+
+        emit!(LiquidityDeposited {
+            pool: ctx.accounts.pool.key(),
+            provider: ctx.accounts.provider.key(),
+            amount,
+            shares,
+        });
+        Ok(())
+    }
+
+    pub fn withdraw_liquidity(
+        ctx: Context<WithdrawLiquidity>,
+        shares: u64,
+        min_amount_out: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        require!(
+            Clock::get()?.unix_timestamp <= deadline,
+            VsolError::DeadlineExpired
+        );
+        require!(
+            ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
+            VsolError::PoolHasOpenPositions
+        );
+        require!(
+            ctx.accounts.provider_position.shares >= shares,
+            VsolError::InvalidPoolShares
+        );
+        let amount = calculate_withdraw_amount(
+            shares,
+            ctx.accounts.pool.total_shares,
+            ctx.accounts.pool_token.amount,
+        )?;
+        require!(amount >= min_amount_out, VsolError::SlippageExceeded);
+
+        ctx.accounts.provider_position.shares = ctx
+            .accounts
+            .provider_position
+            .shares
+            .checked_sub(shares)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.provider_position.total_withdrawn = ctx
+            .accounts
+            .provider_position
+            .total_withdrawn
+            .checked_add(amount)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.total_shares = ctx
+            .accounts
+            .pool
+            .total_shares
+            .checked_sub(shares)
+            .ok_or(VsolError::MathOverflow)?;
+
+        let config_key = ctx.accounts.config.key();
+        let settlement_mint_key = ctx.accounts.settlement_mint.key();
+        let pool_seeds: &[&[u8]] = &[
+            POOL_SEED,
+            config_key.as_ref(),
+            settlement_mint_key.as_ref(),
+            ctx.accounts.pool.pool_id.as_ref(),
+            &[ctx.accounts.pool.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.pool_token.to_account_info(),
+            ctx.accounts.provider_destination.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.pool.to_account_info(),
+            amount,
+            ctx.accounts.settlement_mint.decimals,
+            pool_seeds,
+        )?;
+        emit!(LiquidityWithdrawn {
+            pool: ctx.accounts.pool.key(),
+            provider: ctx.accounts.provider.key(),
+            amount,
+            shares,
+        });
+        Ok(())
+    }
+
+    pub fn fill_pool_quote(ctx: Context<FillPoolQuote>, quote: PoolQuoteArgs) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let config = &ctx.accounts.config;
+        let market = &ctx.accounts.market;
+        let pool = &ctx.accounts.pool;
+        require!(!config.paused, VsolError::ProtocolPaused);
+        require!(market.enabled, VsolError::MarketDisabled);
+        require!(
+            ctx.accounts.pool_market.enabled,
+            VsolError::PoolMarketDisabled
+        );
+        require!(now < market.expiry, VsolError::MarketExpired);
+        require!(
+            now < ctx.accounts.pool_market.last_trade_at,
+            VsolError::LastTradeCutoffReached
+        );
+        require!(
+            now <= quote.quote_expiry
+                && quote.quote_expiry <= ctx.accounts.pool_market.last_trade_at
+                && quote.quote_expiry < market.expiry,
+            VsolError::QuoteExpired
+        );
+        require!(
+            quote.premium > 0 && quote.max_payout > 0,
+            VsolError::InvalidAmount
+        );
+        require!(quote.strike > 0 && quote.width > 0, VsolError::InvalidWidth);
+        Direction::try_from(quote.direction)?;
+        require!(pool.total_shares > 0, VsolError::InvalidPoolShares);
+
+        if config.eligibility_required {
+            let eligibility = ctx
+                .accounts
+                .eligibility
+                .as_ref()
+                .ok_or(VsolError::EligibilityRequired)?;
+            require_keys_eq!(
+                eligibility.config,
+                config.key(),
+                VsolError::InvalidEligibility
+            );
+            require_keys_eq!(
+                eligibility.wallet,
+                ctx.accounts.buyer.key(),
+                VsolError::InvalidEligibility
+            );
+            require!(
+                eligibility.can_trade && eligibility.expires_at >= now,
+                VsolError::IneligibleWallet
+            );
+        }
+
+        let config_key = config.key();
+        let pool_key = pool.key();
+        let market_key = market.key();
+        let buyer_key = ctx.accounts.buyer.key();
+        let authority_key = ctx.accounts.quote_authority.key();
+        let quote_context = PoolQuoteMessageContext {
+            program_id: &crate::ID,
+            config: &config_key,
+            pool: &pool_key,
+            market: &market_key,
+            buyer: &buyer_key,
+            quote_authority: &authority_key,
+        };
+        let message = pool_quote_message(
+            &config.domain_separator,
+            config.domain_version,
+            &quote_context,
+            &quote,
+        );
+        verify_preceding_ed25519_instruction(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            &authority_key,
+            &message,
+        )?;
+
+        let total_collateral = ctx
+            .accounts
+            .pool_token
+            .amount
+            .checked_add(pool.locked_collateral)
+            .ok_or(VsolError::MathOverflow)?;
+        let utilization_limit = calculate_bps_limit(total_collateral, pool.max_utilization_bps)?;
+        let position_limit = calculate_bps_limit(total_collateral, pool.max_position_bps)?;
+        let locked_after = pool
+            .locked_collateral
+            .checked_add(quote.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            locked_after <= utilization_limit,
+            VsolError::PoolUtilizationExceeded
+        );
+        require!(
+            quote.max_payout <= position_limit,
+            VsolError::PoolPositionLimitExceeded
+        );
+        require!(
+            ctx.accounts.pool_token.amount >= quote.max_payout,
+            VsolError::InsufficientWriterLiquidity
+        );
+
+        transfer_checked(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.buyer_source.to_account_info(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.buyer.to_account_info(),
+            quote.premium,
+            ctx.accounts.settlement_mint.decimals,
+        )?;
+        let settlement_mint_key = ctx.accounts.settlement_mint.key();
+        let pool_seeds: &[&[u8]] = &[
+            POOL_SEED,
+            config_key.as_ref(),
+            settlement_mint_key.as_ref(),
+            pool.pool_id.as_ref(),
+            &[pool.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.pool_token.to_account_info(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.pool.to_account_info(),
+            quote.max_payout,
+            ctx.accounts.settlement_mint.decimals,
+            pool_seeds,
+        )?;
+        ctx.accounts.position_vault.reload()?;
+        let expected_escrow = quote
+            .premium
+            .checked_add(quote.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            ctx.accounts.position_vault.amount == expected_escrow,
+            VsolError::CollateralMismatch
+        );
+
+        let record = &mut ctx.accounts.nonce_record;
+        record.bump = ctx.bumps.nonce_record;
+        record.status = NonceStatus::Filled as u8;
+        record.pool = pool_key;
+        record.quote_authority = authority_key;
+        record.nonce = quote.nonce;
+        record.position = ctx.accounts.position.key();
+
+        let position = &mut ctx.accounts.position;
+        position.bump = ctx.bumps.position;
+        position.vault_bump = ctx.bumps.position_vault;
+        position.status = PositionStatus::Open as u8;
+        position.direction = quote.direction;
+        position.pool = pool_key;
+        position.market = market_key;
+        position.nonce_record = record.key();
+        position.buyer = buyer_key;
+        position.quote_authority = authority_key;
+        position.settlement_mint = settlement_mint_key;
+        position.nonce = quote.nonce;
+        position.strike = quote.strike;
+        position.width = quote.width;
+        position.premium = quote.premium;
+        position.max_payout = quote.max_payout;
+        position.fee_bps = config.fee_bps;
+        position.opened_at = now;
+        position.quote_expiry = quote.quote_expiry;
+
+        ctx.accounts.pool.locked_collateral = locked_after;
+        ctx.accounts.pool.open_positions = ctx
+            .accounts
+            .pool
+            .open_positions
+            .checked_add(1)
+            .ok_or(VsolError::MathOverflow)?;
+        emit!(PoolQuoteFilled {
+            position: position.key(),
+            pool: pool_key,
+            market: market_key,
+            buyer: buyer_key,
+            quote_authority: authority_key,
+            nonce: quote.nonce,
+            premium: quote.premium,
+            max_payout: quote.max_payout,
+        });
+        Ok(())
+    }
+
+    pub fn settle_pool_position(ctx: Context<SettlePoolPosition>) -> Result<()> {
+        let position = &ctx.accounts.position;
+        let market = &ctx.accounts.market;
+        let oracle = &ctx.accounts.oracle;
+        require!(
+            position.status == PositionStatus::Open as u8,
+            VsolError::PositionNotOpen
+        );
+        require!(oracle.finalized, VsolError::OracleNotFinalized);
+        require!(
+            Clock::get()?.unix_timestamp >= market.expiry,
+            VsolError::MarketNotExpired
+        );
+        let payout = calculate_payout(
+            position.direction,
+            position.strike,
+            position.width,
+            oracle.price,
+            position.max_payout,
+        )?;
+        let fee = calculate_fee(position.premium, position.fee_bps)?;
+        let pool_amount = position
+            .max_payout
+            .checked_sub(payout)
+            .and_then(|value| value.checked_add(position.premium))
+            .and_then(|value| value.checked_sub(fee))
+            .ok_or(VsolError::MathOverflow)?;
+        let expected = position
+            .premium
+            .checked_add(position.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            payout
+                .checked_add(pool_amount)
+                .and_then(|value| value.checked_add(fee))
+                == Some(expected)
+                && ctx.accounts.position_vault.amount == expected,
+            VsolError::CollateralMismatch
+        );
+
+        ctx.accounts.pool.locked_collateral = ctx
+            .accounts
+            .pool
+            .locked_collateral
+            .checked_sub(position.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.open_positions = ctx
+            .accounts
+            .pool
+            .open_positions
+            .checked_sub(1)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.cumulative_premium = ctx
+            .accounts
+            .pool
+            .cumulative_premium
+            .checked_add(position.premium)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.cumulative_payout = ctx
+            .accounts
+            .pool
+            .cumulative_payout
+            .checked_add(payout)
+            .ok_or(VsolError::MathOverflow)?;
+
+        let nonce_record_key = ctx.accounts.nonce_record.key();
+        let position_seeds: &[&[u8]] = &[
+            POOL_POSITION_SEED,
+            nonce_record_key.as_ref(),
+            &[position.bump],
+        ];
+        if payout > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.buyer_destination.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                payout,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        if pool_amount > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.pool_token.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                pool_amount,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        if fee > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.treasury_destination.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                fee,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        close_token_account(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.rent_recipient.to_account_info(),
+            ctx.accounts.position.to_account_info(),
+            position_seeds,
+        )?;
+        emit!(PoolPositionSettled {
+            position: position.key(),
+            pool: ctx.accounts.pool.key(),
+            settlement_price: oracle.price,
+            payout,
+            pool_amount,
+            fee,
+        });
+        Ok(())
+    }
+
+    pub fn refund_pool_position(ctx: Context<RefundPoolPosition>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let position = &ctx.accounts.position;
+        let market = &ctx.accounts.market;
+        require!(
+            position.status == PositionStatus::Open as u8,
+            VsolError::PositionNotOpen
+        );
+        require!(
+            !ctx.accounts.oracle.finalized,
+            VsolError::OracleAlreadyFinalized
+        );
+        let deadline = market
+            .expiry
+            .checked_add(i64::from(market.observation_window_seconds))
+            .and_then(|value| value.checked_add(i64::from(market.settlement_grace_seconds)))
+            .ok_or(VsolError::MathOverflow)?;
+        require!(now > deadline, VsolError::SettlementWindowOpen);
+        let expected = position
+            .premium
+            .checked_add(position.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            ctx.accounts.position_vault.amount == expected,
+            VsolError::CollateralMismatch
+        );
+        ctx.accounts.pool.locked_collateral = ctx
+            .accounts
+            .pool
+            .locked_collateral
+            .checked_sub(position.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.open_positions = ctx
+            .accounts
+            .pool
+            .open_positions
+            .checked_sub(1)
+            .ok_or(VsolError::MathOverflow)?;
+
+        let nonce_record_key = ctx.accounts.nonce_record.key();
+        let position_seeds: &[&[u8]] = &[
+            POOL_POSITION_SEED,
+            nonce_record_key.as_ref(),
+            &[position.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.buyer_destination.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.position.to_account_info(),
+            position.premium,
+            ctx.accounts.settlement_mint.decimals,
+            position_seeds,
+        )?;
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.pool_token.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.position.to_account_info(),
+            position.max_payout,
+            ctx.accounts.settlement_mint.decimals,
+            position_seeds,
+        )?;
+        close_token_account(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.rent_recipient.to_account_info(),
+            ctx.accounts.position.to_account_info(),
+            position_seeds,
+        )?;
+        emit!(PoolPositionRefunded {
+            position: position.key(),
+            pool: ctx.accounts.pool.key(),
+            premium: position.premium,
+            collateral: position.max_payout,
+        });
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -763,6 +1415,38 @@ pub struct QuoteArgs {
     pub quote_expiry: i64,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitializeLiquidityPoolArgs {
+    pub pool_id: [u8; 32],
+    pub quote_authority: Pubkey,
+    pub max_utilization_bps: u16,
+    pub max_position_bps: u16,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetLiquidityPoolMarketArgs {
+    pub last_trade_at: i64,
+    pub enabled: bool,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateLiquidityPoolArgs {
+    pub quote_authority: Pubkey,
+    pub max_utilization_bps: u16,
+    pub max_position_bps: u16,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolQuoteArgs {
+    pub nonce: u64,
+    pub direction: u8,
+    pub strike: u64,
+    pub width: u64,
+    pub premium: u64,
+    pub max_payout: u64,
+    pub quote_expiry: i64,
+}
+
 #[derive(Accounts)]
 pub struct InitializeConfig<'info> {
     #[account(mut)]
@@ -797,12 +1481,12 @@ pub struct SetPause<'info> {
 #[instruction(args: CreateMarketArgs)]
 pub struct CreateMarket<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ VsolError::Unauthorized)]
+    pub creator: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    #[account(init, payer = admin, space = 8 + Market::INIT_SPACE, seeds = [MARKET_SEED, config.key().as_ref(), args.market_id.as_ref()], bump)]
+    #[account(init, payer = creator, space = 8 + Market::INIT_SPACE, seeds = [MARKET_SEED, config.key().as_ref(), args.market_id.as_ref()], bump)]
     pub market: Account<'info, Market>,
-    #[account(init, payer = admin, space = 8 + SettlementOracle::INIT_SPACE, seeds = [ORACLE_SEED, market.key().as_ref()], bump)]
+    #[account(init, payer = creator, space = 8 + SettlementOracle::INIT_SPACE, seeds = [ORACLE_SEED, market.key().as_ref()], bump)]
     pub oracle: Account<'info, SettlementOracle>,
     pub settlement_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
@@ -985,6 +1669,177 @@ pub struct RefundUnsettled<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+#[instruction(args: InitializeLiquidityPoolArgs)]
+pub struct InitializeLiquidityPool<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    pub settlement_mint: Account<'info, Mint>,
+    #[account(init, payer = creator, space = 8 + LiquidityPool::INIT_SPACE, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), args.pool_id.as_ref()], bump)]
+    pub pool: Account<'info, LiquidityPool>,
+    #[account(init, payer = creator, token::mint = settlement_mint, token::authority = pool, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump)]
+    pub pool_token: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+#[instruction(args: SetLiquidityPoolMarketArgs)]
+pub struct SetLiquidityPoolMarket<'info> {
+    #[account(mut)]
+    pub manager: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(seeds = [POOL_SEED, config.key().as_ref(), pool.settlement_mint.as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = manager @ VsolError::Unauthorized)]
+    pub pool: Account<'info, LiquidityPool>,
+    #[account(has_one = config @ VsolError::InvalidMarket)]
+    pub market: Account<'info, Market>,
+    #[account(init_if_needed, payer = manager, space = 8 + LiquidityPoolMarket::INIT_SPACE, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump)]
+    pub pool_market: Account<'info, LiquidityPoolMarket>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateLiquidityPool<'info> {
+    pub manager: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), pool.settlement_mint.as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = manager @ VsolError::Unauthorized)]
+    pub pool: Account<'info, LiquidityPool>,
+}
+
+#[derive(Accounts)]
+pub struct DepositLiquidity<'info> {
+    #[account(mut)]
+    pub provider: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = provider, space = 8 + LiquidityProvider::INIT_SPACE, seeds = [PROVIDER_SEED, pool.key().as_ref(), provider.key().as_ref()], bump)]
+    pub provider_position: Box<Account<'info, LiquidityProvider>>,
+    #[account(mut, token::mint = settlement_mint, token::authority = provider)]
+    pub provider_source: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawLiquidity<'info> {
+    pub provider: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [PROVIDER_SEED, pool.key().as_ref(), provider.key().as_ref()], bump = provider_position.bump, has_one = pool, constraint = provider_position.owner == provider.key() @ VsolError::Unauthorized)]
+    pub provider_position: Box<Account<'info, LiquidityProvider>>,
+    #[account(mut, token::mint = settlement_mint, token::authority = provider)]
+    pub provider_destination: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(quote: PoolQuoteArgs)]
+pub struct FillPoolQuote<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    /// CHECK: Authenticated by the immediately preceding Ed25519 instruction.
+    pub quote_authority: UncheckedAccount<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint, constraint = pool.quote_authority == quote_authority.key() @ VsolError::Unauthorized)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump = pool_market.bump, has_one = pool, has_one = market)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, token::authority = buyer)]
+    pub buyer_source: Box<Account<'info, TokenAccount>>,
+    #[account(init, payer = buyer, space = 8 + PoolQuoteNonce::INIT_SPACE, seeds = [POOL_NONCE_SEED, pool.key().as_ref(), quote_authority.key().as_ref(), quote.nonce.to_le_bytes().as_ref()], bump)]
+    pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
+    #[account(init, payer = buyer, space = 8 + PoolPosition::INIT_SPACE, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump)]
+    pub position: Box<Account<'info, PoolPosition>>,
+    #[account(init, payer = buyer, token::mint = settlement_mint, token::authority = position, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump)]
+    pub position_vault: Box<Account<'info, TokenAccount>>,
+    pub eligibility: Option<Box<Account<'info, Eligibility>>>,
+    /// CHECK: Address-constrained to the transaction instructions sysvar.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct SettlePoolPosition<'info> {
+    pub cranker: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
+    #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
+    pub position: Box<Account<'info, PoolPosition>>,
+    #[account(mut, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
+    pub position_vault: Box<Account<'info, TokenAccount>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, token::mint = settlement_mint, constraint = buyer_destination.owner == position.buyer @ VsolError::InvalidDestination)]
+    pub buyer_destination: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
+    pub treasury_destination: Box<Account<'info, TokenAccount>>,
+    /// CHECK: Receives rent and must be the buyer stored in the position.
+    #[account(mut, address = position.buyer)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RefundPoolPosition<'info> {
+    pub cranker: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
+    #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
+    pub position: Box<Account<'info, PoolPosition>>,
+    #[account(mut, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
+    pub position_vault: Box<Account<'info, TokenAccount>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, token::mint = settlement_mint, constraint = buyer_destination.owner == position.buyer @ VsolError::InvalidDestination)]
+    pub buyer_destination: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    /// CHECK: Receives rent and must be the buyer stored in the position.
+    #[account(mut, address = position.buyer)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
@@ -1020,6 +1875,8 @@ pub struct Market {
     pub pyth_feed_id: [u8; 32],
     pub settlement_decimals: u8,
     pub enabled: bool,
+    // Appended after launch: keep at the end so existing byte offsets stay valid.
+    pub creator: Pubkey,
 }
 
 #[account]
@@ -1090,6 +1947,81 @@ pub struct Eligibility {
     pub expires_at: i64,
 }
 
+#[account]
+#[derive(InitSpace)]
+pub struct LiquidityPool {
+    pub bump: u8,
+    pub token_bump: u8,
+    pub config: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub quote_authority: Pubkey,
+    pub pool_id: [u8; 32],
+    pub total_shares: u64,
+    pub locked_collateral: u64,
+    pub open_positions: u64,
+    pub cumulative_premium: u64,
+    pub cumulative_payout: u64,
+    pub max_utilization_bps: u16,
+    pub max_position_bps: u16,
+    // Appended after launch: keep at the end so existing byte offsets stay valid.
+    pub manager: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct LiquidityProvider {
+    pub bump: u8,
+    pub pool: Pubkey,
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub total_deposited: u64,
+    pub total_withdrawn: u64,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct LiquidityPoolMarket {
+    pub bump: u8,
+    pub pool: Pubkey,
+    pub market: Pubkey,
+    pub last_trade_at: i64,
+    pub enabled: bool,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PoolQuoteNonce {
+    pub bump: u8,
+    pub status: u8,
+    pub pool: Pubkey,
+    pub quote_authority: Pubkey,
+    pub nonce: u64,
+    pub position: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PoolPosition {
+    pub bump: u8,
+    pub vault_bump: u8,
+    pub status: u8,
+    pub direction: u8,
+    pub pool: Pubkey,
+    pub market: Pubkey,
+    pub nonce_record: Pubkey,
+    pub buyer: Pubkey,
+    pub quote_authority: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub nonce: u64,
+    pub strike: u64,
+    pub width: u64,
+    pub premium: u64,
+    pub max_payout: u64,
+    pub fee_bps: u16,
+    pub opened_at: i64,
+    pub quote_expiry: i64,
+}
+
 #[repr(u8)]
 pub enum Direction {
     Up = 0,
@@ -1147,6 +2079,7 @@ pub struct MarketCreated {
     pub market_id: [u8; 32],
     pub expiry: i64,
     pub settlement_mint: Pubkey,
+    pub creator: Pubkey,
 }
 #[event]
 pub struct MarketEnabled {
@@ -1214,6 +2147,76 @@ pub struct PositionRefunded {
     pub collateral: u64,
 }
 
+#[event]
+pub struct LiquidityPoolInitialized {
+    pub pool: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub quote_authority: Pubkey,
+    pub manager: Pubkey,
+}
+
+#[event]
+pub struct LiquidityPoolUpdated {
+    pub pool: Pubkey,
+    pub quote_authority: Pubkey,
+    pub max_utilization_bps: u16,
+    pub max_position_bps: u16,
+}
+
+#[event]
+pub struct LiquidityPoolMarketUpdated {
+    pub pool: Pubkey,
+    pub market: Pubkey,
+    pub last_trade_at: i64,
+    pub enabled: bool,
+}
+
+#[event]
+pub struct LiquidityDeposited {
+    pub pool: Pubkey,
+    pub provider: Pubkey,
+    pub amount: u64,
+    pub shares: u64,
+}
+
+#[event]
+pub struct LiquidityWithdrawn {
+    pub pool: Pubkey,
+    pub provider: Pubkey,
+    pub amount: u64,
+    pub shares: u64,
+}
+
+#[event]
+pub struct PoolQuoteFilled {
+    pub position: Pubkey,
+    pub pool: Pubkey,
+    pub market: Pubkey,
+    pub buyer: Pubkey,
+    pub quote_authority: Pubkey,
+    pub nonce: u64,
+    pub premium: u64,
+    pub max_payout: u64,
+}
+
+#[event]
+pub struct PoolPositionSettled {
+    pub position: Pubkey,
+    pub pool: Pubkey,
+    pub settlement_price: u64,
+    pub payout: u64,
+    pub pool_amount: u64,
+    pub fee: u64,
+}
+
+#[event]
+pub struct PoolPositionRefunded {
+    pub position: Pubkey,
+    pub pool: Pubkey,
+    pub premium: u64,
+    pub collateral: u64,
+}
+
 #[error_code]
 pub enum VsolError {
     #[msg("The protocol is paused.")]
@@ -1244,6 +2247,8 @@ pub enum VsolError {
     InvalidPythExponent,
     #[msg("The underlying mint cannot be the default public key.")]
     InvalidUnderlyingMint,
+    #[msg("The market id does not match the deterministic hash of its parameters.")]
+    InvalidMarketId,
     #[msg("The amount must be positive.")]
     InvalidAmount,
     #[msg("The payout width must be positive.")]
@@ -1302,6 +2307,58 @@ pub enum VsolError {
     InvalidNonce,
     #[msg("A settlement destination token account is invalid.")]
     InvalidDestination,
+    #[msg("The liquidity pool has active collateral obligations.")]
+    PoolHasOpenPositions,
+    #[msg("The liquidity pool share amount is invalid.")]
+    InvalidPoolShares,
+    #[msg("The liquidity pool has no assets backing outstanding shares.")]
+    PoolInsolvent,
+    #[msg("The deposit or withdrawal is too small after conservative rounding.")]
+    DepositTooSmall,
+    #[msg("The requested minimum output was not met.")]
+    SlippageExceeded,
+    #[msg("The transaction deadline has expired.")]
+    DeadlineExpired,
+    #[msg("The liquidity pool risk limits are invalid.")]
+    InvalidPoolRiskLimits,
+    #[msg("The liquidity pool is not enabled for this market.")]
+    PoolMarketDisabled,
+    #[msg("The market's last-trade cutoff is invalid.")]
+    InvalidLastTradeCutoff,
+    #[msg("The market's last-trade cutoff has been reached.")]
+    LastTradeCutoffReached,
+    #[msg("The liquidity pool utilization limit would be exceeded.")]
+    PoolUtilizationExceeded,
+    #[msg("The position exceeds the liquidity pool's per-position risk limit.")]
+    PoolPositionLimitExceeded,
+}
+
+/// Deterministic market id: identical series parameters bind to one PDA, so
+/// factory creation cannot fragment the same market across duplicate accounts.
+fn expected_market_id(args: &CreateMarketArgs, settlement_mint: Pubkey) -> [u8; 32] {
+    solana_sha256_hasher::hashv(&[
+        MARKET_ID_DOMAIN,
+        &args.pyth_feed_id,
+        settlement_mint.as_ref(),
+        &args.expiry.to_le_bytes(),
+        &args.observation_window_seconds.to_le_bytes(),
+        &args.settlement_grace_seconds.to_le_bytes(),
+        &args.price_scale.to_le_bytes(),
+        &args.max_confidence_bps.to_le_bytes(),
+        &args.symbol,
+    ])
+    .to_bytes()
+}
+
+fn validate_pool_risk_limits(max_utilization_bps: u16, max_position_bps: u16) -> Result<()> {
+    require!(
+        max_utilization_bps > 0
+            && u64::from(max_utilization_bps) <= BPS_DENOMINATOR
+            && max_position_bps > 0
+            && max_position_bps <= max_utilization_bps,
+        VsolError::InvalidPoolRiskLimits
+    );
+    Ok(())
 }
 
 fn normalize_pyth_price(price: PythPrice, target_scale: u64) -> Result<(u64, u64)> {
@@ -1456,5 +2513,97 @@ mod oracle_tests {
         assert!(normalize_pyth_price(price(0, 1, -5), 1_000_000).is_err());
         assert!(normalize_pyth_price(price(1, 1, -19), 1_000_000).is_err());
         assert!(normalize_pyth_price(price(i64::MAX, 1, 18), u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+    }
+
+    fn fixture_symbol() -> [u8; 16] {
+        let mut symbol = [0u8; 16];
+        symbol[..4].copy_from_slice(b"NVDA");
+        symbol
+    }
+
+    fn fixture_args(market_id: [u8; 32]) -> CreateMarketArgs {
+        CreateMarketArgs {
+            market_id,
+            underlying_mint: Pubkey::new_from_array([0x33; 32]),
+            symbol: fixture_symbol(),
+            price_scale: 1_000_000,
+            expiry: 1_800_000_000,
+            observation_window_seconds: 30,
+            settlement_grace_seconds: 900,
+            max_confidence_bps: 100,
+            pyth_feed_id: [0x11; 32],
+        }
+    }
+
+    fn fixture_settlement_mint() -> Pubkey {
+        Pubkey::new_from_array([0x22; 32])
+    }
+
+    #[test]
+    fn market_id_hash_matches_the_pinned_known_answer_vector() {
+        let args = fixture_args([0u8; 32]);
+        let id = expected_market_id(&args, fixture_settlement_mint());
+        assert_eq!(
+            to_hex(&id),
+            "454b66775586fcd0389db454f7c7d4950405060ecc5a6fc9761fda8413aad3e1"
+        );
+    }
+
+    #[test]
+    fn market_id_hash_binds_every_parameter() {
+        let base = fixture_args([0u8; 32]);
+        let mint = fixture_settlement_mint();
+        let base_id = expected_market_id(&base, mint);
+
+        let mut different_expiry = base;
+        different_expiry.expiry += 1;
+        assert_ne!(expected_market_id(&different_expiry, mint), base_id);
+
+        let mut different_window = base;
+        different_window.observation_window_seconds += 1;
+        assert_ne!(expected_market_id(&different_window, mint), base_id);
+
+        let mut different_grace = base;
+        different_grace.settlement_grace_seconds += 1;
+        assert_ne!(expected_market_id(&different_grace, mint), base_id);
+
+        let mut different_scale = base;
+        different_scale.price_scale += 1;
+        assert_ne!(expected_market_id(&different_scale, mint), base_id);
+
+        let mut different_confidence = base;
+        different_confidence.max_confidence_bps += 1;
+        assert_ne!(expected_market_id(&different_confidence, mint), base_id);
+
+        let mut different_symbol = base;
+        different_symbol.symbol[15] = 1;
+        assert_ne!(expected_market_id(&different_symbol, mint), base_id);
+
+        let mut different_feed = base;
+        different_feed.pyth_feed_id[0] ^= 0xff;
+        assert_ne!(expected_market_id(&different_feed, mint), base_id);
+
+        let different_mint = Pubkey::new_from_array([0x44; 32]);
+        assert_ne!(expected_market_id(&base, different_mint), base_id);
+    }
+
+    #[test]
+    fn a_wrong_market_id_fails_the_equality_check() {
+        let mint = fixture_settlement_mint();
+        let correct_id = expected_market_id(&fixture_args([0u8; 32]), mint);
+        let args_with_wrong_id = fixture_args([0xffu8; 32]);
+        assert_ne!(args_with_wrong_id.market_id, correct_id);
+
+        let args_with_correct_id = fixture_args(correct_id);
+        assert_eq!(args_with_correct_id.market_id, correct_id);
     }
 }

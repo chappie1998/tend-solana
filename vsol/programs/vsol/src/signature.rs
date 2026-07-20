@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use solana_instructions_sysvar as instructions;
 
-use crate::{QuoteArgs, VsolError, QUOTE_DOMAIN};
+use crate::{PoolQuoteArgs, QuoteArgs, VsolError, POOL_QUOTE_DOMAIN, QUOTE_DOMAIN};
 
 const ED25519_HEADER_LEN: usize = solana_ed25519_program::DATA_START;
 const CURRENT_INSTRUCTION: u16 = u16::MAX;
@@ -12,6 +12,15 @@ pub struct QuoteMessageContext<'a> {
     pub market: &'a Pubkey,
     pub buyer: &'a Pubkey,
     pub maker: &'a Pubkey,
+}
+
+pub struct PoolQuoteMessageContext<'a> {
+    pub program_id: &'a Pubkey,
+    pub config: &'a Pubkey,
+    pub pool: &'a Pubkey,
+    pub market: &'a Pubkey,
+    pub buyer: &'a Pubkey,
+    pub quote_authority: &'a Pubkey,
 }
 
 pub fn quote_message(
@@ -29,6 +38,32 @@ pub fn quote_message(
     message.extend_from_slice(context.market.as_ref());
     message.extend_from_slice(context.buyer.as_ref());
     message.extend_from_slice(context.maker.as_ref());
+    message.extend_from_slice(&quote.nonce.to_le_bytes());
+    message.push(quote.direction);
+    message.extend_from_slice(&quote.strike.to_le_bytes());
+    message.extend_from_slice(&quote.width.to_le_bytes());
+    message.extend_from_slice(&quote.premium.to_le_bytes());
+    message.extend_from_slice(&quote.max_payout.to_le_bytes());
+    message.extend_from_slice(&quote.quote_expiry.to_le_bytes());
+    message
+}
+
+pub fn pool_quote_message(
+    domain_separator: &[u8; 32],
+    domain_version: u16,
+    context: &PoolQuoteMessageContext<'_>,
+    quote: &PoolQuoteArgs,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(283);
+    message.extend_from_slice(POOL_QUOTE_DOMAIN);
+    message.extend_from_slice(domain_separator);
+    message.extend_from_slice(&domain_version.to_le_bytes());
+    message.extend_from_slice(context.program_id.as_ref());
+    message.extend_from_slice(context.config.as_ref());
+    message.extend_from_slice(context.pool.as_ref());
+    message.extend_from_slice(context.market.as_ref());
+    message.extend_from_slice(context.buyer.as_ref());
+    message.extend_from_slice(context.quote_authority.as_ref());
     message.extend_from_slice(&quote.nonce.to_le_bytes());
     message.push(quote.direction);
     message.extend_from_slice(&quote.strike.to_le_bytes());
@@ -151,5 +186,29 @@ mod tests {
         let message = quote_message(&[9u8; 32], 1, &context, &quote);
         assert_eq!(&message[..QUOTE_DOMAIN.len()], QUOTE_DOMAIN);
         assert_eq!(message.len(), 251);
+    }
+
+    #[test]
+    fn pool_quote_binds_pool_and_authority() {
+        let quote = PoolQuoteArgs {
+            nonce: 8,
+            direction: 1,
+            strike: 100_000_000,
+            width: 20_000_000,
+            premium: 1_000_000,
+            max_payout: 5_000_000,
+            quote_expiry: 1_900_000_000,
+        };
+        let context = PoolQuoteMessageContext {
+            program_id: &crate::ID,
+            config: &Pubkey::new_unique(),
+            pool: &Pubkey::new_unique(),
+            market: &Pubkey::new_unique(),
+            buyer: &Pubkey::new_unique(),
+            quote_authority: &Pubkey::new_unique(),
+        };
+        let message = pool_quote_message(&[3u8; 32], 2, &context, &quote);
+        assert_eq!(&message[..POOL_QUOTE_DOMAIN.len()], POOL_QUOTE_DOMAIN);
+        assert_eq!(message.len(), 283);
     }
 }

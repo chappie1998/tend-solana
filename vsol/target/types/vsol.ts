@@ -144,12 +144,9 @@ export type Vsol = {
       ],
       "accounts": [
         {
-          "name": "admin",
+          "name": "creator",
           "writable": true,
-          "signer": true,
-          "relations": [
-            "config"
-          ]
+          "signer": true
         },
         {
           "name": "config",
@@ -239,6 +236,165 @@ export type Vsol = {
               "name": "createMarketArgs"
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "depositLiquidity",
+      "discriminator": [
+        245,
+        99,
+        59,
+        25,
+        151,
+        71,
+        233,
+        249
+      ],
+      "accounts": [
+        {
+          "name": "provider",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "providerPosition",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  118,
+                  105,
+                  100,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              },
+              {
+                "kind": "account",
+                "path": "provider"
+              }
+            ]
+          }
+        },
+        {
+          "name": "providerSource",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "minSharesOut",
+          "type": "u64"
+        },
+        {
+          "name": "deadline",
+          "type": "i64"
         }
       ]
     },
@@ -347,6 +503,290 @@ export type Vsol = {
         {
           "name": "amount",
           "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "fillPoolQuote",
+      "discriminator": [
+        127,
+        177,
+        61,
+        41,
+        158,
+        164,
+        240,
+        162
+      ],
+      "accounts": [
+        {
+          "name": "buyer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "quoteAuthority"
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          },
+          "relations": [
+            "poolMarket"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "poolMarket"
+          ]
+        },
+        {
+          "name": "poolMarket",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "buyerSource",
+          "writable": true
+        },
+        {
+          "name": "nonceRecord",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  110,
+                  111,
+                  110,
+                  99,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              },
+              {
+                "kind": "account",
+                "path": "quoteAuthority"
+              },
+              {
+                "kind": "arg",
+                "path": "quote.nonce"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "nonceRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "positionVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "eligibility",
+          "optional": true
+        },
+        {
+          "name": "instructionsSysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "quote",
+          "type": {
+            "defined": {
+              "name": "poolQuoteArgs"
+            }
+          }
         }
       ]
     },
@@ -638,6 +1078,125 @@ export type Vsol = {
       ]
     },
     {
+      "name": "initializeLiquidityPool",
+      "discriminator": [
+        155,
+        18,
+        138,
+        107,
+        111,
+        23,
+        178,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "creator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "settlementMint"
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "arg",
+                "path": "args.pool_id"
+              }
+            ]
+          }
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "initializeLiquidityPoolArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "initializeWriterVault",
       "discriminator": [
         64,
@@ -874,6 +1433,232 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "refundPoolPosition",
+      "discriminator": [
+        45,
+        46,
+        150,
+        218,
+        231,
+        109,
+        150,
+        242
+      ],
+      "accounts": [
+        {
+          "name": "cranker",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle",
+            "position"
+          ]
+        },
+        {
+          "name": "oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "nonceRecord",
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "nonceRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "positionVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool",
+            "market",
+            "position"
+          ]
+        },
+        {
+          "name": "buyerDestination",
+          "writable": true
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "rentRecipient",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "refundUnsettled",
       "discriminator": [
         24,
@@ -1098,6 +1883,130 @@ export type Vsol = {
         {
           "name": "expiresAt",
           "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "setLiquidityPoolMarket",
+      "discriminator": [
+        251,
+        195,
+        253,
+        78,
+        124,
+        209,
+        8,
+        155
+      ],
+      "accounts": [
+        {
+          "name": "manager",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "pool.settlement_mint",
+                "account": "liquidityPool"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "poolMarket",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "setLiquidityPoolMarketArgs"
+            }
+          }
         }
       ]
     },
@@ -1364,6 +2273,236 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "settlePoolPosition",
+      "discriminator": [
+        164,
+        179,
+        145,
+        132,
+        164,
+        176,
+        104,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "cranker",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle",
+            "position"
+          ]
+        },
+        {
+          "name": "oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "nonceRecord",
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "nonceRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "positionVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool",
+            "market",
+            "position"
+          ]
+        },
+        {
+          "name": "buyerDestination",
+          "writable": true
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasuryDestination",
+          "writable": true
+        },
+        {
+          "name": "rentRecipient",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "updateConfig",
       "discriminator": [
         29,
@@ -1411,6 +2550,247 @@ export type Vsol = {
               "name": "updateConfigArgs"
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "updateLiquidityPool",
+      "discriminator": [
+        255,
+        60,
+        178,
+        169,
+        154,
+        62,
+        55,
+        243
+      ],
+      "accounts": [
+        {
+          "name": "manager",
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "pool.settlement_mint",
+                "account": "liquidityPool"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "updateLiquidityPoolArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "withdrawLiquidity",
+      "discriminator": [
+        149,
+        158,
+        33,
+        185,
+        47,
+        243,
+        253,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "provider",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          },
+          "relations": [
+            "providerPosition"
+          ]
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "providerPosition",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  118,
+                  105,
+                  100,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              },
+              {
+                "kind": "account",
+                "path": "provider"
+              }
+            ]
+          }
+        },
+        {
+          "name": "providerDestination",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "shares",
+          "type": "u64"
+        },
+        {
+          "name": "minAmountOut",
+          "type": "u64"
+        },
+        {
+          "name": "deadline",
+          "type": "i64"
         }
       ]
     },
@@ -1550,6 +2930,45 @@ export type Vsol = {
       ]
     },
     {
+      "name": "liquidityPool",
+      "discriminator": [
+        66,
+        38,
+        17,
+        64,
+        188,
+        80,
+        68,
+        129
+      ]
+    },
+    {
+      "name": "liquidityPoolMarket",
+      "discriminator": [
+        38,
+        196,
+        188,
+        199,
+        242,
+        89,
+        154,
+        113
+      ]
+    },
+    {
+      "name": "liquidityProvider",
+      "discriminator": [
+        219,
+        241,
+        238,
+        133,
+        56,
+        225,
+        229,
+        191
+      ]
+    },
+    {
       "name": "market",
       "discriminator": [
         219,
@@ -1560,6 +2979,32 @@ export type Vsol = {
         227,
         198,
         154
+      ]
+    },
+    {
+      "name": "poolPosition",
+      "discriminator": [
+        246,
+        13,
+        238,
+        156,
+        119,
+        129,
+        253,
+        135
+      ]
+    },
+    {
+      "name": "poolQuoteNonce",
+      "discriminator": [
+        24,
+        11,
+        175,
+        255,
+        135,
+        37,
+        170,
+        6
       ]
     },
     {
@@ -1682,6 +3127,71 @@ export type Vsol = {
       ]
     },
     {
+      "name": "liquidityDeposited",
+      "discriminator": [
+        218,
+        155,
+        74,
+        193,
+        59,
+        66,
+        94,
+        122
+      ]
+    },
+    {
+      "name": "liquidityPoolInitialized",
+      "discriminator": [
+        116,
+        81,
+        252,
+        86,
+        124,
+        191,
+        134,
+        172
+      ]
+    },
+    {
+      "name": "liquidityPoolMarketUpdated",
+      "discriminator": [
+        149,
+        60,
+        78,
+        15,
+        27,
+        254,
+        225,
+        36
+      ]
+    },
+    {
+      "name": "liquidityPoolUpdated",
+      "discriminator": [
+        127,
+        207,
+        196,
+        210,
+        214,
+        37,
+        235,
+        177
+      ]
+    },
+    {
+      "name": "liquidityWithdrawn",
+      "discriminator": [
+        240,
+        120,
+        73,
+        139,
+        154,
+        31,
+        218,
+        68
+      ]
+    },
+    {
       "name": "marketCreated",
       "discriminator": [
         88,
@@ -1731,6 +3241,45 @@ export type Vsol = {
         103,
         90,
         105
+      ]
+    },
+    {
+      "name": "poolPositionRefunded",
+      "discriminator": [
+        25,
+        37,
+        54,
+        232,
+        212,
+        43,
+        5,
+        170
+      ]
+    },
+    {
+      "name": "poolPositionSettled",
+      "discriminator": [
+        38,
+        126,
+        128,
+        22,
+        65,
+        214,
+        86,
+        111
+      ]
+    },
+    {
+      "name": "poolQuoteFilled",
+      "discriminator": [
+        251,
+        24,
+        254,
+        231,
+        157,
+        75,
+        172,
+        26
       ]
     },
     {
@@ -1898,148 +3447,213 @@ export type Vsol = {
     },
     {
       "code": 6014,
+      "name": "invalidMarketId",
+      "msg": "The market id does not match the deterministic hash of its parameters."
+    },
+    {
+      "code": 6015,
       "name": "invalidAmount",
       "msg": "The amount must be positive."
     },
     {
-      "code": 6015,
+      "code": 6016,
       "name": "invalidWidth",
       "msg": "The payout width must be positive."
     },
     {
-      "code": 6016,
+      "code": 6017,
       "name": "invalidDirection",
       "msg": "The direction must be up or down."
     },
     {
-      "code": 6017,
+      "code": 6018,
       "name": "mathOverflow",
       "msg": "A checked arithmetic operation failed."
     },
     {
-      "code": 6018,
+      "code": 6019,
       "name": "marketDisabled",
       "msg": "The market is disabled."
     },
     {
-      "code": 6019,
+      "code": 6020,
       "name": "marketExpired",
       "msg": "The market has expired."
     },
     {
-      "code": 6020,
+      "code": 6021,
       "name": "marketNotExpired",
       "msg": "The market has not expired."
     },
     {
-      "code": 6021,
+      "code": 6022,
       "name": "quoteExpired",
       "msg": "The maker quote has expired."
     },
     {
-      "code": 6022,
+      "code": 6023,
       "name": "missingMakerSignature",
       "msg": "The maker signature instruction is missing."
     },
     {
-      "code": 6023,
+      "code": 6024,
       "name": "invalidMakerSignature",
       "msg": "The maker signature or signed quote message is invalid."
     },
     {
-      "code": 6024,
+      "code": 6025,
       "name": "invalidWriterVault",
       "msg": "The writer vault is invalid."
     },
     {
-      "code": 6025,
+      "code": 6026,
       "name": "insufficientWriterLiquidity",
       "msg": "The writer does not have enough available collateral."
     },
     {
-      "code": 6026,
+      "code": 6027,
       "name": "collateralMismatch",
       "msg": "Escrow does not exactly equal premium plus maximum payout."
     },
     {
-      "code": 6027,
+      "code": 6028,
       "name": "eligibilityRequired",
       "msg": "An eligibility account is required."
     },
     {
-      "code": 6028,
+      "code": 6029,
       "name": "invalidEligibility",
       "msg": "The eligibility account is invalid."
     },
     {
-      "code": 6029,
+      "code": 6030,
       "name": "ineligibleWallet",
       "msg": "The wallet is not eligible to trade."
     },
     {
-      "code": 6030,
+      "code": 6031,
       "name": "invalidMarket",
       "msg": "The market account is invalid."
     },
     {
-      "code": 6031,
+      "code": 6032,
       "name": "invalidOracle",
       "msg": "The oracle account is invalid."
     },
     {
-      "code": 6032,
+      "code": 6033,
       "name": "oracleAlreadyFinalized",
       "msg": "The settlement oracle is already finalized."
     },
     {
-      "code": 6033,
+      "code": 6034,
       "name": "oracleNotFinalized",
       "msg": "The settlement oracle is not finalized."
     },
     {
-      "code": 6034,
+      "code": 6035,
       "name": "invalidOraclePrice",
       "msg": "The oracle price is invalid."
     },
     {
-      "code": 6035,
+      "code": 6036,
       "name": "invalidObservationTime",
       "msg": "The oracle observation timestamp is outside the approved window."
     },
     {
-      "code": 6036,
+      "code": 6037,
       "name": "settlementWindowClosed",
       "msg": "The settlement publication window is closed."
     },
     {
-      "code": 6037,
+      "code": 6038,
       "name": "oracleConfidenceTooWide",
       "msg": "The oracle confidence interval is too wide."
     },
     {
-      "code": 6038,
+      "code": 6039,
       "name": "settlementWindowOpen",
       "msg": "The settlement fallback window is still open."
     },
     {
-      "code": 6039,
+      "code": 6040,
       "name": "invalidPosition",
       "msg": "The position is invalid."
     },
     {
-      "code": 6040,
+      "code": 6041,
       "name": "positionNotOpen",
       "msg": "The position is not open."
     },
     {
-      "code": 6041,
+      "code": 6042,
       "name": "invalidNonce",
       "msg": "The quote nonce record is invalid."
     },
     {
-      "code": 6042,
+      "code": 6043,
       "name": "invalidDestination",
       "msg": "A settlement destination token account is invalid."
+    },
+    {
+      "code": 6044,
+      "name": "poolHasOpenPositions",
+      "msg": "The liquidity pool has active collateral obligations."
+    },
+    {
+      "code": 6045,
+      "name": "invalidPoolShares",
+      "msg": "The liquidity pool share amount is invalid."
+    },
+    {
+      "code": 6046,
+      "name": "poolInsolvent",
+      "msg": "The liquidity pool has no assets backing outstanding shares."
+    },
+    {
+      "code": 6047,
+      "name": "depositTooSmall",
+      "msg": "The deposit or withdrawal is too small after conservative rounding."
+    },
+    {
+      "code": 6048,
+      "name": "slippageExceeded",
+      "msg": "The requested minimum output was not met."
+    },
+    {
+      "code": 6049,
+      "name": "deadlineExpired",
+      "msg": "The transaction deadline has expired."
+    },
+    {
+      "code": 6050,
+      "name": "invalidPoolRiskLimits",
+      "msg": "The liquidity pool risk limits are invalid."
+    },
+    {
+      "code": 6051,
+      "name": "poolMarketDisabled",
+      "msg": "The liquidity pool is not enabled for this market."
+    },
+    {
+      "code": 6052,
+      "name": "invalidLastTradeCutoff",
+      "msg": "The market's last-trade cutoff is invalid."
+    },
+    {
+      "code": 6053,
+      "name": "lastTradeCutoffReached",
+      "msg": "The market's last-trade cutoff has been reached."
+    },
+    {
+      "code": 6054,
+      "name": "poolUtilizationExceeded",
+      "msg": "The liquidity pool utilization limit would be exceeded."
+    },
+    {
+      "code": 6055,
+      "name": "poolPositionLimitExceeded",
+      "msg": "The position exceeds the liquidity pool's per-position risk limit."
     }
   ],
   "types": [
@@ -2313,6 +3927,284 @@ export type Vsol = {
       }
     },
     {
+      "name": "initializeLiquidityPoolArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "poolId",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "maxPositionBps",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityDeposited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "provider",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPool",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "tokenBump",
+            "type": "u8"
+          },
+          {
+            "name": "config",
+            "type": "pubkey"
+          },
+          {
+            "name": "settlementMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "poolId",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "totalShares",
+            "type": "u64"
+          },
+          {
+            "name": "lockedCollateral",
+            "type": "u64"
+          },
+          {
+            "name": "openPositions",
+            "type": "u64"
+          },
+          {
+            "name": "cumulativePremium",
+            "type": "u64"
+          },
+          {
+            "name": "cumulativePayout",
+            "type": "u64"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "maxPositionBps",
+            "type": "u16"
+          },
+          {
+            "name": "manager",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolInitialized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "settlementMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "manager",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolMarket",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "lastTradeAt",
+            "type": "i64"
+          },
+          {
+            "name": "enabled",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolMarketUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "lastTradeAt",
+            "type": "i64"
+          },
+          {
+            "name": "enabled",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "maxPositionBps",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityProvider",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          },
+          {
+            "name": "totalDeposited",
+            "type": "u64"
+          },
+          {
+            "name": "totalWithdrawn",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "provider",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "market",
       "type": {
         "kind": "struct",
@@ -2391,6 +4283,10 @@ export type Vsol = {
           {
             "name": "enabled",
             "type": "bool"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
           }
         ]
       }
@@ -2419,6 +4315,10 @@ export type Vsol = {
           },
           {
             "name": "settlementMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
             "type": "pubkey"
           }
         ]
@@ -2464,6 +4364,250 @@ export type Vsol = {
           {
             "name": "paused",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolPosition",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "vaultBump",
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "type": "u8"
+          },
+          {
+            "name": "direction",
+            "type": "u8"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "nonceRecord",
+            "type": "pubkey"
+          },
+          {
+            "name": "buyer",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "settlementMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "type": "u64"
+          },
+          {
+            "name": "strike",
+            "type": "u64"
+          },
+          {
+            "name": "width",
+            "type": "u64"
+          },
+          {
+            "name": "premium",
+            "type": "u64"
+          },
+          {
+            "name": "maxPayout",
+            "type": "u64"
+          },
+          {
+            "name": "feeBps",
+            "type": "u16"
+          },
+          {
+            "name": "openedAt",
+            "type": "i64"
+          },
+          {
+            "name": "quoteExpiry",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolPositionRefunded",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "premium",
+            "type": "u64"
+          },
+          {
+            "name": "collateral",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolPositionSettled",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "settlementPrice",
+            "type": "u64"
+          },
+          {
+            "name": "payout",
+            "type": "u64"
+          },
+          {
+            "name": "poolAmount",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolQuoteArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "nonce",
+            "type": "u64"
+          },
+          {
+            "name": "direction",
+            "type": "u8"
+          },
+          {
+            "name": "strike",
+            "type": "u64"
+          },
+          {
+            "name": "width",
+            "type": "u64"
+          },
+          {
+            "name": "premium",
+            "type": "u64"
+          },
+          {
+            "name": "maxPayout",
+            "type": "u64"
+          },
+          {
+            "name": "quoteExpiry",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolQuoteFilled",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "buyer",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "type": "u64"
+          },
+          {
+            "name": "premium",
+            "type": "u64"
+          },
+          {
+            "name": "maxPayout",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolQuoteNonce",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "type": "u8"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "type": "u64"
+          },
+          {
+            "name": "position",
+            "type": "pubkey"
           }
         ]
       }
@@ -2697,6 +4841,22 @@ export type Vsol = {
       }
     },
     {
+      "name": "setLiquidityPoolMarketArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lastTradeAt",
+            "type": "i64"
+          },
+          {
+            "name": "enabled",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
       "name": "settlementOracle",
       "type": {
         "kind": "struct",
@@ -2814,6 +4974,26 @@ export type Vsol = {
           {
             "name": "eligibilityRequired",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "updateLiquidityPoolArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "quoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "maxPositionBps",
+            "type": "u16"
           }
         ]
       }

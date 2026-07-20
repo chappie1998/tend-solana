@@ -46,6 +46,49 @@ pub fn calculate_fee(premium: u64, fee_bps: u16) -> Result<u64> {
     u64::try_from(fee).map_err(|_| error!(VsolError::MathOverflow))
 }
 
+/// Mints pool shares conservatively. Deposits round down so a depositor cannot
+/// dilute existing liquidity providers through integer division.
+pub fn calculate_deposit_shares(amount: u64, total_shares: u64, total_assets: u64) -> Result<u64> {
+    require!(amount > 0, VsolError::InvalidAmount);
+    if total_shares == 0 {
+        return Ok(amount);
+    }
+    require!(total_assets > 0, VsolError::PoolInsolvent);
+    let shares = (amount as u128)
+        .checked_mul(total_shares as u128)
+        .ok_or(VsolError::MathOverflow)?
+        .checked_div(total_assets as u128)
+        .ok_or(VsolError::MathOverflow)?;
+    let shares = u64::try_from(shares).map_err(|_| error!(VsolError::MathOverflow))?;
+    require!(shares > 0, VsolError::DepositTooSmall);
+    Ok(shares)
+}
+
+/// Returns underlying assets conservatively. Withdrawals round down and leave
+/// any division dust in the pool for remaining providers.
+pub fn calculate_withdraw_amount(shares: u64, total_shares: u64, total_assets: u64) -> Result<u64> {
+    require!(shares > 0, VsolError::InvalidAmount);
+    require!(total_shares > 0, VsolError::InvalidPoolShares);
+    require!(shares <= total_shares, VsolError::InvalidPoolShares);
+    let amount = (shares as u128)
+        .checked_mul(total_assets as u128)
+        .ok_or(VsolError::MathOverflow)?
+        .checked_div(total_shares as u128)
+        .ok_or(VsolError::MathOverflow)?;
+    let amount = u64::try_from(amount).map_err(|_| error!(VsolError::MathOverflow))?;
+    require!(amount > 0, VsolError::DepositTooSmall);
+    Ok(amount)
+}
+
+pub fn calculate_bps_limit(amount: u64, bps: u16) -> Result<u64> {
+    let limit = (amount as u128)
+        .checked_mul(bps as u128)
+        .ok_or(VsolError::MathOverflow)?
+        .checked_div(BPS_DENOMINATOR as u128)
+        .ok_or(VsolError::MathOverflow)?;
+    u64::try_from(limit).map_err(|_| error!(VsolError::MathOverflow))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +108,16 @@ mod tests {
         assert_eq!(calculate_fee(1, 25).unwrap(), 1);
         assert_eq!(calculate_fee(10_000, 25).unwrap(), 25);
         assert_eq!(calculate_fee(10_000, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn pool_share_math_rounds_against_value_extraction() {
+        assert_eq!(calculate_deposit_shares(1_000, 0, 0).unwrap(), 1_000);
+        assert_eq!(calculate_deposit_shares(333, 1_000, 3_000).unwrap(), 111);
+        assert_eq!(calculate_withdraw_amount(111, 1_000, 3_001).unwrap(), 333);
+        assert!(calculate_deposit_shares(1, 1, u64::MAX).is_err());
+        assert!(calculate_deposit_shares(1, 1, 0).is_err());
+        assert_eq!(calculate_bps_limit(10_000, 7_500).unwrap(), 7_500);
     }
 
     proptest! {
