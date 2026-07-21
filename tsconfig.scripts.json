@@ -8,6 +8,7 @@
     "vsol/scripts/bootstrap.ts",
     "vsol/scripts/dev-rpc-proxy.ts",
     "vsol/scripts/http-flow-smoke.ts",
+    "vsol/scripts/keeper.ts",
     "vsol/scripts/verify-deployment.ts",
     "vsol/scripts/web-execution-smoke.ts",
     "vsol/sdk/**/*.ts",

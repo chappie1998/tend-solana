@@ -29,6 +29,7 @@ import {
 } from "@solana/web3.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
+import { rollingMarketSchedule, type SeriesCode } from "./lib/expiry-grid.ts";
 import {
   deriveConfig,
   deriveLiquidityPool,
@@ -84,7 +85,7 @@ const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
 const pythReceiverProgram = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 
 type MarketManifest = {
-  code: "15M" | "1H" | "EOD" | "7D" | "30D";
+  code: SeriesCode;
   address: string;
   oracle: string;
   expiry: number;
@@ -148,57 +149,11 @@ const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
 // (277 bytes through creator, +4 for the appended max_settlement_staleness_seconds
 // u32); accounts of any other size predate the upgrade and no longer deserialize.
 const MARKET_ACCOUNT_SIZE = 281;
-const DAY_SECONDS = 86_400;
 
 // Tend is a 24/7 protocol: there is no market calendar here. Rolling market
-// expiries are pure UTC clock boundaries, mirroring app/lib/expiries.ts.
-
-function nextFixedBoundary(nowSeconds: number, cadenceSeconds: number) {
-  // A fixed onchain series cannot give every entrant exactly the same
-  // duration. Select the first cadence boundary at least one full tenor in
-  // the future, matching app/lib/expiries.ts's nextFixedSeries.
-  return Math.ceil((nowSeconds + cadenceSeconds) / cadenceSeconds) * cadenceSeconds;
-}
-
-/** The next UTC midnight strictly after `target` — the daily settlement boundary. */
-function nextUtcMidnightAfter(target: number) {
-  const boundary = Math.ceil(target / DAY_SECONDS) * DAY_SECONDS;
-  return boundary > target ? boundary : boundary + DAY_SECONDS;
-}
-
-/**
- * Advances `candidate` by whole `stepSeconds` increments of its own cadence
- * until it is strictly greater than `floor`. This is how the grid guarantees
- * 15M < 1H < EOD < 7D < 30D for every possible `now`: each code's natural
- * boundary is computed independently, and only collapses onto (or behind) a
- * neighbor's boundary get nudged forward, on the same clean cadence the code
- * already uses. Market ids stay a pure parameter hash — mirrors
- * app/lib/expiries.ts's advanceUntilAfter exactly.
- */
-function advanceUntilAfter(candidate: number, floor: number, stepSeconds: number): number {
-  let value = candidate;
-  while (value <= floor) value += stepSeconds;
-  return value;
-}
-
-function rollingMarketSchedule(now: number): Array<{
-  code: MarketManifest["code"];
-  expiry: number;
-  lastTradeAt: number;
-}> {
-  const fifteen = nextFixedBoundary(now, 15 * 60);
-  const oneHour = advanceUntilAfter(nextFixedBoundary(now, 60 * 60), fifteen, 60 * 60);
-  const eod = advanceUntilAfter(nextUtcMidnightAfter(now), oneHour, DAY_SECONDS);
-  const seven = advanceUntilAfter(nextUtcMidnightAfter(now + 7 * DAY_SECONDS), eod, DAY_SECONDS);
-  const thirty = advanceUntilAfter(nextUtcMidnightAfter(now + 30 * DAY_SECONDS), seven, DAY_SECONDS);
-  return [
-    { code: "15M", expiry: fifteen, lastTradeAt: fifteen - 60 },
-    { code: "1H", expiry: oneHour, lastTradeAt: oneHour - 300 },
-    { code: "EOD", expiry: eod, lastTradeAt: eod - 300 },
-    { code: "7D", expiry: seven, lastTradeAt: seven - 300 },
-    { code: "30D", expiry: thirty, lastTradeAt: thirty - 300 },
-  ];
-}
+// expiries are pure UTC clock boundaries, mirroring app/lib/expiries.ts. The
+// grid itself (rollingMarketSchedule and its helpers) lives in
+// ./lib/expiry-grid.ts so this script and scripts/keeper.ts can never drift.
 
 async function loadKeypair(path: string): Promise<Keypair> {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(await readFile(path, "utf8")) as number[]));
