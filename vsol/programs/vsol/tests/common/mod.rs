@@ -150,6 +150,24 @@ impl Harness {
         self.svm.set_account(pubkey, account).expect("set_account");
     }
 
+    /// Directly plants an account owned by `owner` with raw `data`, bypassing
+    /// every instruction handler. Used to fabricate a Pyth `PriceUpdateV2`
+    /// fixture account (see `fake_full_pyth_price_update` in
+    /// `tests/common/instructions.rs`) without standing up the real Pyth
+    /// receiver program and Wormhole guardian verification, which is out of
+    /// scope for these instruction-level tests.
+    pub fn set_raw_account(&mut self, pubkey: Pubkey, owner: Pubkey, data: Vec<u8>) {
+        let lamports = self.svm.minimum_balance_for_rent_exemption(data.len());
+        let account = Account {
+            lamports,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+        self.svm.set_account(pubkey, account).expect("set_account");
+    }
+
     pub fn token_balance(&self, token_account: &Pubkey) -> u64 {
         let account = self.get_account(token_account);
         spl_token::state::Account::unpack(&account.data)

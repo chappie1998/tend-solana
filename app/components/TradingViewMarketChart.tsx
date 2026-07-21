@@ -27,7 +27,7 @@ export type MarketSnapshot = {
   publishTime: number;
   slot: number | null;
   ageSeconds: number;
-  mode: "live" | "closed" | "stale";
+  mode: "live" | "stale";
   source: "Pyth Core Hermes";
   warning: string;
 };
@@ -38,7 +38,7 @@ type MarketBarsPayload = {
   symbol: string;
   resolution: ChartResolution;
   source: "Pyth Benchmarks";
-  marketState: "open" | "closed";
+  freshness: "live" | "stale";
   bars: MarketBar[];
   asOf: number;
   lastBarTime: number;
@@ -138,16 +138,15 @@ export function TradingViewMarketChart({
     let stopped = false;
     let pollTimer: number | undefined;
     let activeController: AbortController | null = null;
-    let initialLoadPending = true;
+    let hasLoadedOnce = false;
 
     const loadSnapshot = async () => {
-      // The initial load must never be gated on visibility.
-      if (!initialLoadPending && document.visibilityState === "hidden") {
+      // Until the first load has actually succeeded, never gate on visibility.
+      if (hasLoadedOnce && document.visibilityState === "hidden") {
         if (pollTimer !== undefined) window.clearTimeout(pollTimer);
         pollTimer = window.setTimeout(loadSnapshot, 60_000);
         return;
       }
-      initialLoadPending = false;
       activeController?.abort();
       const controller = new AbortController();
       activeController = controller;
@@ -164,6 +163,7 @@ export function TradingViewMarketChart({
         const result = await response.json() as { snapshot?: MarketSnapshot; error?: string };
         if (!response.ok || !result.snapshot) throw new Error(result.error ?? "Pyth market data is unavailable.");
         if (stopped) return;
+        hasLoadedOnce = true;
         setSnapshot(result.snapshot);
         setSnapshotError("");
         onSnapshot(result.snapshot);
@@ -210,16 +210,15 @@ export function TradingViewMarketChart({
     let stopped = false;
     let pollTimer: number | undefined;
     let activeController: AbortController | null = null;
-    let initialLoadPending = true;
+    let hasLoadedOnce = false;
 
     const loadBars = async () => {
-      // The initial load must never be gated on visibility.
-      if (!initialLoadPending && document.visibilityState === "hidden") {
+      // Until the first load has actually succeeded, never gate on visibility.
+      if (hasLoadedOnce && document.visibilityState === "hidden") {
         if (pollTimer !== undefined) window.clearTimeout(pollTimer);
         pollTimer = window.setTimeout(loadBars, 5 * 60_000);
         return;
       }
-      initialLoadPending = false;
       activeController?.abort();
       const controller = new AbortController();
       activeController = controller;
@@ -238,18 +237,19 @@ export function TradingViewMarketChart({
           throw new Error(result.error ?? "Pyth returned no chart bars.");
         }
         if (stopped) return;
+        hasLoadedOnce = true;
         setBars(result.bars);
         setBarsMeta(result as MarketBarsPayload);
         setChartError("");
         setState("success");
-        const openPollMs: Record<ChartResolution, number> = {
+        const livePollMs: Record<ChartResolution, number> = {
           "1": 30_000,
           "5": 60_000,
           "15": 2 * 60_000,
           "60": 5 * 60_000,
           D: 15 * 60_000,
         };
-        pollTimer = window.setTimeout(loadBars, result.marketState === "open" ? openPollMs[resolution] : 5 * 60_000);
+        pollTimer = window.setTimeout(loadBars, result.freshness === "live" ? livePollMs[resolution] : 5 * 60_000);
       } catch (error) {
         if (stopped) return;
         if (isAbortError(error) && !timedOut) {
@@ -425,14 +425,10 @@ export function TradingViewMarketChart({
     ? "Chart refresh delayed"
     : snapshot?.mode === "live"
     ? "Pyth live"
-    : snapshot?.mode === "closed" || barsMeta?.marketState === "closed"
-      ? "Market closed"
-      : snapshot?.mode === "stale"
-        ? "Pyth stale"
-        : "Checking Pyth";
-  const sourceMode = refreshFailed
-    ? "stale"
-    : snapshot?.mode ?? (barsMeta?.marketState === "closed" ? "closed" : "loading");
+    : snapshot?.mode === "stale"
+      ? "Pyth stale"
+      : "Checking Pyth";
+  const sourceMode = refreshFailed ? "stale" : snapshot?.mode ?? "loading";
 
   return (
     <section className="tv-chart" aria-label={`${ticker} real Pyth market chart`}>

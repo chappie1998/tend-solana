@@ -38,7 +38,7 @@ import type { ExpiryCode } from "./expiries";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
 
-const CREATE_MARKET_DATA_LENGTH = 8 + 32 + 32 + 16 + 8 + 8 + 4 + 4 + 2 + 32;
+const CREATE_MARKET_DATA_LENGTH = 8 + 32 + 32 + 16 + 8 + 8 + 4 + 4 + 2 + 32 + 4;
 const CREATE_POOL_DATA_LENGTH = 8 + 32 + 32 + 2 + 2;
 const AUTHORIZE_MARKET_DATA_LENGTH = 8 + 8 + 1;
 
@@ -71,6 +71,7 @@ export async function buildCreateMarketTransaction(params: {
     priceScale: series.priceScale,
     maxConfidenceBps: series.maxConfidenceBps,
     symbol,
+    maxSettlementStalenessSeconds: series.maxSettlementStalenessSeconds,
   });
   const market = deriveMarket(VSOL_CONFIG, marketId);
   const oracle = deriveOracle(market);
@@ -88,6 +89,10 @@ export async function buildCreateMarketTransaction(params: {
     encodeU32(series.settlementGraceSeconds),
     encodeU16(series.maxConfidenceBps),
     Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
+    // vsol/programs/vsol/src/lib.rs, where this field was appended after
+    // `pyth_feed_id` to keep the on-chain layout backward compatible.
+    encodeU32(series.maxSettlementStalenessSeconds),
   ]);
   const instruction = buildVsolIdlInstruction("create_market", {
     creator: params.creator,

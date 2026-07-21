@@ -1,4 +1,3 @@
-import { isReferenceMarketOpen } from "./expiries";
 import {
   chartLookbackSeconds,
   chartResolutionSeconds,
@@ -13,7 +12,10 @@ export type PythMarketBars = {
   symbol: string;
   resolution: ChartResolution;
   source: "Pyth Benchmarks";
-  marketState: "open" | "closed";
+  // Whether the most recent bar is inside the normal publish cadence for this
+  // resolution. There is no "market closed" state — Tend quotes 24/7 — this
+  // just tells the chart whether to poll fast or slow.
+  freshness: "live" | "stale";
   bars: MarketBar[];
   from: number;
   to: number;
@@ -91,8 +93,7 @@ export async function getPythMarketBars(
   resolution: ChartResolution,
   now = Date.now(),
 ): Promise<PythMarketBars> {
-  const calendarState = isReferenceMarketOpen(now) ? "open" : "closed";
-  const cacheKey = `${market.pythSymbol}:${resolution}:${calendarState}`;
+  const cacheKey = `${market.pythSymbol}:${resolution}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.value;
   const recentFailure = failed.get(cacheKey);
@@ -111,15 +112,12 @@ export async function getPythMarketBars(
       throw new Error("Pyth chart timestamps are outside the requested range");
     }
     const barLagLimit = Math.max(180, resolutionSeconds * 2);
-    const marketState = calendarState === "open"
-      && (resolution === "D" || to - lastBarTime <= barLagLimit)
-      ? "open"
-      : "closed";
+    const freshness: "live" | "stale" = resolution === "D" || to - lastBarTime <= barLagLimit ? "live" : "stale";
     const value: PythMarketBars = {
       symbol: market.symbol,
       resolution,
       source: "Pyth Benchmarks",
-      marketState,
+      freshness,
       bars,
       from,
       to,
@@ -127,7 +125,7 @@ export async function getPythMarketBars(
       lastBarTime,
     };
     cache.set(cacheKey, {
-      expiresAt: now + (marketState === "open" ? 15_000 : 5 * 60_000),
+      expiresAt: now + (freshness === "live" ? 15_000 : 5 * 60_000),
       value,
     });
     failed.delete(cacheKey);

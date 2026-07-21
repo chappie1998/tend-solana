@@ -1,5 +1,5 @@
 // Pure parameter derivation for the permissionless Launch flows. Series
-// created here land on the same NYSE-valid expiry grid and use the exact
+// created here land on the same 24/7 UTC expiry grid and use the exact
 // policy constants the devnet bootstrap used, so identical series parameters
 // always hash to the same deterministic market id and PDA (no duplicates).
 
@@ -14,6 +14,9 @@ export const LAUNCH_SETTLEMENT_GRACE_SECONDS = 900;
 export const LAUNCH_MAX_CONFIDENCE_BPS = 500;
 export const LAUNCH_PRICE_SCALE = 1_000_000n;
 export const LAUNCH_MIN_LEAD_SECONDS = 15;
+// Bounds how old a tier-2 last-known Pyth price may be relative to expiry
+// before settlement falls back to a refund. 24h, matching the devnet bootstrap.
+export const LAUNCH_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
 
 // validate_pool_risk_limits in the program: 0 < position <= utilization <= 10000.
 export const POOL_BPS_DENOMINATOR = 10_000;
@@ -29,6 +32,7 @@ export type LaunchSeriesParams = {
   settlementGraceSeconds: number;
   maxConfidenceBps: number;
   priceScale: bigint;
+  maxSettlementStalenessSeconds: number;
   label: string;
   detail: string;
 };
@@ -50,6 +54,7 @@ export function deriveLaunchSeriesParams(code: ExpiryCode, symbol: string, nowMs
     settlementGraceSeconds: LAUNCH_SETTLEMENT_GRACE_SECONDS,
     maxConfidenceBps: LAUNCH_MAX_CONFIDENCE_BPS,
     priceScale: LAUNCH_PRICE_SCALE,
+    maxSettlementStalenessSeconds: LAUNCH_MAX_SETTLEMENT_STALENESS_SECONDS,
     label: definition.label,
     detail: definition.detail,
   };

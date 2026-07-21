@@ -26,7 +26,7 @@ export async function GET(request: Request) {
   try {
     const result = await getPythMarketBars(market, resolution);
     return json(result, 200, {
-      "Cache-Control": result.marketState === "open"
+      "Cache-Control": result.freshness === "live"
         ? "public, max-age=10, stale-while-revalidate=20"
         : "public, max-age=300, stale-while-revalidate=900",
       "X-Data-Source": "Pyth Benchmarks",

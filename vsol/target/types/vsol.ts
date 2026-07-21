@@ -3412,246 +3412,251 @@ export type Vsol = {
     },
     {
       "code": 6007,
+      "name": "invalidSettlementStaleness",
+      "msg": "The maximum settlement staleness is invalid."
+    },
+    {
+      "code": 6008,
       "name": "invalidConfidence",
       "msg": "The confidence threshold is invalid."
     },
     {
-      "code": 6008,
+      "code": 6009,
       "name": "invalidSymbol",
       "msg": "The symbol is empty."
     },
     {
-      "code": 6009,
+      "code": 6010,
       "name": "invalidPriceScale",
       "msg": "The market price scale must be positive."
     },
     {
-      "code": 6010,
+      "code": 6011,
       "name": "invalidPythFeed",
       "msg": "The Pyth feed identifier is invalid."
     },
     {
-      "code": 6011,
+      "code": 6012,
       "name": "invalidPythPriceUpdate",
       "msg": "The Pyth price update is invalid, stale, or insufficiently verified."
     },
     {
-      "code": 6012,
+      "code": 6013,
       "name": "invalidPythExponent",
       "msg": "The Pyth exponent cannot be represented safely."
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "invalidUnderlyingMint",
       "msg": "The underlying mint cannot be the default public key."
     },
     {
-      "code": 6014,
+      "code": 6015,
       "name": "invalidMarketId",
       "msg": "The market id does not match the deterministic hash of its parameters."
     },
     {
-      "code": 6015,
+      "code": 6016,
       "name": "invalidAmount",
       "msg": "The amount must be positive."
     },
     {
-      "code": 6016,
+      "code": 6017,
       "name": "invalidWidth",
       "msg": "The payout width must be positive."
     },
     {
-      "code": 6017,
+      "code": 6018,
       "name": "invalidDirection",
       "msg": "The direction must be up or down."
     },
     {
-      "code": 6018,
+      "code": 6019,
       "name": "mathOverflow",
       "msg": "A checked arithmetic operation failed."
     },
     {
-      "code": 6019,
+      "code": 6020,
       "name": "marketDisabled",
       "msg": "The market is disabled."
     },
     {
-      "code": 6020,
+      "code": 6021,
       "name": "marketExpired",
       "msg": "The market has expired."
     },
     {
-      "code": 6021,
+      "code": 6022,
       "name": "marketNotExpired",
       "msg": "The market has not expired."
     },
     {
-      "code": 6022,
+      "code": 6023,
       "name": "quoteExpired",
       "msg": "The maker quote has expired."
     },
     {
-      "code": 6023,
+      "code": 6024,
       "name": "missingMakerSignature",
       "msg": "The maker signature instruction is missing."
     },
     {
-      "code": 6024,
+      "code": 6025,
       "name": "invalidMakerSignature",
       "msg": "The maker signature or signed quote message is invalid."
     },
     {
-      "code": 6025,
+      "code": 6026,
       "name": "invalidWriterVault",
       "msg": "The writer vault is invalid."
     },
     {
-      "code": 6026,
+      "code": 6027,
       "name": "insufficientWriterLiquidity",
       "msg": "The writer does not have enough available collateral."
     },
     {
-      "code": 6027,
+      "code": 6028,
       "name": "collateralMismatch",
       "msg": "Escrow does not exactly equal premium plus maximum payout."
     },
     {
-      "code": 6028,
+      "code": 6029,
       "name": "eligibilityRequired",
       "msg": "An eligibility account is required."
     },
     {
-      "code": 6029,
+      "code": 6030,
       "name": "invalidEligibility",
       "msg": "The eligibility account is invalid."
     },
     {
-      "code": 6030,
+      "code": 6031,
       "name": "ineligibleWallet",
       "msg": "The wallet is not eligible to trade."
     },
     {
-      "code": 6031,
+      "code": 6032,
       "name": "invalidMarket",
       "msg": "The market account is invalid."
     },
     {
-      "code": 6032,
+      "code": 6033,
       "name": "invalidOracle",
       "msg": "The oracle account is invalid."
     },
     {
-      "code": 6033,
+      "code": 6034,
       "name": "oracleAlreadyFinalized",
       "msg": "The settlement oracle is already finalized."
     },
     {
-      "code": 6034,
+      "code": 6035,
       "name": "oracleNotFinalized",
       "msg": "The settlement oracle is not finalized."
     },
     {
-      "code": 6035,
+      "code": 6036,
       "name": "invalidOraclePrice",
       "msg": "The oracle price is invalid."
     },
     {
-      "code": 6036,
+      "code": 6037,
       "name": "invalidObservationTime",
       "msg": "The oracle observation timestamp is outside the approved window."
     },
     {
-      "code": 6037,
+      "code": 6038,
       "name": "settlementWindowClosed",
       "msg": "The settlement publication window is closed."
     },
     {
-      "code": 6038,
+      "code": 6039,
       "name": "oracleConfidenceTooWide",
       "msg": "The oracle confidence interval is too wide."
     },
     {
-      "code": 6039,
+      "code": 6040,
       "name": "settlementWindowOpen",
       "msg": "The settlement fallback window is still open."
     },
     {
-      "code": 6040,
+      "code": 6041,
       "name": "invalidPosition",
       "msg": "The position is invalid."
     },
     {
-      "code": 6041,
+      "code": 6042,
       "name": "positionNotOpen",
       "msg": "The position is not open."
     },
     {
-      "code": 6042,
+      "code": 6043,
       "name": "invalidNonce",
       "msg": "The quote nonce record is invalid."
     },
     {
-      "code": 6043,
+      "code": 6044,
       "name": "invalidDestination",
       "msg": "A settlement destination token account is invalid."
     },
     {
-      "code": 6044,
+      "code": 6045,
       "name": "poolHasOpenPositions",
       "msg": "The liquidity pool has active collateral obligations."
     },
     {
-      "code": 6045,
+      "code": 6046,
       "name": "invalidPoolShares",
       "msg": "The liquidity pool share amount is invalid."
     },
     {
-      "code": 6046,
+      "code": 6047,
       "name": "poolInsolvent",
       "msg": "The liquidity pool has no assets backing outstanding shares."
     },
     {
-      "code": 6047,
+      "code": 6048,
       "name": "depositTooSmall",
       "msg": "The deposit or withdrawal is too small after conservative rounding."
     },
     {
-      "code": 6048,
+      "code": 6049,
       "name": "slippageExceeded",
       "msg": "The requested minimum output was not met."
     },
     {
-      "code": 6049,
+      "code": 6050,
       "name": "deadlineExpired",
       "msg": "The transaction deadline has expired."
     },
     {
-      "code": 6050,
+      "code": 6051,
       "name": "invalidPoolRiskLimits",
       "msg": "The liquidity pool risk limits are invalid."
     },
     {
-      "code": 6051,
+      "code": 6052,
       "name": "poolMarketDisabled",
       "msg": "The liquidity pool is not enabled for this market."
     },
     {
-      "code": 6052,
+      "code": 6053,
       "name": "invalidLastTradeCutoff",
       "msg": "The market's last-trade cutoff is invalid."
     },
     {
-      "code": 6053,
+      "code": 6054,
       "name": "lastTradeCutoffReached",
       "msg": "The market's last-trade cutoff has been reached."
     },
     {
-      "code": 6054,
+      "code": 6055,
       "name": "poolUtilizationExceeded",
       "msg": "The liquidity pool utilization limit would be exceeded."
     },
     {
-      "code": 6055,
+      "code": 6056,
       "name": "poolPositionLimitExceeded",
       "msg": "The position exceeds the liquidity pool's per-position risk limit."
     }
@@ -3833,6 +3838,10 @@ export type Vsol = {
                 32
               ]
             }
+          },
+          {
+            "name": "maxSettlementStalenessSeconds",
+            "type": "u32"
           }
         ]
       }
@@ -4287,6 +4296,10 @@ export type Vsol = {
           {
             "name": "creator",
             "type": "pubkey"
+          },
+          {
+            "name": "maxSettlementStalenessSeconds",
+            "type": "u32"
           }
         ]
       }
@@ -4905,6 +4918,10 @@ export type Vsol = {
           {
             "name": "finalized",
             "type": "bool"
+          },
+          {
+            "name": "settledFromStalePrice",
+            "type": "bool"
           }
         ]
       }
@@ -4942,6 +4959,10 @@ export type Vsol = {
                 32
               ]
             }
+          },
+          {
+            "name": "settledFromStalePrice",
+            "type": "bool"
           }
         ]
       }

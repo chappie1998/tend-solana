@@ -165,6 +165,7 @@ export type MarketIdParams = {
   priceScale: bigint;
   maxConfidenceBps: number;
   symbol: Uint8Array | number[];
+  maxSettlementStalenessSeconds: number;
 };
 
 // Mirrors the on-chain `expected_market_id` check byte-for-byte, so identical
@@ -184,6 +185,7 @@ export async function deriveMarketId(params: MarketIdParams): Promise<Buffer> {
     u64(params.priceScale),
     u16(params.maxConfidenceBps),
     symbol,
+    u32(params.maxSettlementStalenessSeconds),
   ]);
   const digest = await crypto.subtle.digest("SHA-256", message);
   return Buffer.from(digest);

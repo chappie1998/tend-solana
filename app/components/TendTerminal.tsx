@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { markets } from "../lib/markets";
-import { expiryCodes, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
+import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
 import {
@@ -231,7 +231,6 @@ function VsolStatus() {
 const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
   [/cutoff/i, "Cutoff passed"],
   [/already settled/i, "Settled"],
-  [/session/i, "Session closed"],
 ];
 
 // Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
@@ -284,15 +283,10 @@ function TradeView({
       durationMinutes: Math.max(1, Math.ceil((expiryAt - now) / 60_000)),
       observationWindowSeconds: series.observationWindowSeconds,
       tradeLockSeconds: Math.max(0, series.expiry - series.lastTradeAt),
-      detail: new Intl.DateTimeFormat("en-US", code === "15M" || code === "1H" || code === "EOD"
-        ? { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
-        : { timeZone: "America/New_York", month: "short", day: "numeric" }).format(new Date(expiryAt)),
+      detail: formatExpiryDetail(code, expiryAt, now),
       available: series.available,
       availabilityReason: series.availabilityReason,
     };
-    if (definition.group === "intraday" && marketSnapshot?.mode !== "live") {
-      return { ...exact, available: false, availabilityReason: "Intraday execution requires a fresh Pyth reference update during the US session." };
-    }
     return exact;
   });
   const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
@@ -508,7 +502,7 @@ function TradeView({
 
         <div className="market-card">
           <div className="price-row">
-            <div><span className="eyebrow">Pyth settlement reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "closed" ? "Closed" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div></div>
+            <div><span className="eyebrow">Pyth settlement reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div>{marketSnapshot?.mode === "stale" && <small className="reference-gap-note">Reference {Math.max(1, Math.round(marketSnapshot.ageSeconds / 60))} min old · gap risk priced</small>}</div>
             <div className="market-stats"><div><span>Pyth confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div><div><span>Oracle slot</span><strong>{marketSnapshot?.slot?.toLocaleString() ?? "—"}</strong></div><div><span>Pricing vol</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />

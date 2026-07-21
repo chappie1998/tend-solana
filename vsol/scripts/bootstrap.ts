@@ -87,6 +87,7 @@ type MarketManifest = {
   expiry: number;
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
+  maxSettlementStalenessSeconds: number;
   lastTradeAt: number;
   creator: string;
 };
@@ -133,67 +134,47 @@ type Deployment = {
   generatedAt: string;
 };
 
-const NEW_YORK = "America/New_York";
 const USER_MARKET_OBSERVATION_SECONDS = 30;
 const USER_MARKET_SETTLEMENT_GRACE_SECONDS = 900;
-// 8-byte discriminator + Market::INIT_SPACE under the upgraded factory layout;
-// accounts of any other size predate the upgrade and no longer deserialize.
-const MARKET_ACCOUNT_SIZE = 277;
+// Tier 2's last-known-price fallback window: 24h is generous enough to cover
+// a full overnight/weekend gap in the Pyth equities feed while still keeping
+// a hard ceiling on how old a settlement print can be.
+const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
+// 8-byte discriminator + Market::INIT_SPACE under the upgraded factory layout
+// (277 bytes through creator, +4 for the appended max_settlement_staleness_seconds
+// u32); accounts of any other size predate the upgrade and no longer deserialize.
+const MARKET_ACCOUNT_SIZE = 281;
+const DAY_SECONDS = 86_400;
 
-function newYorkParts(timestampMs: number) {
-  const values: Record<string, string> = {};
-  for (const part of new Intl.DateTimeFormat("en-US", {
-    timeZone: NEW_YORK,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(timestampMs))) {
-    if (part.type !== "literal") values[part.type] = part.value;
-  }
-  return {
-    year: Number(values.year),
-    month: Number(values.month),
-    day: Number(values.day),
-    hour: Number(values.hour),
-    minute: Number(values.minute),
-    second: Number(values.second),
-  };
+// Tend is a 24/7 protocol: there is no market calendar here. Rolling market
+// expiries are pure UTC clock boundaries, mirroring app/lib/expiries.ts.
+
+function nextFixedBoundary(nowSeconds: number, cadenceSeconds: number) {
+  // A fixed onchain series cannot give every entrant exactly the same
+  // duration. Select the first cadence boundary at least one full tenor in
+  // the future, matching app/lib/expiries.ts's nextFixedSeries.
+  return Math.ceil((nowSeconds + cadenceSeconds) / cadenceSeconds) * cadenceSeconds;
 }
 
-function timeZoneOffset(timestampMs: number) {
-  const parts = newYorkParts(timestampMs);
-  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second)
-    - Math.floor(timestampMs / 1_000) * 1_000;
+/** The next UTC midnight strictly after `target` — the daily settlement boundary. */
+function nextUtcMidnightAfter(target: number) {
+  const boundary = Math.ceil(target / DAY_SECONDS) * DAY_SECONDS;
+  return boundary > target ? boundary : boundary + DAY_SECONDS;
 }
 
-function newYorkTimeToUtc(year: number, month: number, day: number, hour: number, minute: number) {
-  const guess = Date.UTC(year, month - 1, day, hour, minute);
-  return Math.floor((guess - timeZoneOffset(guess)) / 1_000);
-}
-
-function addCalendarDays(year: number, month: number, day: number, days: number) {
-  const date = new Date(Date.UTC(year, month - 1, day + days));
-  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
-}
-
-function isWeekday(parts: { year: number; month: number; day: number }) {
-  const weekday = new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
-  return weekday >= 1 && weekday <= 5;
-}
-
-function nextSessionDay(timestampSeconds: number, minimumSeconds: number) {
-  const start = newYorkParts(timestampSeconds * 1_000);
-  for (let offset = 0; offset < 45; offset += 1) {
-    const day = addCalendarDays(start.year, start.month, start.day, offset);
-    if (!isWeekday(day)) continue;
-    const close = newYorkTimeToUtc(day.year, day.month, day.day, 15, 59);
-    if (close >= minimumSeconds) return day;
-  }
-  throw new Error("Could not resolve a session-aligned expiry");
+/**
+ * Advances `candidate` by whole `stepSeconds` increments of its own cadence
+ * until it is strictly greater than `floor`. This is how the grid guarantees
+ * 15M < 1H < EOD < 7D < 30D for every possible `now`: each code's natural
+ * boundary is computed independently, and only collapses onto (or behind) a
+ * neighbor's boundary get nudged forward, on the same clean cadence the code
+ * already uses. Market ids stay a pure parameter hash — mirrors
+ * app/lib/expiries.ts's advanceUntilAfter exactly.
+ */
+function advanceUntilAfter(candidate: number, floor: number, stepSeconds: number): number {
+  let value = candidate;
+  while (value <= floor) value += stepSeconds;
+  return value;
 }
 
 function rollingMarketSchedule(now: number): Array<{
@@ -201,27 +182,11 @@ function rollingMarketSchedule(now: number): Array<{
   expiry: number;
   lastTradeAt: number;
 }> {
-  const nextDay = nextSessionDay(now, now + 15 * 60);
-  const open = newYorkTimeToUtc(nextDay.year, nextDay.month, nextDay.day, 9, 30);
-  const close = newYorkTimeToUtc(nextDay.year, nextDay.month, nextDay.day, 15, 59);
-
-  const firstGridExpiry = (minimum: number, step: number, first: number) => {
-    if (minimum <= first) return first;
-    const steps = Math.ceil((minimum - first) / step);
-    const candidate = first + steps * step;
-    if (candidate <= close) return candidate;
-    const following = nextSessionDay(close + 60, close + 60);
-    return newYorkTimeToUtc(following.year, following.month, following.day, 9, 30) + step;
-  };
-
-  const fifteen = firstGridExpiry(now + 15 * 60, 15 * 60, open + 15 * 60);
-  const oneHour = firstGridExpiry(now + 60 * 60, 60 * 60, open + 60 * 60);
-  const eodDay = nextSessionDay(now, now + 5 * 60);
-  const eod = newYorkTimeToUtc(eodDay.year, eodDay.month, eodDay.day, 15, 59);
-  const sevenDay = nextSessionDay(now, now + 7 * 86_400);
-  const thirtyDay = nextSessionDay(now, now + 30 * 86_400);
-  const seven = newYorkTimeToUtc(sevenDay.year, sevenDay.month, sevenDay.day, 15, 59);
-  const thirty = newYorkTimeToUtc(thirtyDay.year, thirtyDay.month, thirtyDay.day, 15, 59);
+  const fifteen = nextFixedBoundary(now, 15 * 60);
+  const oneHour = advanceUntilAfter(nextFixedBoundary(now, 60 * 60), fifteen, 60 * 60);
+  const eod = advanceUntilAfter(nextUtcMidnightAfter(now), oneHour, DAY_SECONDS);
+  const seven = advanceUntilAfter(nextUtcMidnightAfter(now + 7 * DAY_SECONDS), eod, DAY_SECONDS);
+  const thirty = advanceUntilAfter(nextUtcMidnightAfter(now + 30 * DAY_SECONDS), seven, DAY_SECONDS);
   return [
     { code: "15M", expiry: fifteen, lastTradeAt: fifteen - 60 },
     { code: "1H", expiry: oneHour, lastTradeAt: oneHour - 300 },
@@ -331,6 +296,7 @@ async function createMarket(params: {
   expiry: number;
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
+  maxSettlementStalenessSeconds: number;
   pythFeedId: number[];
 }) {
   const symbol = symbolBytes(params.symbol);
@@ -345,6 +311,7 @@ async function createMarket(params: {
     priceScale: PRICE_SCALE,
     maxConfidenceBps: 500,
     symbol,
+    maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
   });
   const market = deriveMarket(params.config, id);
   const oracle = deriveOracle(market);
@@ -360,6 +327,7 @@ async function createMarket(params: {
         settlementGraceSeconds: params.settlementGraceSeconds,
         maxConfidenceBps: 500,
         pythFeedId: params.pythFeedId,
+        maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
       })
       .accountsStrict({
         creator: params.creator.publicKey,
@@ -759,6 +727,7 @@ async function main(): Promise<void> {
       expiry: series.expiry,
       observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
       settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+      maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
       pythFeedId: pythFeedBytes,
     });
     catalog.push({
@@ -768,6 +737,7 @@ async function main(): Promise<void> {
       expiry: series.expiry,
       observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
       settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+      maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
       lastTradeAt: series.lastTradeAt,
       creator: creator.publicKey.toBase58(),
       marketKey: created.market,
@@ -860,6 +830,7 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
     observationWindowSeconds: 120,
     settlementGraceSeconds: 600,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
     pythFeedId: smokePythFeedBytes,
   });
   const refundMarket = await createMarket({
@@ -872,6 +843,7 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
     observationWindowSeconds: 5,
     settlementGraceSeconds: 15,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
     pythFeedId: smokePythFeedBytes,
   });
 
@@ -1198,6 +1170,7 @@ async function main(): Promise<void> {
       expiry: series.expiry,
       observationWindowSeconds: series.observationWindowSeconds,
       settlementGraceSeconds: series.settlementGraceSeconds,
+      maxSettlementStalenessSeconds: series.maxSettlementStalenessSeconds,
       lastTradeAt: series.lastTradeAt,
       creator: creator.publicKey.toBase58(),
     })),

@@ -13,6 +13,8 @@ type DeploymentSeries = {
   lastTradeAt: number;
   // Optional until the permissionless factory redeploy publishes it.
   creator?: string;
+  // Optional until the manifest publishes it for this series.
+  maxSettlementStalenessSeconds?: number;
 };
 
 type LiquidityDeployment = {

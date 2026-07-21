@@ -16,6 +16,7 @@ use common::*;
 const MARKET_LEAD_SECONDS: i64 = 60;
 const OBSERVATION_WINDOW: u32 = 30;
 const SETTLEMENT_GRACE: u32 = 900;
+const MAX_SETTLEMENT_STALENESS: u32 = 86_400;
 
 /// A config plus every keypair that controls it, wired up in one call so
 /// individual tests can read straight past setup to the behavior under test.
@@ -74,6 +75,9 @@ struct MarketFixture {
     oracle: Pubkey,
     settlement_mint: Pubkey,
     expiry: i64,
+    observation_window_seconds: u32,
+    settlement_grace_seconds: u32,
+    max_settlement_staleness_seconds: u32,
 }
 
 fn setup_market(harness: &mut Harness, fixture: &ConfigFixture, creator: &Keypair, settlement_mint: Pubkey) -> MarketFixture {
@@ -91,6 +95,32 @@ fn setup_market_variant(
     settlement_mint: Pubkey,
     feed_salt: u8,
 ) -> MarketFixture {
+    setup_market_with_terms(
+        harness,
+        fixture,
+        creator,
+        settlement_mint,
+        feed_salt,
+        OBSERVATION_WINDOW,
+        SETTLEMENT_GRACE,
+        MAX_SETTLEMENT_STALENESS,
+    )
+}
+
+/// Full-control market setup: lets `publish_pyth_settlement` tier tests pick
+/// short observation/grace windows so a test can warp past
+/// `observation_end` quickly, alongside an independent staleness bound.
+#[allow(clippy::too_many_arguments)]
+fn setup_market_with_terms(
+    harness: &mut Harness,
+    fixture: &ConfigFixture,
+    creator: &Keypair,
+    settlement_mint: Pubkey,
+    feed_salt: u8,
+    observation_window_seconds: u32,
+    settlement_grace_seconds: u32,
+    max_settlement_staleness_seconds: u32,
+) -> MarketFixture {
     let now = harness.now();
     let expiry = now + MARKET_LEAD_SECONDS + 3600;
     let mut args = vsol::CreateMarketArgs {
@@ -99,10 +129,11 @@ fn setup_market_variant(
         symbol: symbol_bytes("NVDA"),
         price_scale: 1_000_000,
         expiry,
-        observation_window_seconds: OBSERVATION_WINDOW,
-        settlement_grace_seconds: SETTLEMENT_GRACE,
+        observation_window_seconds,
+        settlement_grace_seconds,
         max_confidence_bps: 100,
         pyth_feed_id: [feed_salt; 32],
+        max_settlement_staleness_seconds,
     };
     args.market_id = expected_market_id(&args, settlement_mint);
 
@@ -116,6 +147,9 @@ fn setup_market_variant(
         oracle,
         settlement_mint,
         expiry,
+        observation_window_seconds,
+        settlement_grace_seconds,
+        max_settlement_staleness_seconds,
     }
 }
 
@@ -1366,4 +1400,334 @@ fn refund_pool_position_returns_funds_when_settlement_window_closes_unfinalized(
     assert_eq!(pool_after_refund.locked_collateral, 0);
     assert_eq!(harness.token_balance(&buyer_destination), quote.premium);
     assert_eq!(harness.token_balance(&pool.pool_token), 100 * ONE_TOKEN);
+}
+
+// =====================================================================
+// publish_pyth_settlement: two-tier settlement.
+//
+// Tier 1 (unchanged): a fresh print inside [expiry, observation_end]
+// settles exactly as before. Tier 2 (new fallback): once the primary
+// window has fully elapsed with nothing acceptable published, a
+// last-known price at or before `expiry` is accepted provided it is no
+// staler than `max_settlement_staleness_seconds`. This is what lets
+// options on Pyth equity feeds -- which go dark overnight and on
+// weekends -- settle 24/7 instead of always falling through to a
+// timeout refund.
+// =====================================================================
+
+const TIER_TEST_OBSERVATION_WINDOW: u32 = 30;
+const TIER_TEST_SETTLEMENT_GRACE: u32 = 60;
+const TIER_TEST_MAX_STALENESS: u32 = 3_600;
+const TIER_TEST_FEED_SALT: u8 = 0x77;
+
+/// A market with a short observation/grace window (so tests can warp past
+/// `observation_end` quickly) and an explicit, moderate staleness bound.
+fn setup_tier_test_market(
+    harness: &mut Harness,
+    fixture: &ConfigFixture,
+    creator: &Keypair,
+    settlement_mint: Pubkey,
+) -> MarketFixture {
+    setup_market_with_terms(
+        harness,
+        fixture,
+        creator,
+        settlement_mint,
+        TIER_TEST_FEED_SALT,
+        TIER_TEST_OBSERVATION_WINDOW,
+        TIER_TEST_SETTLEMENT_GRACE,
+        TIER_TEST_MAX_STALENESS,
+    )
+}
+
+/// Plants a fake, fully-verified Pyth `PriceUpdateV2` account (see
+/// `fake_full_pyth_price_update`) for `TIER_TEST_FEED_SALT`, priced at
+/// exactly $100 (matching `default_quote`'s 100-token strike) so settlement
+/// price equals strike and the payout math is trivial to assert on.
+fn plant_price_update(harness: &mut Harness, publish_time: i64) -> Pubkey {
+    let price_update = Pubkey::new_unique();
+    let data = fake_full_pyth_price_update([TIER_TEST_FEED_SALT; 32], 100_000_000, 100, -6, publish_time);
+    harness.set_raw_account(price_update, vsol::PYTH_RECEIVER_PROGRAM_ID, data);
+    price_update
+}
+
+#[test]
+fn publish_pyth_settlement_tier_one_settles_with_a_fresh_in_window_print() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let publish_time = market.expiry + 5;
+    assert!(publish_time <= observation_end);
+    let price_update = plant_price_update(&mut harness, publish_time);
+
+    harness.warp_to_timestamp(publish_time + 1);
+    let ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    harness.send_ok(&creator, &[ix], &[]);
+
+    let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
+    assert!(oracle.finalized);
+    assert!(!oracle.settled_from_stale_price);
+    assert_eq!(oracle.price, 100 * ONE_TOKEN);
+    assert_eq!(oracle.observed_at, publish_time);
+}
+
+#[test]
+fn publish_pyth_settlement_rejects_tier_two_price_before_observation_window_elapses() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    // A pre-expiry print, comfortably within the staleness bound...
+    let publish_time = market.expiry - 100;
+    let price_update = plant_price_update(&mut harness, publish_time);
+
+    // ...but `now` is still inside the primary observation window, so tier 2
+    // must not be allowed to short-circuit it: a fresh post-expiry print
+    // could still arrive before the window closes.
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let now = market.expiry + 10;
+    assert!(now <= observation_end);
+    harness.warp_to_timestamp(now);
+
+    let ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    let failed = harness.send_err(&creator, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidObservationTime);
+}
+
+#[test]
+fn publish_pyth_settlement_tier_two_succeeds_after_window_elapses_and_pays_out() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let maker = harness.funded_keypair();
+    let buyer = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&maker, &maker.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &maker, settlement_mint);
+
+    let writer_vault = writer_vault_pda(&fixture.config, &maker.pubkey(), &market.settlement_mint);
+    let writer_token = writer_token_pda(&writer_vault);
+    harness.send_ok(
+        &maker,
+        &[initialize_writer_vault_ix(
+            &maker.pubkey(),
+            &fixture.config,
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+        )],
+        &[],
+    );
+    let maker_source = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &maker_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &maker,
+        &[deposit_writer_ix(
+            &fixture.config,
+            &maker.pubkey(),
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+            &maker_source,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &buyer_source, 10 * ONE_TOKEN);
+
+    let quote = default_quote(1, harness.now() + 30);
+    let nonce_record = nonce_pda(&fixture.config, &maker.pubkey(), quote.nonce);
+    let position = position_pda(&nonce_record);
+    let position_vault = position_vault_pda(&position);
+    let fill_accounts = FillQuoteAccounts {
+        buyer: buyer.pubkey(),
+        maker: maker.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        settlement_mint: market.settlement_mint,
+        writer_vault,
+        writer_token,
+        buyer_source,
+        nonce_record,
+        position,
+        position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_quote_ixs(&maker, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    // The only price ever available is a print from 30 minutes before
+    // expiry -- comfortably inside the 1-hour staleness bound -- exactly
+    // what happens when an equities feed goes dark overnight.
+    let publish_time = market.expiry - 1_800;
+    assert!(market.expiry - publish_time <= i64::from(market.max_settlement_staleness_seconds));
+    let price_update = plant_price_update(&mut harness, publish_time);
+
+    // Warp past the primary observation window, but still inside the
+    // settlement deadline, before publishing.
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let settlement_deadline = observation_end + i64::from(market.settlement_grace_seconds);
+    let publish_now = observation_end + 1;
+    assert!(publish_now <= settlement_deadline);
+    harness.warp_to_timestamp(publish_now);
+
+    let publish_ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    harness.send_ok(&buyer, &[publish_ix], &[]);
+
+    let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
+    assert!(oracle.finalized);
+    assert!(oracle.settled_from_stale_price);
+    assert_eq!(oracle.price, 100 * ONE_TOKEN);
+    assert_eq!(oracle.observed_at, publish_time);
+
+    let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    let maker_destination = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&maker, &market.settlement_mint, &fixture.treasury_owner);
+    let settle_accounts = SettleAccounts {
+        cranker: buyer.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        nonce_record,
+        position,
+        position_vault,
+        settlement_mint: market.settlement_mint,
+        buyer_destination,
+        maker_destination,
+        treasury_destination,
+        rent_recipient: buyer.pubkey(),
+    };
+    harness.send_ok(&buyer, &[settle_ix(&settle_accounts)], &[]);
+
+    // `default_quote` is direction Up, strike 100 * ONE_TOKEN; the tier-2
+    // price settles exactly at strike, so the buyer's payout is zero and
+    // the maker keeps the full collateral plus premium (minus fee).
+    assert_eq!(harness.token_balance(&buyer_destination), 0);
+    assert!(harness.token_balance(&maker_destination) > 0);
+}
+
+#[test]
+fn publish_pyth_settlement_rejects_pre_expiry_price_older_than_staleness_bound() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    // One second older than `max_settlement_staleness_seconds` allows.
+    let publish_time = market.expiry - i64::from(market.max_settlement_staleness_seconds) - 1;
+    let price_update = plant_price_update(&mut harness, publish_time);
+
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    harness.warp_to_timestamp(observation_end + 1);
+
+    let ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    let failed = harness.send_err(&creator, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidObservationTime);
+}
+
+/// Ties the staleness-bound rejection above to the existing timeout-refund
+/// path: when even the tier-2 fallback has nothing acceptable to offer,
+/// `refund_unsettled` remains the buyer and maker's recourse once the
+/// settlement deadline fully elapses.
+#[test]
+fn refund_unsettled_still_works_when_no_acceptable_settlement_price_exists() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let maker = harness.funded_keypair();
+    let buyer = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&maker, &maker.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &maker, settlement_mint);
+
+    let writer_vault = writer_vault_pda(&fixture.config, &maker.pubkey(), &market.settlement_mint);
+    let writer_token = writer_token_pda(&writer_vault);
+    harness.send_ok(
+        &maker,
+        &[initialize_writer_vault_ix(
+            &maker.pubkey(),
+            &fixture.config,
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+        )],
+        &[],
+    );
+    let maker_source = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &maker_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &maker,
+        &[deposit_writer_ix(
+            &fixture.config,
+            &maker.pubkey(),
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+            &maker_source,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_quote(1, harness.now() + 30);
+    let nonce_record = nonce_pda(&fixture.config, &maker.pubkey(), quote.nonce);
+    let position = position_pda(&nonce_record);
+    let position_vault = position_vault_pda(&position);
+    let fill_accounts = FillQuoteAccounts {
+        buyer: buyer.pubkey(),
+        maker: maker.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        settlement_mint: market.settlement_mint,
+        writer_vault,
+        writer_token,
+        buyer_source,
+        nonce_record,
+        position,
+        position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_quote_ixs(&maker, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    // A price too stale even for tier 2 is attempted first and rejected...
+    let publish_time = market.expiry - i64::from(market.max_settlement_staleness_seconds) - 1;
+    let price_update = plant_price_update(&mut harness, publish_time);
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let settlement_deadline = observation_end + i64::from(market.settlement_grace_seconds);
+    harness.warp_to_timestamp(observation_end + 1);
+    let publish_failed = harness.send_err(
+        &buyer,
+        &[publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update)],
+        &[],
+    );
+    assert_vsol_error(&publish_failed, vsol::VsolError::InvalidObservationTime);
+
+    // ...so once the settlement deadline fully elapses, `refund_unsettled`
+    // is the only remaining path, exactly as when no oracle print ever
+    // arrives at all.
+    harness.warp_to_timestamp(settlement_deadline + 1);
+    let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    let maker_destination = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    let refund_accounts = RefundUnsettledAccounts {
+        cranker: buyer.pubkey(),
+        market: market.market,
+        oracle: market.oracle,
+        nonce_record,
+        position,
+        position_vault,
+        settlement_mint: market.settlement_mint,
+        buyer_destination,
+        maker_destination,
+        rent_recipient: buyer.pubkey(),
+    };
+    harness.send_ok(&buyer, &[refund_unsettled_ix(&refund_accounts)], &[]);
+    assert_eq!(harness.token_balance(&buyer_destination), quote.premium);
+    assert_eq!(harness.token_balance(&maker_destination), quote.max_payout);
 }

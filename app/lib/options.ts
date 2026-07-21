@@ -1,5 +1,15 @@
 export type Direction = "up" | "down";
 
+// Off-hours, Pyth's Equity.US.NVDA/USD feed stops printing fresh updates, so
+// the reference price can go stale. Tend never closes for that — instead the
+// gap-risk (the price could jump before the feed resumes) gets priced into
+// the premium via a bounded, monotonic vol bump. Every extra hour of
+// unobserved time scales the effective volatility up by sqrt(elapsed time),
+// capped so it can never push the premium past the existing 0.95×amount
+// ceiling.
+const GAP_RISK_VOL_SCALE_PER_HOUR = 0.35;
+const GAP_RISK_MAX_VOL_MULTIPLIER = 1.75;
+
 export function quoteFor(params: {
   spot: number;
   amount: number;
@@ -7,6 +17,7 @@ export function quoteFor(params: {
   direction: Direction;
   payoff: number;
   volatility: number;
+  referenceAgeSeconds?: number;
 }) {
   const { spot, amount, direction, durationMinutes } = params;
   if (!Number.isFinite(spot) || spot <= 0 || !Number.isFinite(amount) || amount <= 0) {
@@ -17,8 +28,14 @@ export function quoteFor(params: {
   if (!Number.isFinite(params.volatility) || params.volatility < 1 || params.volatility > 400) {
     throw new RangeError("Volatility is outside maker risk bounds");
   }
+  const referenceAgeSeconds = params.referenceAgeSeconds ?? 0;
+  if (!Number.isFinite(referenceAgeSeconds) || referenceAgeSeconds < 0) {
+    throw new RangeError("Reference age must be a non-negative finite value");
+  }
   const payoff = params.payoff;
-  const volatility = params.volatility / 100;
+  const gapRiskHours = referenceAgeSeconds / 3_600;
+  const gapRiskMultiplier = Math.min(GAP_RISK_MAX_VOL_MULTIPLIER, 1 + GAP_RISK_VOL_SCALE_PER_HOUR * Math.sqrt(gapRiskHours));
+  const volatility = (params.volatility / 100) * gapRiskMultiplier;
   const timeYears = Math.max(durationMinutes, 15) / 525_600;
   const expectedMove = volatility * Math.sqrt(timeYears);
   const directionFactor = direction === "up" ? 1 : 1.06;

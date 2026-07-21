@@ -22,6 +22,7 @@ pub fn expected_market_id(args: &vsol::CreateMarketArgs, settlement_mint: Pubkey
         &args.price_scale.to_le_bytes(),
         &args.max_confidence_bps.to_le_bytes(),
         &args.symbol,
+        &args.max_settlement_staleness_seconds.to_le_bytes(),
     ])
     .to_bytes()
 }
@@ -114,6 +115,69 @@ pub fn create_market_ix(
         ],
         data: vsol::instruction::CreateMarket { args }.data(),
     }
+}
+
+/// `publish_pyth_settlement` takes no signer at all (it's a permissionless
+/// crank): `config`/`market` are read-only, `oracle` is the only mutable
+/// account, and `price_update` is an `UncheckedAccount` whose entire
+/// validation happens inside the program via `parse_fully_verified_price_update`.
+pub fn publish_pyth_settlement_ix(
+    config: &Pubkey,
+    market: &Pubkey,
+    oracle: &Pubkey,
+    price_update: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new_readonly(*market, false),
+            AccountMeta::new(*oracle, false),
+            AccountMeta::new_readonly(*price_update, false),
+        ],
+        data: vsol::instruction::PublishPythSettlement.data(),
+    }
+}
+
+/// Builds the raw bytes of a `PriceUpdateV2` account exactly as the upgraded
+/// Pyth receiver program would leave them after a fully-verified guardian
+/// update, mirroring the private wire format `pyth::parse_fully_verified_price_update`
+/// parses (see `src/pyth.rs`: discriminator, verification-level variant,
+/// feed id, price, confidence, exponent, publish time). Duplicated here for
+/// the same reason `expected_market_id` above is: the parser and its offsets
+/// are intentionally private, so an off-chain (or test) caller must
+/// reproduce the layout rather than import it. Setting an account with this
+/// data and owner `vsol::PYTH_RECEIVER_PROGRAM_ID` reproduces the exact
+/// trust boundary `publish_pyth_settlement` relies on: the guardian/Wormhole
+/// verification itself is the receiver program's responsibility (out of
+/// scope here, exactly as it is for `src/pyth.rs`'s own unit tests), and
+/// vsol only ever checks owner + discriminator + verification level + feed id.
+pub fn fake_full_pyth_price_update(
+    feed_id: [u8; 32],
+    price: i64,
+    confidence: u64,
+    exponent: i32,
+    publish_time: i64,
+) -> Vec<u8> {
+    const DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+    const FULL_VERIFICATION_VARIANT: u8 = 1;
+    const MIN_LEN: usize = 133;
+    const VERIFICATION_OFFSET: usize = 40;
+    const FEED_ID_OFFSET: usize = 41;
+    const PRICE_OFFSET: usize = 73;
+    const CONFIDENCE_OFFSET: usize = 81;
+    const EXPONENT_OFFSET: usize = 89;
+    const PUBLISH_TIME_OFFSET: usize = 93;
+
+    let mut data = vec![0_u8; MIN_LEN];
+    data[..8].copy_from_slice(&DISCRIMINATOR);
+    data[VERIFICATION_OFFSET] = FULL_VERIFICATION_VARIANT;
+    data[FEED_ID_OFFSET..FEED_ID_OFFSET + 32].copy_from_slice(&feed_id);
+    data[PRICE_OFFSET..PRICE_OFFSET + 8].copy_from_slice(&price.to_le_bytes());
+    data[CONFIDENCE_OFFSET..CONFIDENCE_OFFSET + 8].copy_from_slice(&confidence.to_le_bytes());
+    data[EXPONENT_OFFSET..EXPONENT_OFFSET + 4].copy_from_slice(&exponent.to_le_bytes());
+    data[PUBLISH_TIME_OFFSET..PUBLISH_TIME_OFFSET + 8].copy_from_slice(&publish_time.to_le_bytes());
+    data
 }
 
 // --- Eligibility ---

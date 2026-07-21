@@ -138,7 +138,7 @@ test("program covers collateral, replay, signature, pause, and refund invariants
   assert.match(math, /settlement_conserves_escrow/);
 });
 
-test("short-duration products remain explicitly oracle gated", async () => {
+test("short-duration products stay oracle gated but never session gated", async () => {
   const [terminal, quotesRoute, expiries] = await Promise.all([
     readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
     readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
@@ -146,29 +146,109 @@ test("short-duration products remain explicitly oracle gated", async () => {
   ]);
   assert.match(terminal, /No verified.*onchain series is published/);
   assert.doesNotMatch(quotesRoute, /expiryCode\s*!==\s*["']30D["']/);
+  assert.doesNotMatch(quotesRoute, /snapshot\.mode\s*!==\s*["']live["']/);
 
-  const regularSession = Date.parse("2026-07-17T14:00:00Z");
-  const intraday = expiries.resolveExpiry("15M", "NVDA", regularSession);
+  const now = Date.parse("2026-07-17T14:00:00Z");
+  const intraday = expiries.resolveExpiry("15M", "NVDA", now);
   assert.equal(intraday.available, true);
   assert.equal(intraday.durationMinutes, 15);
   assert.equal(intraday.observationWindowSeconds, 60);
 
-  const summerCloses = expiries.previousReferenceMarketCloses(2, Date.parse("2026-07-17T22:00:00Z"));
-  assert.deepEqual(summerCloses.map((value) => new Date(value).toISOString()), [
-    "2026-07-16T20:00:00.000Z",
-    "2026-07-17T20:00:00.000Z",
-  ]);
-  const winterCloses = expiries.previousReferenceMarketCloses(2, Date.parse("2026-01-09T23:00:00Z"));
-  assert.deepEqual(winterCloses.map((value) => new Date(value).toISOString()), [
-    "2026-01-08T21:00:00.000Z",
-    "2026-01-09T21:00:00.000Z",
-  ]);
+  // Regression guard: Tend is 24/7. A Saturday-night timestamp (both a
+  // weekend and outside any US equity trading window) must resolve every
+  // expiry code as available, on pure UTC clock boundaries, with no mention
+  // of sessions, holidays, weekends, or market hours anywhere in the surface.
+  const weekendOvernight = Date.parse("2026-07-18T22:15:00Z");
+  for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
+    const definition = expiries.resolveExpiry(code, "NVDA", weekendOvernight);
+    assert.equal(definition.available, true, `${code} must be available on a weekend/overnight timestamp`);
+    assert.doesNotMatch(definition.availabilityReason, /session|holiday|weekend|market (open|close)/i);
+  }
+  assert.equal(new Date(expiries.resolveExpiry("15M", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-18T22:30:00.000Z");
+  assert.equal(new Date(expiries.resolveExpiry("1H", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-19T00:00:00.000Z");
+  const eod = expiries.resolveExpiry("EOD", "NVDA", weekendOvernight);
+  // EOD's natural boundary (next UTC midnight) is also 2026-07-19T00:00:00Z here —
+  // identical to 1H's boundary. The grid must not collapse the two onto one
+  // market, so EOD advances by one full day (its own cadence) past the collision.
+  assert.equal(new Date(eod.expiryAt).toISOString(), "2026-07-20T00:00:00.000Z");
+  assert.equal(eod.label, "Next daily settlement");
+  assert.equal(eod.shortLabel, "Daily");
+  assert.equal(new Date(expiries.resolveExpiry("7D", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-26T00:00:00.000Z");
+  assert.equal(new Date(expiries.resolveExpiry("30D", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-08-18T00:00:00.000Z");
 
-  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-07-03T15:00:00Z")), false, "observed Independence Day must stay closed");
-  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-11-27T17:59:00Z")), true, "early-close session is open before 1pm ET");
-  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2026-11-27T18:00:00Z")), false, "early-close session closes at 1pm ET");
-  assert.equal(new Date(expiries.nextReferenceMarketClose(Date.parse("2026-11-26T15:00:00Z"))).toISOString(), "2026-11-27T18:00:00.000Z");
-  assert.equal(expiries.isReferenceMarketOpen(Date.parse("2029-07-02T15:00:00Z")), false, "unpublished calendar years fail closed");
+  // Only a missing intraday feed can make a code unavailable, never the clock.
+  const unsupportedSymbol = expiries.resolveExpiry("15M", "TSLA", now);
+  assert.equal(unsupportedSymbol.available, false);
+  assert.doesNotMatch(unsupportedSymbol.availabilityReason, /session|holiday|weekend/i);
+});
+
+test("expiry grid stays strictly increasing and collision-free across every UTC clock position", async () => {
+  const expiries = await import(new URL("app/lib/expiries.ts", root));
+  const codes = ["15M", "1H", "EOD", "7D", "30D"];
+
+  function assertGridOrdering(atMs, label) {
+    const boundaries = codes.map((code) => expiries.resolveExpiry(code, "NVDA", atMs).expiryAt);
+    for (let i = 1; i < boundaries.length; i += 1) {
+      assert.ok(
+        boundaries[i] > boundaries[i - 1],
+        `${label}: ${codes[i]} (${new Date(boundaries[i]).toISOString()}) must be strictly after ` +
+          `${codes[i - 1]} (${new Date(boundaries[i - 1]).toISOString()})`,
+      );
+    }
+    const distinct = new Set(boundaries);
+    assert.equal(distinct.size, boundaries.length, `${label}: all five expiries must be distinct, got ${boundaries.join(", ")}`);
+  }
+
+  // The exact collision that shipped: bootstrap ran at 2026-07-20T22:49 UTC,
+  // where the next hourly boundary (00:00) coincided with the next UTC
+  // midnight (00:00), collapsing 1H and EOD onto the same market PDA.
+  assertGridOrdering(Date.parse("2026-07-20T22:49:00Z"), "pinned 22:49 UTC collision case");
+
+  // Sweep every 7 minutes across 48+ hours (crossing multiple UTC midnights
+  // and every hourly boundary, including the full 22:00-00:00 band on both
+  // days) to prove the ordering holds by construction, not just at one
+  // hand-picked instant.
+  const sweepStart = Date.parse("2026-07-20T00:00:00Z");
+  const sevenMinutes = 7 * 60_000;
+  const sweepDurationMs = 50 * 60 * 60_000; // 50 hours
+  for (let elapsed = 0; elapsed <= sweepDurationMs; elapsed += sevenMinutes) {
+    const at = sweepStart + elapsed;
+    assertGridOrdering(at, `sweep at ${new Date(at).toISOString()}`);
+  }
+});
+
+test("expiry chip details disambiguate by calendar day, never just time-of-day", async () => {
+  const expiries = await import(new URL("app/lib/expiries.ts", root));
+
+  // Pinned real case: 1H lands on the next UTC midnight, EOD on the one after —
+  // a full day apart — while 15M stays inside the current UTC calendar day.
+  // Before the fix, 1H and EOD both formatted as time-only ("12:00 AM UTC")
+  // and were indistinguishable on the chips despite expiring a day apart.
+  const now = Date.parse("2026-07-21T22:57:00Z");
+  const fifteen = expiries.resolveExpiry("15M", "NVDA", now);
+  const oneHour = expiries.resolveExpiry("1H", "NVDA", now);
+  const eod = expiries.resolveExpiry("EOD", "NVDA", now);
+
+  assert.equal(new Date(fifteen.expiryAt).toISOString(), "2026-07-21T23:15:00.000Z");
+  assert.equal(new Date(oneHour.expiryAt).toISOString(), "2026-07-22T00:00:00.000Z");
+  assert.equal(new Date(eod.expiryAt).toISOString(), "2026-07-23T00:00:00.000Z");
+
+  // Two codes resolving to different UTC calendar days must never produce the
+  // same detail string.
+  assert.notEqual(oneHour.detail, eod.detail);
+  assert.equal(oneHour.detail, "Jul 22, 12:00 AM UTC");
+  assert.equal(eod.detail, "Jul 23, 12:00 AM UTC");
+
+  // The same-day code (15M, still on 2026-07-21) stays time-only — no date
+  // noise added when there is no ambiguity to resolve.
+  assert.equal(fifteen.detail, "11:15 PM UTC");
+  assert.doesNotMatch(fifteen.detail, /Jul/);
+
+  // formatExpiryDetail is the single source of truth both expiries.ts and
+  // TendTerminal.tsx must call, so the two surfaces can never disagree on the
+  // same (code, expiryAt, now) triple.
+  assert.equal(expiries.formatExpiryDetail("1H", oneHour.expiryAt, now), oneHour.detail);
+  assert.equal(expiries.formatExpiryDetail("EOD", eod.expiryAt, now), eod.detail);
 });
 
 test("liquidity page uses real V2 pool state, wallet signatures, persisted simulation, and post-state reconciliation", async () => {

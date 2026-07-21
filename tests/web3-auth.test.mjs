@@ -149,14 +149,14 @@ test("PoolPosition decoding matches the on-chain layout byte for byte", async ()
   assert.throws(() => decodePoolPositionAccount(badDirection), /direction is invalid/);
 });
 
-test("launch series parameters stay on the NYSE grid and bind the deterministic market id", async () => {
+test("launch series parameters stay on the 24/7 UTC grid and bind the deterministic market id", async () => {
   const [launch, expiries, sdk] = await Promise.all([
     import(new URL("app/lib/launch-params.ts", root)),
     import(new URL("app/lib/expiries.ts", root)),
     import(new URL("vsol/sdk/index.ts", root)),
   ]);
 
-  const now = Date.parse("2026-07-17T14:00:00Z"); // regular NYSE session
+  const now = Date.parse("2026-07-17T14:00:00Z");
   for (const code of ["7D", "30D"]) {
     const params = launch.deriveLaunchSeriesParams(code, "NVDA", now);
     const definition = expiries.resolveExpiry(code, "NVDA", now);
@@ -183,15 +183,25 @@ test("launch series parameters stay on the NYSE grid and bind the deterministic 
     priceScale: params.priceScale,
     maxConfidenceBps: params.maxConfidenceBps,
     symbol: sdk.symbolBytes(params.symbol),
+    maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
   };
+  assert.equal(params.maxSettlementStalenessSeconds, launch.LAUNCH_MAX_SETTLEMENT_STALENESS_SECONDS);
   const id = await sdk.deriveMarketId(base);
   assert.equal(id.length, 32);
   assert.deepEqual(await sdk.deriveMarketId(base), id);
   const differentExpiry = await sdk.deriveMarketId({ ...base, expiry: BigInt(params.expiry + 60) });
   assert.notDeepEqual(differentExpiry, id);
+  const differentStaleness = await sdk.deriveMarketId({
+    ...base,
+    maxSettlementStalenessSeconds: base.maxSettlementStalenessSeconds + 60,
+  });
+  assert.notDeepEqual(differentStaleness, id);
 
-  // Intraday slots outside the session fail closed with the calendar reason.
-  assert.throws(() => launch.deriveLaunchSeriesParams("15M", "NVDA", Date.parse("2026-07-18T14:00:00Z")), /session/i);
+  // Tend is 24/7: a weekend/overnight timestamp still derives a valid intraday
+  // series — no session, holiday, or weekend gating.
+  const weekendOvernight = Date.parse("2026-07-18T22:15:00Z");
+  const weekendSeries = launch.deriveLaunchSeriesParams("15M", "NVDA", weekendOvernight);
+  assert.equal(new Date(weekendSeries.expiry * 1_000).toISOString(), "2026-07-18T22:30:00.000Z");
 
   // Pool risk limits mirror the program bounds.
   launch.validatePoolRiskLimits(8_000, 2_500);

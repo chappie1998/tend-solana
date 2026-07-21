@@ -10,6 +10,10 @@ use math::{
     calculate_withdraw_amount,
 };
 use pyth::{parse_fully_verified_price_update, PythPrice};
+// Re-exported purely so the LiteSVM integration test suite (a separate crate
+// that depends on `vsol` with `no-entrypoint`) can construct a receiver-owned
+// fixture account without duplicating this address; see tests/common.
+pub use pyth::PYTH_RECEIVER_PROGRAM_ID;
 use signature::{
     pool_quote_message, quote_message, verify_preceding_ed25519_instruction,
     PoolQuoteMessageContext, QuoteMessageContext,
@@ -42,6 +46,11 @@ pub const MIN_MARKET_LEAD_SECONDS: i64 = 15;
 pub const MAX_OBSERVATION_WINDOW_SECONDS: u32 = 3_600;
 pub const MAX_SETTLEMENT_GRACE_SECONDS: u32 = 604_800;
 pub const MAX_PYTH_EXPONENT_ABS: u32 = 18;
+// Tier 2's last-known-price fallback: how far before `expiry` a print may
+// have been published and still be accepted once the primary observation
+// window has fully elapsed. Capped at 7 days for the same reason the
+// settlement grace period is.
+pub const MAX_SETTLEMENT_STALENESS_SECONDS: u32 = 604_800;
 
 #[program]
 pub mod vsol {
@@ -178,6 +187,11 @@ pub mod vsol {
             VsolError::InvalidSettlementGrace
         );
         require!(
+            args.max_settlement_staleness_seconds > 0
+                && args.max_settlement_staleness_seconds <= MAX_SETTLEMENT_STALENESS_SECONDS,
+            VsolError::InvalidSettlementStaleness
+        );
+        require!(
             args.max_confidence_bps > 0 && args.max_confidence_bps <= 2_000,
             VsolError::InvalidConfidence
         );
@@ -216,6 +230,7 @@ pub mod vsol {
         market.settlement_decimals = ctx.accounts.settlement_mint.decimals;
         market.enabled = true;
         market.creator = ctx.accounts.creator.key();
+        market.max_settlement_staleness_seconds = args.max_settlement_staleness_seconds;
 
         let oracle = &mut ctx.accounts.oracle;
         oracle.bump = ctx.bumps.oracle;
@@ -228,6 +243,7 @@ pub mod vsol {
         oracle.feed_id = args.pyth_feed_id;
         oracle.exponent = 0;
         oracle.finalized = false;
+        oracle.settled_from_stale_price = false;
 
         emit!(MarketCreated {
             market: market.key(),
@@ -523,22 +539,58 @@ pub mod vsol {
             VsolError::SettlementWindowClosed
         );
 
-        let maximum_age = i64::from(market.observation_window_seconds)
-            .checked_add(i64::from(market.settlement_grace_seconds))
-            .ok_or(VsolError::MathOverflow)?;
         let pyth_price = parse_fully_verified_price_update(
             &ctx.accounts.price_update.to_account_info(),
             market.pyth_feed_id,
         )?;
+
+        // Tier 1 (preferred, unchanged): a print inside the primary
+        // observation window settles exactly as before. This is the only
+        // path used while Pyth equities are actively publishing.
+        let tier_one_ok = pyth_price.publish_time >= market.expiry
+            && pyth_price.publish_time <= observation_end
+            && pyth_price.publish_time <= now;
+
+        // Tier 2 (last-known price, fallback): once the primary window has
+        // fully elapsed with no acceptable fresh print, accept a print at or
+        // before `expiry` provided it is not staler than
+        // `max_settlement_staleness_seconds`. Gating tier 2 behind
+        // `now > observation_end` stops anyone racing to finalize at a stale
+        // pre-expiry mark while a fresh post-expiry print could still
+        // arrive; the update itself is still cryptographically verified by
+        // the Pyth receiver and the confidence-bound check below still
+        // applies, so tier 2 only widens *when* a legitimate price is
+        // acceptable, never *who* may supply one. This is what lets options
+        // on equities settle overnight and on weekends, when the underlying
+        // feed has gone dark, instead of always falling through to a
+        // timeout refund.
+        let tier_two_ok = now > observation_end
+            && pyth_price.publish_time <= market.expiry
+            && market
+                .expiry
+                .checked_sub(pyth_price.publish_time)
+                .map(|staleness| staleness <= i64::from(market.max_settlement_staleness_seconds))
+                .unwrap_or(false);
+
+        require!(tier_one_ok || tier_two_ok, VsolError::InvalidObservationTime);
+        let settled_from_stale_price = !tier_one_ok;
+
+        // Bounds the update's absolute staleness (publish_time -> now). This
+        // must not defeat a legitimate tier-2 print, so it is widened to
+        // cover the worst case across both tiers: a tier-1 print can be as
+        // old as `expiry` when `now` reaches `settlement_deadline`
+        // (observation_window + settlement_grace after expiry), and a
+        // tier-2 print can additionally be up to `max_settlement_staleness_seconds`
+        // older than `expiry`. The configured staleness bound remains the
+        // operative limit on how stale a tier-2 price may be; this check is
+        // a secondary sanity bound on the gap between publish time and now.
+        let maximum_age = i64::from(market.observation_window_seconds)
+            .checked_add(i64::from(market.settlement_grace_seconds))
+            .and_then(|value| value.checked_add(i64::from(market.max_settlement_staleness_seconds)))
+            .ok_or(VsolError::MathOverflow)?;
         require!(
             pyth_price.publish_time.saturating_add(maximum_age) >= now,
             VsolError::InvalidPythPriceUpdate
-        );
-        require!(
-            pyth_price.publish_time >= market.expiry
-                && pyth_price.publish_time <= observation_end
-                && pyth_price.publish_time <= now,
-            VsolError::InvalidObservationTime
         );
         let (price, confidence) = normalize_pyth_price(pyth_price, market.price_scale)?;
 
@@ -561,6 +613,7 @@ pub mod vsol {
         oracle.feed_id = market.pyth_feed_id;
         oracle.exponent = pyth_price.exponent;
         oracle.finalized = true;
+        oracle.settled_from_stale_price = settled_from_stale_price;
         emit!(SettlementPublished {
             market: market.key(),
             price,
@@ -568,6 +621,7 @@ pub mod vsol {
             observed_at: pyth_price.publish_time,
             price_update: ctx.accounts.price_update.key(),
             feed_id: market.pyth_feed_id,
+            settled_from_stale_price,
         });
         Ok(())
     }
@@ -1402,6 +1456,7 @@ pub struct CreateMarketArgs {
     pub settlement_grace_seconds: u32,
     pub max_confidence_bps: u16,
     pub pyth_feed_id: [u8; 32],
+    pub max_settlement_staleness_seconds: u32,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1877,6 +1932,10 @@ pub struct Market {
     pub enabled: bool,
     // Appended after launch: keep at the end so existing byte offsets stay valid.
     pub creator: Pubkey,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. Bounds how old a tier-2 last-known price may be relative to
+    // `expiry` (see `publish_pyth_settlement`).
+    pub max_settlement_staleness_seconds: u32,
 }
 
 #[account]
@@ -1892,6 +1951,10 @@ pub struct SettlementOracle {
     pub feed_id: [u8; 32],
     pub exponent: i32,
     pub finalized: bool,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. True when the finalized price came from the tier-2 last-known-
+    // price fallback rather than a fresh in-window (tier 1) print.
+    pub settled_from_stale_price: bool,
 }
 
 #[account]
@@ -2131,6 +2194,11 @@ pub struct SettlementPublished {
     pub observed_at: i64,
     pub price_update: Pubkey,
     pub feed_id: [u8; 32],
+    // True when this settlement used the tier-2 last-known-price fallback
+    // (a pre-expiry print accepted only after the primary observation
+    // window fully elapsed) rather than a fresh tier-1 print, so indexers
+    // and the UI can disclose it honestly.
+    pub settled_from_stale_price: bool,
 }
 #[event]
 pub struct PositionSettled {
@@ -2233,6 +2301,8 @@ pub enum VsolError {
     InvalidObservationWindow,
     #[msg("The settlement grace period is invalid.")]
     InvalidSettlementGrace,
+    #[msg("The maximum settlement staleness is invalid.")]
+    InvalidSettlementStaleness,
     #[msg("The confidence threshold is invalid.")]
     InvalidConfidence,
     #[msg("The symbol is empty.")]
@@ -2346,6 +2416,7 @@ fn expected_market_id(args: &CreateMarketArgs, settlement_mint: Pubkey) -> [u8; 
         &args.price_scale.to_le_bytes(),
         &args.max_confidence_bps.to_le_bytes(),
         &args.symbol,
+        &args.max_settlement_staleness_seconds.to_le_bytes(),
     ])
     .to_bytes()
 }
@@ -2541,6 +2612,7 @@ mod factory_tests {
             settlement_grace_seconds: 900,
             max_confidence_bps: 100,
             pyth_feed_id: [0x11; 32],
+            max_settlement_staleness_seconds: 86_400,
         }
     }
 
@@ -2554,7 +2626,7 @@ mod factory_tests {
         let id = expected_market_id(&args, fixture_settlement_mint());
         assert_eq!(
             to_hex(&id),
-            "454b66775586fcd0389db454f7c7d4950405060ecc5a6fc9761fda8413aad3e1"
+            "37cb5a119ad74934cd1d9254aef808898eefa3240e1862b9ce89df67dcb86c86"
         );
     }
 
@@ -2591,6 +2663,10 @@ mod factory_tests {
         let mut different_feed = base;
         different_feed.pyth_feed_id[0] ^= 0xff;
         assert_ne!(expected_market_id(&different_feed, mint), base_id);
+
+        let mut different_staleness = base;
+        different_staleness.max_settlement_staleness_seconds += 1;
+        assert_ne!(expected_market_id(&different_staleness, mint), base_id);
 
         let different_mint = Pubkey::new_from_array([0x44; 32]);
         assert_ne!(expected_market_id(&base, different_mint), base_id);

@@ -31,8 +31,16 @@ if (!Array.isArray(liquidityPools) || liquidityPools.length < 1) throw new Error
 const smoke = deployment.smoke as Record<string, unknown> | undefined;
 if (!smoke) throw new Error("The deployment manifest has no smoke-test evidence");
 
+// Factory market layout, offsets from the start of the account data
+// (including the 8-byte Anchor discriminator): ... settlement_decimals @ 243,
+// enabled @ 244, creator @ 245..277, max_settlement_staleness_seconds (u32)
+// @ 277..281 -- appended after launch, so total account size is 281 bytes.
 async function expectFactoryMarket(label: string, data: Buffer, expectedCreator?: unknown) {
-  if (data.length < 277) throw new Error(`${label} does not use the factory market layout`);
+  if (data.length < 281) throw new Error(`${label} does not use the factory market layout`);
+  const maxSettlementStalenessSeconds = data.readUInt32LE(277);
+  if (maxSettlementStalenessSeconds <= 0 || maxSettlementStalenessSeconds > 604_800) {
+    throw new Error(`${label} has an invalid max settlement staleness`);
+  }
   const id = await deriveMarketId({
     pythFeedId: data.subarray(211, 243),
     settlementMint: new PublicKey(data.subarray(105, 137)),
@@ -42,6 +50,7 @@ async function expectFactoryMarket(label: string, data: Buffer, expectedCreator?
     priceScale: data.readBigUInt64LE(185),
     maxConfidenceBps: data.readUInt16LE(209),
     symbol: data.subarray(169, 185),
+    maxSettlementStalenessSeconds,
   });
   if (!id.equals(data.subarray(41, 73))) {
     throw new Error(`${label} market id is not the deterministic hash of its onchain parameters`);
@@ -51,6 +60,7 @@ async function expectFactoryMarket(label: string, data: Buffer, expectedCreator?
   if (typeof expectedCreator === "string" && creator.toBase58() !== expectedCreator) {
     throw new Error(`${label} creator does not match the manifest`);
   }
+  return maxSettlementStalenessSeconds;
 }
 
 async function fetchTransactionWithRetry(connection: Connection, signature: string, attempts = 5) {
@@ -131,10 +141,10 @@ for (const series of markets) {
   if (!expectedCodes.delete(code)) throw new Error(`Unexpected or duplicate rolling market code ${code}`);
   const address = new PublicKey(String(series.address));
   const account = accountInfo(address);
-  if (!account || !account.owner.equals(programId) || account.data.length < 277) {
+  if (!account || !account.owner.equals(programId) || account.data.length < 281) {
     throw new Error(`Rolling market ${code} is missing or invalid`);
   }
-  await expectFactoryMarket(`Rolling market ${code}`, Buffer.from(account.data), series.creator);
+  const maxSettlementStalenessSeconds = await expectFactoryMarket(`Rolling market ${code}`, Buffer.from(account.data), series.creator);
   const feedId = Buffer.from(account.data.subarray(211, 243)).toString("hex");
   const expiry = Number(account.data.readBigInt64LE(193));
   const observationWindow = account.data.readUInt32LE(201);
@@ -144,21 +154,16 @@ for (const series of markets) {
   if (observationWindow !== Number(series.observationWindowSeconds) || observationWindow > 30) {
     throw new Error(`Rolling market ${code} does not use the narrow Pyth settlement window`);
   }
+  if (
+    typeof series.maxSettlementStalenessSeconds === "number"
+    && maxSettlementStalenessSeconds !== series.maxSettlementStalenessSeconds
+  ) {
+    throw new Error(`Rolling market ${code} settlement staleness bound does not match the manifest`);
+  }
   if (!(lastTradeAt > 0 && lastTradeAt < expiry)) throw new Error(`Rolling market ${code} has an invalid trade cutoff`);
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(expiry * 1_000));
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  if (values.weekday === "Sat" || values.weekday === "Sun") throw new Error(`Rolling market ${code} expires on a weekend`);
-  const minutes = Number(values.hour) * 60 + Number(values.minute);
-  if (minutes < 9 * 60 + 30 || minutes > 15 * 60 + 59) throw new Error(`Rolling market ${code} expires outside the reference session`);
 }
 if (String(deployment.uiMarket) !== String(markets.find((series) => series.code === "30D")?.address)) {
-  throw new Error("The legacy UI pointer does not reference the catalog's session-aligned 30D market");
+  throw new Error("The legacy UI pointer does not reference the catalog's 30D market");
 }
 const legacyUnsafe = accountInfo(LEGACY_UNSAFE_UI_MARKET);
 if (legacyUnsafe && legacyUnsafe.data.at(-1) !== 0) {
@@ -256,7 +261,9 @@ const successOracleFeedId = successOracle && successOracle.data.length >= 137
   ? Buffer.from(successOracle.data.subarray(105, 137)).toString("hex")
   : "";
 if (successOracleFeedId !== smokeFeedId) throw new Error("Finalized smoke oracle does not record the expected Pyth feed");
-if (!successOracle || successOracle.data.length < 142 || successOracle.data[141] !== 1) {
+// Oracle layout offsets: finalized @ 141, settled_from_stale_price (bool,
+// appended after launch) @ 142 -- total account size 143 bytes.
+if (!successOracle || successOracle.data.length < 143 || successOracle.data[141] !== 1) {
   throw new Error("The smoke settlement oracle is not finalized onchain");
 }
 

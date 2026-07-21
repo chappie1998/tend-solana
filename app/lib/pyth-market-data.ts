@@ -1,4 +1,3 @@
-import { isReferenceMarketOpen } from "./expiries";
 import type { Market } from "./markets";
 import { getPythMarketBars } from "./pyth-market-bars";
 import { runtimeEnv } from "./runtime-env";
@@ -27,7 +26,7 @@ export type PythMarketSnapshot = {
   publishTime: number;
   slot: number | null;
   ageSeconds: number;
-  mode: "live" | "closed" | "stale";
+  mode: "live" | "stale";
   source: "Pyth Core Hermes";
   warning: string;
 };
@@ -46,13 +45,6 @@ const snapshotCache = new Map<string, { expiresAt: number; value: PythMarketSnap
 const snapshotInFlight = new Map<string, Promise<PythMarketSnapshot>>();
 const snapshotFailures = new Map<string, { expiresAt: number; error: Error }>();
 const volatilityCache = new Map<string, { expiresAt: number; value: RealizedVolatility }>();
-
-const newYorkTradingDate = new Intl.DateTimeFormat("en-CA", {
-  timeZone: "America/New_York",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-});
 
 const utcTradingDate = new Intl.DateTimeFormat("en-CA", {
   timeZone: "UTC",
@@ -162,9 +154,9 @@ export async function getPythSnapshot(market: Market): Promise<PythMarketSnapsho
     const price = parsePrice(parsed, market.pythFeedId);
     const nowSeconds = Math.floor(Date.now() / 1_000);
     const ageSeconds = Math.max(0, nowSeconds - price.publishTime);
-    const marketOpen = isReferenceMarketOpen();
-    const mode = ageSeconds <= 30 ? "live" : marketOpen ? "stale" : "closed";
+    const mode = ageSeconds <= 30 ? "live" : "stale";
     const confidenceBps = (price.confidence / price.price) * 10_000;
+    const ageMinutes = Math.max(1, Math.round(ageSeconds / 60));
     const value: PythMarketSnapshot = {
       ...price,
       confidenceBps,
@@ -174,9 +166,7 @@ export async function getPythSnapshot(market: Market): Promise<PythMarketSnapsho
       source: "Pyth Core Hermes",
       warning: mode === "live"
         ? "Fresh Pyth reference; settlement still uses an onchain verified update."
-        : mode === "closed"
-          ? "The US reference session is closed; this is Pyth's last published market price."
-          : "Pyth did not publish a fresh update while the reference session is open.",
+        : `Reference is ${ageMinutes} min old; Equity.US.NVDA/USD is not printing fresh updates right now. Gap risk is priced into the quote, not hidden.`,
     };
     snapshotCache.set(market.pythFeedId, { expiresAt: Date.now() + 5_000, value });
     snapshotFailures.delete(market.pythFeedId);
@@ -199,10 +189,11 @@ export async function getPythRealizedVolatility(market: Market): Promise<Realize
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
   const history = await getPythMarketBars(market, "D");
-  const asOfDate = newYorkTradingDate.format(new Date(history.asOf));
-  const completedBars = isReferenceMarketOpen(history.asOf)
-    ? history.bars.filter((bar) => utcTradingDate.format(new Date(bar.time * 1_000)) !== asOfDate)
-    : history.bars;
+  // The most recent daily bar may still be forming (its UTC day hasn't
+  // finished yet); drop it so realized vol is never computed off a partial
+  // candle. This has nothing to do with trading hours — it's just calendar math.
+  const asOfDate = utcTradingDate.format(new Date(history.asOf));
+  const completedBars = history.bars.filter((bar) => utcTradingDate.format(new Date(bar.time * 1_000)) !== asOfDate);
   const prices = completedBars.slice(-21).map((bar) => bar.close);
   if (prices.length < 10) throw new Error("Pyth historical coverage is insufficient for volatility pricing");
   const returns = prices.slice(1).map((price, index) => Math.log(price / prices[index]));

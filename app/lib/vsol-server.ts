@@ -201,7 +201,7 @@ function decodeConfigAccount(data: Buffer) {
 }
 
 export function decodeMarketAccount(data: Buffer) {
-  expectAccount(data, 277, MARKET_ACCOUNT_DISCRIMINATOR, "VSOL market");
+  expectAccount(data, 281, MARKET_ACCOUNT_DISCRIMINATOR, "VSOL market");
   return {
     config: publicKeyAt(data, 9),
     marketId: data.subarray(41, 73),
@@ -218,15 +218,21 @@ export function decodeMarketAccount(data: Buffer) {
     settlementDecimals: data[243],
     enabled: data[244] === 1,
     creator: publicKeyAt(data, 245),
+    // Appended after launch: bounds how old a tier-2 last-known price may be
+    // relative to `expiry` (see the two-tier settlement note on the oracle).
+    maxSettlementStalenessSeconds: data.readUInt32LE(277),
   };
 }
 
 function decodeOracleAccount(data: Buffer) {
-  expectAccount(data, 142, ORACLE_ACCOUNT_DISCRIMINATOR, "VSOL oracle");
+  expectAccount(data, 143, ORACLE_ACCOUNT_DISCRIMINATOR, "VSOL oracle");
   return {
     market: publicKeyAt(data, 9),
     pythFeedId: data.subarray(105, 137).toString("hex"),
     finalized: data[141] === 1,
+    // Appended after launch: true when the finalized price came from the
+    // tier-2 last-known-price fallback rather than a fresh in-window print.
+    settledFromStalePrice: data[142] === 1,
   };
 }
 
@@ -499,7 +505,10 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     && oracle.pythFeedId === VSOL_PYTH_FEED_ID
     && market.expiry === series.expiry
     && market.observationWindowSeconds === series.observationWindowSeconds
-    && market.settlementGraceSeconds === series.settlementGraceSeconds;
+    && market.settlementGraceSeconds === series.settlementGraceSeconds
+    // Optional until the manifest publishes it (mirrors VSOL_LIQUIDITY.managerKey below).
+    && (series.maxSettlementStalenessSeconds === undefined
+      || market.maxSettlementStalenessSeconds === series.maxSettlementStalenessSeconds);
   if (!exactBinding) throw new Error("The deployed series catalog does not match verified onchain state");
 
   const beforeCutoff = now < poolMarket.lastTradeAt;

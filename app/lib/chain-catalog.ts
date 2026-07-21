@@ -11,7 +11,7 @@ import {
   getVsolConnection,
 } from "./vsol-server";
 
-const MARKET_ACCOUNT_SIZE = 277;
+const MARKET_ACCOUNT_SIZE = 281;
 const POOL_ACCOUNT_SIZE = 214;
 const POOL_MARKET_ACCOUNT_SIZE = 82;
 

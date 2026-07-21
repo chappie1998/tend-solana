@@ -79,10 +79,6 @@ export async function POST(request: Request) {
     const reason = error instanceof Error ? error.message : "Pyth pricing is unavailable";
     return json({ error: `Executable pricing requires fresh Pyth spot and historical observations: ${reason}` }, 503);
   }
-  if (snapshot.mode !== "live") {
-    return json({ error: "Executable quotes pause unless the Pyth equity feed is fresh during the US reference session." }, 503);
-  }
-
   const economics = quoteFor({
     spot: snapshot.price,
     amount,
@@ -90,6 +86,7 @@ export async function POST(request: Request) {
     direction,
     payoff,
     volatility: volatility.value,
+    referenceAgeSeconds: snapshot.ageSeconds,
   });
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
@@ -170,6 +167,8 @@ export async function POST(request: Request) {
     referencePrice: snapshot.price,
     referenceConfidence: snapshot.confidence,
     referencePublishTime: snapshot.publishTime,
+    referenceAgeSeconds: snapshot.ageSeconds,
+    pricingMode: snapshot.mode,
     referenceSource: "Pyth Core Hermes · exact onchain feed id",
     settlement: "European cash-settled · fully verified Pyth PriceUpdateV2",
     expiry: {

@@ -36,8 +36,9 @@ const MARKET_ID_FIXTURE = {
   priceScale: 1_000_000n,
   maxConfidenceBps: 100,
   symbol: symbolBytes("NVDA"),
+  maxSettlementStalenessSeconds: 86_400,
 };
-const MARKET_ID_KNOWN_ANSWER = "454b66775586fcd0389db454f7c7d4950405060ecc5a6fc9761fda8413aad3e1";
+const MARKET_ID_KNOWN_ANSWER = "37cb5a119ad74934cd1d9254aef808898eefa3240e1862b9ce89df67dcb86c86";
 
 const quote: Quote = {
   nonce: 7n,
@@ -128,6 +129,7 @@ test("deriveMarketId binds every series parameter", async () => {
     { priceScale: MARKET_ID_FIXTURE.priceScale + 1n },
     { maxConfidenceBps: 101 },
     { symbol: symbolBytes("NVDA2") },
+    { maxSettlementStalenessSeconds: 86_401 },
   ];
   for (const variant of variants) {
     const changed = await deriveMarketId({ ...MARKET_ID_FIXTURE, ...variant });

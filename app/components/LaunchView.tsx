@@ -157,7 +157,7 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
 
       <div className="liquidity-grid">
         <section className="positions-card liquidity-action-card">
-          <div className="section-head"><div><h2><CalendarPlus size={17} aria-hidden="true" /> Create a series</h2><p>Series land on the NYSE-valid grid. Identical parameters share one deterministic onchain address, so duplicates are impossible.</p></div></div>
+          <div className="section-head"><div><h2><CalendarPlus size={17} aria-hidden="true" /> Create a series</h2><p>Series land on the published expiry grid, 24/7. Identical parameters share one deterministic onchain address, so duplicates are impossible.</p></div></div>
           <form onSubmit={(event) => submitPanel("series", event)}>
             <div className="choice-row standard-expiry-row">
               {gridOptions.map((option) => (

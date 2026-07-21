@@ -59,6 +59,7 @@ export async function POST(request: Request) {
         observationWindowSeconds: built.series.observationWindowSeconds,
         settlementGraceSeconds: built.series.settlementGraceSeconds,
         maxConfidenceBps: built.series.maxConfidenceBps,
+        maxSettlementStalenessSeconds: built.series.maxSettlementStalenessSeconds,
         symbol: built.series.symbol,
       };
       summary = { marketAddress: built.marketAddress, oracleAddress: built.oracleAddress, marketId: built.marketId, expiry: built.series.expiry, detail: built.series.detail };
