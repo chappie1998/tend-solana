@@ -14,7 +14,8 @@
     "check": "npm run build:program && npm run test:rust && npm run test:lint && npm run test:sdk",
     "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
     "devnet:verify": "node --import tsx scripts/verify-deployment.ts",
-    "keeper": "node --import tsx scripts/keeper.ts"
+    "keeper": "node --import tsx scripts/keeper.ts",
+    "lookup-table": "node --import tsx scripts/create-lookup-table.ts"
   },
   "dependencies": {
     "@anchor-lang/core": "1.0.2",

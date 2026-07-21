@@ -1,6 +1,6 @@
 "use client";
 
-import { Transaction } from "@solana/web3.js";
+import { Transaction, VersionedTransaction } from "@solana/web3.js";
 import type { SolanaWalletProvider } from "./vsol";
 
 export function injectedSolanaWallet() {
@@ -17,10 +17,28 @@ function bytesToBase64(bytes: Uint8Array) {
   return btoa(binary);
 }
 
+/**
+ * Deserializes base64 transaction bytes as either a legacy Transaction or a
+ * v0 VersionedTransaction (Phantom -- and every other injected wallet this
+ * app supports -- can sign both). VersionedTransaction.deserialize
+ * understands both wire formats (it reads the version prefix inside the
+ * message itself), so this is a cheap, side-effect-free probe: try it first,
+ * and fall back to the plain legacy parser only if that probe throws.
+ */
+function deserializeSolanaTransaction(bytes: Uint8Array): Transaction | VersionedTransaction {
+  try {
+    const versioned = VersionedTransaction.deserialize(bytes);
+    if (versioned.message.version !== "legacy") return versioned;
+  } catch {
+    // Fall through to the legacy parser below.
+  }
+  return Transaction.from(bytes);
+}
+
 export async function signSerializedSolanaTransaction(encoded: string, provider = injectedSolanaWallet()) {
   if (!provider) throw new Error("Solana wallet unavailable");
   const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
-  const transaction = Transaction.from(bytes);
+  const transaction = deserializeSolanaTransaction(bytes);
   const signed = await provider.signTransaction(transaction);
   return bytesToBase64(signed.serialize());
 }

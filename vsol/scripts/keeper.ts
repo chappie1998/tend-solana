@@ -4,10 +4,19 @@ import { resolve } from "node:path";
 import { AnchorError, AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import BN from "bn.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import {
+  AddressLookupTableProgram,
+  Connection,
+  Keypair,
+  PublicKey,
+  sendAndConfirmTransaction,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
+import { missingAddresses } from "./lib/lookup-table.ts";
 import {
   deriveConfig,
   deriveLiquidityPool,
@@ -56,7 +65,7 @@ const MARKET_SYMBOL = "NVDA";
 // never mint a rung the app derives a different market address for.
 const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v3`;
 
-type Counters = { created: number; authorized: number; skipped: number };
+type Counters = { created: number; authorized: number; skipped: number; altExtended: number };
 
 async function loadRequiredKeypair(name: string): Promise<Keypair> {
   const path = resolve(devnetDir, `${name}.json`);
@@ -111,6 +120,61 @@ function anchorErrorCode(error: unknown): string | undefined {
   return error instanceof AnchorError ? error.error.errorCode.code : undefined;
 }
 
+/**
+ * Best-effort, read-only peek at the manifest for a single optional field.
+ * The keeper otherwise never depends on (or writes) the deployment manifest
+ * for market creation -- this exists only so newly created markets can be
+ * folded into the address lookup table (ALT) when create-lookup-table.ts has
+ * already published one. Any failure to read it (missing file, bad JSON,
+ * field absent) is treated as "no table yet", never as a keeper failure.
+ */
+async function readAddressLookupTable(): Promise<PublicKey | undefined> {
+  try {
+    const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
+    const deployment = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    return typeof deployment.addressLookupTable === "string" ? new PublicKey(deployment.addressLookupTable) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extends the ALT with a newly created market's address and oracle, skipping
+ * whichever of the two are already present. A failure here must never fail
+ * the keeper run -- the market itself was already created successfully,
+ * which is the operation that matters; a later keeper run or a manual
+ * "npm run lookup-table" pass will pick up the missing address next time.
+ */
+async function extendLookupTableWithMarket(params: {
+  authority: Keypair;
+  lookupTable: PublicKey;
+  code: string;
+  market: PublicKey;
+  oracle: PublicKey;
+  counters: Counters;
+}): Promise<void> {
+  try {
+    const lookup = await connection.getAddressLookupTable(params.lookupTable, { commitment });
+    const existing = lookup.value?.state.addresses ?? [];
+    const toAdd = missingAddresses(existing, [params.market, params.oracle]);
+    if (toAdd.length === 0) {
+      console.log(`skip: ${params.code} market and oracle already present in ALT ${params.lookupTable.toBase58()}`);
+      return;
+    }
+    const instruction = AddressLookupTableProgram.extendLookupTable({
+      payer: params.authority.publicKey,
+      authority: params.authority.publicKey,
+      lookupTable: params.lookupTable,
+      addresses: toAdd,
+    });
+    await sendAndConfirmTransaction(connection, new Transaction().add(instruction), [params.authority], { commitment });
+    console.log(`extended: ALT ${params.lookupTable.toBase58()} with ${toAdd.length} address(es) for ${params.code}`);
+    params.counters.altExtended += toAdd.length;
+  } catch (error) {
+    console.log(`warn: failed to extend ALT for ${params.code} market ${params.market.toBase58()} -- market creation still succeeded (${describeError(error)})`);
+  }
+}
+
 type MarketRung = {
   series: ScheduledSeries;
   id: Buffer;
@@ -126,6 +190,7 @@ async function ensureMarkets(params: {
   underlyingMint: PublicKey;
   schedule: ScheduledSeries[];
   counters: Counters;
+  addressLookupTable?: PublicKey;
 }): Promise<MarketRung[]> {
   const rungs: MarketRung[] = [];
   for (const series of params.schedule) {
@@ -179,6 +244,19 @@ async function ensureMarkets(params: {
         `created: ${series.code} market ${market.toBase58()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
       );
       params.counters.created += 1;
+
+      if (params.addressLookupTable) {
+        await extendLookupTableWithMarket({
+          authority: params.creator,
+          lookupTable: params.addressLookupTable,
+          code: series.code,
+          market,
+          oracle,
+          counters: params.counters,
+        });
+      } else {
+        console.log(`skip: ALT extension for ${series.code} -- no addressLookupTable is published in the manifest`);
+      }
     } catch (error) {
       if (isLostCreateRace(error) || (await accountExists(market))) {
         console.log(`skip: ${series.code} market creation lost a create race at ${market.toBase58()}`);
@@ -314,7 +392,11 @@ async function main(): Promise<void> {
   // Bounded by construction: rollingMarketSchedule always returns exactly
   // the five current rungs, so this run can never create more than five
   // markets or authorize more than five series.
-  const counters: Counters = { created: 0, authorized: 0, skipped: 0 };
+  const counters: Counters = { created: 0, authorized: 0, skipped: 0, altExtended: 0 };
+
+  // Read-only, best-effort: the keeper's market creation must not depend on
+  // the manifest existing at all, let alone publishing an ALT yet.
+  const addressLookupTable = await readAddressLookupTable();
 
   const rungs = await ensureMarkets({
     creatorProgram,
@@ -324,6 +406,7 @@ async function main(): Promise<void> {
     underlyingMint,
     schedule,
     counters,
+    addressLookupTable,
   });
 
   await ensurePoolAuthorizations({
@@ -336,7 +419,10 @@ async function main(): Promise<void> {
     counters,
   });
 
-  console.log(`Keeper summary: created ${counters.created} markets, authorized ${counters.authorized} series, skipped ${counters.skipped}`);
+  console.log(
+    `Keeper summary: created ${counters.created} markets, authorized ${counters.authorized} series, ` +
+      `ALT-extended ${counters.altExtended} addresses, skipped ${counters.skipped}`,
+  );
 }
 
 main().catch((error: unknown) => {

@@ -13,6 +13,8 @@ This is a devnet system, not a mainnet release. Executable quotes fail closed wh
 - `scripts/bootstrap.ts`: idempotent market/pool setup plus adversarial direct and pooled smoke lifecycles
 - `scripts/keeper.ts`: lightweight, idempotent series keeper -- mints the next rolling markets and authorizes them on the passive pool
 - `scripts/lib/expiry-grid.ts`: the shared rolling 15M/1H/EOD/7D/30D UTC grid logic used by both bootstrap and the keeper
+- `scripts/create-lookup-table.ts`: idempotent address lookup table (ALT) provisioner for the fill path
+- `scripts/lib/lookup-table.ts`: the shared stable-address set for the ALT, used by `create-lookup-table.ts` and `verify-deployment.ts`
 - `scripts/verify-deployment.ts`: batched independent account and transaction verifier
 - `deployments/devnet.json`: public deployment evidence
 - `target/idl` and `target/types`: generated client interface tracked for the web build
@@ -54,6 +56,24 @@ It is safe to run on a short interval -- every 5 minutes is a reasonable default
 npm run keeper
 ```
 
+When a market is created, the keeper also folds that market's address and its oracle address into the address lookup table (see below), if one is published in the manifest. That extension is best-effort: a failure to extend never fails the keeper run, since the market itself was already created successfully.
+
+## Address lookup table (ALT)
+
+The fill transaction sits close enough to Solana's 1232-byte limit that the four-instruction mint-on-demand fill cannot be submitted at all without help. `scripts/create-lookup-table.ts` creates (or verifies and extends) a single on-chain address lookup table that replaces repeated 32-byte account keys with 1-byte indices in v0 transactions, which fixes both the tight direct-fill margin and the oversized mint-on-demand fill.
+
+It is idempotent: run it as many times as you like.
+
+- If `deployments/<cluster>.json` has no `addressLookupTable` yet, it creates one (authority and payer are the same persisted `.devnet/<cluster>-creator.json` signer the keeper uses) and seeds it with the stable accounts every fill touches: the VSOL program, config, the main liquidity pool and its token vault, the settlement mint, the treasury token account, the Ed25519 program, the SPL token program, the system program, the rent sysvar, and the instructions sysvar.
+- If `addressLookupTable` is already published, it verifies the on-chain account exists, is owned by the AddressLookupTable program, and has the expected authority, then extends it with whichever stable addresses are still missing (diffed against the table's current contents) rather than creating a second table. If the recorded table fails that verification, the script fails loudly instead of silently creating an orphan.
+- Extends are chunked at ~30 addresses per transaction (Solana's practical per-instruction ceiling); freshly extended addresses only become usable by v0 transactions about one slot after the extend lands, so callers should tolerate a brief warm-up window right after a run.
+
+```bash
+npm run lookup-table
+```
+
+The rolling grid keeps minting markets, and the keeper appends each new market and oracle address to the table as it goes -- so the ALT will keep filling over its lifetime (up to the protocol maximum of 256 addresses). Deactivating and closing an ALT is supported by the on-chain program (`AddressLookupTableProgram.deactivateLookupTable` / `.closeLookupTable`), but no cleanup path is implemented here yet; that is future work once the table's growth rate is understood in practice.
+
 ## Commands
 
 ```bash
@@ -61,6 +81,7 @@ npm run check
 npm run devnet:bootstrap
 npm run devnet:verify
 npm run keeper
+npm run lookup-table
 ```
 
 The bootstrap script creates only mock assets and local ignored test signers. It posts a fully verified Pyth price update through the official receiver, publishes permissionless settlement, verifies successful settlement and timeout refund, then writes the deployment-ready flag. Never commit `.devnet`, deployment keypairs, upgrade authorities, or funded wallets.

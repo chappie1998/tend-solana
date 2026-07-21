@@ -12,7 +12,10 @@
     "vsol/scripts/verify-deployment.ts",
     "vsol/scripts/web-execution-smoke.ts",
     "vsol/sdk/**/*.ts",
-    "vsol/tests/**/*.ts"
+    "vsol/tests/**/*.ts",
+    "vsol/scripts/create-lookup-table.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules"
+  ]
 }

@@ -1,7 +1,7 @@
 import "../../../lib/runtime-env-worker";
 import { eq } from "drizzle-orm";
-import { Transaction, VersionedTransaction } from "@solana/web3.js";
-import { decodeSignedTransaction, getVsolConnection, inspectVsolFillTransaction } from "../../../lib/vsol-server";
+import { VersionedTransaction } from "@solana/web3.js";
+import { decodeSignedTransaction, getVsolConnection, inspectVsolFillTransaction, resolveSignedVsolFillTransaction } from "../../../lib/vsol-server";
 import { ensureDb, getDb } from "../../../../db";
 import { rfqQuotes, transactionSimulations } from "../../../../db/schema";
 import { boundedLogs, hashHex, resolveUserKey, safeJson, sameOrigin } from "../../../lib/session";
@@ -21,9 +21,18 @@ export async function POST(request: Request) {
   let simulationId = "";
   try {
     const raw = decodeSignedTransaction(input.transaction);
-    const transaction = Transaction.from(raw);
-    if (!transaction.verifySignatures()) return Response.json({ error: "The wallet signature is invalid." }, { status: 422 });
-    const inspected = await inspectVsolFillTransaction(transaction);
+    // Accepts both wire formats: legacy verification uses
+    // Transaction.verifySignatures(); a v0 transaction (VersionedTransaction
+    // has no built-in verifySignatures()) is verified by hand, and its
+    // lookup-table-indexed accounts are resolved ONLY against the
+    // manifest-pinned address lookup table -- never a table the client's own
+    // transaction names -- before inspectVsolFillTransaction ever sees a
+    // single pubkey. See resolveSignedVsolFillTransaction in vsol-server.ts.
+    const resolved = await resolveSignedVsolFillTransaction(raw, connection);
+    if (!resolved) {
+      return Response.json({ error: "The wallet signature is invalid, or the transaction references an untrusted lookup table." }, { status: 422 });
+    }
+    const inspected = await inspectVsolFillTransaction(resolved);
     if (!inspected) return Response.json({ error: "Only maker-signed VSOL fill transactions are accepted." }, { status: 422 });
     if (inspected.position.toBase58() !== input.quoteId || inspected.buyer.toBase58() !== input.walletAddress) {
       return Response.json({ error: "The signed buyer and position do not match this quote request." }, { status: 422 });

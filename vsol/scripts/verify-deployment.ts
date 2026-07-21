@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { AddressLookupTableAccount, AddressLookupTableProgram, Connection, PublicKey } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, unpackAccount } from "@solana/spl-token";
 import {
   deriveLiquidityPool,
@@ -8,6 +8,7 @@ import {
   deriveLiquidityPoolToken,
   deriveMarketId,
 } from "../sdk/index.ts";
+import { stableFillAddresses } from "./lib/lookup-table.ts";
 
 const cluster = process.env.VSOL_CLUSTER ?? "devnet";
 const path = resolve(import.meta.dirname, "..", "deployments", `${cluster}.json`);
@@ -114,6 +115,9 @@ for (const poolManifest of liquidityPools) {
   poolAuthorizationAddresses.set(pool.toBase58(), authorizations);
   accountAddresses.push(pool, token, ...authorizations);
 }
+const addressLookupTable = typeof deployment.addressLookupTable === "string" ? deployment.addressLookupTable : undefined;
+const lookupTableAddress = addressLookupTable ? new PublicKey(addressLookupTable) : undefined;
+if (lookupTableAddress) accountAddresses.push(lookupTableAddress);
 const uniqueAccountAddresses = [...new Map(accountAddresses.map((address) => [address.toBase58(), address])).values()];
 const accountInfos = await connection.getMultipleAccountsInfo(uniqueAccountAddresses, "confirmed");
 const accounts = new Map(uniqueAccountAddresses.map((address, index) => [address.toBase58(), accountInfos[index]]));
@@ -378,6 +382,34 @@ if (hasCloseEarlyEvidence) {
   }
 }
 
+// The ALT is optional in general (older manifests predate it), but once the
+// manifest claims one exists this is fail-closed exactly like
+// pythUpgradeDeployed above: a published addressLookupTable that turns out
+// to be missing, mis-owned, mis-authorized, or incomplete is a verification
+// failure, not a silent skip.
+if (lookupTableAddress) {
+  const lookupTableAccountInfo = accountInfo(lookupTableAddress);
+  if (!lookupTableAccountInfo) {
+    throw new Error(`Address lookup table ${lookupTableAddress.toBase58()} does not exist`);
+  }
+  if (!lookupTableAccountInfo.owner.equals(AddressLookupTableProgram.programId)) {
+    throw new Error(`Address lookup table ${lookupTableAddress.toBase58()} is not owned by the AddressLookupTable program`);
+  }
+  const lookupTableState = AddressLookupTableAccount.deserialize(lookupTableAccountInfo.data);
+  const expectedAuthority = String(deployment.creator);
+  if (!lookupTableState.authority || lookupTableState.authority.toBase58() !== expectedAuthority) {
+    throw new Error(`Address lookup table ${lookupTableAddress.toBase58()} authority does not match the expected creator ${expectedAuthority}`);
+  }
+  const storedAddresses = new Set(lookupTableState.addresses.map((address) => address.toBase58()));
+  const expectedStable = stableFillAddresses(deployment);
+  const missingStable = expectedStable.filter((entry) => !storedAddresses.has(entry.address.toBase58()));
+  if (missingStable.length > 0) {
+    throw new Error(
+      `Address lookup table ${lookupTableAddress.toBase58()} is missing stable address(es): ${missingStable.map((entry) => entry.label).join(", ")}`,
+    );
+  }
+}
+
 console.log(JSON.stringify({
   ok: true,
   cluster,
@@ -387,5 +419,6 @@ console.log(JSON.stringify({
   pythReceiverProgram: deployment.pythReceiverProgram,
   pythFeedId: deployment.pythFeedId,
   smokePythFeedId: deployment.smokePythFeedId,
+  addressLookupTable: deployment.addressLookupTable ?? null,
   verifiedAt: new Date().toISOString(),
 }, null, 2));

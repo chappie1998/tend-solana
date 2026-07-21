@@ -20,6 +20,13 @@ type LiquidityDeployment = {
 
 type ExtendedDeployment = typeof deployment & {
   liquidityPools?: LiquidityDeployment[];
+  // Published once the ALT that collapses VSOL fill transactions (both the
+  // plain 2-instruction fill and the 4-instruction mint-on-demand shape)
+  // under Solana's 1232-byte packet limit has been created and extended
+  // onchain. Absent until then -- see app/lib/vsol-server.ts's
+  // getVsolAddressLookupTableAccount, which must keep building legacy
+  // transactions exactly as before whenever this is missing.
+  addressLookupTable?: string;
 };
 
 const deployed = deployment as ExtendedDeployment;
@@ -44,6 +51,12 @@ export const VSOL_MAKER = new PublicKey(deployment.maker);
 export const VSOL_SETTLEMENT_MINT = new PublicKey(deployment.settlementMint);
 export const VSOL_WRITER_VAULT = new PublicKey(deployment.writerVault);
 export const VSOL_WRITER_TOKEN = new PublicKey(deployment.writerToken);
+// The address lookup table that lets fill transactions compile as v0 (see
+// app/lib/vsol-server.ts). Null until the manifest publishes it -- every
+// caller must keep working with plain legacy transactions in that case.
+export const VSOL_ADDRESS_LOOKUP_TABLE = deployed.addressLookupTable
+  ? new PublicKey(deployed.addressLookupTable)
+  : null;
 // The manifest's own `markets` array (bootstrap-time evidence of the series
 // that were minted during setup) is intentionally NOT read here anymore. A
 // keeper mints fresh grid rungs continuously, so a checked-in snapshot goes

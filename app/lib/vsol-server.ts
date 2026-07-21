@@ -5,15 +5,19 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
+  AddressLookupTableAccount,
   Connection,
   Ed25519Program,
   Keypair,
+  MessageV0,
   PublicKey,
   SYSVAR_INSTRUCTIONS_PUBKEY,
   SYSVAR_RENT_PUBKEY,
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import nacl from "tweetnacl";
 // Explicit .ts/.json import specifiers (with a JSON import attribute) below
@@ -24,6 +28,7 @@ import deployment from "../../vsol/deployments/devnet.json" with { type: "json" 
 import idl from "../../vsol/target/idl/vsol.json" with { type: "json" };
 import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
 import {
+  VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
   VSOL_LIQUIDITY,
   VSOL_PYTH_FEED_ID,
@@ -59,6 +64,81 @@ export const SERIES_NOT_YET_MINTED_REASON = "This series has not been minted yet
 // transaction; if the composed size ever exceeds this, ship no path at all
 // rather than a silently-broken oversized transaction.
 const MAX_TRANSACTION_BYTES = 1232;
+// Read on every quote (see buildVsolQuoteTransaction below), so the fetched
+// AddressLookupTableAccount is cached briefly rather than refetched per
+// request; a few seconds is enough to absorb request bursts while still
+// noticing a freshly-extended table quickly.
+const ADDRESS_LOOKUP_TABLE_CACHE_MS = 5_000;
+let addressLookupTableCache: { account: AddressLookupTableAccount | null; expiresAt: number } | null = null;
+
+/**
+ * Fetches (and briefly caches) the manifest-pinned address lookup table
+ * account (VSOL_ADDRESS_LOOKUP_TABLE, see app/lib/vsol.ts). Returns null --
+ * never throws -- when the manifest publishes no table, or the published
+ * address does not resolve to a live account onchain, so every caller can
+ * treat "no ALT" as an ordinary, expected state and fall back to legacy
+ * transactions exactly as before the ALT existed.
+ */
+export async function getVsolAddressLookupTableAccount(
+  connection: Connection,
+  now = Date.now(),
+): Promise<AddressLookupTableAccount | null> {
+  if (addressLookupTableCache && addressLookupTableCache.expiresAt > now) return addressLookupTableCache.account;
+  let account: AddressLookupTableAccount | null = null;
+  if (VSOL_ADDRESS_LOOKUP_TABLE) {
+    try {
+      const result = await connection.getAddressLookupTable(VSOL_ADDRESS_LOOKUP_TABLE);
+      account = result.value ?? null;
+    } catch {
+      account = null;
+    }
+  }
+  addressLookupTableCache = { account, expiresAt: now + ADDRESS_LOOKUP_TABLE_CACHE_MS };
+  return account;
+}
+
+/**
+ * Composes a fill's instructions into a v0 transaction (compiled against the
+ * given lookup table, so accounts also present in that table collapse into
+ * 1-byte indices instead of repeated 32-byte pubkeys) when a table is
+ * supplied, or a legacy Transaction -- built exactly as before the ALT
+ * existed -- when it is not. Pure and synchronous: tests exercise it
+ * directly with a stub AddressLookupTableAccount, no RPC involved.
+ */
+export function composeVsolFillTransaction(params: {
+  feePayer: PublicKey;
+  blockhash: string;
+  lastValidBlockHeight: number;
+  instructions: TransactionInstruction[];
+  lookupTableAccount?: AddressLookupTableAccount | null;
+}): Transaction | VersionedTransaction {
+  if (params.lookupTableAccount) {
+    const v0Message = new TransactionMessage({
+      payerKey: params.feePayer,
+      recentBlockhash: params.blockhash,
+      instructions: params.instructions,
+    }).compileToV0Message([params.lookupTableAccount]);
+    return new VersionedTransaction(v0Message);
+  }
+  return new Transaction({
+    feePayer: params.feePayer,
+    blockhash: params.blockhash,
+    lastValidBlockHeight: params.lastValidBlockHeight,
+  }).add(...params.instructions);
+}
+
+/** Signs either transaction shape with an additional required signer (used for the pool manager on mint-on-demand fills). */
+function partialSignVsolTransaction(transaction: Transaction | VersionedTransaction, signer: Keypair) {
+  if (transaction instanceof VersionedTransaction) transaction.sign([signer]);
+  else transaction.partialSign(signer);
+}
+
+/** Serializes either transaction shape to the exact bytes that will go over the wire once fully signed. */
+export function serializeVsolTransaction(transaction: Transaction | VersionedTransaction): Buffer {
+  if (transaction instanceof VersionedTransaction) return Buffer.from(transaction.serialize());
+  return transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
+}
+
 const POOL_QUOTE_DOMAIN = Buffer.from("VSOLPLP1", "ascii");
 const MARKET_SEED = Buffer.from("market");
 const ORACLE_SEED = Buffer.from("oracle");
@@ -958,21 +1038,32 @@ export async function buildVsolQuoteTransaction(params: {
     rent: SYSVAR_RENT_PUBKEY,
   }, quoteData(quote));
   const latest = await connection.getLatestBlockhash("confirmed");
-  const transaction = new Transaction({
+  // When the manifest publishes an ALT, compile as a v0 transaction so
+  // repeated 32-byte account keys collapse into 1-byte indices -- this is
+  // what lets the 4-instruction mint-on-demand shape (otherwise ~1469 bytes)
+  // fit under the 1232-byte packet limit. Falls back to the exact legacy
+  // shape used before the ALT existed whenever no table is available.
+  const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
+  const transaction = composeVsolFillTransaction({
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
-  }).add(...mintInstructions, signatureInstruction, fillInstruction);
+    instructions: [...mintInstructions, signatureInstruction, fillInstruction],
+    lookupTableAccount,
+  });
   // The pool manager is a required signer on set_liquidity_pool_market; sign
   // now server-side (the buyer signs everything else, including this
   // instruction's other accounts, in their wallet next).
-  if (poolManager) transaction.partialSign(poolManager);
+  if (poolManager) partialSignVsolTransaction(transaction, poolManager);
 
-  const serialized = transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
+  const serialized = serializeVsolTransaction(transaction);
   if (serialized.length > MAX_TRANSACTION_BYTES) {
     // Do not ship a silently-broken oversized transaction: fail the quote
     // honestly so the caller reports the series as unavailable rather than
-    // handing the wallet something that can never fit in a packet.
+    // handing the wallet something that can never fit in a packet -- this
+    // can now only genuinely happen when no ALT is published at all, since
+    // ALT compression brings even the mint-on-demand shape back under the
+    // limit (see the size-measurement test in tests/vsol-versioned-fill.test.mjs).
     const error = new Error(
       `Minting this series requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit. A versioned transaction or address lookup table is required before this series can trade.`,
     );
@@ -1104,12 +1195,37 @@ export async function verifyVsolFill(signature: string, buyer: PublicKey, positi
   return buyerSigned && invokesProgram && createsPosition && usesPool && usesExpectedMarket && fillLogged && exactPosition;
 }
 
-export function isVsolFillTransaction(transaction: Transaction) {
-  if (transaction.instructions.length !== 2 || !VSOL_LIQUIDITY) return false;
+// A transaction's instructions, normalized to fully-resolved account keys --
+// identical in shape whether they came from a legacy Transaction (whose
+// TransactionInstruction.keys are already resolved pubkeys) or from a v0
+// VersionedTransaction whose lookup-table indices have been resolved against
+// the manifest-pinned ALT (see resolveSignedVsolTransaction below). Every
+// inspection function below operates purely on this shape, so the same
+// strict checks run identically regardless of transaction version.
+export type ResolvedInstructionAccount = { pubkey: PublicKey; isSigner: boolean; isWritable: boolean };
+export type ResolvedInstruction = { programId: PublicKey; keys: ResolvedInstructionAccount[]; data: Buffer };
+export type ResolvedFillTransaction = { feePayer: PublicKey; instructions: ResolvedInstruction[] };
+
+function normalizeFillTransaction(input: Transaction | ResolvedFillTransaction): ResolvedFillTransaction | null {
+  if (!(input instanceof Transaction)) return input;
+  if (!input.feePayer) return null;
+  return {
+    feePayer: input.feePayer,
+    instructions: input.instructions.map((instruction) => ({
+      programId: instruction.programId,
+      keys: instruction.keys.map((key) => ({ pubkey: key.pubkey, isSigner: key.isSigner, isWritable: key.isWritable })),
+      data: Buffer.from(instruction.data),
+    })),
+  };
+}
+
+export function isVsolFillTransaction(input: Transaction | ResolvedFillTransaction) {
+  const transaction = normalizeFillTransaction(input);
+  if (!transaction || transaction.instructions.length !== 2 || !VSOL_LIQUIDITY) return false;
   const [signatureInstruction, fillInstruction] = transaction.instructions;
   return signatureInstruction.programId.equals(Ed25519Program.programId)
     && fillInstruction.programId.equals(VSOL_PROGRAM_ID)
-    && Buffer.from(fillInstruction.data).subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
+    && fillInstruction.data.subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
 }
 
 // The mint-on-demand shape: create_market, set_liquidity_pool_market, then
@@ -1118,16 +1234,17 @@ export function isVsolFillTransaction(transaction: Transaction) {
 // instruction, extra instructions, or these four out of order) is rejected
 // by construction, since this check (and inspectVsolFillTransaction below)
 // only ever reads instructions at these four fixed indices.
-export function isVsolMintAndFillTransaction(transaction: Transaction) {
-  if (transaction.instructions.length !== 4 || !VSOL_LIQUIDITY) return false;
+export function isVsolMintAndFillTransaction(input: Transaction | ResolvedFillTransaction) {
+  const transaction = normalizeFillTransaction(input);
+  if (!transaction || transaction.instructions.length !== 4 || !VSOL_LIQUIDITY) return false;
   const [createInstruction, authorizeInstruction, signatureInstruction, fillInstruction] = transaction.instructions;
   return createInstruction.programId.equals(VSOL_PROGRAM_ID)
-    && Buffer.from(createInstruction.data).subarray(0, 8).equals(vsolInstructionDiscriminator("create_market"))
+    && createInstruction.data.subarray(0, 8).equals(vsolInstructionDiscriminator("create_market"))
     && authorizeInstruction.programId.equals(VSOL_PROGRAM_ID)
-    && Buffer.from(authorizeInstruction.data).subarray(0, 8).equals(vsolInstructionDiscriminator("set_liquidity_pool_market"))
+    && authorizeInstruction.data.subarray(0, 8).equals(vsolInstructionDiscriminator("set_liquidity_pool_market"))
     && signatureInstruction.programId.equals(Ed25519Program.programId)
     && fillInstruction.programId.equals(VSOL_PROGRAM_ID)
-    && Buffer.from(fillInstruction.data).subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
+    && fillInstruction.data.subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
 }
 
 /**
@@ -1136,7 +1253,7 @@ export function isVsolMintAndFillTransaction(transaction: Transaction) {
  * Shared by both the plain-fill and mint-and-fill inspection paths below --
  * the fill instruction itself is checked identically either way.
  */
-function verifyFillInstruction(fill: TransactionInstruction, verifiedSeries: VsolSeries) {
+function verifyFillInstruction(fill: ResolvedInstruction, verifiedSeries: VsolSeries) {
   if (!VSOL_LIQUIDITY) return null;
   if (fill.keys.length !== FILL_POOL_QUOTE.accounts.length) return null;
   const buyer = fill.keys[0];
@@ -1180,14 +1297,14 @@ function verifyFillInstruction(fill: TransactionInstruction, verifiedSeries: Vso
  * rolling-grid rung), because that's the only input buildCreateMarketInstruction
  * is given here.
  */
-async function verifyCreateMarketInstruction(instruction: TransactionInstruction, creator: PublicKey, verifiedSeries: VsolSeries) {
+async function verifyCreateMarketInstruction(instruction: ResolvedInstruction, creator: PublicKey, verifiedSeries: VsolSeries) {
   const expected = await buildCreateMarketInstruction({
     creator,
     series: verifiedSeries,
     expected: { market: verifiedSeries.marketKey, oracle: verifiedSeries.oracleKey },
   });
   if (!instruction.programId.equals(expected.instruction.programId)) return false;
-  if (!Buffer.from(instruction.data).equals(Buffer.from(expected.instruction.data))) return false;
+  if (!instruction.data.equals(Buffer.from(expected.instruction.data))) return false;
   if (instruction.keys.length !== expected.instruction.keys.length) return false;
   for (let i = 0; i < instruction.keys.length; i += 1) {
     if (!instruction.keys[i].pubkey.equals(expected.instruction.keys[i].pubkey)) return false;
@@ -1203,7 +1320,7 @@ async function verifyCreateMarketInstruction(instruction: TransactionInstruction
  * `verifiedSeries` -- and, when the manifest publishes a manager key, that
  * the signing manager is that exact key (not merely "some signer").
  */
-function verifyAuthorizeMarketInstruction(instruction: TransactionInstruction, verifiedSeries: VsolSeries) {
+function verifyAuthorizeMarketInstruction(instruction: ResolvedInstruction, verifiedSeries: VsolSeries) {
   if (!VSOL_LIQUIDITY) return false;
   if (!instruction.programId.equals(VSOL_PROGRAM_ID)) return false;
   if (instruction.keys.length !== 6) return false;
@@ -1214,7 +1331,7 @@ function verifyAuthorizeMarketInstruction(instruction: TransactionInstruction, v
     encodeI64(BigInt(verifiedSeries.lastTradeAt)),
     Buffer.from([1]),
   ]);
-  if (!Buffer.from(instruction.data).equals(expectedData)) return false;
+  if (!instruction.data.equals(expectedData)) return false;
   if (!manager.isSigner || !manager.isWritable) return false;
   if (VSOL_LIQUIDITY.managerKey && !manager.pubkey.equals(VSOL_LIQUIDITY.managerKey)) return false;
   if (!instruction.keys[1].pubkey.equals(VSOL_CONFIG)) return false;
@@ -1225,8 +1342,10 @@ function verifyAuthorizeMarketInstruction(instruction: TransactionInstruction, v
   return true;
 }
 
-export async function inspectVsolFillTransaction(transaction: Transaction) {
+export async function inspectVsolFillTransaction(input: Transaction | ResolvedFillTransaction) {
   if (!VSOL_LIQUIDITY) return null;
+  const transaction = normalizeFillTransaction(input);
+  if (!transaction) return null;
 
   if (isVsolFillTransaction(transaction)) {
     const fill = transaction.instructions[1];
@@ -1256,6 +1375,138 @@ export async function inspectVsolFillTransaction(transaction: Transaction) {
   }
 
   return null;
+}
+
+/**
+ * Detects whether raw signed-transaction bytes are a legacy or a v0
+ * (versioned) transaction. VersionedTransaction.deserialize understands both
+ * wire formats (it reads the message version prefix internally), so this is
+ * a cheap, side-effect-free probe rather than a second real parse.
+ */
+function isVersionedVsolTransactionBytes(raw: Buffer): boolean {
+  try {
+    return VersionedTransaction.deserialize(raw).message.version !== "legacy";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verifies every required signature on a v0 transaction against its message
+ * bytes and each signer's static account key -- VersionedTransaction has no
+ * built-in verifySignatures() (unlike the legacy Transaction class), so this
+ * mirrors Transaction.verifySignatures()'s default (requireAllSignatures =
+ * true) semantics by hand: every required signer must have a present,
+ * non-placeholder, valid signature.
+ */
+function verifyVersionedVsolSignatures(transaction: VersionedTransaction): boolean {
+  const { message } = transaction;
+  const numRequiredSignatures = message.header.numRequiredSignatures;
+  if (transaction.signatures.length !== numRequiredSignatures) return false;
+  const messageBytes = message.serialize();
+  for (let index = 0; index < numRequiredSignatures; index += 1) {
+    const signature = transaction.signatures[index];
+    const signerKey = message.staticAccountKeys[index];
+    if (!signature || signature.length !== 64 || !signerKey) return false;
+    if (signature.every((byte) => byte === 0)) return false; // unsigned placeholder, not a real signature
+    if (!nacl.sign.detached.verify(messageBytes, signature, signerKey.toBytes())) return false;
+  }
+  return true;
+}
+
+/**
+ * Accepts a signed VSOL fill transaction as raw, base64-decoded bytes in
+ * EITHER wire format and returns it normalized to fully-resolved account
+ * keys, or null on any malformed input, missing/invalid signature, or an
+ * untrusted lookup table reference.
+ *
+ * SECURITY: a v0 transaction's `addressTableLookups` name which lookup
+ * table(s) its account-key indices resolve against. Those indices are
+ * entirely client-chosen -- if this function resolved them using whatever
+ * table the client's transaction happened to name, an attacker could publish
+ * their own table mapping every index to accounts of their choosing (their
+ * own "pool", their own "quote authority", their own destination token
+ * account, ...) and every downstream check in inspectVsolFillTransaction
+ * would dutifully validate a fabricated transaction against attacker-chosen
+ * accounts, since those checks only ever see whatever pubkeys they're handed
+ * here. So: resolution below uses ONLY the manifest-pinned
+ * VSOL_ADDRESS_LOOKUP_TABLE (app/lib/vsol.ts), fetched independently by this
+ * server -- never the client's transaction bytes -- and any transaction
+ * whose addressTableLookups reference a different table (or any table when
+ * this deployment has not published one) is rejected outright, before a
+ * single account key is resolved.
+ */
+export async function resolveSignedVsolFillTransaction(
+  raw: Buffer,
+  connection: Connection,
+): Promise<ResolvedFillTransaction | null> {
+  if (!isVersionedVsolTransactionBytes(raw)) {
+    let transaction: Transaction;
+    try {
+      transaction = Transaction.from(raw);
+    } catch {
+      return null;
+    }
+    if (!transaction.feePayer || !transaction.verifySignatures()) return null;
+    return normalizeFillTransaction(transaction);
+  }
+
+  let versioned: VersionedTransaction;
+  try {
+    versioned = VersionedTransaction.deserialize(raw);
+  } catch {
+    return null;
+  }
+  if (versioned.message.version === "legacy") return null;
+  // Narrowed (not merely asserted): the check above already ruled out
+  // "legacy", so this is exactly the MessageV0 branch of the VersionedMessage
+  // union -- kept as a local so every access below resolves against the same
+  // narrowed type.
+  const message: MessageV0 = versioned.message;
+  if (!verifyVersionedVsolSignatures(versioned)) return null;
+
+  const lookups = message.addressTableLookups;
+  let lookupTableAccount: AddressLookupTableAccount | null = null;
+  if (lookups.length > 0) {
+    // Fail closed: no pinned table published means nothing can be trusted to
+    // resolve against, and any reference to a table other than the pinned
+    // one is rejected regardless of how many lookups are present.
+    const pinnedTable = VSOL_ADDRESS_LOOKUP_TABLE;
+    if (!pinnedTable) return null;
+    const referencesForeignTable = lookups.some((lookup) => !lookup.accountKey.equals(pinnedTable));
+    if (referencesForeignTable) return null;
+    lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
+    if (!lookupTableAccount) return null;
+  }
+
+  let accountKeys;
+  try {
+    accountKeys = message.getAccountKeys({
+      addressLookupTableAccounts: lookupTableAccount ? [lookupTableAccount] : [],
+    });
+  } catch {
+    return null;
+  }
+  const feePayer = accountKeys.get(0);
+  if (!feePayer) return null;
+
+  const instructions: ResolvedInstruction[] = [];
+  for (const compiled of message.compiledInstructions) {
+    const programId = accountKeys.get(compiled.programIdIndex);
+    if (!programId) return null;
+    const keys: ResolvedInstructionAccount[] = [];
+    for (const accountIndex of compiled.accountKeyIndexes) {
+      const pubkey = accountKeys.get(accountIndex);
+      if (!pubkey) return null;
+      keys.push({
+        pubkey,
+        isSigner: message.isAccountSigner(accountIndex),
+        isWritable: message.isAccountWritable(accountIndex),
+      });
+    }
+    instructions.push({ programId, keys, data: Buffer.from(compiled.data) });
+  }
+  return { feePayer, instructions };
 }
 
 export function calculateDepositShares(amount: bigint, totalShares: bigint, totalAssets: bigint) {
