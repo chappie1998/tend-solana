@@ -190,9 +190,10 @@ function expectAccount(data: Buffer, size: number, discriminator: Buffer, label:
   }
 }
 
-function decodeConfigAccount(data: Buffer) {
+export function decodeConfigAccount(data: Buffer) {
   expectAccount(data, 239, CONFIG_ACCOUNT_DISCRIMINATOR, "VSOL config");
   return {
+    treasuryOwner: publicKeyAt(data, 169),
     paused: data[203] === 1,
     eligibilityRequired: data[204] === 1,
     domainSeparator: data.subarray(205, 237),
@@ -224,7 +225,7 @@ export function decodeMarketAccount(data: Buffer) {
   };
 }
 
-function decodeOracleAccount(data: Buffer) {
+export function decodeOracleAccount(data: Buffer) {
   expectAccount(data, 143, ORACLE_ACCOUNT_DISCRIMINATOR, "VSOL oracle");
   return {
     market: publicKeyAt(data, 9),

@@ -41,6 +41,13 @@ export const VSOL_CLUSTER = "devnet" as const;
 export const VSOL_RPC_URL = deployment.rpcUrl;
 export const VSOL_PROGRAM_ID = new PublicKey(deployment.programId);
 export const VSOL_PYTH_UPGRADE_DEPLOYED = deployment.pythUpgradeDeployed;
+// The `close_pool_position` instruction landed in the program source and IDL
+// (vsol/programs/vsol/src/lib.rs, vsol/target/idl/vsol.json) but the last
+// devnet program upgrade predates it. Until the manifest publishes this flag
+// as `true` (set only after a redeploy that includes the instruction), the
+// close flow must fail closed rather than build transactions the deployed
+// program cannot execute.
+export const VSOL_CLOSE_POSITION_DEPLOYED = Boolean((deployed as unknown as { closePoolPositionDeployed?: boolean }).closePoolPositionDeployed);
 export const VSOL_PYTH_RECEIVER_PROGRAM_ID = new PublicKey(deployment.pythReceiverProgram);
 export const VSOL_PYTH_FEED_ID = deployment.pythFeedId;
 export const VSOL_CONFIG = new PublicKey(deployment.config);

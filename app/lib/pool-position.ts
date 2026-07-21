@@ -71,6 +71,14 @@ export function decodePoolPositionAccount(data: Buffer): DecodedPoolPosition {
   };
 }
 
+/** Decimal precision for a market's price scale (e.g. 1_000_000n -> 6). Every
+ * published market uses a power-of-ten scale; anything else renders
+ * conservatively at 6 decimals rather than inventing a conversion. */
+export function priceScaleDecimals(priceScale: bigint) {
+  const text = priceScale.toString();
+  return /^10*$/.test(text) ? text.length - 1 : 6;
+}
+
 /** Formats a 6-decimal atom amount as a display decimal string (no float math). */
 export function formatAtomsDecimal(value: bigint, decimals = 6, maximumFractionDigits = 2) {
   if (value < 0n || decimals < 0) throw new RangeError("Invalid atom amount");

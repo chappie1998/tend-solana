@@ -145,6 +145,47 @@ export const launchActions = sqliteTable(
   ],
 );
 
+export const closeActions = sqliteTable(
+  "close_actions",
+  {
+    id: text("id").primaryKey(),
+    walletAddress: text("wallet_address").notNull(),
+    positionAddress: text("position_address").notNull(),
+    poolAddress: text("pool_address").notNull(),
+    marketAddress: text("market_address").notNull(),
+    buyerDestinationAddress: text("buyer_destination_address").notNull(),
+    treasuryDestinationAddress: text("treasury_destination_address").notNull(),
+    buybackAmountAtoms: text("buyback_amount_atoms").notNull(),
+    minProceedsAtoms: text("min_proceeds_atoms").notNull(),
+    fairValueAtoms: text("fair_value_atoms").notNull(),
+    spreadBps: real("spread_bps").notNull(),
+    quoteExpiry: integer("quote_expiry").notNull(),
+    transactionMessageHash: text("transaction_message_hash").notNull(),
+    transactionHash: text("transaction_hash"),
+    simulationStatus: text("simulation_status", { enum: ["passed", "failed"] }),
+    simulationSlot: integer("simulation_slot"),
+    simulationUnitsConsumed: integer("simulation_units_consumed"),
+    simulationLogsJson: text("simulation_logs_json"),
+    simulationLogsHash: text("simulation_logs_hash"),
+    simulationErrorJson: text("simulation_error_json"),
+    transactionSignature: text("transaction_signature"),
+    submissionStatus: text("submission_status", { enum: ["prepared", "confirmed", "failed"] }).notNull(),
+    submissionError: text("submission_error"),
+    preBuyerAtoms: text("pre_buyer_atoms").notNull(),
+    postBuyerAtoms: text("post_buyer_atoms"),
+    postStateVerified: integer("post_state_verified", { mode: "boolean" }),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+  },
+  (table) => [
+    index("close_actions_wallet_created_idx").on(table.walletAddress, table.createdAt),
+    index("close_actions_position_idx").on(table.positionAddress),
+    uniqueIndex("close_actions_message_unique_idx").on(table.transactionMessageHash),
+    uniqueIndex("close_actions_transaction_hash_unique_idx").on(table.transactionHash),
+    uniqueIndex("close_actions_signature_unique_idx").on(table.transactionSignature),
+  ],
+);
+
 export const liquidityActions = sqliteTable(
   "liquidity_actions",
   {
