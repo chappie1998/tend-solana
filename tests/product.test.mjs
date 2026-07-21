@@ -89,7 +89,14 @@ test("server creates buyer-bound V2 pool RFQs and verifies fills before persiste
   assert.match(server, /Instruction: FillPoolQuote/);
   assert.match(server, /POOL_POSITION_ACCOUNT_DISCRIMINATOR/);
   assert.match(server, /FILL_POOL_QUOTE/);
-  assert.match(server, /VSOL_LIQUIDITY\.authorizedMarketKeys/);
+  // Pool-market authorization is verified live on-chain — PDA derivation plus
+  // program ownership plus the decoded pool/market bindings — never against a
+  // checked-in manifest allowlist (which would reject any rung the keeper
+  // authorized after the last bootstrap snapshot).
+  assert.doesNotMatch(server, /authorizedMarketKeys/);
+  assert.match(server, /derivePoolMarket\(VSOL_LIQUIDITY\.poolKey, series\.marketKey\)/);
+  assert.match(server, /state\.pool\.equals\(VSOL_LIQUIDITY\.poolKey\)/);
+  assert.match(server, /state\.market\.equals\(series\.marketKey\)/);
   assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(positionsRoute, /persisted, passing simulation/);

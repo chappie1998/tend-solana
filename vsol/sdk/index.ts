@@ -27,6 +27,20 @@ export const POOL_BUYBACK_DOMAIN = Buffer.from("VSOLCLS1", "ascii");
 export const MARKET_ID_DOMAIN = Buffer.from("VSOLMKT1", "ascii");
 export const PRICE_SCALE = 1_000_000n;
 
+// Rolling-series policy constants shared by the app's permissionless launch
+// flow (app/lib/launch-params.ts) and the devnet bootstrap/keeper scripts
+// (vsol/scripts/bootstrap.ts, vsol/scripts/keeper.ts). All three feed
+// deriveMarketId above, so a single shared home keeps them from ever drifting
+// — a divergence there would make the app derive different market addresses
+// than the keeper mints, and the UI would silently see nothing.
+export const MARKET_OBSERVATION_WINDOW_SECONDS = 30;
+export const MARKET_SETTLEMENT_GRACE_SECONDS = 900;
+export const MARKET_MAX_CONFIDENCE_BPS = 500;
+// Tier 2's last-known-price fallback window: 24h is generous enough to cover
+// a full overnight/weekend gap in the Pyth equities feed while still keeping
+// a hard ceiling on how old a settlement print can be.
+export const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
+
 export type Quote = {
   nonce: bigint;
   direction: 0 | 1;

@@ -25,10 +25,16 @@ import {
   VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RPC_URL,
-  VSOL_SERIES,
   VSOL_SETTLEMENT_MINT,
 } from "./vsol";
 import { runtimeEnv } from "./runtime-env";
+import { markets } from "./markets";
+import {
+  resolveAvailableVsolSeries,
+  resolveVsolSeries,
+  resolveVsolSeriesCatalog,
+  type ResolvedVsolSeries,
+} from "./series-resolver";
 
 export function getVsolConnection() {
   // Resolve this after the request route has installed Cloudflare bindings.
@@ -75,7 +81,23 @@ const PROVIDER_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityProvide
 const POOL_MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPoolMarket");
 const POOL_POSITION_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("PoolPosition");
 
-export type VsolSeries = (typeof VSOL_SERIES)[number];
+// Re-exported under the historical name: callers throughout this file (and
+// its consumers) still refer to a resolved series candidate as `VsolSeries`.
+export type VsolSeries = ResolvedVsolSeries;
+
+function allMarketSymbols(): string[] {
+  return markets.map((market) => market.symbol);
+}
+
+// Fallback for callers (currently just vsol/scripts/web-execution-smoke.ts)
+// that don't specify a series explicitly. Historically defaulted to
+// whichever manifest entry happened to be the "30D" series; now resolves the
+// live chain-derived 30D rung for the first configured market symbol.
+async function defaultQuoteSeries(): Promise<ResolvedVsolSeries | null> {
+  const defaultSymbol = markets[0]?.symbol ?? "NVDA";
+  const resolution = await resolveVsolSeries(defaultSymbol, "30D");
+  return resolution.available ? resolution.series : null;
+}
 
 export type VsolSeriesState = {
   symbol: string;
@@ -464,18 +486,24 @@ async function getPoolCore(connection: Connection): Promise<PoolCore> {
   return { config, pool, poolAssets: poolToken.amount, decimals: mint.decimals };
 }
 
+// Authorization for a (pool, market) pair is verified entirely on-chain here,
+// never against a checked-in manifest allowlist: the pool-market PDA is
+// derived from (pool, market), the account is owned by the VSOL program and
+// stores both bindings, and only the pool manager can create/enable it. That
+// makes the PDA derivation plus the ownership/discriminator/binding checks
+// below strictly sufficient — a manifest snapshot adds no security and only
+// goes stale as the keeper mints fresh rungs. `lastTradeAt` is likewise
+// treated as authoritative from chain rather than compared against a
+// locally-derived policy value; the caller applies it via the existing
+// before-cutoff / before-expiry availability logic.
 async function getPoolMarketState(series: VsolSeries, connection: Connection) {
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
-  if (!VSOL_LIQUIDITY.authorizedMarketKeys.some((market) => market.equals(series.marketKey))) {
-    throw new Error("This series is not authorized in the published V2 pool manifest");
-  }
   const address = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
   const account = await connection.getAccountInfo(address, "confirmed");
   if (!account || !account.owner.equals(VSOL_PROGRAM_ID)) throw new Error("The VSOL pool-market authorization is unavailable");
+  // decodePoolMarketAccount enforces the account discriminator and exact size.
   const state = decodePoolMarketAccount(Buffer.from(account.data));
-  if (!state.pool.equals(VSOL_LIQUIDITY.poolKey)
-      || !state.market.equals(series.marketKey)
-      || state.lastTradeAt !== series.lastTradeAt) {
+  if (!state.pool.equals(VSOL_LIQUIDITY.poolKey) || !state.market.equals(series.marketKey)) {
     throw new Error("The published pool-market authorization does not match onchain state");
   }
   return { ...state, address };
@@ -488,7 +516,7 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     getPoolMarketState(series, connection),
     clusterTime(connection),
   ]);
-  if (!marketAccount || !oracleAccount) throw new Error("The deployed VSOL series accounts are unavailable");
+  if (!marketAccount || !oracleAccount) throw new Error("This series has not been minted yet.");
   if (!marketAccount.owner.equals(VSOL_PROGRAM_ID) || !oracleAccount.owner.equals(VSOL_PROGRAM_ID)) {
     throw new Error("The deployed VSOL series is not owned by the verified program");
   }
@@ -507,10 +535,18 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     && market.expiry === series.expiry
     && market.observationWindowSeconds === series.observationWindowSeconds
     && market.settlementGraceSeconds === series.settlementGraceSeconds
-    // Optional until the manifest publishes it (mirrors VSOL_LIQUIDITY.managerKey below).
-    && (series.maxSettlementStalenessSeconds === undefined
-      || market.maxSettlementStalenessSeconds === series.maxSettlementStalenessSeconds);
+    // Chain-derived series always know their expected staleness bound (it is
+    // one of the parameters hashed into the market id itself), so this check
+    // is now mandatory rather than optional.
+    && market.maxSettlementStalenessSeconds === series.maxSettlementStalenessSeconds;
   if (!exactBinding) throw new Error("The deployed series catalog does not match verified onchain state");
+  // The on-chain lastTradeAt is authoritative (not required to equal the
+  // locally-derived policy value), but it must still be a sane cutoff: a
+  // pool manager can enable a pool-market with any lastTradeAt, so this
+  // guards against one that sits at or past the market's own expiry.
+  if (poolMarket.lastTradeAt >= market.expiry) {
+    throw new Error("The onchain pool-market trade cutoff is not before its expiry");
+  }
 
   const beforeCutoff = now < poolMarket.lastTradeAt;
   const available = market.enabled && !oracle.finalized && poolMarket.enabled && beforeCutoff && now < market.expiry;
@@ -536,10 +572,53 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
   };
 }
 
-export async function getVsolSeriesStates() {
-  if (!VSOL_SERIES.length) throw new Error("No verified VSOL V2 series are published");
-  const connection = getVsolConnection();
-  return Promise.all(VSOL_SERIES.map((series) => getVsolSeriesState(series, connection)));
+/**
+ * Resolves the current rolling grid for every configured market symbol and
+ * verifies each rung on-chain. Every (symbol, code) pair always appears in
+ * the result — a code the grid currently rules out, or whose derived market
+ * has not been minted yet, or that fails verification, surfaces as
+ * `available: false` with an honest reason. A single bad rung never takes
+ * down the rest of the catalog (each is checked and reported independently).
+ */
+export async function getVsolSeriesStates(connection = getVsolConnection()): Promise<VsolSeriesState[]> {
+  const resolutions = await resolveVsolSeriesCatalog(allMarketSymbols());
+  return Promise.all(resolutions.map(async (resolution): Promise<VsolSeriesState> => {
+    if (!resolution.available) {
+      return {
+        symbol: resolution.symbol,
+        code: resolution.code,
+        market: "",
+        oracle: "",
+        expiry: 0,
+        observationWindowSeconds: 0,
+        lastTradeAt: 0,
+        enabled: false,
+        finalized: false,
+        poolAuthorized: false,
+        available: false,
+        availabilityReason: resolution.reason,
+      };
+    }
+    try {
+      return await getVsolSeriesState(resolution.series, connection);
+    } catch (error) {
+      const { series } = resolution;
+      return {
+        symbol: series.symbol,
+        code: series.code,
+        market: series.marketKey.toBase58(),
+        oracle: series.oracleKey.toBase58(),
+        expiry: series.expiry,
+        observationWindowSeconds: series.observationWindowSeconds,
+        lastTradeAt: series.lastTradeAt,
+        enabled: false,
+        finalized: false,
+        poolAuthorized: false,
+        available: false,
+        availabilityReason: describeRpcFailure(error, "This series has not been minted yet."),
+      };
+    }
+  }));
 }
 
 export async function getVsolLiquidityState(owner?: PublicKey, connection = getVsolConnection()): Promise<VsolLiquidityState> {
@@ -620,7 +699,7 @@ export async function buildVsolQuoteTransaction(params: {
 }) {
   if (!VSOL_PYTH_UPGRADE_DEPLOYED) throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
-  const series = params.series ?? VSOL_SERIES.find((entry) => entry.code === "30D");
+  const series = params.series ?? await defaultQuoteSeries();
   if (!series) throw new Error("No verified VSOL V2 quote series is published");
   const connection = getVsolConnection();
   const authority = vsolQuoteAuthority();
@@ -838,7 +917,7 @@ export function isVsolFillTransaction(transaction: Transaction) {
     && Buffer.from(fillInstruction.data).subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
 }
 
-export function inspectVsolFillTransaction(transaction: Transaction) {
+export async function inspectVsolFillTransaction(transaction: Transaction) {
   if (!isVsolFillTransaction(transaction) || !VSOL_LIQUIDITY) return null;
   const fill = transaction.instructions[1];
   if (fill.keys.length !== FILL_POOL_QUOTE.accounts.length) return null;
@@ -849,7 +928,12 @@ export function inspectVsolFillTransaction(transaction: Transaction) {
   const poolMarket = fill.keys[5];
   const nonceRecord = fill.keys[9];
   const position = fill.keys[10];
-  const verifiedSeries = VSOL_SERIES.find((series) => series.marketKey.equals(market.pubkey));
+  // Chain-derived: re-resolve the current rolling grid rather than trusting a
+  // checked-in manifest, so this check can never pass a fill for a market
+  // that a stale snapshot would have missed (or reject a legitimate current
+  // rung the snapshot hadn't caught up with yet).
+  const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
+  const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market.pubkey));
   if (!verifiedSeries
       || !buyer.isSigner || !buyer.isWritable
       || !quoteAuthority.pubkey.equals(VSOL_LIQUIDITY.quoteAuthorityKey)

@@ -7,7 +7,8 @@ import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getPythRealizedVolatility, getPythSnapshot } from "../../lib/pyth-market-data";
 import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesState, parsePublicKey } from "../../lib/vsol-server";
-import { solanaExplorerUrl, vsolSeries, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
+import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
+import { resolveVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 
 export async function POST(request: Request) {
@@ -48,13 +49,14 @@ export async function POST(request: Request) {
   const requestedAt = Date.now();
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
   if (!expiry.available) return json({ error: expiry.availabilityReason }, 422);
-  const series = vsolSeries(symbol, expiryCode);
-  if (!series) {
+  const resolution = await resolveVsolSeries(symbol, expiryCode, requestedAt);
+  if (!resolution.available) {
     return json({
-      error: `No verified ${symbol} ${expiryCode} onchain series is currently published.`,
+      error: resolution.reason,
       code: "VSOL_SERIES_NOT_DEPLOYED",
     }, 503);
   }
+  const series = resolution.series;
   let seriesState;
   try {
     seriesState = await getVsolSeriesState(series);

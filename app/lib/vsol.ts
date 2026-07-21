@@ -1,21 +1,9 @@
 import { PublicKey } from "@solana/web3.js";
-import deployment from "../../vsol/deployments/devnet.json";
-import type { ExpiryCode } from "./expiries";
-
-type DeploymentSeries = {
-  code: ExpiryCode;
-  symbol?: string;
-  address: string;
-  oracle: string;
-  expiry: number;
-  observationWindowSeconds: number;
-  settlementGraceSeconds: number;
-  lastTradeAt: number;
-  // Optional until the permissionless factory redeploy publishes it.
-  creator?: string;
-  // Optional until the manifest publishes it for this series.
-  maxSettlementStalenessSeconds?: number;
-};
+// The import attribute keeps this module importable both by the bundler and
+// directly by the node:test suite (native ESM requires it for JSON modules),
+// so app/lib/series-resolver.ts — which depends on the constants below — can
+// be unit-tested without a build step.
+import deployment from "../../vsol/deployments/devnet.json" with { type: "json" };
 
 type LiquidityDeployment = {
   id: string;
@@ -31,7 +19,6 @@ type LiquidityDeployment = {
 };
 
 type ExtendedDeployment = typeof deployment & {
-  markets?: DeploymentSeries[];
   liquidityPools?: LiquidityDeployment[];
 };
 
@@ -57,13 +44,20 @@ export const VSOL_MAKER = new PublicKey(deployment.maker);
 export const VSOL_SETTLEMENT_MINT = new PublicKey(deployment.settlementMint);
 export const VSOL_WRITER_VAULT = new PublicKey(deployment.writerVault);
 export const VSOL_WRITER_TOKEN = new PublicKey(deployment.writerToken);
-const deploymentSeries = (deployed.markets ?? []) as DeploymentSeries[];
-export const VSOL_SERIES = Object.freeze(deploymentSeries.map((series) => ({
-  ...series,
-  symbol: (series.symbol ?? "NVDA").toUpperCase(),
-  marketKey: new PublicKey(series.address),
-  oracleKey: new PublicKey(series.oracle),
-})));
+// The manifest's own `markets` array (bootstrap-time evidence of the series
+// that were minted during setup) is intentionally NOT read here anymore. A
+// keeper mints fresh grid rungs continuously, so a checked-in snapshot goes
+// stale within minutes; the rolling series catalog is now resolved live from
+// chain via deterministic market-id derivation — see app/lib/series-resolver.ts.
+// The manifest keeps its other roles: program id, config, pool, mints below.
+// `authorizedMarkets` (bootstrap-time evidence of which markets a pool
+// authorized) is intentionally NOT turned into a PublicKey allowlist here
+// anymore: pool-market authorization is verified live on-chain (see
+// getPoolMarketState in app/lib/vsol-server.ts) rather than gated against a
+// checked-in manifest snapshot, which would reject any rung the keeper
+// authorized after the last bootstrap run. The raw manifest field stays on
+// this object (via the spread below) since vsol/scripts/verify-deployment.ts
+// still reads it independently.
 const liquidity = deployed.liquidityPools?.[0];
 export const VSOL_LIQUIDITY = liquidity
   ? Object.freeze({
@@ -72,14 +66,9 @@ export const VSOL_LIQUIDITY = liquidity
       assetVaultKey: new PublicKey(liquidity.token),
       quoteAuthorityKey: new PublicKey(liquidity.quoteAuthority),
       settlementMintKey: new PublicKey(liquidity.settlementMint),
-      authorizedMarketKeys: liquidity.authorizedMarkets.map((address) => new PublicKey(address)),
       managerKey: liquidity.manager ? new PublicKey(liquidity.manager) : null,
     })
   : null;
-
-export function vsolSeries(symbol: string, expiryCode: ExpiryCode) {
-  return VSOL_SERIES.find((series) => series.symbol === symbol.toUpperCase() && series.code === expiryCode) ?? null;
-}
 
 export function solanaExplorerUrl(kind: "address" | "tx", value: string) {
   return `https://explorer.solana.com/${kind}/${value}?cluster=devnet`;

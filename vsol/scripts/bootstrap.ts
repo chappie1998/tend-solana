@@ -50,6 +50,10 @@ import {
   calculatePayout,
   deriveMarketId,
   liquidityPoolId,
+  MARKET_MAX_CONFIDENCE_BPS,
+  MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  MARKET_OBSERVATION_WINDOW_SECONDS as USER_MARKET_OBSERVATION_SECONDS,
+  MARKET_SETTLEMENT_GRACE_SECONDS as USER_MARKET_SETTLEMENT_GRACE_SECONDS,
   poolBuybackMessage,
   poolQuoteMessage,
   PRICE_SCALE,
@@ -139,12 +143,11 @@ type Deployment = {
   generatedAt: string;
 };
 
-const USER_MARKET_OBSERVATION_SECONDS = 30;
-const USER_MARKET_SETTLEMENT_GRACE_SECONDS = 900;
-// Tier 2's last-known-price fallback window: 24h is generous enough to cover
-// a full overnight/weekend gap in the Pyth equities feed while still keeping
-// a hard ceiling on how old a settlement print can be.
-const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
+// USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS, and
+// MARKET_MAX_SETTLEMENT_STALENESS_SECONDS now live in ../sdk/index.ts (see the
+// import above) — the single shared home with app/lib/launch-params.ts and
+// vsol/scripts/keeper.ts, so this script and the app can never derive
+// different market ids from the same rolling-grid parameters.
 // 8-byte discriminator + Market::INIT_SPACE under the upgraded factory layout
 // (277 bytes through creator, +4 for the appended max_settlement_staleness_seconds
 // u32); accounts of any other size predate the upgrade and no longer deserialize.
@@ -268,7 +271,7 @@ async function createMarket(params: {
     observationWindowSeconds: params.observationWindowSeconds,
     settlementGraceSeconds: params.settlementGraceSeconds,
     priceScale: PRICE_SCALE,
-    maxConfidenceBps: 500,
+    maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
     symbol,
     maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
   });
@@ -284,7 +287,7 @@ async function createMarket(params: {
         expiry: new BN(params.expiry),
         observationWindowSeconds: params.observationWindowSeconds,
         settlementGraceSeconds: params.settlementGraceSeconds,
-        maxConfidenceBps: 500,
+        maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
         pythFeedId: params.pythFeedId,
         maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
       })

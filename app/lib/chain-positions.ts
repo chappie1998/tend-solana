@@ -3,8 +3,10 @@
 // with zero database rows. The DB remains a provenance cache only.
 
 import { Connection, PublicKey } from "@solana/web3.js";
-import { VSOL_PROGRAM_ID, VSOL_SERIES } from "./vsol";
+import { VSOL_PROGRAM_ID } from "./vsol";
 import { decodeMarketAccount, getVsolConnection } from "./vsol-server";
+import { markets } from "./markets";
+import { resolveAvailableVsolSeries } from "./series-resolver";
 import {
   POOL_POSITION_ACCOUNT_SIZE,
   POOL_POSITION_BUYER_OFFSET,
@@ -82,10 +84,18 @@ export async function getChainPositions(buyer: PublicKey, connection: Connection
     });
   }
 
+  // Chain-derived, best-effort label only: matches a position's market
+  // against the CURRENT rolling grid. A position whose market has since
+  // rolled off the grid (its code now targets a different future expiry)
+  // won't match here — that's fine, since `market` (decoded above straight
+  // from the position's own on-chain market account) already carries the
+  // authoritative symbol/expiry; this is purely a nicer "15M"/"30D"-style label.
+  const currentSeries = await resolveAvailableVsolSeries(markets.map((market) => market.symbol));
+
   return decoded
     .map(({ address, position }): ChainPosition => {
       const market = marketInfo.get(position.market.toBase58()) ?? null;
-      const series = VSOL_SERIES.find((entry) => entry.marketKey.equals(position.market)) ?? null;
+      const series = currentSeries.find((entry) => entry.marketKey.equals(position.market)) ?? null;
       const scaleDecimals = market ? priceDecimals(market.priceScale) : 6;
       const settlementDecimals = market?.settlementDecimals ?? 6;
       return {

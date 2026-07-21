@@ -16,6 +16,10 @@ import {
   deriveMarketId,
   deriveOracle,
   liquidityPoolId,
+  MARKET_MAX_CONFIDENCE_BPS as MAX_CONFIDENCE_BPS,
+  MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  MARKET_OBSERVATION_WINDOW_SECONDS as USER_MARKET_OBSERVATION_SECONDS,
+  MARKET_SETTLEMENT_GRACE_SECONDS as USER_MARKET_SETTLEMENT_GRACE_SECONDS,
   PRICE_SCALE,
   symbolBytes,
   VSOL_PROGRAM_ID,
@@ -39,15 +43,17 @@ const devnetDir = resolve(workspace, ".devnet");
 // Mirrors bootstrap.ts's rolling-catalog parameters exactly. These are not
 // re-derived from the deployment manifest because the keeper must never
 // depend on (or write) that manifest -- it only has to agree with bootstrap
-// on the deterministic factory inputs, which is why both scripts hardcode
-// the same constants.
+// on the deterministic factory inputs, which is why both scripts import the
+// shared policy constants from ../sdk/index.ts rather than each hardcoding
+// their own copies.
 const PYTH_FEED_ID = "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593";
 const PYTH_FEED_BYTES = [...Buffer.from(PYTH_FEED_ID, "hex")];
 const MARKET_SYMBOL = "NVDA";
-const USER_MARKET_OBSERVATION_SECONDS = 30;
-const USER_MARKET_SETTLEMENT_GRACE_SECONDS = 900;
-const MAX_CONFIDENCE_BPS = 500;
-const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
+// USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+// MAX_CONFIDENCE_BPS, and MARKET_MAX_SETTLEMENT_STALENESS_SECONDS now live in
+// ../sdk/index.ts (see the import above) — the single shared home with
+// vsol/scripts/bootstrap.ts and app/lib/launch-params.ts, so the keeper can
+// never mint a rung the app derives a different market address for.
 const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v3`;
 
 type Counters = { created: number; authorized: number; skipped: number };

@@ -3,13 +3,15 @@
 // read-only with an explicit tradability note, never invented as executable.
 
 import { Connection } from "@solana/web3.js";
-import { VSOL_LIQUIDITY, VSOL_PROGRAM_ID, VSOL_SERIES } from "./vsol";
+import { VSOL_LIQUIDITY, VSOL_PROGRAM_ID } from "./vsol";
 import {
   decodeMarketAccount,
   decodePoolAccount,
   decodePoolMarketAccount,
   getVsolConnection,
 } from "./vsol-server";
+import { markets } from "./markets";
+import { resolveAvailableVsolSeries } from "./series-resolver";
 
 const MARKET_ACCOUNT_SIZE = 281;
 const POOL_ACCOUNT_SIZE = 214;
@@ -93,15 +95,20 @@ export async function getVsolChainCatalog(connection: Connection = getVsolConnec
   }
   pools.sort((left, right) => Number(right.quotable) - Number(left.quotable) || left.address.localeCompare(right.address));
 
-  const manifestMarkets = new Set(VSOL_SERIES.map((series) => series.marketKey.toBase58()));
+  // Chain-derived: the current rolling grid's market addresses, resolved live
+  // rather than read from a checked-in manifest. These are the series that
+  // ship separately (via getVsolSeriesStates) with full onchain verification,
+  // so they are excluded below rather than double-listed as "discovered".
+  const currentSeries = await resolveAvailableVsolSeries(markets.map((market) => market.symbol));
+  const rollingGridMarkets = new Set(currentSeries.map((series) => series.marketKey.toBase58()));
   const tendAuthorized = new Set(manifestPool ? authorizations.get(manifestPool) ?? [] : []);
   const discovered: DiscoveredMarket[] = [];
   for (const { pubkey, account } of marketAccounts) {
     try {
       const market = decodeMarketAccount(Buffer.from(account.data));
       const address = pubkey.toBase58();
-      const verified = manifestMarkets.has(address);
-      if (verified) continue; // The verified manifest series ship separately with full state checks.
+      const verified = rollingGridMarkets.has(address);
+      if (verified) continue; // The rolling grid's series ship separately with full state checks.
       const authorizedAnywhere = pools.some((pool) => pool.authorizedMarkets.includes(address));
       discovered.push({
         address,

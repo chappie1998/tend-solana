@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     const raw = decodeSignedTransaction(input.transaction);
     const transaction = Transaction.from(raw);
     if (!transaction.verifySignatures()) return Response.json({ error: "The wallet signature is invalid." }, { status: 422 });
-    const inspected = inspectVsolFillTransaction(transaction);
+    const inspected = await inspectVsolFillTransaction(transaction);
     if (!inspected) return Response.json({ error: "Only maker-signed VSOL fill transactions are accepted." }, { status: 422 });
     if (inspected.position.toBase58() !== input.quoteId || inspected.buyer.toBase58() !== input.walletAddress) {
       return Response.json({ error: "The signed buyer and position do not match this quote request." }, { status: 422 });
