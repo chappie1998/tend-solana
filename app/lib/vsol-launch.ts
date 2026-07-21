@@ -9,21 +9,15 @@ import {
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
-  deriveMarket,
-  deriveMarketId,
-  deriveOracle,
-  symbolBytes,
 } from "../../vsol/sdk";
-import deployment from "../../vsol/deployments/devnet.json";
-import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_PYTH_FEED_ID, VSOL_SETTLEMENT_MINT } from "./vsol";
+import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_SETTLEMENT_MINT } from "./vsol";
 import {
+  buildCreateMarketInstruction,
   buildVsolIdlInstruction,
   decodeMarketAccount,
   decodePoolAccount,
   encodeI64,
   encodeU16,
-  encodeU64,
-  encodeU32,
   getVsolClusterTime,
   getVsolConnection,
   vsolInstructionDiscriminator,
@@ -61,48 +55,16 @@ export async function buildCreateMarketTransaction(params: {
   if (series.expiry < now + LAUNCH_MIN_LEAD_SECONDS) {
     throw new Error("The selected grid expiry is already inside the onchain lead window. Pick a later expiry.");
   }
-  const symbol = symbolBytes(series.symbol);
-  const marketId = await deriveMarketId({
-    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
-    settlementMint: VSOL_SETTLEMENT_MINT,
-    expiry: BigInt(series.expiry),
-    observationWindowSeconds: series.observationWindowSeconds,
-    settlementGraceSeconds: series.settlementGraceSeconds,
-    priceScale: series.priceScale,
-    maxConfidenceBps: series.maxConfidenceBps,
-    symbol,
-    maxSettlementStalenessSeconds: series.maxSettlementStalenessSeconds,
+  // Shared with the mint-on-demand quote path (app/lib/vsol-server.ts) and its
+  // send-path inspector, so there is exactly one create_market encoder.
+  const { instruction, market, oracle, marketId } = await buildCreateMarketInstruction({
+    creator: params.creator,
+    series,
   });
-  const market = deriveMarket(VSOL_CONFIG, marketId);
-  const oracle = deriveOracle(market);
   const existing = await connection.getAccountInfo(market, "confirmed");
   if (existing) {
     throw new Error("A series with these exact parameters already exists on-chain. Identical series share one deterministic address.");
   }
-  const data = Buffer.concat([
-    marketId,
-    new PublicKey(deployment.underlyingMint).toBuffer(),
-    Buffer.from(symbol),
-    encodeU64(series.priceScale),
-    encodeI64(BigInt(series.expiry)),
-    encodeU32(series.observationWindowSeconds),
-    encodeU32(series.settlementGraceSeconds),
-    encodeU16(series.maxConfidenceBps),
-    Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
-    // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
-    // vsol/programs/vsol/src/lib.rs, where this field was appended after
-    // `pyth_feed_id` to keep the on-chain layout backward compatible.
-    encodeU32(series.maxSettlementStalenessSeconds),
-  ]);
-  const instruction = buildVsolIdlInstruction("create_market", {
-    creator: params.creator,
-    config: VSOL_CONFIG,
-    market,
-    oracle,
-    settlement_mint: VSOL_SETTLEMENT_MINT,
-    token_program: TOKEN_PROGRAM_ID,
-    system_program: SystemProgram.programId,
-  }, data);
   const transaction = await withBlockhash(connection, params.creator, new Transaction().add(instruction));
   return {
     transaction,

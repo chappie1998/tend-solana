@@ -6,7 +6,7 @@ import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getPythRealizedVolatility, getPythSnapshot } from "../../lib/pyth-market-data";
-import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesState, parsePublicKey } from "../../lib/vsol-server";
+import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesStateOrPlan, parsePublicKey } from "../../lib/vsol-server";
 import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
 import { resolveVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
@@ -57,9 +57,12 @@ export async function POST(request: Request) {
     }, 503);
   }
   const series = resolution.series;
+  // Not-yet-minted rungs resolve here as an available "plan" rather than an
+  // error -- buildVsolQuoteTransaction below mints the market as part of the
+  // buyer's own fill instead of requiring a keeper to have pre-minted it.
   let seriesState;
   try {
-    seriesState = await getVsolSeriesState(series);
+    seriesState = await getVsolSeriesStateOrPlan(series);
   } catch (error) {
     return json({
       error: describeRpcFailure(error, "The onchain series could not be verified."),
@@ -106,6 +109,18 @@ export async function POST(request: Request) {
   } catch (error) {
     if (error instanceof Error && error.name === "VsolTestFundsRequired") {
       return json({ error: error.message, code: "VSOL_TEST_FUNDS_REQUIRED" }, 409);
+    }
+    if (error instanceof Error && error.name === "VsolPoolManagerUnavailable") {
+      // Fails closed, honestly: mint-on-demand cannot proceed without the
+      // pool manager key. Ordinary fills on already-minted series never take
+      // this branch, so this never blocks the common case.
+      return json({ error: error.message, code: "VSOL_MINT_ON_DEMAND_UNAVAILABLE" }, 503);
+    }
+    if (error instanceof Error && error.name === "VsolTransactionTooLarge") {
+      // The composed mint-on-demand transaction did not fit in a packet.
+      // Report the series as unavailable with the measured size rather than
+      // shipping a transaction that can never be sent.
+      return json({ error: error.message, code: "VSOL_TRANSACTION_TOO_LARGE" }, 503);
     }
     return json({ error: describeRpcFailure(error, "The VSOL maker did not return an executable quote.") }, 503);
   }

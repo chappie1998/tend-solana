@@ -1,4 +1,7 @@
-import deployment from "../../vsol/deployments/devnet.json";
+// The import attribute keeps this module importable both by the bundler and
+// directly by the node:test suite (native ESM requires it for JSON modules),
+// matching the convention used by app/lib/vsol.ts.
+import deployment from "../../vsol/deployments/devnet.json" with { type: "json" };
 
 export type Market = {
   symbol: string;

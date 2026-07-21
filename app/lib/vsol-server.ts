@@ -16,8 +16,13 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import nacl from "tweetnacl";
-import deployment from "../../vsol/deployments/devnet.json";
-import idl from "../../vsol/target/idl/vsol.json";
+// Explicit .ts/.json import specifiers (with a JSON import attribute) below
+// keep this module directly importable by the node:test suite (Node's native
+// type-stripping ESM loader requires both), matching the convention already
+// used by app/lib/series-resolver.ts and app/lib/launch-params.ts.
+import deployment from "../../vsol/deployments/devnet.json" with { type: "json" };
+import idl from "../../vsol/target/idl/vsol.json" with { type: "json" };
+import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
 import {
   VSOL_CONFIG,
   VSOL_LIQUIDITY,
@@ -26,15 +31,16 @@ import {
   VSOL_PROGRAM_ID,
   VSOL_RPC_URL,
   VSOL_SETTLEMENT_MINT,
-} from "./vsol";
-import { runtimeEnv } from "./runtime-env";
-import { markets } from "./markets";
+} from "./vsol.ts";
+import { runtimeEnv } from "./runtime-env.ts";
+import { markets } from "./markets.ts";
 import {
   resolveAvailableVsolSeries,
   resolveVsolSeries,
   resolveVsolSeriesCatalog,
   type ResolvedVsolSeries,
-} from "./series-resolver";
+} from "./series-resolver.ts";
+import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
 
 export function getVsolConnection() {
   // Resolve this after the request route has installed Cloudflare bindings.
@@ -43,6 +49,16 @@ export function getVsolConnection() {
 
 const TOKEN_SCALE = 1_000_000n;
 const PRICE_SCALE = 1_000_000n;
+// Exact string thrown by getVsolSeriesState when the market account itself
+// does not exist onchain yet. Exported so callers (and the client catalog
+// consumer in TendTerminal.tsx) can recognize "just needs minting" without
+// re-deriving or duplicating the literal.
+export const SERIES_NOT_YET_MINTED_REASON = "This series has not been minted yet.";
+// Solana's max transaction packet size (IPv6 MTU minus headers). The
+// mint-on-demand path adds two instructions to an already-large fill
+// transaction; if the composed size ever exceeds this, ship no path at all
+// rather than a silently-broken oversized transaction.
+const MAX_TRANSACTION_BYTES = 1232;
 const POOL_QUOTE_DOMAIN = Buffer.from("VSOLPLP1", "ascii");
 const MARKET_SEED = Buffer.from("market");
 const ORACLE_SEED = Buffer.from("oracle");
@@ -398,7 +414,7 @@ function quoteData(quote: Quote) {
   ]);
 }
 
-function loadSecret(name: "VSOL_MAKER_SECRET_KEY" | "VSOL_FAUCET_SECRET_KEY") {
+function loadSecret(name: "VSOL_MAKER_SECRET_KEY" | "VSOL_FAUCET_SECRET_KEY" | "VSOL_POOL_MANAGER_SECRET_KEY") {
   const encoded = runtimeEnv(name);
   if (!encoded) throw new Error(`${name} is not configured`);
   let values: number[];
@@ -423,6 +439,22 @@ export function vsolQuoteAuthority() {
 
 export function vsolMaker() {
   return vsolQuoteAuthority();
+}
+
+// Mirrors vsolQuoteAuthority exactly: loads the server-held signer and
+// verifies its public key against the published V2 liquidity manifest before
+// trusting it for anything. Used only by the mint-on-demand path (see
+// buildVsolQuoteTransaction below) to sign `set_liquidity_pool_market` as the
+// pool's manager. If VSOL_POOL_MANAGER_SECRET_KEY is absent or mismatched,
+// this throws -- callers must fail closed rather than silently skip
+// authorization, and ordinary fills on already-minted series never call this.
+export function vsolPoolManager() {
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  const manager = loadSecret("VSOL_POOL_MANAGER_SECRET_KEY");
+  if (!VSOL_LIQUIDITY.managerKey || !manager.publicKey.equals(VSOL_LIQUIDITY.managerKey)) {
+    throw new Error("VSOL pool manager key does not match the published V2 liquidity pool");
+  }
+  return manager;
 }
 
 export function vsolFaucet() {
@@ -516,7 +548,7 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     getPoolMarketState(series, connection),
     clusterTime(connection),
   ]);
-  if (!marketAccount || !oracleAccount) throw new Error("This series has not been minted yet.");
+  if (!marketAccount || !oracleAccount) throw new Error(SERIES_NOT_YET_MINTED_REASON);
   if (!marketAccount.owner.equals(VSOL_PROGRAM_ID) || !oracleAccount.owner.equals(VSOL_PROGRAM_ID)) {
     throw new Error("The deployed VSOL series is not owned by the verified program");
   }
@@ -572,6 +604,115 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
   };
 }
 
+export type VsolSeriesStateOrPlan = VsolSeriesState & { mintOnDemand: boolean };
+
+/**
+ * Like `getVsolSeriesState`, but when the market account itself does not
+ * exist onchain yet, returns a synthetic "would exist" state (derived purely
+ * from the already-resolved grid parameters in `series`, no chain state to
+ * read yet) with `mintOnDemand: true` instead of throwing. This is the single
+ * gate mint-on-demand quoting/building hangs off: checked directly against
+ * the market account (not by matching an error string), so it can never be
+ * confused with a genuinely broken series (wrong owner, disabled, expired,
+ * or a market that exists but was never authorized for this pool -- those
+ * still throw/report unavailable exactly as before).
+ */
+export async function getVsolSeriesStateOrPlan(series: VsolSeries, connection = getVsolConnection()): Promise<VsolSeriesStateOrPlan> {
+  const marketAccount = await connection.getAccountInfo(series.marketKey, "confirmed");
+  if (marketAccount) {
+    const state = await getVsolSeriesState(series, connection);
+    return { ...state, mintOnDemand: false };
+  }
+  return {
+    symbol: series.symbol,
+    code: series.code,
+    market: series.marketKey.toBase58(),
+    oracle: series.oracleKey.toBase58(),
+    expiry: series.expiry,
+    observationWindowSeconds: series.observationWindowSeconds,
+    lastTradeAt: series.lastTradeAt,
+    enabled: true,
+    finalized: false,
+    poolAuthorized: true,
+    available: true,
+    availabilityReason: "Available",
+    mintOnDemand: true,
+  };
+}
+
+type CreateMarketSeriesParams = {
+  symbol: string;
+  expiry: number;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+  maxSettlementStalenessSeconds: number;
+};
+
+/**
+ * Builds the `create_market` instruction for a series, deriving its market id
+ * (and PDA addresses) the exact same way the onchain factory and
+ * app/lib/series-resolver.ts do. Shared by three callers so there is exactly
+ * one encoder: app/lib/vsol-launch.ts's standalone Launch-a-series flow,
+ * buildVsolQuoteTransaction's mint-on-demand path below, and
+ * inspectVsolFillTransaction's strict re-derivation of a signed mint-and-fill
+ * transaction's create_market instruction. Lives here (not in vsol-launch.ts,
+ * which already depends on this module) so no import cycle is introduced.
+ *
+ * When `expected` is supplied, the derived market/oracle must match it
+ * exactly or this throws -- a defense-in-depth guard for callers that already
+ * know the target address (the mint-on-demand and inspector paths), so any
+ * future drift between this encoder and app/lib/series-resolver.ts's PDA
+ * derivation fails loudly instead of silently minting the wrong address.
+ */
+export async function buildCreateMarketInstruction(params: {
+  creator: PublicKey;
+  series: CreateMarketSeriesParams;
+  expected?: { market: PublicKey; oracle: PublicKey };
+}) {
+  const symbol = symbolBytes(params.series.symbol);
+  const marketId = await deriveMarketId({
+    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    settlementMint: VSOL_SETTLEMENT_MINT,
+    expiry: BigInt(params.series.expiry),
+    observationWindowSeconds: params.series.observationWindowSeconds,
+    settlementGraceSeconds: params.series.settlementGraceSeconds,
+    priceScale: LAUNCH_PRICE_SCALE,
+    maxConfidenceBps: LAUNCH_MAX_CONFIDENCE_BPS,
+    symbol,
+    maxSettlementStalenessSeconds: params.series.maxSettlementStalenessSeconds,
+  });
+  const market = PublicKey.findProgramAddressSync([MARKET_SEED, VSOL_CONFIG.toBuffer(), marketId], VSOL_PROGRAM_ID)[0];
+  const oracle = PublicKey.findProgramAddressSync([ORACLE_SEED, market.toBuffer()], VSOL_PROGRAM_ID)[0];
+  if (params.expected && (!market.equals(params.expected.market) || !oracle.equals(params.expected.oracle))) {
+    throw new Error("The derived market parameters do not match the resolved series");
+  }
+  const data = Buffer.concat([
+    marketId,
+    new PublicKey(deployment.underlyingMint).toBuffer(),
+    Buffer.from(symbol),
+    encodeU64(LAUNCH_PRICE_SCALE),
+    encodeI64(BigInt(params.series.expiry)),
+    encodeU32(params.series.observationWindowSeconds),
+    encodeU32(params.series.settlementGraceSeconds),
+    encodeU16(LAUNCH_MAX_CONFIDENCE_BPS),
+    Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
+    // vsol/programs/vsol/src/lib.rs, where this field was appended after
+    // `pyth_feed_id` to keep the on-chain layout backward compatible.
+    encodeU32(params.series.maxSettlementStalenessSeconds),
+  ]);
+  const instruction = instructionFromIdl(idlInstruction("create_market"), {
+    creator: params.creator,
+    config: VSOL_CONFIG,
+    market,
+    oracle,
+    settlement_mint: VSOL_SETTLEMENT_MINT,
+    token_program: TOKEN_PROGRAM_ID,
+    system_program: SystemProgram.programId,
+  }, data);
+  return { instruction, market, oracle, marketId };
+}
+
 /**
  * Resolves the current rolling grid for every configured market symbol and
  * verifies each rung on-chain. Every (symbol, code) pair always appears in
@@ -615,7 +756,7 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
         finalized: false,
         poolAuthorized: false,
         available: false,
-        availabilityReason: describeRpcFailure(error, "This series has not been minted yet."),
+        availabilityReason: describeRpcFailure(error, SERIES_NOT_YET_MINTED_REASON),
       };
     }
   }));
@@ -705,9 +846,46 @@ export async function buildVsolQuoteTransaction(params: {
   const authority = vsolQuoteAuthority();
   const [core, seriesState] = await Promise.all([
     getPoolCore(connection),
-    getVsolSeriesState(series, connection),
+    getVsolSeriesStateOrPlan(series, connection),
   ]);
   if (!seriesState.available) throw new Error(seriesState.availabilityReason);
+
+  // Mint-on-demand: the market this rung resolves to does not exist onchain
+  // yet. Rather than fail, the buyer becomes the market's creator (paying its
+  // rent) and the pool manager authorizes it in the same transaction, ahead
+  // of the existing Ed25519 + fill_pool_quote pair. The pool manager key is
+  // loaded fresh here (never persisted beyond this call) and fails closed --
+  // with VSOL_POOL_MANAGER_SECRET_KEY unset or mismatched, vsolPoolManager()
+  // throws and this whole quote attempt fails honestly; ordinary fills on
+  // already-minted series never reach this branch at all.
+  const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
+  let poolManager: Keypair | null = null;
+  let mintInstructions: TransactionInstruction[] = [];
+  if (seriesState.mintOnDemand) {
+    try {
+      poolManager = vsolPoolManager();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The pool manager key is not configured";
+      const wrapped = new Error(`Mint-on-demand is unavailable: ${message}`);
+      wrapped.name = "VsolPoolManagerUnavailable";
+      throw wrapped;
+    }
+    const created = await buildCreateMarketInstruction({
+      creator: params.buyer,
+      series,
+      expected: { market: series.marketKey, oracle: series.oracleKey },
+    });
+    const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
+    const authorizeInstruction = instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
+      manager: poolManager.publicKey,
+      config: VSOL_CONFIG,
+      pool: VSOL_LIQUIDITY.poolKey,
+      market: series.marketKey,
+      pool_market: poolMarket,
+      system_program: SystemProgram.programId,
+    }, authorizeData);
+    mintInstructions = [created.instruction, authorizeInstruction];
+  }
 
   const buyerSource = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, params.buyer);
   if (!(await connection.getAccountInfo(buyerSource, "confirmed"))) {
@@ -743,7 +921,6 @@ export async function buildVsolQuoteTransaction(params: {
     maxPayout,
     quoteExpiry,
   };
-  const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
   const nonceRecord = derivePoolNonce(VSOL_LIQUIDITY.poolKey, authority.publicKey, quote.nonce);
   const position = derivePoolPosition(nonceRecord);
   const positionVault = derivePoolPositionVault(position);
@@ -785,13 +962,31 @@ export async function buildVsolQuoteTransaction(params: {
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
-  }).add(signatureInstruction, fillInstruction);
+  }).add(...mintInstructions, signatureInstruction, fillInstruction);
+  // The pool manager is a required signer on set_liquidity_pool_market; sign
+  // now server-side (the buyer signs everything else, including this
+  // instruction's other accounts, in their wallet next).
+  if (poolManager) transaction.partialSign(poolManager);
+
+  const serialized = transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
+  if (serialized.length > MAX_TRANSACTION_BYTES) {
+    // Do not ship a silently-broken oversized transaction: fail the quote
+    // honestly so the caller reports the series as unavailable rather than
+    // handing the wallet something that can never fit in a packet.
+    const error = new Error(
+      `Minting this series requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit. A versioned transaction or address lookup table is required before this series can trade.`,
+    );
+    error.name = "VsolTransactionTooLarge";
+    throw error;
+  }
+
   return {
-    transaction: transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64"),
+    transaction: serialized.toString("base64"),
     positionAddress: position.toBase58(),
     nonce: quote.nonce.toString(),
     marketAddress: series.marketKey.toBase58(),
     poolAddress: VSOL_LIQUIDITY.poolKey.toBase58(),
+    mintOnDemand: seriesState.mintOnDemand,
   };
 }
 
@@ -917,9 +1112,32 @@ export function isVsolFillTransaction(transaction: Transaction) {
     && Buffer.from(fillInstruction.data).subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
 }
 
-export async function inspectVsolFillTransaction(transaction: Transaction) {
-  if (!isVsolFillTransaction(transaction) || !VSOL_LIQUIDITY) return null;
-  const fill = transaction.instructions[1];
+// The mint-on-demand shape: create_market, set_liquidity_pool_market, then
+// the same Ed25519 + fill_pool_quote pair as an ordinary fill. Exact order,
+// exact program ids, exact discriminators -- any other shape (missing an
+// instruction, extra instructions, or these four out of order) is rejected
+// by construction, since this check (and inspectVsolFillTransaction below)
+// only ever reads instructions at these four fixed indices.
+export function isVsolMintAndFillTransaction(transaction: Transaction) {
+  if (transaction.instructions.length !== 4 || !VSOL_LIQUIDITY) return false;
+  const [createInstruction, authorizeInstruction, signatureInstruction, fillInstruction] = transaction.instructions;
+  return createInstruction.programId.equals(VSOL_PROGRAM_ID)
+    && Buffer.from(createInstruction.data).subarray(0, 8).equals(vsolInstructionDiscriminator("create_market"))
+    && authorizeInstruction.programId.equals(VSOL_PROGRAM_ID)
+    && Buffer.from(authorizeInstruction.data).subarray(0, 8).equals(vsolInstructionDiscriminator("set_liquidity_pool_market"))
+    && signatureInstruction.programId.equals(Ed25519Program.programId)
+    && fillInstruction.programId.equals(VSOL_PROGRAM_ID)
+    && Buffer.from(fillInstruction.data).subarray(0, 8).equals(Buffer.from(FILL_POOL_QUOTE.discriminator));
+}
+
+/**
+ * Verifies the Ed25519 + fill_pool_quote pair against a series the caller has
+ * already independently verified as a legitimate current rolling-grid rung.
+ * Shared by both the plain-fill and mint-and-fill inspection paths below --
+ * the fill instruction itself is checked identically either way.
+ */
+function verifyFillInstruction(fill: TransactionInstruction, verifiedSeries: VsolSeries) {
+  if (!VSOL_LIQUIDITY) return null;
   if (fill.keys.length !== FILL_POOL_QUOTE.accounts.length) return null;
   const buyer = fill.keys[0];
   const quoteAuthority = fill.keys[1];
@@ -928,13 +1146,7 @@ export async function inspectVsolFillTransaction(transaction: Transaction) {
   const poolMarket = fill.keys[5];
   const nonceRecord = fill.keys[9];
   const position = fill.keys[10];
-  // Chain-derived: re-resolve the current rolling grid rather than trusting a
-  // checked-in manifest, so this check can never pass a fill for a market
-  // that a stale snapshot would have missed (or reject a legitimate current
-  // rung the snapshot hadn't caught up with yet).
-  const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
-  const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market.pubkey));
-  if (!verifiedSeries
+  if (!market.pubkey.equals(verifiedSeries.marketKey)
       || !buyer.isSigner || !buyer.isWritable
       || !quoteAuthority.pubkey.equals(VSOL_LIQUIDITY.quoteAuthorityKey)
       || !pool.pubkey.equals(VSOL_LIQUIDITY.poolKey)
@@ -955,6 +1167,95 @@ export async function inspectVsolFillTransaction(transaction: Transaction) {
   if (!position.pubkey.equals(derivePoolPosition(nonceRecord.pubkey))) return null;
   if (!fill.keys[11].pubkey.equals(derivePoolPositionVault(position.pubkey))) return null;
   return { buyer: buyer.pubkey, pool: pool.pubkey, market: market.pubkey, position: position.pubkey };
+}
+
+/**
+ * Re-derives the create_market instruction that MUST have been used to mint
+ * `verifiedSeries` -- with `creator` bound to the signed-in buyer -- and
+ * compares it byte-for-byte (program id, full data buffer, and every account
+ * pubkey/signer/writable flag) against the instruction actually present in
+ * the transaction. This is what stops a buyer from minting a market on
+ * arbitrary terms and trading against the pool: the only args that can pass
+ * are the exact resolved grid parameters for `verifiedSeries` (current
+ * rolling-grid rung), because that's the only input buildCreateMarketInstruction
+ * is given here.
+ */
+async function verifyCreateMarketInstruction(instruction: TransactionInstruction, creator: PublicKey, verifiedSeries: VsolSeries) {
+  const expected = await buildCreateMarketInstruction({
+    creator,
+    series: verifiedSeries,
+    expected: { market: verifiedSeries.marketKey, oracle: verifiedSeries.oracleKey },
+  });
+  if (!instruction.programId.equals(expected.instruction.programId)) return false;
+  if (!Buffer.from(instruction.data).equals(Buffer.from(expected.instruction.data))) return false;
+  if (instruction.keys.length !== expected.instruction.keys.length) return false;
+  for (let i = 0; i < instruction.keys.length; i += 1) {
+    if (!instruction.keys[i].pubkey.equals(expected.instruction.keys[i].pubkey)) return false;
+    if (instruction.keys[i].isSigner !== expected.instruction.keys[i].isSigner) return false;
+    if (instruction.keys[i].isWritable !== expected.instruction.keys[i].isWritable) return false;
+  }
+  return true;
+}
+
+/**
+ * Verifies set_liquidity_pool_market binds exactly the expected pool, the
+ * expected (newly-minted) market, and the expected `lastTradeAt` cutoff for
+ * `verifiedSeries` -- and, when the manifest publishes a manager key, that
+ * the signing manager is that exact key (not merely "some signer").
+ */
+function verifyAuthorizeMarketInstruction(instruction: TransactionInstruction, verifiedSeries: VsolSeries) {
+  if (!VSOL_LIQUIDITY) return false;
+  if (!instruction.programId.equals(VSOL_PROGRAM_ID)) return false;
+  if (instruction.keys.length !== 6) return false;
+  const manager = instruction.keys[0];
+  const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, verifiedSeries.marketKey);
+  const expectedData = Buffer.concat([
+    vsolInstructionDiscriminator("set_liquidity_pool_market"),
+    encodeI64(BigInt(verifiedSeries.lastTradeAt)),
+    Buffer.from([1]),
+  ]);
+  if (!Buffer.from(instruction.data).equals(expectedData)) return false;
+  if (!manager.isSigner || !manager.isWritable) return false;
+  if (VSOL_LIQUIDITY.managerKey && !manager.pubkey.equals(VSOL_LIQUIDITY.managerKey)) return false;
+  if (!instruction.keys[1].pubkey.equals(VSOL_CONFIG)) return false;
+  if (!instruction.keys[2].pubkey.equals(VSOL_LIQUIDITY.poolKey)) return false;
+  if (!instruction.keys[3].pubkey.equals(verifiedSeries.marketKey)) return false;
+  if (!instruction.keys[4].pubkey.equals(poolMarket)) return false;
+  if (!instruction.keys[5].pubkey.equals(SystemProgram.programId)) return false;
+  return true;
+}
+
+export async function inspectVsolFillTransaction(transaction: Transaction) {
+  if (!VSOL_LIQUIDITY) return null;
+
+  if (isVsolFillTransaction(transaction)) {
+    const fill = transaction.instructions[1];
+    const market = fill.keys[4]?.pubkey;
+    if (!market) return null;
+    // Chain-derived: re-resolve the current rolling grid rather than trusting
+    // a checked-in manifest, so this check can never pass a fill for a market
+    // that a stale snapshot would have missed (or reject a legitimate current
+    // rung the snapshot hadn't caught up with yet).
+    const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
+    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market));
+    if (!verifiedSeries) return null;
+    return verifyFillInstruction(fill, verifiedSeries);
+  }
+
+  if (isVsolMintAndFillTransaction(transaction)) {
+    const [createInstruction, authorizeInstruction, , fillInstruction] = transaction.instructions;
+    const market = fillInstruction.keys[4]?.pubkey;
+    const buyer = fillInstruction.keys[0];
+    if (!market || !buyer?.isSigner) return null;
+    const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
+    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market));
+    if (!verifiedSeries) return null;
+    if (!(await verifyCreateMarketInstruction(createInstruction, buyer.pubkey, verifiedSeries))) return null;
+    if (!verifyAuthorizeMarketInstruction(authorizeInstruction, verifiedSeries)) return null;
+    return verifyFillInstruction(fillInstruction, verifiedSeries);
+  }
+
+  return null;
 }
 
 export function calculateDepositShares(amount: bigint, totalShares: bigint, totalAssets: bigint) {

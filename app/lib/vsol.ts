@@ -91,4 +91,8 @@ export type VsolQuotePayload = {
   nonce: string;
   marketAddress: string;
   explorerUrl: string;
+  // True when this fill also mints (create_market) and authorizes
+  // (set_liquidity_pool_market) its own series onchain -- the buyer pays that
+  // rent as part of signing this same transaction. See app/lib/vsol-server.ts.
+  mintOnDemand?: boolean;
 };

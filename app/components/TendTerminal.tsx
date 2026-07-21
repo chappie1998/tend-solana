@@ -233,10 +233,25 @@ const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
   [/already settled/i, "Settled"],
 ];
 
+// Exact string app/lib/vsol-server.ts's getVsolSeriesState throws (and the
+// onchain catalog reports via /api/markets) when a rung's market account does
+// not exist yet. A buyer can still trade it -- their fill mints and
+// authorizes the series in the same transaction (see buildVsolQuoteTransaction) --
+// so this is treated as selectable, not blocked, while keeping the honest
+// underlying reason intact for anything that still needs the real one.
+const MINT_ON_DEMAND_REASON = "This series has not been minted yet.";
+const MINT_ON_DEMAND_CHIP_NOTE = "Mints on fill";
+const MINT_ON_DEMAND_FULL_NOTE = "First trade mints this series onchain — you pay ~0.003 SOL rent.";
+
 // Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
 function expiryChipNote(item: Pick<ExpiryDefinition, "available" | "detail" | "availabilityReason">): string {
-  if (item.available) return item.detail;
+  if (item.available) return item.availabilityReason === MINT_ON_DEMAND_REASON ? MINT_ON_DEMAND_CHIP_NOTE : item.detail;
   return EXPIRY_NOTE_RULES.find(([test]) => test.test(item.availabilityReason))?.[1] ?? "Unavailable";
+}
+
+function expiryChipTitle(item: Pick<ExpiryDefinition, "available" | "label" | "detail" | "availabilityReason">): string {
+  if (!item.available) return item.availabilityReason;
+  return item.availabilityReason === MINT_ON_DEMAND_REASON ? MINT_ON_DEMAND_FULL_NOTE : `${item.label}, settles ${item.detail}`;
 }
 
 function TradeView({
@@ -284,7 +299,11 @@ function TradeView({
       observationWindowSeconds: series.observationWindowSeconds,
       tradeLockSeconds: Math.max(0, series.expiry - series.lastTradeAt),
       detail: formatExpiryDetail(code, expiryAt, now),
-      available: series.available,
+      // A rung whose market hasn't been minted yet is still selectable: the
+      // first buyer's fill mints and authorizes it. availabilityReason is
+      // left as-is so expiryChipNote/the policy line below can still tell
+      // this case apart from a genuinely tradeable, already-minted series.
+      available: series.available || series.availabilityReason === MINT_ON_DEMAND_REASON,
       availabilityReason: series.availabilityReason,
     };
     return exact;
@@ -527,10 +546,10 @@ function TradeView({
 
           <fieldset className="field-group expiry-field"><legend>Expires</legend>
             <div className="expiry-group-head"><span>Intraday</span><small>Protocol-ready · oracle gated</small></div>
-            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
+            <div className="choice-row expiry-row">{expiryOptions.filter((item) => item.group === "intraday").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={expiryChipTitle(item)} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
             <div className="expiry-group-head standard"><span>Standard</span><small>Longer observation window</small></div>
-            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={item.available ? `${item.label}, settles ${item.detail}` : item.availabilityReason} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
-            <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {expiryDefinition.available ? `${expiryDefinition.tradeLockSeconds}s trade lock · ${expiryDefinition.observationWindowSeconds}s oracle window` : expiryDefinition.availabilityReason}</p>
+            <div className="choice-row standard-expiry-row">{expiryOptions.filter((item) => item.group === "standard").map((item) => <button type="button" key={item.code} className={expiry === item.code ? "choice active" : "choice"} disabled={!item.available} title={expiryChipTitle(item)} onClick={() => { setExpiry(item.code); invalidateQuote(); }}>{item.shortLabel}<small>{expiryChipNote(item)}</small></button>)}</div>
+            <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {expiryDefinition.available ? (expiryDefinition.availabilityReason === MINT_ON_DEMAND_REASON ? MINT_ON_DEMAND_FULL_NOTE : `${expiryDefinition.tradeLockSeconds}s trade lock · ${expiryDefinition.observationWindowSeconds}s oracle window`) : expiryDefinition.availabilityReason}</p>
           </fieldset>
 
           {authorizedPools.length > 1 && (
@@ -578,6 +597,7 @@ function TradeView({
             <div className="success-mark"><ShieldCheck size={25} aria-hidden="true" /></div>
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
+            {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
             <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
