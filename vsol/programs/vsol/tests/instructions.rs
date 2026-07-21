@@ -1131,6 +1131,364 @@ fn update_liquidity_pool_rejects_while_pool_has_open_positions_or_locked_collate
 }
 
 // =====================================================================
+// set_liquidity_pool_market: the `PoolHasOpenPositions` guard is only
+// unconditional for mutating an *existing* authorization. Authorizing a
+// brand-new series for the first time is additive -- it cannot change the
+// risk of a position that already exists, since collateral is fixed at
+// fill time and utilization/per-position caps are enforced then too -- so
+// it must be allowed while the pool is busy. That's the mint-on-demand
+// case: a first buyer creating and trading a rung in one transaction.
+// =====================================================================
+
+/// Deposits liquidity into `pool`, authorizes `market` for trading (a
+/// first-time enable, done while the pool is still idle so it's guaranteed
+/// to succeed regardless of what's under test), and fills one quote against
+/// it so the pool ends up with exactly one open position and non-zero
+/// locked collateral. Returns `market`'s `pool_market` PDA so callers can
+/// exercise further authorization changes against an authorization that is
+/// known to already exist.
+fn open_pool_position(
+    harness: &mut Harness,
+    fixture: &ConfigFixture,
+    pool: &PoolFixture,
+    market: &MarketFixture,
+    quote_nonce: u64,
+) -> Pubkey {
+    let provider = harness.funded_keypair();
+    let provider_position = provider_position_pda(&pool.pool, &provider.pubkey());
+    let provider_source = harness.create_token_account(&provider, &pool.settlement_mint, &provider.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &provider,
+        &[deposit_liquidity_ix(
+            &provider.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider_position,
+            &provider_source,
+            100 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let buyer = harness.funded_keypair();
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_pool_quote(quote_nonce, harness.now() + 30);
+    let pool_nonce_record = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote.nonce);
+    let pool_position = pool_position_pda(&pool_nonce_record);
+    let pool_position_vault = pool_position_vault_pda(&pool_position);
+    let fill_accounts = FillPoolQuoteAccounts {
+        buyer: buyer.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        pool_market,
+        settlement_mint: market.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    let pool_after_fill: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(pool_after_fill.open_positions, 1);
+    assert!(pool_after_fill.locked_collateral > 0);
+
+    pool_market
+}
+
+#[test]
+fn set_liquidity_pool_market_allows_new_series_while_pool_has_open_position() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market_a = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x11);
+    open_pool_position(&mut harness, &fixture, &pool, &market_a, 1);
+
+    // The broken-today case: authorizing a second, brand-new series while
+    // the pool already has an open position (and locked collateral) from
+    // market_a must succeed -- this is a first-time enable, so it does not
+    // touch the `PoolHasOpenPositions` guard at all.
+    let market_b = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x22);
+    let pool_market_b = pool_market_pda(&pool.pool, &market_b.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market_b.market,
+            &pool_market_b,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market_b.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let authorized: vsol::LiquidityPoolMarket = harness.read_account(&pool_market_b);
+    assert!(authorized.enabled);
+    assert_eq!(authorized.pool, pool.pool);
+    assert_eq!(authorized.market, market_b.market);
+}
+
+#[test]
+fn set_liquidity_pool_market_rejects_disabling_existing_authorization_with_open_position() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market_a = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x11);
+    let pool_market_a = open_pool_position(&mut harness, &fixture, &pool, &market_a, 1);
+
+    // market_a's authorization already exists (it's the one the open
+    // position depends on), so disabling it while the pool is busy must
+    // stay gated, unlike a first-time enable.
+    let ix = set_liquidity_pool_market_ix(
+        &pool.manager.pubkey(),
+        &fixture.config,
+        &pool.pool,
+        &market_a.market,
+        &pool_market_a,
+        vsol::SetLiquidityPoolMarketArgs {
+            last_trade_at: market_a.expiry - 30,
+            enabled: false,
+        },
+    );
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::PoolHasOpenPositions);
+}
+
+#[test]
+fn set_liquidity_pool_market_rejects_last_trade_at_change_on_existing_authorization_with_open_position() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market_a = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x11);
+    let pool_market_a = open_pool_position(&mut harness, &fixture, &pool, &market_a, 1);
+
+    // Same authorization, still enabled, just a different trade cutoff:
+    // this mutates an existing record and must stay gated.
+    let ix = set_liquidity_pool_market_ix(
+        &pool.manager.pubkey(),
+        &fixture.config,
+        &pool.pool,
+        &market_a.market,
+        &pool_market_a,
+        vsol::SetLiquidityPoolMarketArgs {
+            last_trade_at: market_a.expiry - 60,
+            enabled: true,
+        },
+    );
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::PoolHasOpenPositions);
+}
+
+#[test]
+fn set_liquidity_pool_market_rejects_reenabling_existing_authorization_with_open_position() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market_a = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x11);
+    let market_b = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x22);
+
+    // Authorize market_b, then disable it again, both while the pool is
+    // still idle -- this establishes a real (non-default) pool_market
+    // account for market_b before any position exists.
+    let pool_market_b = pool_market_pda(&pool.pool, &market_b.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market_b.market,
+            &pool_market_b,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market_b.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market_b.market,
+            &pool_market_b,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market_b.expiry - 30,
+                enabled: false,
+            },
+        )],
+        &[],
+    );
+
+    open_pool_position(&mut harness, &fixture, &pool, &market_a, 1);
+
+    // Re-enabling market_b now touches an already-existing pool_market
+    // account (not a first-time enable), so it must stay gated even though
+    // the request itself sets `enabled: true`.
+    let ix = set_liquidity_pool_market_ix(
+        &pool.manager.pubkey(),
+        &fixture.config,
+        &pool.pool,
+        &market_b.market,
+        &pool_market_b,
+        vsol::SetLiquidityPoolMarketArgs {
+            last_trade_at: market_b.expiry - 30,
+            enabled: true,
+        },
+    );
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::PoolHasOpenPositions);
+}
+
+#[test]
+fn set_liquidity_pool_market_first_time_disable_still_requires_idle_pool() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market_a = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x11);
+    open_pool_position(&mut harness, &fixture, &pool, &market_a, 1);
+
+    // First-time creation of market_b's pool_market, but with
+    // `enabled: false`: this is not an enable at all, so it does not
+    // qualify for the first-time-enable carve-out and must still be
+    // rejected while the pool is busy.
+    let market_b = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x22);
+    let pool_market_b = pool_market_pda(&pool.pool, &market_b.market);
+    let ix = set_liquidity_pool_market_ix(
+        &pool.manager.pubkey(),
+        &fixture.config,
+        &pool.pool,
+        &market_b.market,
+        &pool_market_b,
+        vsol::SetLiquidityPoolMarketArgs {
+            last_trade_at: market_b.expiry - 30,
+            enabled: false,
+        },
+    );
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::PoolHasOpenPositions);
+}
+
+#[test]
+fn set_liquidity_pool_market_all_transitions_succeed_while_pool_idle() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+
+    // No open positions or locked collateral at any point in this test:
+    // every transition below must behave exactly as it did before this
+    // change (the quiet case is unaffected by the carve-out).
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    let after_enable: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert!(after_enable.enabled);
+    assert_eq!(after_enable.last_trade_at, market.expiry - 30);
+
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 60,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    let after_change: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert_eq!(after_change.last_trade_at, market.expiry - 60);
+
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 60,
+                enabled: false,
+            },
+        )],
+        &[],
+    );
+    let after_disable: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert!(!after_disable.enabled);
+
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    let after_reenable: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert!(after_reenable.enabled);
+}
+
+// =====================================================================
 // Pooled lifecycle smoke test: create_market -> initialize_liquidity_pool
 // -> set_liquidity_pool_market -> deposit_liquidity -> fill_pool_quote ->
 // settle_pool_position.

@@ -837,10 +837,35 @@ pub mod vsol {
         args: SetLiquidityPoolMarketArgs,
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
-        require!(
-            ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
-            VsolError::PoolHasOpenPositions
-        );
+
+        // `pool_market` is `init_if_needed`: this call either creates a brand
+        // new authorization record or mutates one that already exists.
+        // Anchor zero-initializes an account on creation, and `pool` is only
+        // ever written to a non-default value right below in this same
+        // instruction (it is never left at `Pubkey::default()` once set), so
+        // "pool_market.pool is still the zero pubkey" is a sound signal that
+        // this account did not exist before this instruction ran. We check
+        // it before making any writes. We deliberately do not use
+        // `last_trade_at == 0` for this: `enabled == false` is a legitimate,
+        // reachable state for `last_trade_at` to be left at (or reset to)
+        // zero, so that field can't distinguish "never created" from
+        // "created and since disabled".
+        let is_first_time_enable =
+            ctx.accounts.pool_market.pool == Pubkey::default() && args.enabled;
+
+        // Authorizing a brand-new series is additive: it cannot change the
+        // risk of any position that already exists, because per-position
+        // collateral is fixed at fill time and utilization/per-position caps
+        // are enforced then too. Mutating an *existing* authorization is not
+        // additive — e.g. disabling a series or moving its trade cutoff can
+        // affect positions that were opened depending on it — so that case
+        // stays gated on the pool being fully idle.
+        if !is_first_time_enable {
+            require!(
+                ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
+                VsolError::PoolHasOpenPositions
+            );
+        }
         require_keys_eq!(
             ctx.accounts.market.settlement_mint,
             ctx.accounts.pool.settlement_mint,

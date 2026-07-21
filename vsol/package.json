@@ -11,7 +11,7 @@
     "test:rust": "cargo test --workspace --all-targets",
     "test:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "test:sdk": "node --import tsx --test tests/*.test.ts",
-    "check": "npm run test:rust && npm run test:lint && npm run test:sdk && npm run build:program",
+    "check": "npm run build:program && npm run test:rust && npm run test:lint && npm run test:sdk",
     "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
     "devnet:verify": "node --import tsx scripts/verify-deployment.ts",
     "keeper": "node --import tsx scripts/keeper.ts"
