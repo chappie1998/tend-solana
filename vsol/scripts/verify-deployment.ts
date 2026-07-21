@@ -347,6 +347,37 @@ if (!publishTransaction?.meta?.logMessages?.some((line) => line.includes("Instru
   throw new Error("The saved settlement transaction did not execute PublishPythSettlement");
 }
 
+// The early-close (buyback) proof is independently re-verified rather than
+// trusted from the manifest: `closePoolPositionDeployed` is fail-closed on
+// this evidence exactly like `pythUpgradeDeployed` is on the Pyth upgrade
+// proof. Older manifests may simply have neither the flag nor the evidence,
+// which is fine; what's never acceptable is the flag without the evidence.
+const closeEarlySignature = smoke.closeEarlySignature != null ? String(smoke.closeEarlySignature) : undefined;
+const closeEarlyPosition = smoke.closeEarlyPosition != null ? String(smoke.closeEarlyPosition) : undefined;
+const hasCloseEarlyEvidence = closeEarlySignature !== undefined && closeEarlyPosition !== undefined;
+if (deployment.closePoolPositionDeployed === true && !hasCloseEarlyEvidence) {
+  throw new Error("closePoolPositionDeployed is true but the manifest has no recorded early-close evidence");
+}
+if (hasCloseEarlyEvidence) {
+  if (deployment.closePoolPositionDeployed !== true) {
+    throw new Error("Early-close evidence is recorded but closePoolPositionDeployed is not true");
+  }
+  // The batched getTransactions call above is for the fixed set of
+  // core-lifecycle signatures; re-fetching this one individually with the
+  // resilient helper avoids adding it to a call that already gets rate-limited.
+  const closeEarlyTransaction = await fetchTransactionWithRetry(connection, closeEarlySignature!);
+  if (!closeEarlyTransaction || closeEarlyTransaction.meta?.err) {
+    throw new Error(`Early-close transaction ${closeEarlySignature} is missing or failed`);
+  }
+  if (!closeEarlyTransaction.meta?.logMessages?.some((line) => line.includes("Instruction: ClosePoolPosition"))) {
+    throw new Error(`Early-close transaction ${closeEarlySignature} did not execute ClosePoolPosition`);
+  }
+  const closeEarlyPositionAccount = await connection.getAccountInfo(new PublicKey(closeEarlyPosition!), "confirmed");
+  if (closeEarlyPositionAccount) {
+    throw new Error(`Early-closed pool position ${closeEarlyPosition} is still open onchain`);
+  }
+}
+
 console.log(JSON.stringify({
   ok: true,
   cluster,

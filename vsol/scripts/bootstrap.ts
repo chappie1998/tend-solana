@@ -49,13 +49,16 @@ import {
   calculatePayout,
   deriveMarketId,
   liquidityPoolId,
+  poolBuybackMessage,
   poolQuoteMessage,
   PRICE_SCALE,
   quoteMessage,
   symbolBytes,
+  toAnchorPoolBuyback,
   toAnchorQuote,
   type Quote,
   type PoolQuote,
+  type PoolBuyback,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
 
@@ -109,6 +112,7 @@ type Deployment = {
   rpcUrl: string;
   programId: string;
   pythUpgradeDeployed: boolean;
+  closePoolPositionDeployed: boolean;
   programUpgradeSignature?: string;
   pythReceiverProgram: string;
   pythFeedId: string;
@@ -526,6 +530,61 @@ async function buildPoolFill(params: {
     })
     .instruction();
   return { transaction: new Transaction().add(signatureInstruction, fillInstruction), nonceRecord, position, positionVault };
+}
+
+async function buildPoolClose(params: {
+  buyerProgram: Program<Vsol>;
+  buyer: Keypair;
+  buyerDestination: PublicKey;
+  quoteAuthority: Keypair;
+  config: PublicKey;
+  pool: PublicKey;
+  market: PublicKey;
+  oracle: PublicKey;
+  position: PublicKey;
+  positionVault: PublicKey;
+  settlementMint: PublicKey;
+  poolToken: PublicKey;
+  treasuryDestination: PublicKey;
+  buyback: PoolBuyback;
+  domainSeparator: Uint8Array;
+  domainVersion: number;
+}) {
+  const message = poolBuybackMessage({
+    domainSeparator: params.domainSeparator,
+    domainVersion: params.domainVersion,
+    config: params.config,
+    pool: params.pool,
+    market: params.market,
+    position: params.position,
+    buyer: params.buyer.publicKey,
+    quoteAuthority: params.quoteAuthority.publicKey,
+    buyback: params.buyback,
+  });
+  const signatureInstruction = Ed25519Program.createInstructionWithPrivateKey({
+    privateKey: params.quoteAuthority.secretKey,
+    message,
+  });
+  const closeInstruction = await params.buyerProgram.methods
+    .closePoolPosition(toAnchorPoolBuyback(params.buyback))
+    .accountsStrict({
+      buyer: params.buyer.publicKey,
+      config: params.config,
+      pool: params.pool,
+      market: params.market,
+      oracle: params.oracle,
+      position: params.position,
+      positionVault: params.positionVault,
+      settlementMint: params.settlementMint,
+      buyerDestination: params.buyerDestination,
+      poolToken: params.poolToken,
+      treasuryDestination: params.treasuryDestination,
+      rentRecipient: params.buyer.publicKey,
+      instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .instruction();
+  return new Transaction().add(signatureInstruction, closeInstruction);
 }
 
 async function clusterUnixTime(): Promise<number> {
@@ -1117,6 +1176,169 @@ async function main(): Promise<void> {
   if (settledPoolAssets !== expectedPoolAssets) {
     throw new Error(`Pool conservation failed: expected ${expectedPoolAssets}, received ${settledPoolAssets}`);
   }
+
+  // --- Early-close (buyback) smoke lifecycle ---
+  // Runs on its own market so it cannot disturb the settle/refund lifecycles
+  // above: a pool position is opened and then bought back by the pool's own
+  // quote authority before the market expires, proving `close_pool_position`
+  // (an Ed25519-authenticated one-shot buyback quote, domain VSOLCLS1) works
+  // end-to-end against a live cluster.
+  const closeExpiry = (await clusterUnixTime()) + (cluster === "localnet" ? 90 : 300);
+  const closeMarket = await createMarket({
+    creatorProgram,
+    creator,
+    config,
+    settlementMint,
+    underlyingMint,
+    symbol: "VSOL-TEST",
+    expiry: closeExpiry,
+    observationWindowSeconds: 120,
+    settlementGraceSeconds: 600,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+    pythFeedId: smokePythFeedBytes,
+  });
+  const closePoolMarket = await authorizePoolMarket({
+    managerProgram: creatorProgram,
+    manager: creator,
+    config,
+    pool: smokePool.pool,
+    market: closeMarket.market,
+    lastTradeAt: closeExpiry - 10,
+  });
+  // Top up the smoke pool so it can lock collateral for this quote without
+  // touching the balance the settle/refund conservation check above already
+  // verified.
+  const closeDeposit = 5_000n * 1_000_000n;
+  const poolBeforeCloseDeposit = await adminProgram.account.liquidityPool.fetch(smokePool.pool);
+  const poolAssetsBeforeCloseDeposit = (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const closeMinShares = calculateDepositShares(
+    closeDeposit,
+    BigInt(poolBeforeCloseDeposit.totalShares.toString()),
+    poolAssetsBeforeCloseDeposit,
+  );
+  await makerProgram.methods
+    .depositLiquidity(
+      new BN(closeDeposit.toString()),
+      new BN(closeMinShares.toString()),
+      new BN((await clusterUnixTime()) + 600),
+    )
+    .accountsStrict({
+      provider: maker.publicKey,
+      config,
+      settlementMint,
+      pool: smokePool.pool,
+      poolToken: smokePool.poolToken,
+      providerPosition: smokeProvider,
+      providerSource: makerToken,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+    })
+    .rpc();
+
+  // Pre-fill obligations: the position we are about to open and then close
+  // early must leave the pool's locked collateral and open-position count
+  // exactly where they started.
+  const poolBeforeCloseFill = await adminProgram.account.liquidityPool.fetch(smokePool.pool);
+  const lockedCollateralBeforeCloseFill = poolBeforeCloseFill.lockedCollateral;
+  const openPositionsBeforeCloseFill = poolBeforeCloseFill.openPositions;
+
+  const closeQuote: PoolQuote = {
+    nonce: successQuote.nonce + 30n,
+    direction: 0,
+    strike: 100n * PRICE_SCALE,
+    width: 10n * PRICE_SCALE,
+    premium: 500n * 1_000_000n,
+    maxPayout: 5_000n * 1_000_000n,
+    quoteExpiry: BigInt(closeExpiry - 10),
+  };
+  const closeFill = await buildPoolFill({
+    buyerProgram,
+    buyer,
+    buyerSource: buyerToken,
+    quoteAuthority: maker,
+    config,
+    pool: smokePool.pool,
+    poolMarket: closePoolMarket,
+    poolToken: smokePool.poolToken,
+    market: closeMarket.market,
+    settlementMint,
+    quote: closeQuote,
+    domainSeparator,
+    domainVersion,
+  });
+  const closeFillSignature = await sendAndConfirmTransaction(connection, closeFill.transaction, [buyer], { commitment });
+
+  // Pre-close balances: the baseline the buyback's token movements are
+  // measured against.
+  const preCloseBuyerBalance = (await getAccount(connection, buyerToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const preClosePoolVaultBalance = (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const preCloseTreasuryBalance = (await getAccount(connection, treasuryToken, commitment, TOKEN_PROGRAM_ID)).amount;
+
+  // Roughly the premium: strictly less than max_payout, and non-zero.
+  const closeBuybackAmount = closeQuote.premium;
+  const closeBuyback: PoolBuyback = {
+    buybackAmount: closeBuybackAmount,
+    minProceeds: closeBuybackAmount,
+    quoteExpiry: BigInt((await clusterUnixTime()) + 30),
+  };
+  const closeTransaction = await buildPoolClose({
+    buyerProgram,
+    buyer,
+    buyerDestination: buyerToken,
+    quoteAuthority: maker,
+    config,
+    pool: smokePool.pool,
+    market: closeMarket.market,
+    oracle: closeMarket.oracle,
+    position: closeFill.position,
+    positionVault: closeFill.positionVault,
+    settlementMint,
+    poolToken: smokePool.poolToken,
+    treasuryDestination: treasuryToken,
+    buyback: closeBuyback,
+    domainSeparator,
+    domainVersion,
+  });
+  const closeEarlySignature = await sendAndConfirmTransaction(connection, closeTransaction, [buyer], { commitment });
+
+  if (await accountExists(closeFill.position)) throw new Error("Early-closed pool position account did not close");
+  if (await accountExists(closeFill.positionVault)) throw new Error("Early-closed pool position vault did not close");
+
+  const closeFee = (closeQuote.premium * feeBps + 9_999n) / 10_000n;
+  const postCloseBuyerBalance = (await getAccount(connection, buyerToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const postClosePoolVaultBalance = (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const postCloseTreasuryBalance = (await getAccount(connection, treasuryToken, commitment, TOKEN_PROGRAM_ID)).amount;
+
+  const buyerDelta = postCloseBuyerBalance - preCloseBuyerBalance;
+  if (buyerDelta !== closeBuybackAmount) {
+    throw new Error(`Early close did not pay the buyer the buyback amount: expected ${closeBuybackAmount}, received ${buyerDelta}`);
+  }
+  const treasuryDelta = postCloseTreasuryBalance - preCloseTreasuryBalance;
+  if (treasuryDelta !== closeFee) {
+    throw new Error(`Early close did not charge the expected fee: expected ${closeFee}, received ${treasuryDelta}`);
+  }
+  const expectedPoolVaultDelta = closeQuote.maxPayout + closeQuote.premium - closeBuybackAmount - closeFee;
+  const poolVaultDelta = postClosePoolVaultBalance - preClosePoolVaultBalance;
+  if (poolVaultDelta !== expectedPoolVaultDelta) {
+    throw new Error(`Early close did not return the residual to the pool: expected ${expectedPoolVaultDelta}, received ${poolVaultDelta}`);
+  }
+  const poolAfterCloseFill = await adminProgram.account.liquidityPool.fetch(smokePool.pool);
+  if (
+    !poolAfterCloseFill.lockedCollateral.eq(lockedCollateralBeforeCloseFill)
+    || !poolAfterCloseFill.openPositions.eq(openPositionsBeforeCloseFill)
+  ) {
+    throw new Error("Pool locked collateral / open positions did not return to their pre-fill values after early close");
+  }
+  const closeTotalMovement = buyerDelta + treasuryDelta + poolVaultDelta;
+  const closeExpectedTotalMovement = closeQuote.maxPayout + closeQuote.premium;
+  if (closeTotalMovement !== closeExpectedTotalMovement) {
+    throw new Error(
+      `Early close did not conserve max_payout + premium: expected ${closeExpectedTotalMovement}, moved ${closeTotalMovement}`,
+    );
+  }
+  const closeEarlyPositionClosed = !(await accountExists(closeFill.position)) && !(await accountExists(closeFill.positionVault));
+  const closeEarlyConservationVerified = closeTotalMovement === closeExpectedTotalMovement;
+
   const providerBeforeWithdraw = await adminProgram.account.liquidityProvider.fetch(smokeProvider);
   const poolWithdrawSignature = await makerProgram.methods
     .withdrawLiquidity(
@@ -1144,6 +1366,7 @@ async function main(): Promise<void> {
     rpcUrl: cluster === "devnet" ? "https://api.devnet.solana.com" : rpcUrl,
     programId: VSOL_PROGRAM_ID.toBase58(),
     pythUpgradeDeployed: true,
+    closePoolPositionDeployed: true,
     programUpgradeSignature: previousDeployment.programUpgradeSignature,
     pythReceiverProgram,
     pythFeedId,
@@ -1218,6 +1441,12 @@ async function main(): Promise<void> {
       poolConservationVerified: settledPoolAssets === expectedPoolAssets,
       poolObligationsCleared: poolAccount.openPositions.isZero() && poolAccount.lockedCollateral.isZero(),
       poolWithdrawalCleared: (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount === 0n,
+      closeEarlyFillSignature: closeFillSignature,
+      closeEarlySignature,
+      closeEarlyPosition: closeFill.position.toBase58(),
+      closeEarlyBuybackAmount: closeBuybackAmount.toString(),
+      closeEarlyPositionClosed,
+      closeEarlyConservationVerified,
     },
     generatedAt: new Date().toISOString(),
   };
