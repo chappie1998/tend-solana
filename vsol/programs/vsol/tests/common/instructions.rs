@@ -697,6 +697,68 @@ pub fn refund_pool_position_ix(a: &RefundPoolPositionAccounts) -> Instruction {
     }
 }
 
+pub struct ClosePoolPositionAccounts {
+    pub buyer: Pubkey,
+    pub config: Pubkey,
+    pub pool: Pubkey,
+    pub market: Pubkey,
+    pub oracle: Pubkey,
+    pub position: Pubkey,
+    pub position_vault: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub buyer_destination: Pubkey,
+    pub pool_token: Pubkey,
+    pub treasury_destination: Pubkey,
+    pub rent_recipient: Pubkey,
+}
+
+/// Builds the two-instruction transaction body `close_pool_position` requires:
+/// an Ed25519 precompile instruction carrying the pool's `quote_authority`
+/// signature over the buyback message, immediately followed by
+/// `close_pool_position` itself. Mirrors `fill_pool_quote_ixs` above (see
+/// `src/signature.rs::verify_preceding_ed25519_instruction`).
+pub fn close_pool_position_ixs(
+    quote_authority: &Keypair,
+    accounts: &ClosePoolPositionAccounts,
+    domain_separator: &[u8; 32],
+    domain_version: u16,
+    args: vsol::PoolBuybackArgs,
+) -> Vec<Instruction> {
+    let context = quote_signing::PoolBuybackMessageContext {
+        program_id: &vsol::ID,
+        config: &accounts.config,
+        pool: &accounts.pool,
+        market: &accounts.market,
+        position: &accounts.position,
+        buyer: &accounts.buyer,
+        quote_authority: &quote_authority.pubkey(),
+    };
+    let message = quote_signing::pool_buyback_message(domain_separator, domain_version, &context, &args);
+    let signature_ix = ed25519_ix_for(quote_authority, &message);
+
+    let close_ix = Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(accounts.buyer, true),
+            AccountMeta::new_readonly(accounts.config, false),
+            AccountMeta::new(accounts.pool, false),
+            AccountMeta::new_readonly(accounts.market, false),
+            AccountMeta::new_readonly(accounts.oracle, false),
+            AccountMeta::new(accounts.position, false),
+            AccountMeta::new(accounts.position_vault, false),
+            AccountMeta::new_readonly(accounts.settlement_mint, false),
+            AccountMeta::new(accounts.buyer_destination, false),
+            AccountMeta::new(accounts.pool_token, false),
+            AccountMeta::new(accounts.treasury_destination, false),
+            AccountMeta::new(accounts.rent_recipient, false),
+            AccountMeta::new_readonly(instructions_sysvar_id(), false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vsol::instruction::ClosePoolPosition { args }.data(),
+    };
+    vec![signature_ix, close_ix]
+}
+
 /// Builds the Ed25519 precompile instruction carrying `signer`'s signature
 /// over `message`, in the exact layout `verify_preceding_ed25519_instruction`
 /// requires (offsets pointing at the current instruction).

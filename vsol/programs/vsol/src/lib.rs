@@ -15,8 +15,8 @@ use pyth::{parse_fully_verified_price_update, PythPrice};
 // fixture account without duplicating this address; see tests/common.
 pub use pyth::PYTH_RECEIVER_PROGRAM_ID;
 use signature::{
-    pool_quote_message, quote_message, verify_preceding_ed25519_instruction,
-    PoolQuoteMessageContext, QuoteMessageContext,
+    pool_buyback_message, pool_quote_message, quote_message, verify_preceding_ed25519_instruction,
+    PoolBuybackMessageContext, PoolQuoteMessageContext, QuoteMessageContext,
 };
 
 declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
@@ -39,6 +39,10 @@ pub const POOL_POSITION_SEED: &[u8] = b"pool-position";
 pub const POOL_POSITION_VAULT_SEED: &[u8] = b"pool-position-vault";
 pub const QUOTE_DOMAIN: &[u8; 8] = b"VSOLRFQ1";
 pub const POOL_QUOTE_DOMAIN: &[u8; 8] = b"VSOLPLP1";
+// Distinct from the fill domains above so a signed early-close buyback quote
+// can never be replayed as (or confused with) a fill quote, even though both
+// are ultimately authenticated via the same Ed25519-precompile trust model.
+pub const POOL_BUYBACK_DOMAIN: &[u8; 8] = b"VSOLCLS1";
 pub const MARKET_ID_DOMAIN: &[u8; 8] = b"VSOLMKT1";
 pub const BPS_DENOMINATOR: u64 = 10_000;
 pub const MAX_FEE_BPS: u16 = 1_000;
@@ -1422,6 +1426,167 @@ pub mod vsol {
         });
         Ok(())
     }
+
+    /// Lets a buyer exit an open pool-backed position before expiry by
+    /// selling it back to the pool at a price the pool's own
+    /// `quote_authority` quotes and signs one-shot, exactly like it signs
+    /// fills. This is the buyer's only way out before settlement/timeout
+    /// refund; today they are locked in until one of those two paths.
+    ///
+    /// Guardian: this is a buyer exit, so -- like `settle`/`settle_pool_position`
+    /// -- it must work even while the protocol is paused. It is intentionally
+    /// NOT gated on `config.paused`.
+    pub fn close_pool_position(ctx: Context<ClosePoolPosition>, args: PoolBuybackArgs) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let position = &ctx.accounts.position;
+        let market = &ctx.accounts.market;
+        let oracle = &ctx.accounts.oracle;
+        let pool = &ctx.accounts.pool;
+
+        require!(
+            position.status == PositionStatus::Open as u8,
+            VsolError::PositionNotOpen
+        );
+        require!(now < market.expiry, VsolError::MarketExpired);
+        require!(!oracle.finalized, VsolError::OracleAlreadyFinalized);
+        require!(now <= args.quote_expiry, VsolError::QuoteExpired);
+
+        let config_key = ctx.accounts.config.key();
+        let pool_key = pool.key();
+        let market_key = market.key();
+        let position_key = position.key();
+        let buyer_key = ctx.accounts.buyer.key();
+        let quote_authority_key = pool.quote_authority;
+        let message_context = PoolBuybackMessageContext {
+            program_id: &crate::ID,
+            config: &config_key,
+            pool: &pool_key,
+            market: &market_key,
+            position: &position_key,
+            buyer: &buyer_key,
+            quote_authority: &quote_authority_key,
+        };
+        let message = pool_buyback_message(
+            &ctx.accounts.config.domain_separator,
+            ctx.accounts.config.domain_version,
+            &message_context,
+            &args,
+        );
+        verify_preceding_ed25519_instruction(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            &quote_authority_key,
+            &message,
+        )?;
+
+        // HARD INVARIANT: the pool must never pay more to close a position
+        // early than its worst-case obligation at expiry (`max_payout`).
+        // Regardless of what the pool's quote authority signs, the program
+        // itself enforces this bound so early close can never be more
+        // expensive to the pool than letting the position run to settlement.
+        require!(
+            args.buyback_amount <= position.max_payout,
+            VsolError::BuybackExceedsMaxPayout
+        );
+        // The buyer's slippage guard: they will not accept less than this,
+        // and it is bound into (and authenticated by) the signed quote above.
+        require!(
+            args.buyback_amount >= args.min_proceeds,
+            VsolError::SlippageExceeded
+        );
+
+        // Charge the protocol fee exactly as `settle_pool_position` does, so
+        // an early close is economically identical in fee terms to letting
+        // the position run to settlement.
+        let fee = calculate_fee(position.premium, position.fee_bps)?;
+        let expected = position
+            .max_payout
+            .checked_add(position.premium)
+            .ok_or(VsolError::MathOverflow)?;
+        let pool_amount = expected
+            .checked_sub(args.buyback_amount)
+            .and_then(|value| value.checked_sub(fee))
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            args.buyback_amount
+                .checked_add(pool_amount)
+                .and_then(|value| value.checked_add(fee))
+                == Some(expected)
+                && ctx.accounts.position_vault.amount == expected,
+            VsolError::CollateralMismatch
+        );
+
+        ctx.accounts.pool.locked_collateral = ctx
+            .accounts
+            .pool
+            .locked_collateral
+            .checked_sub(position.max_payout)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.open_positions = ctx
+            .accounts
+            .pool
+            .open_positions
+            .checked_sub(1)
+            .ok_or(VsolError::MathOverflow)?;
+
+        let nonce_record_key = position.nonce_record;
+        let position_seeds: &[&[u8]] = &[
+            POOL_POSITION_SEED,
+            nonce_record_key.as_ref(),
+            &[position.bump],
+        ];
+        if args.buyback_amount > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.buyer_destination.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                args.buyback_amount,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        if fee > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.treasury_destination.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                fee,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        if pool_amount > 0 {
+            transfer_checked_signed(
+                ctx.accounts.token_program.key(),
+                ctx.accounts.position_vault.to_account_info(),
+                ctx.accounts.pool_token.to_account_info(),
+                ctx.accounts.settlement_mint.to_account_info(),
+                ctx.accounts.position.to_account_info(),
+                pool_amount,
+                ctx.accounts.settlement_mint.decimals,
+                position_seeds,
+            )?;
+        }
+        close_token_account(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.position_vault.to_account_info(),
+            ctx.accounts.rent_recipient.to_account_info(),
+            ctx.accounts.position.to_account_info(),
+            position_seeds,
+        )?;
+
+        emit!(PoolPositionClosedEarly {
+            position: position_key,
+            buyer: buyer_key,
+            buyback_amount: args.buyback_amount,
+            fee,
+            pool_amount,
+        });
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1499,6 +1664,17 @@ pub struct PoolQuoteArgs {
     pub width: u64,
     pub premium: u64,
     pub max_payout: u64,
+    pub quote_expiry: i64,
+}
+
+/// A one-shot, pool-`quote_authority`-signed offer to buy back an open pool
+/// position before expiry. `buyback_amount` is what the pool pays the buyer;
+/// `min_proceeds` is the buyer's slippage guard, bound into the same signed
+/// message so it can't be tampered with independently of `buyback_amount`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolBuybackArgs {
+    pub buyback_amount: u64,
+    pub min_proceeds: u64,
     pub quote_expiry: i64,
 }
 
@@ -1895,6 +2071,44 @@ pub struct RefundPoolPosition<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Mirrors `SettlePoolPosition` as closely as possible: same pool/market/
+/// oracle/position/vault/settlement-mint/destination shape, minus the
+/// `nonce_record` (not needed to authorize an early close: the position's
+/// own stored `nonce_record` pubkey is sufficient to re-derive and verify its
+/// PDA) and `cranker` (replaced by the buyer, who must sign in person and
+/// must equal `position.buyer`), plus `instructions_sysvar` for the Ed25519
+/// check that authenticates the pool's signed buyback quote.
+#[derive(Accounts)]
+pub struct ClosePoolPosition<'info> {
+    pub buyer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), settlement_mint.key().as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = settlement_mint)]
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, position.nonce_record.as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = settlement_mint @ VsolError::InvalidPosition, constraint = position.buyer == buyer.key() @ VsolError::Unauthorized)]
+    pub position: Box<Account<'info, PoolPosition>>,
+    #[account(mut, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
+    pub position_vault: Box<Account<'info, TokenAccount>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, token::mint = settlement_mint, constraint = buyer_destination.owner == position.buyer @ VsolError::InvalidDestination)]
+    pub buyer_destination: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
+    pub pool_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
+    pub treasury_destination: Box<Account<'info, TokenAccount>>,
+    /// CHECK: Receives rent and must be the buyer stored in the position.
+    #[account(mut, address = position.buyer)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    /// CHECK: Address-constrained to the transaction instructions sysvar.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
@@ -2285,6 +2499,15 @@ pub struct PoolPositionRefunded {
     pub collateral: u64,
 }
 
+#[event]
+pub struct PoolPositionClosedEarly {
+    pub position: Pubkey,
+    pub buyer: Pubkey,
+    pub buyback_amount: u64,
+    pub fee: u64,
+    pub pool_amount: u64,
+}
+
 #[error_code]
 pub enum VsolError {
     #[msg("The protocol is paused.")]
@@ -2401,6 +2624,8 @@ pub enum VsolError {
     PoolUtilizationExceeded,
     #[msg("The position exceeds the liquidity pool's per-position risk limit.")]
     PoolPositionLimitExceeded,
+    #[msg("The buyback amount cannot exceed the position's maximum payout.")]
+    BuybackExceedsMaxPayout,
 }
 
 /// Deterministic market id: identical series parameters bind to one PDA, so

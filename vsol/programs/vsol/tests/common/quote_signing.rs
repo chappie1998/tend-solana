@@ -78,3 +78,36 @@ pub fn pool_quote_message(
     message.extend_from_slice(&quote.quote_expiry.to_le_bytes());
     message
 }
+
+pub struct PoolBuybackMessageContext<'a> {
+    pub program_id: &'a Pubkey,
+    pub config: &'a Pubkey,
+    pub pool: &'a Pubkey,
+    pub market: &'a Pubkey,
+    pub position: &'a Pubkey,
+    pub buyer: &'a Pubkey,
+    pub quote_authority: &'a Pubkey,
+}
+
+pub fn pool_buyback_message(
+    domain_separator: &[u8; 32],
+    domain_version: u16,
+    context: &PoolBuybackMessageContext<'_>,
+    args: &vsol::PoolBuybackArgs,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(290);
+    message.extend_from_slice(vsol::POOL_BUYBACK_DOMAIN);
+    message.extend_from_slice(domain_separator);
+    message.extend_from_slice(&domain_version.to_le_bytes());
+    message.extend_from_slice(context.program_id.as_ref());
+    message.extend_from_slice(context.config.as_ref());
+    message.extend_from_slice(context.pool.as_ref());
+    message.extend_from_slice(context.market.as_ref());
+    message.extend_from_slice(context.position.as_ref());
+    message.extend_from_slice(context.buyer.as_ref());
+    message.extend_from_slice(context.quote_authority.as_ref());
+    message.extend_from_slice(&args.buyback_amount.to_le_bytes());
+    message.extend_from_slice(&args.min_proceeds.to_le_bytes());
+    message.extend_from_slice(&args.quote_expiry.to_le_bytes());
+    message
+}

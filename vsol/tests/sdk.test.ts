@@ -20,9 +20,12 @@ import {
   derivePositionVault,
   liquidityPoolId,
   MARKET_SEED,
+  POOL_BUYBACK_DOMAIN,
+  poolBuybackMessage,
   poolQuoteMessage,
   quoteMessage,
   symbolBytes,
+  type PoolBuyback,
   type Quote,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
@@ -94,6 +97,49 @@ test("pool quote serialization binds pool, market, buyer, and quote authority", 
   });
   assert.equal(message.length, 283);
   assert.equal(message.subarray(0, 8).toString("ascii"), "VSOLPLP1");
+});
+
+const POOL_BUYBACK_KNOWN_ANSWER =
+  "56534f4c434c5331070707070707070707070707070707070707070707070707070707070707070705001570683178d1dc41d13a545d59af13f8577f6e7511f2f103b1f718085a25a0d901010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040505050505050505050505050505050505050505050505050505050505050505060606060606060606060606060606060606060606060606060606060606060687d612000000000040420f000000000000d2496b00000000";
+
+const buyback: PoolBuyback = {
+  buybackAmount: 1_234_567n,
+  minProceeds: 1_000_000n,
+  quoteExpiry: 1_800_000_000n,
+};
+
+test("pool buyback message matches the pinned Rust known-answer vector byte for byte", () => {
+  const message = poolBuybackMessage({
+    domainSeparator: new Uint8Array(32).fill(0x07),
+    domainVersion: 5,
+    config: new PublicKey(Buffer.alloc(32, 0x01)),
+    pool: new PublicKey(Buffer.alloc(32, 0x02)),
+    market: new PublicKey(Buffer.alloc(32, 0x03)),
+    position: new PublicKey(Buffer.alloc(32, 0x04)),
+    buyer: new PublicKey(Buffer.alloc(32, 0x05)),
+    quoteAuthority: new PublicKey(Buffer.alloc(32, 0x06)),
+    buyback,
+  });
+  assert.equal(message.length, 290);
+  assert.equal(message.subarray(0, 8).toString("ascii"), "VSOLCLS1");
+  assert.equal(message.subarray(0, 8).toString("hex"), POOL_BUYBACK_DOMAIN.toString("hex"));
+  assert.equal(message.toString("hex"), POOL_BUYBACK_KNOWN_ANSWER);
+});
+
+test("pool buyback message binds the exact position pubkey", () => {
+  const base = {
+    domainSeparator: new Uint8Array(32).fill(4),
+    domainVersion: 2,
+    config: deriveConfig(),
+    pool: new PublicKey("SysvarC1ock11111111111111111111111111111111"),
+    market: new PublicKey("SysvarRent111111111111111111111111111111111"),
+    buyer: VSOL_PROGRAM_ID,
+    quoteAuthority: VSOL_PROGRAM_ID,
+    buyback,
+  };
+  const messageA = poolBuybackMessage({ ...base, position: new PublicKey("11111111111111111111111111111111") });
+  const messageB = poolBuybackMessage({ ...base, position: deriveConfig() });
+  assert.notEqual(messageA.toString("hex"), messageB.toString("hex"));
 });
 
 test("pool PDAs are deterministic and use isolated namespaces", () => {

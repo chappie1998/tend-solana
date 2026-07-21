@@ -1403,6 +1403,377 @@ fn refund_pool_position_returns_funds_when_settlement_window_closes_unfinalized(
 }
 
 // =====================================================================
+// close_pool_position: early exit for a pool-backed buyer, before expiry.
+// The counterparty is the pool itself, and the pool's `quote_authority`
+// signs a one-shot buyback quote exactly like it signs fills -- same
+// Ed25519-precompile trust model, no new authority introduced.
+// =====================================================================
+
+/// An open pool position plus everything needed to close it early: the pool
+/// and market it was opened against, the buyer who holds it, the exact quote
+/// used to open it, and its derived PDAs.
+struct OpenPoolPositionFixture {
+    pool: PoolFixture,
+    market: MarketFixture,
+    buyer: Keypair,
+    quote: vsol::PoolQuoteArgs,
+    position: Pubkey,
+    position_vault: Pubkey,
+}
+
+/// Stands up a pool, a market enabled for it, provider liquidity, and one
+/// filled pool position (nonce `nonce`) against buyer-funded collateral --
+/// the common precondition for every `close_pool_position` test below.
+fn setup_open_pool_position(harness: &mut Harness, fixture: &ConfigFixture, nonce: u64) -> OpenPoolPositionFixture {
+    let pool = setup_pool(harness, fixture);
+    let market = setup_market(harness, fixture, &pool.manager, pool.settlement_mint);
+
+    let provider = harness.funded_keypair();
+    let provider_position = provider_position_pda(&pool.pool, &provider.pubkey());
+    let provider_source = harness.create_token_account(&provider, &pool.settlement_mint, &provider.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider_source, 200 * ONE_TOKEN);
+    harness.send_ok(
+        &provider,
+        &[deposit_liquidity_ix(
+            &provider.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider_position,
+            &provider_source,
+            200 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let buyer = harness.funded_keypair();
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_pool_quote(nonce, harness.now() + 30);
+    let pool_nonce_record = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote.nonce);
+    let position = pool_position_pda(&pool_nonce_record);
+    let position_vault = pool_position_vault_pda(&position);
+    let fill_accounts = FillPoolQuoteAccounts {
+        buyer: buyer.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        pool_market,
+        settlement_mint: market.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source,
+        nonce_record: pool_nonce_record,
+        position,
+        position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    OpenPoolPositionFixture {
+        pool,
+        market,
+        buyer,
+        quote,
+        position,
+        position_vault,
+    }
+}
+
+fn default_buyback_args(quote_expiry: i64, buyback_amount: u64, min_proceeds: u64) -> vsol::PoolBuybackArgs {
+    vsol::PoolBuybackArgs {
+        buyback_amount,
+        min_proceeds,
+        quote_expiry,
+    }
+}
+
+fn close_accounts_for(
+    fixture: &ConfigFixture,
+    opened: &OpenPoolPositionFixture,
+    buyer_destination: Pubkey,
+    treasury_destination: Pubkey,
+) -> ClosePoolPositionAccounts {
+    ClosePoolPositionAccounts {
+        buyer: opened.buyer.pubkey(),
+        config: fixture.config,
+        pool: opened.pool.pool,
+        market: opened.market.market,
+        oracle: opened.market.oracle,
+        position: opened.position,
+        position_vault: opened.position_vault,
+        settlement_mint: opened.market.settlement_mint,
+        buyer_destination,
+        pool_token: opened.pool.pool_token,
+        treasury_destination,
+        rent_recipient: opened.buyer.pubkey(),
+    }
+}
+
+#[test]
+fn close_pool_position_happy_path_conserves_escrow_and_returns_rent() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    // fee_bps = 50 (0.5%) on a 1-token premium divides evenly: no rounding.
+    let expected_fee = 5_000u64;
+    let buyback_amount = 3_000_000u64;
+    let expected_escrow = opened.quote.premium + opened.quote.max_payout;
+    let expected_pool_amount = expected_escrow - buyback_amount - expected_fee;
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let pool_token_balance_before = harness.token_balance(&opened.pool.pool_token);
+
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+    let args = default_buyback_args(harness.now() + 20, buyback_amount, 2_900_000);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    harness.send_ok(&opened.buyer, &ixs, &[]);
+
+    // Buyer receives exactly `buyback_amount`.
+    assert_eq!(harness.token_balance(&buyer_destination), buyback_amount);
+    // Treasury receives exactly the fee.
+    assert_eq!(harness.token_balance(&treasury_destination), expected_fee);
+    // Pool vault receives exactly the residual.
+    assert_eq!(
+        harness.token_balance(&opened.pool.pool_token),
+        pool_token_balance_before + expected_pool_amount
+    );
+    // Total token movement conserves max_payout + premium.
+    assert_eq!(buyback_amount + expected_pool_amount + expected_fee, expected_escrow);
+
+    // Pool accounting returns to zero exposure.
+    let pool_after: vsol::LiquidityPool = harness.read_account(&opened.pool.pool);
+    assert_eq!(pool_after.open_positions, 0);
+    assert_eq!(pool_after.locked_collateral, 0);
+
+    // Position and its vault are closed (rent returned, no longer live accounts).
+    let position_account = harness.svm.get_account(&opened.position);
+    assert_eq!(position_account.map(|a| a.lamports).unwrap_or(0), 0);
+    let vault_account = harness.svm.get_account(&opened.position_vault);
+    assert_eq!(vault_account.map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+#[test]
+fn close_pool_position_rejects_buyback_amount_above_max_payout() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    // One unit above `max_payout` -- the hard invariant must reject this
+    // regardless of what the quote authority signed.
+    let args = default_buyback_args(harness.now() + 20, opened.quote.max_payout + 1, 0);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    let failed = harness.send_err(&opened.buyer, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::BuybackExceedsMaxPayout);
+}
+
+#[test]
+fn close_pool_position_rejects_signature_from_a_key_other_than_quote_authority() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+    let impostor = harness.funded_keypair();
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 0);
+    // Signed by an unrelated keypair, not the pool's `quote_authority`.
+    let ixs = close_pool_position_ixs(&impostor, &close_accounts, &fixture.domain_separator, 1, args);
+    let failed = harness.send_err(&opened.buyer, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidMakerSignature);
+}
+
+#[test]
+fn close_pool_position_rejects_a_quote_signed_for_a_different_position() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+    // A second, unrelated open position under the same pool/quote_authority.
+    let other = setup_open_pool_position(&mut harness, &fixture, 2);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 0);
+    // The signed message binds `other.position`, not `opened.position`, but
+    // the instruction accounts point at `opened`'s position/vault -- a
+    // signature valid for one position must never apply to another.
+    let message_context = quote_signing::PoolBuybackMessageContext {
+        program_id: &vsol::ID,
+        config: &fixture.config,
+        pool: &opened.pool.pool,
+        market: &opened.market.market,
+        position: &other.position,
+        buyer: &opened.buyer.pubkey(),
+        quote_authority: &opened.pool.quote_authority.pubkey(),
+    };
+    let message = quote_signing::pool_buyback_message(&fixture.domain_separator, 1, &message_context, &args);
+    let signature_ix = ed25519_ix_for(&opened.pool.quote_authority, &message);
+    let close_ix = Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(opened.buyer.pubkey(), true),
+            AccountMeta::new_readonly(fixture.config, false),
+            AccountMeta::new(opened.pool.pool, false),
+            AccountMeta::new_readonly(opened.market.market, false),
+            AccountMeta::new_readonly(opened.market.oracle, false),
+            AccountMeta::new(opened.position, false),
+            AccountMeta::new(opened.position_vault, false),
+            AccountMeta::new_readonly(opened.market.settlement_mint, false),
+            AccountMeta::new(buyer_destination, false),
+            AccountMeta::new(opened.pool.pool_token, false),
+            AccountMeta::new(treasury_destination, false),
+            AccountMeta::new(opened.buyer.pubkey(), false),
+            AccountMeta::new_readonly(instructions_sysvar_id(), false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vsol::instruction::ClosePoolPosition { args }.data(),
+    };
+    let failed = harness.send_err(&opened.buyer, &[signature_ix, close_ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidMakerSignature);
+}
+
+#[test]
+fn close_pool_position_rejects_expired_quote() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    let quote_expiry = harness.now() + 10;
+    let args = default_buyback_args(quote_expiry, 3_000_000, 0);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+
+    harness.warp_to_timestamp(quote_expiry + 1);
+    let failed = harness.send_err(&opened.buyer, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::QuoteExpired);
+}
+
+#[test]
+fn close_pool_position_rejects_buyback_amount_below_min_proceeds() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    // min_proceeds above buyback_amount: the buyer's own slippage guard rejects it.
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 3_000_001);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    let failed = harness.send_err(&opened.buyer, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::SlippageExceeded);
+}
+
+#[test]
+fn close_pool_position_rejects_caller_who_is_not_the_buyer() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+    let impostor = harness.funded_keypair();
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    // Accounts still reference the real position, but the transaction is
+    // signed and submitted with `buyer` set to an impostor.
+    let mut close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+    close_accounts.buyer = impostor.pubkey();
+
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 0);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    let failed = harness.send_err(&impostor, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::Unauthorized);
+}
+
+#[test]
+fn close_pool_position_rejects_after_market_expiry() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    let args = default_buyback_args(opened.market.expiry + 3_600, 3_000_000, 0);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+
+    // Past expiry, the buyer's only path is `settle_pool_position`.
+    harness.warp_to_timestamp(opened.market.expiry);
+    let failed = harness.send_err(&opened.buyer, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketExpired);
+}
+
+#[test]
+fn close_pool_position_succeeds_while_protocol_is_paused() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    harness.send_ok(
+        &fixture.pause_authority,
+        &[set_pause_ix(&fixture.pause_authority.pubkey(), &fixture.config, true)],
+        &[],
+    );
+    assert!(read_config(&harness, &fixture.config).paused);
+
+    let buyer_destination = harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 0);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    // Buyer exits must never be blocked by the guardian pause.
+    harness.send_ok(&opened.buyer, &ixs, &[]);
+
+    let pool_after: vsol::LiquidityPool = harness.read_account(&opened.pool.pool);
+    assert_eq!(pool_after.open_positions, 0);
+    assert_eq!(pool_after.locked_collateral, 0);
+}
+
+// =====================================================================
 // publish_pyth_settlement: two-tier settlement.
 //
 // Tier 1 (unchanged): a fresh print inside [expiry, observation_end]

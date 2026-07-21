@@ -21,6 +21,9 @@ export const POOL_POSITION_SEED = Buffer.from("pool-position");
 export const POOL_POSITION_VAULT_SEED = Buffer.from("pool-position-vault");
 export const QUOTE_DOMAIN = Buffer.from("VSOLRFQ1", "ascii");
 export const POOL_QUOTE_DOMAIN = Buffer.from("VSOLPLP1", "ascii");
+// Distinct from the fill domains above so a signed early-close buyback quote
+// can never be replayed as (or confused with) a fill quote.
+export const POOL_BUYBACK_DOMAIN = Buffer.from("VSOLCLS1", "ascii");
 export const MARKET_ID_DOMAIN = Buffer.from("VSOLMKT1", "ascii");
 export const PRICE_SCALE = 1_000_000n;
 
@@ -35,6 +38,16 @@ export type Quote = {
 };
 
 export type PoolQuote = Quote;
+
+// A one-shot, pool-`quoteAuthority`-signed offer to buy back an open pool
+// position before expiry. `buybackAmount` is what the pool pays the buyer;
+// `minProceeds` is the buyer's slippage guard, bound into the same signed
+// message so it can't be tampered with independently of `buybackAmount`.
+export type PoolBuyback = {
+  buybackAmount: bigint;
+  minProceeds: bigint;
+  quoteExpiry: bigint;
+};
 
 function u64(value: bigint): Buffer {
   if (value < 0n || value > 0xffff_ffff_ffff_ffffn) throw new RangeError("u64 out of range");
@@ -138,6 +151,51 @@ export function poolQuoteMessage(params: {
     u64(quote.maxPayout),
     i64(quote.quoteExpiry),
   ]);
+}
+
+export function poolBuybackMessage(params: {
+  domainSeparator: Uint8Array;
+  domainVersion: number;
+  config: PublicKey;
+  pool: PublicKey;
+  market: PublicKey;
+  position: PublicKey;
+  buyer: PublicKey;
+  quoteAuthority: PublicKey;
+  buyback: PoolBuyback;
+  programId?: PublicKey;
+}): Buffer {
+  const programId = params.programId ?? VSOL_PROGRAM_ID;
+  const { buyback } = params;
+  if (params.domainSeparator.length !== 32) throw new RangeError("domain separator must be 32 bytes");
+  if (!Number.isInteger(params.domainVersion) || params.domainVersion < 0 || params.domainVersion > 65_535) {
+    throw new RangeError("domain version must be a u16");
+  }
+  const domainVersion = Buffer.alloc(2);
+  domainVersion.writeUInt16LE(params.domainVersion);
+  return Buffer.concat([
+    POOL_BUYBACK_DOMAIN,
+    Buffer.from(params.domainSeparator),
+    domainVersion,
+    programId.toBuffer(),
+    params.config.toBuffer(),
+    params.pool.toBuffer(),
+    params.market.toBuffer(),
+    params.position.toBuffer(),
+    params.buyer.toBuffer(),
+    params.quoteAuthority.toBuffer(),
+    u64(buyback.buybackAmount),
+    u64(buyback.minProceeds),
+    i64(buyback.quoteExpiry),
+  ]);
+}
+
+export function toAnchorPoolBuyback(buyback: PoolBuyback) {
+  return {
+    buybackAmount: new BN(buyback.buybackAmount.toString()),
+    minProceeds: new BN(buyback.minProceeds.toString()),
+    quoteExpiry: new BN(buyback.quoteExpiry.toString()),
+  };
 }
 
 export function toAnchorQuote(quote: Quote) {

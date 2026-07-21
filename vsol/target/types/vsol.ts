@@ -131,6 +131,255 @@ export type Vsol = {
       ]
     },
     {
+      "name": "closePoolPosition",
+      "docs": [
+        "Lets a buyer exit an open pool-backed position before expiry by",
+        "selling it back to the pool at a price the pool's own",
+        "`quote_authority` quotes and signs one-shot, exactly like it signs",
+        "fills. This is the buyer's only way out before settlement/timeout",
+        "refund; today they are locked in until one of those two paths.",
+        "",
+        "Guardian: this is a buyer exit, so -- like `settle`/`settle_pool_position`",
+        "-- it must work even while the protocol is paused. It is intentionally",
+        "NOT gated on `config.paused`."
+      ],
+      "discriminator": [
+        42,
+        17,
+        73,
+        101,
+        165,
+        34,
+        118,
+        221
+      ],
+      "accounts": [
+        {
+          "name": "buyer",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool",
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "settlementMint"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle",
+            "position"
+          ]
+        },
+        {
+          "name": "oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce_record",
+                "account": "poolPosition"
+              }
+            ]
+          }
+        },
+        {
+          "name": "positionVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "pool",
+            "market",
+            "position"
+          ]
+        },
+        {
+          "name": "buyerDestination",
+          "writable": true
+        },
+        {
+          "name": "poolToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasuryDestination",
+          "writable": true
+        },
+        {
+          "name": "rentRecipient",
+          "writable": true
+        },
+        {
+          "name": "instructionsSysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "poolBuybackArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "createMarket",
       "discriminator": [
         103,
@@ -3244,6 +3493,19 @@ export type Vsol = {
       ]
     },
     {
+      "name": "poolPositionClosedEarly",
+      "discriminator": [
+        79,
+        3,
+        229,
+        97,
+        6,
+        52,
+        251,
+        141
+      ]
+    },
+    {
       "name": "poolPositionRefunded",
       "discriminator": [
         25,
@@ -3659,6 +3921,11 @@ export type Vsol = {
       "code": 6056,
       "name": "poolPositionLimitExceeded",
       "msg": "The position exceeds the liquidity pool's per-position risk limit."
+    },
+    {
+      "code": 6057,
+      "name": "buybackExceedsMaxPayout",
+      "msg": "The buyback amount cannot exceed the position's maximum payout."
     }
   ],
   "types": [
@@ -4382,6 +4649,32 @@ export type Vsol = {
       }
     },
     {
+      "name": "poolBuybackArgs",
+      "docs": [
+        "A one-shot, pool-`quote_authority`-signed offer to buy back an open pool",
+        "position before expiry. `buyback_amount` is what the pool pays the buyer;",
+        "`min_proceeds` is the buyer's slippage guard, bound into the same signed",
+        "message so it can't be tampered with independently of `buyback_amount`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "buybackAmount",
+            "type": "u64"
+          },
+          {
+            "name": "minProceeds",
+            "type": "u64"
+          },
+          {
+            "name": "quoteExpiry",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "poolPosition",
       "type": {
         "kind": "struct",
@@ -4457,6 +4750,34 @@ export type Vsol = {
           {
             "name": "quoteExpiry",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "poolPositionClosedEarly",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "buyer",
+            "type": "pubkey"
+          },
+          {
+            "name": "buybackAmount",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "poolAmount",
+            "type": "u64"
           }
         ]
       }
