@@ -6,8 +6,17 @@ import {
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
+  deriveMarket,
   deriveMarketId,
+  deriveOracle,
+  MARKET_MAX_CONFIDENCE_BPS,
+  MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  MARKET_OBSERVATION_WINDOW_SECONDS,
+  MARKET_SETTLEMENT_GRACE_SECONDS,
+  PRICE_SCALE,
+  symbolBytes,
 } from "../sdk/index.ts";
+import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
 import { type RetiringLookupTableEntry, stableFillAddresses } from "./lib/lookup-table.ts";
 
 const cluster = process.env.VSOL_CLUSTER ?? "devnet";
@@ -31,38 +40,6 @@ const liquidityPools = deployment.liquidityPools as Array<Record<string, unknown
 if (!Array.isArray(liquidityPools) || liquidityPools.length < 1) throw new Error("No passive liquidity pool is deployed");
 const smoke = deployment.smoke as Record<string, unknown> | undefined;
 if (!smoke) throw new Error("The deployment manifest has no smoke-test evidence");
-
-// Factory market layout, offsets from the start of the account data
-// (including the 8-byte Anchor discriminator): ... settlement_decimals @ 243,
-// enabled @ 244, creator @ 245..277, max_settlement_staleness_seconds (u32)
-// @ 277..281 -- appended after launch, so total account size is 281 bytes.
-async function expectFactoryMarket(label: string, data: Buffer, expectedCreator?: unknown) {
-  if (data.length < 281) throw new Error(`${label} does not use the factory market layout`);
-  const maxSettlementStalenessSeconds = data.readUInt32LE(277);
-  if (maxSettlementStalenessSeconds <= 0 || maxSettlementStalenessSeconds > 604_800) {
-    throw new Error(`${label} has an invalid max settlement staleness`);
-  }
-  const id = await deriveMarketId({
-    pythFeedId: data.subarray(211, 243),
-    settlementMint: new PublicKey(data.subarray(105, 137)),
-    expiry: data.readBigInt64LE(193),
-    observationWindowSeconds: data.readUInt32LE(201),
-    settlementGraceSeconds: data.readUInt32LE(205),
-    priceScale: data.readBigUInt64LE(185),
-    maxConfidenceBps: data.readUInt16LE(209),
-    symbol: data.subarray(169, 185),
-    maxSettlementStalenessSeconds,
-  });
-  if (!id.equals(data.subarray(41, 73))) {
-    throw new Error(`${label} market id is not the deterministic hash of its onchain parameters`);
-  }
-  const creator = new PublicKey(data.subarray(245, 277));
-  if (creator.equals(PublicKey.default)) throw new Error(`${label} has no recorded creator`);
-  if (typeof expectedCreator === "string" && creator.toBase58() !== expectedCreator) {
-    throw new Error(`${label} creator does not match the manifest`);
-  }
-  return maxSettlementStalenessSeconds;
-}
 
 async function fetchTransactionWithRetry(connection: Connection, signature: string, attempts = 5) {
   let lastResult: Awaited<ReturnType<Connection["getTransaction"]>> = null;
@@ -88,6 +65,62 @@ async function fetchTransactionWithRetry(connection: Connection, signature: stri
   return lastResult;
 }
 
+// The rolling 15M/1H/EOD/7D/30D grid is NOT verified against
+// deployment.markets: the keeper (scripts/keeper.ts) mints new rungs on
+// every UTC boundary but never rewrites that array, and the settlement
+// cranker (scripts/cranker.ts) now closes expired markets once their
+// positions are settled -- including ones still listed there. So that array
+// is a frozen bootstrap-time snapshot that can go stale in both directions
+// (it can list an address the cranker has since legitimately closed, and it
+// never lists a rung the keeper minted after the last manifest write). It
+// remains a structural/manifest-shape input below, but "must be alive
+// onchain" is instead re-derived straight from chain, the same way the app
+// resolves the tradeable grid (see app/lib/series-resolver.ts /
+// resolveVsolSeries and app/lib/expiries.ts): recompute the current grid
+// from the cluster clock via the shared rollingMarketSchedule that
+// bootstrap.ts and keeper.ts both import, then rebuild each rung's
+// deterministic market id/address with the same series-policy constants
+// they use. rollingMarketSchedule always returns rungs strictly ahead of
+// `now` (see expiry-grid.ts's nextFixedBoundary/advanceUntilAfter), so every
+// rung it returns is, by construction, currently tradeable -- there is no
+// separate "is this expired" filter to apply here.
+const MARKET_SYMBOL = "NVDA"; // Not an SDK export -- mirrors the same local constant in scripts/keeper.ts and scripts/bootstrap.ts.
+// Anchor account discriminator for the `Market` struct (see
+// target/idl/vsol.json's accounts[].discriminator), so a same-owner account
+// of a different type can never be mistaken for a rolling-grid market.
+const MARKET_ACCOUNT_DISCRIMINATOR = Buffer.from([219, 190, 213, 55, 0, 227, 198, 154]);
+const configAddress = new PublicKey(String(deployment.config));
+const settlementMintAddress = new PublicKey(String(deployment.settlementMint));
+const pythFeedBytes = [...Buffer.from(expectedFeedId, "hex")];
+
+async function clusterUnixTime(): Promise<number> {
+  const slot = await connection.getSlot("confirmed");
+  const blockTime = await connection.getBlockTime(slot);
+  if (blockTime === null) throw new Error(`No block time is available for slot ${slot}`);
+  return blockTime;
+}
+
+type CurrentGridRung = { series: ScheduledSeries; id: Buffer; market: PublicKey; oracle: PublicKey };
+
+const now = await clusterUnixTime();
+const currentGrid: CurrentGridRung[] = [];
+for (const series of rollingMarketSchedule(now)) {
+  const id = await deriveMarketId({
+    pythFeedId: pythFeedBytes,
+    settlementMint: settlementMintAddress,
+    expiry: BigInt(series.expiry),
+    observationWindowSeconds: MARKET_OBSERVATION_WINDOW_SECONDS,
+    settlementGraceSeconds: MARKET_SETTLEMENT_GRACE_SECONDS,
+    priceScale: PRICE_SCALE,
+    maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
+    symbol: symbolBytes(MARKET_SYMBOL),
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  });
+  const market = deriveMarket(configAddress, id);
+  const oracle = deriveOracle(market);
+  currentGrid.push({ series, id, market, oracle });
+}
+
 // Read the entire public deployment state in one RPC batch. Public devnet endpoints
 // aggressively rate-limit sequential account lookups, and verification should not
 // fail merely because the manifest contains a complete rolling series catalog.
@@ -96,10 +129,7 @@ const accountAddresses: PublicKey[] = [
   ...requiredExecutable.map((field) => new PublicKey(String(deployment[field]))),
   ...requiredAccounts.map((field) => new PublicKey(String(deployment[field]))),
   LEGACY_UNSAFE_UI_MARKET,
-  ...markets.map((series) => new PublicKey(String(series.address))),
-  new PublicKey(String(smoke.successMarket)),
-  new PublicKey(String(smoke.refundMarket)),
-  new PublicKey(String(smoke.successOracle)),
+  ...currentGrid.flatMap((rung) => [rung.market, rung.oracle]),
   new PublicKey(String(smoke.smokePool)),
   new PublicKey(String(smoke.smokePoolToken)),
   new PublicKey(String(smoke.smokeProvider)),
@@ -144,35 +174,78 @@ const marketFeedId = marketAccount && marketAccount.data.length >= 243
   : "";
 if (marketFeedId !== expectedFeedId) throw new Error(`UI market is not bound to Pyth feed ${expectedFeedId}`);
 
+// Structural check only -- the manifest must still list one entry per
+// expected code with no duplicates. This does NOT require any of these
+// addresses to exist onchain: see the chain-derived current-grid check
+// below for what "must be alive" means now.
 const expectedCodes = new Set(["15M", "1H", "EOD", "7D", "30D"]);
 for (const series of markets) {
   const code = String(series.code);
   if (!expectedCodes.delete(code)) throw new Error(`Unexpected or duplicate rolling market code ${code}`);
-  const address = new PublicKey(String(series.address));
-  const account = accountInfo(address);
-  if (!account || !account.owner.equals(programId) || account.data.length < 281) {
-    throw new Error(`Rolling market ${code} is missing or invalid`);
-  }
-  const maxSettlementStalenessSeconds = await expectFactoryMarket(`Rolling market ${code}`, Buffer.from(account.data), series.creator);
-  const feedId = Buffer.from(account.data.subarray(211, 243)).toString("hex");
-  const expiry = Number(account.data.readBigInt64LE(193));
-  const observationWindow = account.data.readUInt32LE(201);
-  const manifestExpiry = Number(series.expiry);
-  const lastTradeAt = Number(series.lastTradeAt);
-  if (feedId !== expectedFeedId || expiry !== manifestExpiry) throw new Error(`Rolling market ${code} has mismatched onchain terms`);
-  if (observationWindow !== Number(series.observationWindowSeconds) || observationWindow > 30) {
-    throw new Error(`Rolling market ${code} does not use the narrow Pyth settlement window`);
-  }
-  if (
-    typeof series.maxSettlementStalenessSeconds === "number"
-    && maxSettlementStalenessSeconds !== series.maxSettlementStalenessSeconds
-  ) {
-    throw new Error(`Rolling market ${code} settlement staleness bound does not match the manifest`);
-  }
-  if (!(lastTradeAt > 0 && lastTradeAt < expiry)) throw new Error(`Rolling market ${code} has an invalid trade cutoff`);
 }
 if (String(deployment.uiMarket) !== String(markets.find((series) => series.code === "30D")?.address)) {
   throw new Error("The legacy UI pointer does not reference the catalog's 30D market");
+}
+
+// Chain-derived current grid: every rung rollingMarketSchedule(now) returns
+// is currently tradeable by construction, so a market that DOES exist must
+// be correctly formed (hard failure below). A rung that does NOT yet exist
+// is treated as keeper lag -- a soft warning, not a failure -- since the
+// keeper mints on its own interval and verify-deployment must not become
+// flaky against that timing. This never touches an already-expired rung: a
+// closed, formerly-listed address from an older schedule (or from the stale
+// deployment.markets snapshot above) is simply not part of currentGrid at all.
+for (const rung of currentGrid) {
+  const account = accountInfo(rung.market);
+  if (!account) {
+    console.warn(
+      `warn: currently-live rolling market ${rung.series.code} (expiry ${new Date(rung.series.expiry * 1000).toISOString()}) `
+      + `is not yet minted onchain at ${rung.market.toBase58()} -- treating as keeper lag, not a failure`,
+    );
+    continue;
+  }
+  if (!account.owner.equals(programId)) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) is not owned by the VSOL program`);
+  }
+  const data = Buffer.from(account.data);
+  if (data.length < 281 || !data.subarray(0, 8).equals(MARKET_ACCOUNT_DISCRIMINATOR)) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) does not decode as a Market account`);
+  }
+  if (!rung.id.equals(data.subarray(41, 73))) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) market id does not match its derived parameters`);
+  }
+  const creator = new PublicKey(data.subarray(245, 277));
+  if (creator.equals(PublicKey.default)) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) has no recorded creator`);
+  }
+  const feedId = data.subarray(211, 243).toString("hex");
+  if (feedId !== expectedFeedId) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) is not bound to Pyth feed ${expectedFeedId}`);
+  }
+  const onchainExpiry = Number(data.readBigInt64LE(193));
+  if (onchainExpiry !== rung.series.expiry) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) expiry does not match the derived grid`);
+  }
+  const observationWindow = data.readUInt32LE(201);
+  const settlementGrace = data.readUInt32LE(205);
+  const maxConfidenceBps = data.readUInt16LE(209);
+  const maxSettlementStalenessSeconds = data.readUInt32LE(277);
+  if (
+    observationWindow !== MARKET_OBSERVATION_WINDOW_SECONDS
+    || settlementGrace !== MARKET_SETTLEMENT_GRACE_SECONDS
+    || maxConfidenceBps !== MARKET_MAX_CONFIDENCE_BPS
+    || maxSettlementStalenessSeconds !== MARKET_MAX_SETTLEMENT_STALENESS_SECONDS
+  ) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) does not use the expected series policy constants`);
+  }
+  const onchainSettlementMint = new PublicKey(data.subarray(105, 137));
+  if (!onchainSettlementMint.equals(settlementMintAddress)) {
+    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) settlement mint does not match the manifest`);
+  }
+  const oracleAccount = accountInfo(rung.oracle);
+  if (!oracleAccount || !oracleAccount.owner.equals(programId)) {
+    throw new Error(`Current rolling market ${rung.series.code}'s oracle ${rung.oracle.toBase58()} is missing or not owned by the VSOL program`);
+  }
 }
 const legacyUnsafe = accountInfo(LEGACY_UNSAFE_UI_MARKET);
 if (legacyUnsafe && legacyUnsafe.data.at(-1) !== 0) {
@@ -256,25 +329,19 @@ for (const poolManifest of liquidityPools) {
   }
 }
 
-const smokeFeedId = String(deployment.smokePythFeedId);
-for (const field of ["successMarket", "refundMarket"]) {
-  const account = accountInfo(new PublicKey(String(smoke[field])));
-  const feedId = account && account.data.length >= 243
-    ? Buffer.from(account.data.subarray(211, 243)).toString("hex")
-    : "";
-  if (!account || feedId !== smokeFeedId) throw new Error(`${field} is not bound to the configured 24/7 Pyth smoke feed`);
-  await expectFactoryMarket(field, Buffer.from(account.data), deployment.creator);
-}
-const successOracle = accountInfo(new PublicKey(String(smoke.successOracle)));
-const successOracleFeedId = successOracle && successOracle.data.length >= 137
-  ? Buffer.from(successOracle.data.subarray(105, 137)).toString("hex")
-  : "";
-if (successOracleFeedId !== smokeFeedId) throw new Error("Finalized smoke oracle does not record the expected Pyth feed");
-// Oracle layout offsets: finalized @ 141, settled_from_stale_price (bool,
-// appended after launch) @ 142 -- total account size 143 bytes.
-if (!successOracle || successOracle.data.length < 143 || successOracle.data[141] !== 1) {
-  throw new Error("The smoke settlement oracle is not finalized onchain");
-}
+// successMarket/refundMarket (and their oracles) are ephemeral smoke
+// markets: they are created, traded through a full lifecycle, settled, and
+// are then legitimately cleanable by the same market cleaner
+// (scripts/cranker.ts's closeSettledMarketOnChain) that the rolling grid
+// above had to stop trusting live-account existence for. Requiring these
+// specific accounts to still exist and decode/bind to smokePythFeedId is
+// exactly the stale-snapshot bug fixed above, just in the smoke-evidence
+// block -- so it is deliberately NOT checked here. The durable proof of the
+// smoke lifecycle (including that settlement was bound to the correct feed
+// at the time) is the recorded transaction signatures below: every one of
+// them is checked to still exist, have no error, and contain its expected
+// instruction log line, which is permanent on-chain history regardless of
+// whether the market/oracle account itself still exists.
 
 const smokePoolAddress = new PublicKey(String(smoke.smokePool));
 const smokePoolAccount = accountInfo(smokePoolAddress);

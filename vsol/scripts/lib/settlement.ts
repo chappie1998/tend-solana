@@ -12,6 +12,93 @@ import {
   VSOL_PROGRAM_ID,
 } from "../../sdk/index.ts";
 
+// --- Direct-maker Position account decoding ---------------------------------
+// The on-chain account type is named `Position` (see the struct in
+// vsol/programs/vsol/src/lib.rs, ~line 2351); referred to here as "direct
+// position" (as opposed to `PoolPosition`) to keep the two scans and their
+// results unambiguous throughout this module. `fill_quote` (still
+// permissionlessly callable) opens one of these against a maker's own
+// writer vault, and `settle`/`refund_unsettled` are the only instructions
+// that close it -- both `has_one = market`, exactly like `PoolPosition`'s
+// `settle_pool_position`/`refund_pool_position`. A market with an open
+// direct Position is therefore just as unsafe to close as one with an open
+// PoolPosition: `settle`'s `Settle` accounts struct loads `Market` via
+// `has_one` and would fail forever once the market is gone, stranding the
+// position's escrowed premium/collateral with no recovery path. The
+// market-cleanup pass MUST treat both account types as equally load-bearing.
+//
+// Layout mirrors `Position` in vsol/target/idl/vsol.json and is reproduced
+// independently here (not imported from app/, which has no decoder for this
+// account type) --
+//   8  discriminator
+//   8  bump (u8), 9 vault_bump (u8), 10 status (u8), 11 direction (u8)
+//   12 market, 44 nonce_record, 76 buyer, 108 maker, 140 settlement_mint (pubkeys)
+//   172 nonce (u64), 180 strike (u64), 188 width (u64), 196 premium (u64),
+//   204 max_payout (u64), 212 fee_bps (u16), 214 opened_at (i64),
+//   222 quote_expiry (i64) => 230 bytes total.
+export const DIRECT_POSITION_ACCOUNT_SIZE = 230;
+// sha256("account:Position")[0..8].
+export const DIRECT_POSITION_DISCRIMINATOR = Object.freeze([170, 188, 143, 228, 122, 64, 247, 208]);
+
+export type DecodedDirectPosition = {
+  address: string;
+  market: string;
+};
+
+/**
+ * Pure decoder: no RPC, so it is directly unit-testable against fixture
+ * buffers. Only decodes the `market` field -- the one thing the market-cleanup
+ * pass needs from this account type -- rather than the full record, since
+ * this scan does not (yet) drive a direct-path settle/refund flow (see the
+ * module doc in cranker.ts for what is and is not implemented there).
+ */
+export function decodeDirectPositionMarket(address: PublicKey, data: Buffer): DecodedDirectPosition {
+  if (data.length !== DIRECT_POSITION_ACCOUNT_SIZE) {
+    throw new Error("The direct position account size is invalid");
+  }
+  if (!data.subarray(0, 8).equals(Buffer.from(DIRECT_POSITION_DISCRIMINATOR))) {
+    throw new Error("The direct position account discriminator is invalid");
+  }
+  return {
+    address: address.toBase58(),
+    market: publicKeyAt(data, 12),
+  };
+}
+
+/** Enumerates every open direct-maker Position account program-wide via getProgramAccounts (dataSize filter only), the same scanning pattern fetchOpenPoolPositions uses. Malformed entries are skipped, never thrown. */
+export async function fetchOpenDirectPositions(
+  connection: Connection,
+  programId: PublicKey = VSOL_PROGRAM_ID,
+): Promise<DecodedDirectPosition[]> {
+  const accounts = await connection.getProgramAccounts(programId, {
+    commitment: "confirmed",
+    filters: [{ dataSize: DIRECT_POSITION_ACCOUNT_SIZE }],
+  });
+  const positions: DecodedDirectPosition[] = [];
+  for (const { pubkey, account } of accounts) {
+    try {
+      positions.push(decodeDirectPositionMarket(pubkey, Buffer.from(account.data)));
+    } catch {
+      // Same size but a different account shape (or a corrupt read): not a
+      // Position, so it is silently excluded rather than failing the run.
+    }
+  }
+  return positions;
+}
+
+// --- Market account decoding (for the market-cleanup pass) ------------------
+// Layout mirrors `Market` in vsol/target/types/vsol.ts and the byte offsets
+// documented in app/lib/vsol-server.ts's decodeMarketAccount; reproduced
+// independently here (rather than imported) so this script package has no
+// dependency on app/. Only the fields the cleanup pass actually needs are
+// decoded: oracle@137 (to call close_settled_market without re-deriving it),
+// expiry@193 / observationWindowSeconds@201 / settlementGraceSeconds@205 (to
+// compute the close deadline), and creator@245 (the required rent_recipient
+// and, on devnet, the same key as the cranker's own signer).
+export const MARKET_ACCOUNT_SIZE = 281;
+// sha256("account:Market")[0..8].
+export const MARKET_ACCOUNT_DISCRIMINATOR = Object.freeze([219, 190, 213, 55, 0, 227, 198, 154]);
+
 // Reusable settlement-cranking logic for scripts/cranker.ts. Kept free of
 // module-scope `main()` side effects (unlike bootstrap.ts and keeper.ts) so
 // this module is directly importable by the node:test suite. The official
@@ -120,6 +207,62 @@ export async function fetchOpenPoolPositions(
   return positions;
 }
 
+export type DecodedMarketForCleanup = {
+  address: string;
+  oracle: string;
+  creator: string;
+  expiry: number;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+};
+
+/** Pure decoder: no RPC, so it is directly unit-testable against fixture buffers. */
+export function decodeMarketAccountForCleanup(address: PublicKey, data: Buffer): DecodedMarketForCleanup {
+  if (data.length !== MARKET_ACCOUNT_SIZE) {
+    throw new Error("The market account size is invalid");
+  }
+  if (!data.subarray(0, 8).equals(Buffer.from(MARKET_ACCOUNT_DISCRIMINATOR))) {
+    throw new Error("The market account discriminator is invalid");
+  }
+  return {
+    address: address.toBase58(),
+    oracle: publicKeyAt(data, 137),
+    expiry: Number(data.readBigInt64LE(193)),
+    observationWindowSeconds: data.readUInt32LE(201),
+    settlementGraceSeconds: data.readUInt32LE(205),
+    creator: publicKeyAt(data, 245),
+  };
+}
+
+/**
+ * Enumerates every Market account program-wide via getProgramAccounts (dataSize
+ * filter only), the same scanning pattern fetchOpenPoolPositions uses for
+ * PoolPosition accounts. Malformed entries are skipped, never thrown. A market
+ * that has already been closed (its account no longer exists) simply does not
+ * appear in the result -- that is precisely what makes "already closed" safe
+ * to treat as a non-candidate rather than an error (see
+ * selectMarketCloseCandidates below).
+ */
+export async function fetchAllMarkets(
+  connection: Connection,
+  programId: PublicKey = VSOL_PROGRAM_ID,
+): Promise<DecodedMarketForCleanup[]> {
+  const accounts = await connection.getProgramAccounts(programId, {
+    commitment: "confirmed",
+    filters: [{ dataSize: MARKET_ACCOUNT_SIZE }],
+  });
+  const markets: DecodedMarketForCleanup[] = [];
+  for (const { pubkey, account } of accounts) {
+    try {
+      markets.push(decodeMarketAccountForCleanup(pubkey, Buffer.from(account.data)));
+    } catch {
+      // Same size but a different account shape (or a corrupt read): not a
+      // Market, so it is silently excluded rather than failing the run.
+    }
+  }
+  return markets;
+}
+
 // --- Pure decision logic (no RPC; the unit-tested core) --------------------
 
 export type MarketWindow = {
@@ -156,6 +299,71 @@ export function groupPositionsByMarket(
     else groups.set(position.market, [position]);
   }
   return groups;
+}
+
+/**
+ * Builds the "markets with an open position" set selectMarketCloseCandidates
+ * uses for its stranding-prevention check. Two account types reference a
+ * market via `has_one = market` and both must count: pool-backed
+ * `PoolPosition` and direct-maker `Position` (see decodeDirectPositionMarket's
+ * doc comment for why the latter is just as load-bearing -- `settle` and
+ * `refund_unsettled` both load `Market` via `has_one` exactly like
+ * `settle_pool_position`/`refund_pool_position` do). Pulling this into its
+ * own pure, exported function (rather than inlining `new Set([...a, ...b])`
+ * at the call site) makes the union itself directly unit-testable: a
+ * regression that drops one of the two input arrays here is exactly the bug
+ * class this function exists to catch.
+ */
+export function marketsWithOpenPositions(params: {
+  poolPositions: readonly DecodedPoolPosition[];
+  directPositions: readonly DecodedDirectPosition[];
+}): Set<string> {
+  return new Set([
+    ...params.poolPositions.map((position) => position.market),
+    ...params.directPositions.map((position) => position.market),
+  ]);
+}
+
+/**
+ * The market-cleanup safety predicate. `close_settled_market` cannot verify
+ * on-chain that no open position still references the market (positions are
+ * PDAs keyed by nonce, not enumerable from the market), so this predicate is
+ * the only thing standing between a candidate market and a permanently
+ * stranded position. A market is a close candidate ONLY IF, ALL of:
+ *
+ *   1. Its close deadline has fully elapsed: `now > computeSettlementDeadline(market)`
+ *      (`expiry + observationWindowSeconds + settlementGraceSeconds`), using
+ *      the same strict `>` the on-chain instruction itself requires -- this
+ *      mirrors sdk/index.ts's `marketCloseableAfter` byte-for-byte.
+ *   2. Its address is NOT in `marketsWithOpenPositions` -- the
+ *      stranding-prevention check. This set MUST be built from a position
+ *      scan the caller took at or after the moment it decided to run
+ *      cleanup this pass (see cranker.ts, which re-scans open positions
+ *      immediately after the settle/refund phase and only then computes this
+ *      set and calls this function), so that a position just settled or
+ *      refunded this same pass has already dropped out of it before this
+ *      predicate runs.
+ *
+ * "Already closed" requires no explicit branch here: a closed market's
+ * account no longer exists on-chain, so it is simply absent from the
+ * `markets` array the caller passes in (see fetchAllMarkets), never present
+ * with some "closed" flag to check.
+ *
+ * The result is capped at `maxPerRun`, preserving `markets` order, so a large
+ * backlog of closeable markets cannot make a single run unbounded.
+ */
+export function selectMarketCloseCandidates(params: {
+  markets: readonly DecodedMarketForCleanup[];
+  now: number;
+  marketsWithOpenPositions: ReadonlySet<string>;
+  maxPerRun: number;
+}): DecodedMarketForCleanup[] {
+  const candidates = params.markets.filter((market) => {
+    if (params.now <= computeSettlementDeadline(market)) return false;
+    if (params.marketsWithOpenPositions.has(market.address)) return false;
+    return true;
+  });
+  return candidates.slice(0, Math.max(0, params.maxPerRun));
 }
 
 export type MarketPublishDecision = { kind: "publish" } | { kind: "skip"; reason: string };
@@ -420,6 +628,44 @@ export async function refundPoolPositionOnChain(params: {
       poolToken,
       rentRecipient: buyer,
       tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .rpc();
+}
+
+// --- Market cleanup ----------------------------------------------------------
+
+/**
+ * Calls close_settled_market for a market already proven safe by
+ * selectMarketCloseCandidates. Deliberately omits the optional pool/pool_market
+ * pair -- disabling a pool-market authorization requires an idle pool and is
+ * fragile, and the instruction's safety does not depend on it (fill_quote and
+ * fill_pool_quote both hard-require `now < market.expiry`, so no new position
+ * can open past the close deadline regardless of pool_market.enabled; see the
+ * instruction's own doc comment in lib.rs). `authority` and `rentRecipient`
+ * are both the caller-supplied signer; the program enforces authority ==
+ * market.creator || config.admin, and separately enforces rent_recipient ==
+ * market.creator by address constraint, so passing a signer that is not the
+ * market's creator (and not config.admin) simply fails with Unauthorized,
+ * which the caller treats as a skip.
+ */
+export async function closeSettledMarketOnChain(params: {
+  program: Program<Vsol>;
+  authority: PublicKey;
+  config: PublicKey;
+  market: PublicKey;
+  oracle: PublicKey;
+  rentRecipient: PublicKey;
+}): Promise<string> {
+  return params.program.methods
+    .closeSettledMarket()
+    .accountsStrict({
+      authority: params.authority,
+      config: params.config,
+      market: params.market,
+      oracle: params.oracle,
+      pool: null,
+      poolMarket: null,
+      rentRecipient: params.rentRecipient,
     })
     .rpc();
 }
