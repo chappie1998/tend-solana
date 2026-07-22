@@ -759,6 +759,36 @@ pub fn close_pool_position_ixs(
     vec![signature_ix, close_ix]
 }
 
+pub struct CloseSettledMarketAccounts {
+    pub authority: Pubkey,
+    pub config: Pubkey,
+    pub market: Pubkey,
+    pub oracle: Pubkey,
+    /// `Some` only when demonstrating that a specific pool's authorization
+    /// for this market has been disabled; `None` when no pool ever traded
+    /// this market (or the caller relies solely on the elapsed-window
+    /// argument -- see `CloseSettledMarket`'s doc comment in `src/lib.rs`).
+    pub pool: Option<Pubkey>,
+    pub pool_market: Option<Pubkey>,
+    pub rent_recipient: Pubkey,
+}
+
+pub fn close_settled_market_ix(a: &CloseSettledMarketAccounts) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(a.authority, true),
+            AccountMeta::new_readonly(a.config, false),
+            AccountMeta::new(a.market, false),
+            AccountMeta::new(a.oracle, false),
+            AccountMeta::new_readonly(a.pool.unwrap_or_else(no_pool), false),
+            AccountMeta::new_readonly(a.pool_market.unwrap_or_else(no_pool_market), false),
+            AccountMeta::new(a.rent_recipient, false),
+        ],
+        data: vsol::instruction::CloseSettledMarket.data(),
+    }
+}
+
 /// Builds the Ed25519 precompile instruction carrying `signer`'s signature
 /// over `message`, in the exact layout `verify_preceding_ed25519_instruction`
 /// requires (offsets pointing at the current instruction).

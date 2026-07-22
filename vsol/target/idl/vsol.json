@@ -374,6 +374,157 @@
       ]
     },
     {
+      "name": "close_settled_market",
+      "docs": [
+        "Reclaims a fully-settled market's rent by closing both the `Market`",
+        "and its `SettlementOracle` accounts once nothing can ever reference",
+        "either of them again. This is the rolling grid's only cleanup path:",
+        "markets and oracles are otherwise never closed, so without this",
+        "instruction their rent is permanently consumed as the factory keeps",
+        "minting new series.",
+        "",
+        "Safety argument -- why this cannot strand or double-spend anything:",
+        "",
+        "1. `now > expiry + observation_window_seconds + settlement_grace_seconds`",
+        "is exactly the deadline `refund_pool_position` already uses as \"the",
+        "settlement fallback window is closed\" (`VsolError::SettlementWindowOpen`).",
+        "Past this point `publish_pyth_settlement` can never publish a new",
+        "settlement (neither tier 1 nor the tier-2 last-known-price",
+        "fallback), so the oracle's `finalized`/`price` state is frozen",
+        "forever -- there is no future event that could still need this",
+        "market or oracle to exist.",
+        "2. `fill_quote` and `fill_pool_quote` both hard-require",
+        "`now < market.expiry` before opening a new position. Since the",
+        "deadline above is strictly after `expiry`, by the time it has",
+        "elapsed no new writer- or pool-backed position can ever be opened",
+        "against this market again, full stop -- this holds independently",
+        "of `market.enabled`/`pool_market.enabled`, which are therefore not",
+        "load-bearing for \"no new obligations\": that is already guaranteed",
+        "by the expiry check those two instructions perform themselves.",
+        "3. The one obligation this instruction *cannot* cheaply verify",
+        "on-chain is \"no already-open `Position`/`PoolPosition` still",
+        "references this market\". Those are independent PDAs keyed by",
+        "nonce record (not by market), so there is no bounded on-chain",
+        "enumeration of \"every position that ever referenced this market\"",
+        "-- unlike the pool-authorization case below, which is a single",
+        "fixed-address PDA per (pool, market) pair. If an open position",
+        "were left unsettled/unrefunded, closing the market would strand it",
+        "forever: `settle`, `settle_pool_position`, `refund_unsettled`, and",
+        "`refund_pool_position` all load the `Market` account via `has_one`",
+        "and would simply fail once that account no longer exists, with no",
+        "way to ever recover the position's escrowed funds.",
+        "==> OFF-CHAIN ASSUMPTION (required, not enforced by this",
+        "instruction): the caller -- the off-chain cleaner -- must confirm",
+        "every `Position` and `PoolPosition` that ever referenced this",
+        "market has already been settled or refunded (its vault closed)",
+        "before calling `close_settled_market`. This is the documented gap",
+        "the task that added this instruction explicitly flagged and",
+        "accepted, given positions are not cheaply enumerable on-chain.",
+        "4. As a cheap, *additional* on-chain check (defense-in-depth, not the",
+        "primary safety argument above, which already holds regardless): if",
+        "the caller passes a `pool`/`pool_market` pair, it must be the",
+        "authorization record for *this* market and pool, and it must have",
+        "`enabled == false`. Passing `None` for both is accepted (an",
+        "omitted pair is not proof no pool was ever authorized, but no",
+        "cheaper on-chain check exists -- see point 3).",
+        "5. Permission: the caller must be `market.creator` or `config.admin`.",
+        "Rent always returns to `market.creator` (`rent_recipient` is",
+        "address-constrained to it), never to an arbitrary caller-supplied",
+        "account.",
+        "6. Deliberately *not* gated on `config.paused`: this is maintenance",
+        "cleanup, not a trading action, so it must remain callable while",
+        "the protocol is paused (mirrors `close_pool_position`'s guardian",
+        "rationale for staying pause-independent)."
+      ],
+      "discriminator": [
+        223,
+        102,
+        55,
+        116,
+        87,
+        131,
+        141,
+        161
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "relations": [
+            "oracle"
+          ]
+        },
+        {
+          "name": "oracle",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "pool",
+          "optional": true
+        },
+        {
+          "name": "pool_market",
+          "optional": true
+        },
+        {
+          "name": "rent_recipient",
+          "docs": [
+            "constrained to the market's own creator so rent can never be",
+            "redirected to an arbitrary caller-supplied account."
+          ],
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "create_market",
       "discriminator": [
         103,
@@ -3435,6 +3586,19 @@
       ]
     },
     {
+      "name": "MarketClosed",
+      "discriminator": [
+        86,
+        91,
+        119,
+        43,
+        94,
+        0,
+        217,
+        113
+      ]
+    },
+    {
       "name": "MarketCreated",
       "discriminator": [
         88,
@@ -3920,6 +4084,16 @@
       "code": 6057,
       "name": "BuybackExceedsMaxPayout",
       "msg": "The buyback amount cannot exceed the position's maximum payout."
+    },
+    {
+      "code": 6058,
+      "name": "MarketNotCloseable",
+      "msg": "The market cannot be closed yet: its settlement window has not fully elapsed, or its pool authorization is still enabled."
+    },
+    {
+      "code": 6059,
+      "name": "InvalidPoolMarket",
+      "msg": "The supplied pool/pool-market pair is invalid or inconsistent."
     }
   ],
   "types": [
@@ -4561,6 +4735,22 @@
           {
             "name": "max_settlement_staleness_seconds",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "creator",
+            "type": "pubkey"
           }
         ]
       }

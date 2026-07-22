@@ -371,6 +371,20 @@ export function calculateWithdrawAmount(shares: bigint, totalShares: bigint, tot
   return amount;
 }
 
+// Mirrors the on-chain `close_settled_market` (and `refund_pool_position`)
+// deadline computation byte-for-byte: `expiry + observation_window_seconds +
+// settlement_grace_seconds`. The instruction requires `now > deadline`
+// (strictly), so an off-chain cleaner should treat this value as "not yet
+// safe to close" and only call `close_settled_market` once the cluster
+// clock has moved *past* it.
+export function marketCloseableAfter(params: {
+  expiry: bigint;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+}): bigint {
+  return params.expiry + BigInt(params.observationWindowSeconds) + BigInt(params.settlementGraceSeconds);
+}
+
 export function calculatePayout(quote: Pick<Quote, "direction" | "strike" | "width" | "maxPayout">, price: bigint): bigint {
   if (quote.width <= 0n || quote.maxPayout <= 0n) throw new RangeError("invalid payout parameters");
   const rawDelta = quote.direction === 0 ? price - quote.strike : quote.strike - price;

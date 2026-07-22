@@ -2460,3 +2460,375 @@ fn refund_unsettled_still_works_when_no_acceptable_settlement_price_exists() {
     assert_eq!(harness.token_balance(&buyer_destination), quote.premium);
     assert_eq!(harness.token_balance(&maker_destination), quote.max_payout);
 }
+
+// =====================================================================
+// close_settled_market
+// =====================================================================
+
+/// The exact deadline `close_settled_market` (and `refund_pool_position`)
+/// require `now` to be strictly greater than: the entire two-tier settlement
+/// window, counted from `expiry`.
+fn full_settlement_deadline(market: &MarketFixture) -> i64 {
+    market.expiry
+        + i64::from(market.observation_window_seconds)
+        + i64::from(market.settlement_grace_seconds)
+}
+
+#[test]
+fn close_settled_market_closes_market_and_oracle_and_returns_rent_to_creator() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+
+    // Stand up a pool authorization for this market and then disable it, so
+    // this test exercises the "pool_market passed and disabled" branch, not
+    // just the "no pool ever involved" branch. `set_liquidity_pool_market`
+    // requires the pool and market to share a settlement mint, so the
+    // market is created under the pool's own mint.
+    let pool = setup_pool(&mut harness, &fixture);
+    let market = setup_market(&mut harness, &fixture, &creator, pool.settlement_mint);
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: false,
+            },
+        )],
+        &[],
+    );
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    let creator_lamports_before = harness.get_account(&creator.pubkey()).lamports;
+    let market_lamports = harness.get_account(&market.market).lamports;
+    let oracle_lamports = harness.get_account(&market.oracle).lamports;
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: Some(pool.pool),
+        pool_market: Some(pool_market),
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+
+    // Both accounts are gone (zero lamports / no longer live).
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+    assert_eq!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0), 0);
+
+    // The creator received exactly both accounts' rent (minus the tx fee,
+    // which `send_ok` already paid from this same account as the payer --
+    // so just assert the balance grew, rather than pin an exact fee-adjusted
+    // amount).
+    let creator_lamports_after = harness.get_account(&creator.pubkey()).lamports;
+    assert!(creator_lamports_after > creator_lamports_before);
+    assert!(creator_lamports_after >= creator_lamports_before + market_lamports + oracle_lamports - 10_000);
+}
+
+#[test]
+fn close_settled_market_succeeds_with_no_pool_ever_authorized() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+    assert_eq!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+#[test]
+fn close_settled_market_rejects_before_settlement_window_fully_elapses() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    // Exactly at the deadline is still "not yet fully elapsed": the
+    // instruction requires `now > deadline`, strictly.
+    harness.warp_to_timestamp(full_settlement_deadline(&market));
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+
+    // Nothing was closed.
+    assert!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0) > 0);
+    assert!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0) > 0);
+}
+
+#[test]
+fn close_settled_market_rejects_while_pool_market_still_enabled() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let creator = harness.funded_keypair();
+    let market = setup_market(&mut harness, &fixture, &creator, pool.settlement_mint);
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: Some(pool.pool),
+        pool_market: Some(pool_market),
+        rent_recipient: creator.pubkey(),
+    };
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+}
+
+#[test]
+fn close_settled_market_rejects_signer_that_is_neither_creator_nor_admin() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let impostor = harness.funded_keypair();
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: impostor.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    let failed = harness.send_err(&impostor, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::Unauthorized);
+}
+
+#[test]
+fn close_settled_market_allows_admin_as_well_as_creator() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    // The admin did not create this market, but is still permitted to close
+    // it; rent still returns to the market's own creator, not the admin.
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: fixture.admin.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&fixture.admin, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+#[test]
+fn close_settled_market_rejects_rent_recipient_other_than_creator() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let outsider = harness.funded_keypair();
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: outsider.pubkey(),
+    };
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    // `rent_recipient` is address-constrained to `market.creator` by Anchor's
+    // own `address = market.creator` check, not a custom `VsolError` variant.
+    assert_eq!(
+        anchor_error_code(&failed),
+        u32::from(anchor_lang::error::ErrorCode::ConstraintAddress)
+    );
+}
+
+#[test]
+fn close_settled_market_is_maintenance_and_succeeds_while_protocol_paused() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.send_ok(
+        &fixture.pause_authority,
+        &[set_pause_ix(&fixture.pause_authority.pubkey(), &fixture.config, true)],
+        &[],
+    );
+    let config_after_pause = read_config(&harness, &fixture.config);
+    assert!(config_after_pause.paused);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    // Cleanup is maintenance, not trading: it must work even while paused.
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+/// Verifies the reinit-after-close property the rolling grid's safety
+/// depends on: if a *future* grid rung ever happened to hash to the exact
+/// same `market_id` as a market that was previously closed via
+/// `close_settled_market`, `create_market`'s `init` must still succeed at
+/// that now-empty PDA rather than refusing to reinitialize it.
+///
+/// This test has to reconcile two constraints that are normally in tension:
+/// `close_settled_market` only succeeds once `now` is well *past* `expiry`
+/// (the full settlement window has elapsed), while `create_market` only
+/// succeeds while `expiry` is still *in the future* relative to `now`. Since
+/// `market_id` is a hash that includes `expiry` itself, reproducing the
+/// identical `market_id` inherently means reproducing the identical
+/// `expiry` -- so the only way to legitimately observe both instructions
+/// succeed against that same `expiry` is to move the clock back down below
+/// it in between, which `warp_to_timestamp` allows (it is a plain sysvar
+/// overwrite in this in-process harness, not a real ledger). This isolates
+/// the mechanical question this test exists to answer -- can Anchor's
+/// `init` reinitialize a previously-`close`d account? -- from the unrelated,
+/// separately-argued fact (see the test below and the report this task
+/// produced) that under a real, forward-only clock this exact scenario can
+/// never actually arise.
+#[test]
+fn closed_market_pda_can_be_reinitialized_by_create_market() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+
+    let creation_time = harness.now();
+    let mut args = vsol::CreateMarketArgs {
+        market_id: [0u8; 32],
+        underlying_mint: Pubkey::new_unique(),
+        symbol: symbol_bytes("NVDA"),
+        price_scale: 1_000_000,
+        expiry: creation_time + MARKET_LEAD_SECONDS + 3_600,
+        observation_window_seconds: OBSERVATION_WINDOW,
+        settlement_grace_seconds: SETTLEMENT_GRACE,
+        max_confidence_bps: 100,
+        pyth_feed_id: [0x77u8; 32],
+        max_settlement_staleness_seconds: MAX_SETTLEMENT_STALENESS,
+    };
+    args.market_id = expected_market_id(&args, settlement_mint);
+    let market = market_pda(&fixture.config, &args.market_id);
+    let oracle = oracle_pda(&market);
+
+    let create_ix = || create_market_ix(&creator.pubkey(), &fixture.config, &market, &oracle, &settlement_mint, args);
+    harness.send_ok(&creator, &[create_ix()], &[]);
+
+    let deadline = args.expiry
+        + i64::from(args.observation_window_seconds)
+        + i64::from(args.settlement_grace_seconds);
+    harness.warp_to_timestamp(deadline + 1);
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market,
+        oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_eq!(harness.svm.get_account(&market).map(|a| a.lamports).unwrap_or(0), 0);
+    assert_eq!(harness.svm.get_account(&oracle).map(|a| a.lamports).unwrap_or(0), 0);
+
+    // Rewind the clock so the identical `args` (same `market_id`, hence the
+    // same PDA) are valid for `create_market` again -- see the doc comment
+    // above for why this step is necessary to isolate the mechanic under
+    // test.
+    harness.warp_to_timestamp(creation_time);
+    harness.send_ok(&creator, &[create_ix()], &[]);
+
+    let recreated_market: vsol::Market = harness.read_account(&market);
+    assert!(recreated_market.enabled);
+    assert_eq!(recreated_market.creator, creator.pubkey());
+    assert_eq!(recreated_market.expiry, args.expiry);
+    let recreated_oracle: vsol::SettlementOracle = harness.read_account(&oracle);
+    assert!(!recreated_oracle.finalized);
+    assert_eq!(recreated_oracle.price, 0);
+}

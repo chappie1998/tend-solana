@@ -359,3 +359,15 @@ pub fn instructions_sysvar_id() -> Pubkey {
 pub fn no_eligibility() -> Pubkey {
     vsol::ID
 }
+
+/// Same "program id means not provided" sentinel as `no_eligibility`, for
+/// `close_settled_market`'s optional `pool` account.
+pub fn no_pool() -> Pubkey {
+    vsol::ID
+}
+
+/// Same sentinel as `no_pool`, for `close_settled_market`'s optional
+/// `pool_market` account.
+pub fn no_pool_market() -> Pubkey {
+    vsol::ID
+}

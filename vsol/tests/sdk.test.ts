@@ -20,6 +20,7 @@ import {
   derivePositionVault,
   liquidityPoolId,
   MARKET_SEED,
+  marketCloseableAfter,
   POOL_BUYBACK_DOMAIN,
   poolBuybackMessage,
   poolQuoteMessage,
@@ -192,6 +193,30 @@ test("factory market PDA derives from the deterministic market id", async () => 
     VSOL_PROGRAM_ID,
   )[0];
   assert.equal(market.toBase58(), expected.toBase58());
+});
+
+test("marketCloseableAfter mirrors the on-chain close_settled_market deadline", () => {
+  // Same formula the Rust program uses (see `close_settled_market` and
+  // `refund_pool_position` in src/lib.rs): expiry + observation window +
+  // settlement grace, all in seconds.
+  const expiry = 1_800_000_000n;
+  const observationWindowSeconds = 30;
+  const settlementGraceSeconds = 900;
+  const deadline = marketCloseableAfter({ expiry, observationWindowSeconds, settlementGraceSeconds });
+  assert.equal(deadline, expiry + BigInt(observationWindowSeconds) + BigInt(settlementGraceSeconds));
+  assert.equal(deadline, 1_800_000_930n);
+});
+
+test("marketCloseableAfter is strictly after expiry whenever either window is positive", () => {
+  const expiry = 42n;
+  assert.equal(
+    marketCloseableAfter({ expiry, observationWindowSeconds: 1, settlementGraceSeconds: 0 }) > expiry,
+    true,
+  );
+  assert.equal(
+    marketCloseableAfter({ expiry, observationWindowSeconds: 0, settlementGraceSeconds: 1 }) > expiry,
+    true,
+  );
 });
 
 test("pool share math rounds down and rejects insolvent or dust operations", () => {

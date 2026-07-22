@@ -1612,6 +1612,93 @@ pub mod vsol {
         });
         Ok(())
     }
+
+    /// Reclaims a fully-settled market's rent by closing both the `Market`
+    /// and its `SettlementOracle` accounts once nothing can ever reference
+    /// either of them again. This is the rolling grid's only cleanup path:
+    /// markets and oracles are otherwise never closed, so without this
+    /// instruction their rent is permanently consumed as the factory keeps
+    /// minting new series.
+    ///
+    /// Safety argument -- why this cannot strand or double-spend anything:
+    ///
+    /// 1. `now > expiry + observation_window_seconds + settlement_grace_seconds`
+    ///    is exactly the deadline `refund_pool_position` already uses as "the
+    ///    settlement fallback window is closed" (`VsolError::SettlementWindowOpen`).
+    ///    Past this point `publish_pyth_settlement` can never publish a new
+    ///    settlement (neither tier 1 nor the tier-2 last-known-price
+    ///    fallback), so the oracle's `finalized`/`price` state is frozen
+    ///    forever -- there is no future event that could still need this
+    ///    market or oracle to exist.
+    /// 2. `fill_quote` and `fill_pool_quote` both hard-require
+    ///    `now < market.expiry` before opening a new position. Since the
+    ///    deadline above is strictly after `expiry`, by the time it has
+    ///    elapsed no new writer- or pool-backed position can ever be opened
+    ///    against this market again, full stop -- this holds independently
+    ///    of `market.enabled`/`pool_market.enabled`, which are therefore not
+    ///    load-bearing for "no new obligations": that is already guaranteed
+    ///    by the expiry check those two instructions perform themselves.
+    /// 3. The one obligation this instruction *cannot* cheaply verify
+    ///    on-chain is "no already-open `Position`/`PoolPosition` still
+    ///    references this market". Those are independent PDAs keyed by
+    ///    nonce record (not by market), so there is no bounded on-chain
+    ///    enumeration of "every position that ever referenced this market"
+    ///    -- unlike the pool-authorization case below, which is a single
+    ///    fixed-address PDA per (pool, market) pair. If an open position
+    ///    were left unsettled/unrefunded, closing the market would strand it
+    ///    forever: `settle`, `settle_pool_position`, `refund_unsettled`, and
+    ///    `refund_pool_position` all load the `Market` account via `has_one`
+    ///    and would simply fail once that account no longer exists, with no
+    ///    way to ever recover the position's escrowed funds.
+    ///    ==> OFF-CHAIN ASSUMPTION (required, not enforced by this
+    ///    instruction): the caller -- the off-chain cleaner -- must confirm
+    ///    every `Position` and `PoolPosition` that ever referenced this
+    ///    market has already been settled or refunded (its vault closed)
+    ///    before calling `close_settled_market`. This is the documented gap
+    ///    the task that added this instruction explicitly flagged and
+    ///    accepted, given positions are not cheaply enumerable on-chain.
+    /// 4. As a cheap, *additional* on-chain check (defense-in-depth, not the
+    ///    primary safety argument above, which already holds regardless): if
+    ///    the caller passes a `pool`/`pool_market` pair, it must be the
+    ///    authorization record for *this* market and pool, and it must have
+    ///    `enabled == false`. Passing `None` for both is accepted (an
+    ///    omitted pair is not proof no pool was ever authorized, but no
+    ///    cheaper on-chain check exists -- see point 3).
+    /// 5. Permission: the caller must be `market.creator` or `config.admin`.
+    ///    Rent always returns to `market.creator` (`rent_recipient` is
+    ///    address-constrained to it), never to an arbitrary caller-supplied
+    ///    account.
+    /// 6. Deliberately *not* gated on `config.paused`: this is maintenance
+    ///    cleanup, not a trading action, so it must remain callable while
+    ///    the protocol is paused (mirrors `close_pool_position`'s guardian
+    ///    rationale for staying pause-independent).
+    pub fn close_settled_market(ctx: Context<CloseSettledMarket>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let market = &ctx.accounts.market;
+
+        let deadline = market
+            .expiry
+            .checked_add(i64::from(market.observation_window_seconds))
+            .and_then(|value| value.checked_add(i64::from(market.settlement_grace_seconds)))
+            .ok_or(VsolError::MathOverflow)?;
+        require!(now > deadline, VsolError::MarketNotCloseable);
+
+        match (ctx.accounts.pool.as_ref(), ctx.accounts.pool_market.as_ref()) {
+            (Some(pool), Some(pool_market)) => {
+                require_keys_eq!(pool_market.pool, pool.key(), VsolError::InvalidPoolMarket);
+                require_keys_eq!(pool_market.market, market.key(), VsolError::InvalidPoolMarket);
+                require!(!pool_market.enabled, VsolError::MarketNotCloseable);
+            }
+            (None, None) => {}
+            _ => return err!(VsolError::InvalidPoolMarket),
+        }
+
+        emit!(MarketClosed {
+            market: market.key(),
+            creator: market.creator,
+        });
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -2134,6 +2221,48 @@ pub struct ClosePoolPosition<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Accounts for `close_settled_market`. See that instruction's doc comment
+/// for the full safety argument.
+///
+/// `pool`/`pool_market` are optional and must be supplied together (both
+/// `Some` or both `None`): they let the caller demonstrate that a specific
+/// pool authorization for this market has been disabled, but omitting them
+/// is accepted too (see point 3/4 of the safety argument -- this cannot be
+/// made a hard on-chain requirement because positions/authorizations are not
+/// cheaply enumerable from the market alone).
+#[derive(Accounts)]
+pub struct CloseSettledMarket<'info> {
+    #[account(
+        constraint = (authority.key() == market.creator || authority.key() == config.admin)
+            @ VsolError::Unauthorized
+    )]
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        close = rent_recipient,
+        has_one = config @ VsolError::InvalidMarket,
+        has_one = oracle @ VsolError::InvalidOracle
+    )]
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        mut,
+        close = rent_recipient,
+        seeds = [ORACLE_SEED, market.key().as_ref()],
+        bump = oracle.bump,
+        has_one = market @ VsolError::InvalidOracle
+    )]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    pub pool: Option<Box<Account<'info, LiquidityPool>>>,
+    pub pool_market: Option<Box<Account<'info, LiquidityPoolMarket>>>,
+    /// CHECK: Receives the market's and oracle's reclaimed rent. Address-
+    /// constrained to the market's own creator so rent can never be
+    /// redirected to an arbitrary caller-supplied account.
+    #[account(mut, address = market.creator)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
@@ -2533,6 +2662,12 @@ pub struct PoolPositionClosedEarly {
     pub pool_amount: u64,
 }
 
+#[event]
+pub struct MarketClosed {
+    pub market: Pubkey,
+    pub creator: Pubkey,
+}
+
 #[error_code]
 pub enum VsolError {
     #[msg("The protocol is paused.")]
@@ -2651,6 +2786,10 @@ pub enum VsolError {
     PoolPositionLimitExceeded,
     #[msg("The buyback amount cannot exceed the position's maximum payout.")]
     BuybackExceedsMaxPayout,
+    #[msg("The market cannot be closed yet: its settlement window has not fully elapsed, or its pool authorization is still enabled.")]
+    MarketNotCloseable,
+    #[msg("The supplied pool/pool-market pair is invalid or inconsistent.")]
+    InvalidPoolMarket,
 }
 
 /// Deterministic market id: identical series parameters bind to one PDA, so
