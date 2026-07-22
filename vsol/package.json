@@ -15,6 +15,7 @@
     "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
     "devnet:verify": "node --import tsx scripts/verify-deployment.ts",
     "keeper": "node --import tsx scripts/keeper.ts",
+    "cranker": "node --import tsx scripts/cranker.ts",
     "lookup-table": "node --import tsx scripts/create-lookup-table.ts"
   },
   "dependencies": {
