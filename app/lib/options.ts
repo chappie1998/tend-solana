@@ -73,11 +73,88 @@ export function definedRiskPayout(params: {
 
 // The pool must always buy back below fair value. Without a spread, a trader
 // could fill a quote and immediately close it for the mid price, round-tripping
-// the pool for free and bleeding LPs on every cycle. 250 bps is the floor
-// discount; it widens (see `buybackFor` below) when the reference price is
-// stale, because closing against a stale mark is riskier for the pool than
-// closing against a fresh one.
-export const BUYBACK_SPREAD_BPS = 250;
+// the pool for free and bleeding LPs on every cycle. Real options venues don't
+// hold that spread flat: it's tight for liquid near-the-money, short-dated
+// positions and widens for far out-of-the-money or long-dated ones, because
+// the writer's hedging/inventory risk scales with both. `dynamicSpreadBps`
+// below composes three bounded, multiplicative factors on top of this floor:
+//   spreadBps = BASE * moneynessFactor * timeFactor * gapRiskMultiplier
+// each factor is >= 1, so the composed spread is never below BASE and the
+// result is hard-capped at BUYBACK_MAX_SPREAD_BPS. Because every factor is
+// bounded below by 1, `dynamicSpreadBps(...) >= BUYBACK_BASE_SPREAD_BPS`
+// always -- which is what keeps the fill-then-immediately-close round trip
+// unprofitable for every input (see the sweep in
+// tests/close-position.test.mjs): that invariant only ever needed the spread
+// to be at least the old flat 250 bps, never exactly it.
+export const BUYBACK_BASE_SPREAD_BPS = 250;
+
+// Hard ceiling: however far out-of-the-money, long-dated, or stale the
+// inputs are, the pool never discounts a buyback by more than this.
+export const BUYBACK_MAX_SPREAD_BPS = 1_500;
+
+// Moneyness: widths (strike -> cap distance) past the strike, on the losing
+// side, before the moneyness multiplier saturates at its max.
+export const BUYBACK_MONEYNESS_OTM_WIDTHS = 1;
+// At full saturation (a full width out-of-the-money) the spread is this many
+// times the base -- before the time and gap-risk factors are applied.
+export const BUYBACK_MONEYNESS_MAX_MULTIPLIER = 3;
+
+// Time to expiry: at full time remaining the spread is this many times the
+// base (before moneyness/gap-risk); it relaxes linearly toward 1x (no
+// widening) as minutesRemaining/originalMinutes -> 0.
+export const BUYBACK_TIME_MAX_MULTIPLIER = 2;
+
+/** @deprecated Kept for backward compatibility -- equals `BUYBACK_BASE_SPREAD_BPS`,
+ * the tightest (near-the-money, short-dated, fresh-reference) floor of the
+ * dynamic spread. Spread is no longer flat; see `dynamicSpreadBps`. */
+export const BUYBACK_SPREAD_BPS = BUYBACK_BASE_SPREAD_BPS;
+
+/**
+ * The closing spread (in bps) the pool applies to an early-close fair value,
+ * as a base floor scaled by three bounded, multiplicative factors:
+ *
+ * - moneyness: how far spot sits from strike relative to the option's width
+ *   (strike -> cap distance). At or past the strike (spot already on the
+ *   favorable side) the factor is 1 (tightest); it scales up to
+ *   `BUYBACK_MONEYNESS_MAX_MULTIPLIER` as spot moves up to
+ *   `BUYBACK_MONEYNESS_OTM_WIDTHS` widths past the strike on the losing
+ *   side, and saturates there.
+ * - time to expiry: `fraction = minutesRemaining / originalMinutes`. More
+ *   time remaining means more can happen before the pool can unwind its
+ *   hedge, so the factor scales from 1 (at expiry) up to
+ *   `BUYBACK_TIME_MAX_MULTIPLIER` (at full time remaining).
+ * - gap risk: identical widening to `quoteFor`'s entry pricing -- a stale
+ *   reference is riskier to close against.
+ *
+ * Every factor is bounded below by 1, so the result is always
+ * >= `BUYBACK_BASE_SPREAD_BPS`, and it is hard-capped at
+ * `BUYBACK_MAX_SPREAD_BPS`.
+ */
+export function dynamicSpreadBps(params: {
+  direction: Direction;
+  spot: number;
+  strike: number;
+  cap: number;
+  fraction: number;
+  referenceAgeSeconds?: number;
+}): number {
+  const { direction, spot, strike, cap } = params;
+  const fraction = Math.max(0, Math.min(1, params.fraction));
+  const referenceAgeSeconds = params.referenceAgeSeconds ?? 0;
+
+  const width = Math.abs(cap - strike);
+  const signedMoneyness = direction === "up" ? (spot - strike) / width : (strike - spot) / width;
+  const otmWidths = Math.max(0, Math.min(BUYBACK_MONEYNESS_OTM_WIDTHS, -signedMoneyness)) / BUYBACK_MONEYNESS_OTM_WIDTHS;
+  const moneynessFactor = 1 + (BUYBACK_MONEYNESS_MAX_MULTIPLIER - 1) * otmWidths;
+
+  const timeFactor = 1 + (BUYBACK_TIME_MAX_MULTIPLIER - 1) * fraction;
+
+  const gapRiskHours = referenceAgeSeconds / 3_600;
+  const gapRiskMultiplier = Math.min(GAP_RISK_MAX_VOL_MULTIPLIER, 1 + GAP_RISK_VOL_SCALE_PER_HOUR * Math.sqrt(gapRiskHours));
+
+  const raw = BUYBACK_BASE_SPREAD_BPS * moneynessFactor * timeFactor * gapRiskMultiplier;
+  return Math.min(BUYBACK_MAX_SPREAD_BPS, raw);
+}
 
 /**
  * Prices an early close (buyer sells an open pool position back to the pool
@@ -133,12 +210,6 @@ export function buybackFor(params: {
 
   const intrinsic = definedRiskPayout({ direction, settlement: spot, strike, cap, maxPayout });
 
-  // Same gap-risk widening `quoteFor` applies at entry: a stale reference
-  // means more could happen before the feed resumes, so the closing spread
-  // widens with it (this is the only place gap risk feeds into pricing here).
-  const gapRiskHours = referenceAgeSeconds / 3_600;
-  const gapRiskMultiplier = Math.min(GAP_RISK_MAX_VOL_MULTIPLIER, 1 + GAP_RISK_VOL_SCALE_PER_HOUR * Math.sqrt(gapRiskHours));
-
   // Time value decays to zero as minutesRemaining/originalMinutes -> 0 (sqrt
   // shape), anchored to the premium actually paid -- not re-derived from
   // volatility, which `premium` already prices in (see the doc comment above).
@@ -147,7 +218,10 @@ export function buybackFor(params: {
   const timeValue = Math.max(0, premium * decay);
 
   const fairValue = Math.min(maxPayout, intrinsic + timeValue);
-  const spreadBps = BUYBACK_SPREAD_BPS * gapRiskMultiplier;
+  // Moneyness + time-to-expiry + gap-risk, composed multiplicatively and
+  // bounded -- see `dynamicSpreadBps` above. This never re-touches the
+  // fair-value math above; it only scales the discount applied to it.
+  const spreadBps = dynamicSpreadBps({ direction, spot, strike, cap, fraction, referenceAgeSeconds });
   const buyback = Math.max(0, Math.min(maxPayout, fairValue * (1 - spreadBps / 10_000)));
 
   if (!Number.isFinite(fairValue) || !Number.isFinite(buyback) || !Number.isFinite(spreadBps)) {

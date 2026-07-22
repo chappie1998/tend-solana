@@ -5,9 +5,12 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("buybackFor prices an early close strictly below fair value with the expected spread and decay shape", async () => {
-  const { buybackFor, definedRiskPayout, BUYBACK_SPREAD_BPS } = await import(new URL("app/lib/options.ts", root));
+  const { buybackFor, definedRiskPayout, BUYBACK_SPREAD_BPS, BUYBACK_BASE_SPREAD_BPS, BUYBACK_MAX_SPREAD_BPS } =
+    await import(new URL("app/lib/options.ts", root));
 
   assert.equal(BUYBACK_SPREAD_BPS, 250);
+  assert.equal(BUYBACK_BASE_SPREAD_BPS, 250);
+  assert.ok(BUYBACK_MAX_SPREAD_BPS > BUYBACK_BASE_SPREAD_BPS);
 
   const base = {
     direction: "up",
@@ -93,8 +96,13 @@ test("a fill-then-immediately-close round trip is never profitable, across every
   // 90% vol/30D used to pay $240.10 back on a $221.93 premium (+$18.17).
   // Neither must be possible: for every volatility and tenor below, closing
   // at full time remaining (no price movement) must return strictly less
-  // than the premium paid, and the loss must be ~ the spread.
-  const { quoteFor, buybackFor, BUYBACK_SPREAD_BPS } = await import(new URL("app/lib/options.ts", root));
+  // than the premium paid. The spread is now dynamic (moneyness x time x
+  // gap-risk, see dynamicSpreadBps), not flat -- but every factor in that
+  // composition is bounded below by 1, so the effective spread can only ever
+  // be >= BUYBACK_BASE_SPREAD_BPS. That alone is what guarantees the round
+  // trip stays unprofitable here: it never needs to be exactly the base.
+  const { quoteFor, buybackFor, BUYBACK_BASE_SPREAD_BPS, BUYBACK_MAX_SPREAD_BPS } =
+    await import(new URL("app/lib/options.ts", root));
 
   const volatilities = [20, 30, 50, 70, 90, 150];
   const tenors = [
@@ -124,11 +132,24 @@ test("a fill-then-immediately-close round trip is never profitable, across every
           originalMinutes: tenor.minutes,
         });
         const loss = quote.premium - closed.buyback;
-        const expectedLoss = quote.premium * (BUYBACK_SPREAD_BPS / 10_000);
+        const minExpectedLoss = quote.premium * (BUYBACK_BASE_SPREAD_BPS / 10_000);
         const profitable = !(closed.buyback < quote.premium);
-        const spreadMismatch = Math.abs(loss - expectedLoss) > 1e-6 * Math.max(1, quote.premium);
-        if (profitable || spreadMismatch) {
-          failures.push({ volatility, tenor: tenor.label, direction, premium: quote.premium, buyback: closed.buyback, loss, expectedLoss });
+        // The spread must never dip below the base floor (that's the whole
+        // anti-arbitrage guarantee) and never exceed the hard cap.
+        const spreadOutOfBounds =
+          closed.spreadBps < BUYBACK_BASE_SPREAD_BPS - 1e-9 || closed.spreadBps > BUYBACK_MAX_SPREAD_BPS + 1e-9;
+        const lossBelowFloor = loss < minExpectedLoss - 1e-6 * Math.max(1, quote.premium);
+        if (profitable || spreadOutOfBounds || lossBelowFloor) {
+          failures.push({
+            volatility,
+            tenor: tenor.label,
+            direction,
+            premium: quote.premium,
+            buyback: closed.buyback,
+            loss,
+            minExpectedLoss,
+            spreadBps: closed.spreadBps,
+          });
         }
       }
     }
@@ -137,6 +158,79 @@ test("a fill-then-immediately-close round trip is never profitable, across every
   if (failures.length) {
     throw new Error(`round trip was profitable or the loss did not match the spread for: ${JSON.stringify(failures, null, 2)}`);
   }
+});
+
+test("dynamicSpreadBps widens with moneyness, time, and staleness, and stays within [base, cap]", async () => {
+  const { dynamicSpreadBps, BUYBACK_BASE_SPREAD_BPS, BUYBACK_MAX_SPREAD_BPS } =
+    await import(new URL("app/lib/options.ts", root));
+
+  const strike = 200;
+  const cap = 220; // width = 20
+  const base = { direction: "up", strike, cap, fraction: 0.5, referenceAgeSeconds: 0 };
+
+  // Moneyness: holding time/gap fixed, moving spot further out-of-the-money
+  // (further below the strike, for an "up" position) must never tighten the
+  // spread, and must strictly widen it before saturation.
+  const spotsFarToNear = [180, 185, 190, 195, 200, 205, 210]; // strike-width .. past strike
+  const moneynessSpreads = spotsFarToNear.map((spot) => dynamicSpreadBps({ ...base, spot }));
+  for (let i = 1; i < moneynessSpreads.length; i += 1) {
+    assert.ok(
+      moneynessSpreads[i] <= moneynessSpreads[i - 1],
+      `spread must not increase as spot moves toward/through the strike: ${JSON.stringify(moneynessSpreads)}`,
+    );
+  }
+  // Strictly wider deep out-of-the-money than at/past the strike.
+  assert.ok(moneynessSpreads[0] > moneynessSpreads[moneynessSpreads.length - 1]);
+  // At or past the strike (favorable side), moneyness contributes no widening.
+  assert.equal(dynamicSpreadBps({ ...base, spot: strike }), dynamicSpreadBps({ ...base, spot: 300 }));
+
+  // Time to expiry: holding spot/gap fixed, more time remaining must never
+  // tighten the spread, and must strictly widen it away from expiry.
+  const fractions = [0, 0.1, 0.25, 0.5, 0.75, 1];
+  const timeSpreads = fractions.map((fraction) => dynamicSpreadBps({ ...base, spot: 190, fraction }));
+  for (let i = 1; i < timeSpreads.length; i += 1) {
+    assert.ok(
+      timeSpreads[i] >= timeSpreads[i - 1],
+      `spread must not decrease as time remaining grows: ${JSON.stringify(timeSpreads)}`,
+    );
+  }
+  assert.ok(timeSpreads[timeSpreads.length - 1] > timeSpreads[0], "full time remaining is strictly wider than expiry");
+
+  // Gap risk: a staler reference must never tighten the spread, and must
+  // strictly widen it until the gap-risk multiplier itself saturates.
+  const referenceAges = [0, 1 * 3_600, 2 * 3_600, 6 * 3_600, 24 * 3_600];
+  const staleSpreads = referenceAges.map((referenceAgeSeconds) => dynamicSpreadBps({ ...base, spot: 190, referenceAgeSeconds }));
+  for (let i = 1; i < staleSpreads.length; i += 1) {
+    assert.ok(
+      staleSpreads[i] >= staleSpreads[i - 1],
+      `spread must not decrease as the reference gets staler: ${JSON.stringify(staleSpreads)}`,
+    );
+  }
+  assert.ok(staleSpreads[staleSpreads.length - 1] > staleSpreads[0], "a stale reference strictly widens the spread");
+
+  // Bounds: across a broad sweep of moneyness x time x staleness, the spread
+  // never drops below the base floor and never exceeds the hard cap.
+  const sweepSpots = [50, 100, 150, 180, 190, 195, 200, 205, 220, 300, 1_000];
+  const sweepFractions = [0, 0.01, 0.1, 0.5, 0.9, 1];
+  const sweepAges = [0, 3_600, 6 * 3_600, 48 * 3_600];
+  for (const spot of sweepSpots) {
+    for (const fraction of sweepFractions) {
+      for (const referenceAgeSeconds of sweepAges) {
+        for (const direction of ["up", "down"]) {
+          const spreadBps = dynamicSpreadBps({ direction, spot, strike, cap, fraction, referenceAgeSeconds });
+          assert.ok(spreadBps >= BUYBACK_BASE_SPREAD_BPS - 1e-9, `spread ${spreadBps} fell below the base floor`);
+          assert.ok(spreadBps <= BUYBACK_MAX_SPREAD_BPS + 1e-9, `spread ${spreadBps} exceeded the hard cap`);
+        }
+      }
+    }
+  }
+
+  // At/near expiry and at/past the strike, with a fresh reference, the
+  // spread approaches the tight floor.
+  const tightest = dynamicSpreadBps({ direction: "up", spot: strike, strike, cap, fraction: 0, referenceAgeSeconds: 0 });
+  assert.equal(tightest, BUYBACK_BASE_SPREAD_BPS);
+  const nearTightest = dynamicSpreadBps({ direction: "up", spot: strike + 1, strike, cap, fraction: 0.01, referenceAgeSeconds: 0 });
+  assert.ok(nearTightest - BUYBACK_BASE_SPREAD_BPS < 10, "near expiry and near-the-money must sit close to the floor");
 });
 
 test("the close-position flow reuses the audited session-wallet-only, message-hash-bound, strictly-inspected pattern", async () => {
