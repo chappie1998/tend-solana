@@ -34,6 +34,7 @@ import {
   VSOL_PYTH_FEED_ID,
   VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
+  VSOL_RETIRING_LOOKUP_TABLES,
   VSOL_RPC_URL,
   VSOL_SETTLEMENT_MINT,
 } from "./vsol.ts";
@@ -67,33 +68,40 @@ const MAX_TRANSACTION_BYTES = 1232;
 // Read on every quote (see buildVsolQuoteTransaction below), so the fetched
 // AddressLookupTableAccount is cached briefly rather than refetched per
 // request; a few seconds is enough to absorb request bursts while still
-// noticing a freshly-extended table quickly.
+// noticing a freshly-extended table quickly. Keyed by table address (rather
+// than a single slot) because resolution may now need either the CURRENT
+// table or one of the published RETIRING tables (see
+// resolveSignedVsolFillTransaction below).
 const ADDRESS_LOOKUP_TABLE_CACHE_MS = 5_000;
-let addressLookupTableCache: { account: AddressLookupTableAccount | null; expiresAt: number } | null = null;
+const addressLookupTableCache = new Map<string, { account: AddressLookupTableAccount | null; expiresAt: number }>();
 
 /**
- * Fetches (and briefly caches) the manifest-pinned address lookup table
- * account (VSOL_ADDRESS_LOOKUP_TABLE, see app/lib/vsol.ts). Returns null --
- * never throws -- when the manifest publishes no table, or the published
- * address does not resolve to a live account onchain, so every caller can
- * treat "no ALT" as an ordinary, expected state and fall back to legacy
- * transactions exactly as before the ALT existed.
+ * Fetches (and briefly caches) an address lookup table account. Defaults to
+ * the manifest-pinned CURRENT table (VSOL_ADDRESS_LOOKUP_TABLE, see
+ * app/lib/vsol.ts); callers resolving a transaction that references a
+ * RETIRING table pass its address explicitly. Returns null -- never throws --
+ * when `tableAddress` is null, or the address does not resolve to a live
+ * account onchain, so every caller can treat "no ALT" as an ordinary,
+ * expected state and fall back to legacy transactions exactly as before the
+ * ALT existed.
  */
 export async function getVsolAddressLookupTableAccount(
   connection: Connection,
   now = Date.now(),
+  tableAddress: PublicKey | null = VSOL_ADDRESS_LOOKUP_TABLE,
 ): Promise<AddressLookupTableAccount | null> {
-  if (addressLookupTableCache && addressLookupTableCache.expiresAt > now) return addressLookupTableCache.account;
+  if (!tableAddress) return null;
+  const cacheKey = tableAddress.toBase58();
+  const cached = addressLookupTableCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.account;
   let account: AddressLookupTableAccount | null = null;
-  if (VSOL_ADDRESS_LOOKUP_TABLE) {
-    try {
-      const result = await connection.getAddressLookupTable(VSOL_ADDRESS_LOOKUP_TABLE);
-      account = result.value ?? null;
-    } catch {
-      account = null;
-    }
+  try {
+    const result = await connection.getAddressLookupTable(tableAddress);
+    account = result.value ?? null;
+  } catch {
+    account = null;
   }
-  addressLookupTableCache = { account, expiresAt: now + ADDRESS_LOOKUP_TABLE_CACHE_MS };
+  addressLookupTableCache.set(cacheKey, { account, expiresAt: now + ADDRESS_LOOKUP_TABLE_CACHE_MS });
   return account;
 }
 
@@ -1429,16 +1437,34 @@ function verifyVersionedVsolSignatures(transaction: VersionedTransaction): boole
  * account, ...) and every downstream check in inspectVsolFillTransaction
  * would dutifully validate a fabricated transaction against attacker-chosen
  * accounts, since those checks only ever see whatever pubkeys they're handed
- * here. So: resolution below uses ONLY the manifest-pinned
- * VSOL_ADDRESS_LOOKUP_TABLE (app/lib/vsol.ts), fetched independently by this
- * server -- never the client's transaction bytes -- and any transaction
- * whose addressTableLookups reference a different table (or any table when
- * this deployment has not published one) is rejected outright, before a
+ * here. So: resolution below uses ONLY a table this deployment explicitly
+ * trusts -- the CURRENT manifest-pinned VSOL_ADDRESS_LOOKUP_TABLE, or one of
+ * the published VSOL_RETIRING_LOOKUP_TABLES (app/lib/vsol.ts) -- fetched
+ * independently by this server, never the client's transaction bytes. A
+ * retiring table is trusted here (never for compiling new fills, only for
+ * resolving an already-signed one) because a quote issued moments before a
+ * rotation may have been compiled against the table that was still current
+ * at quote time; it stays trusted until vsol/scripts/keeper.ts closes it
+ * onchain, at which point getAddressLookupTable simply stops resolving it and
+ * this falls back to the "no such table" rejection path below. Any
+ * transaction whose addressTableLookups reference a table outside {current}
+ * ∪ {retiring} -- or that reference more than one distinct table, which
+ * composeVsolFillTransaction never produces -- is rejected outright, before a
  * single account key is resolved.
+ *
+ * `trustedLookupTables` defaults to exactly {VSOL_ADDRESS_LOOKUP_TABLE} ∪
+ * {every VSOL_RETIRING_LOOKUP_TABLES address} -- production callers never
+ * pass it. Tests pass a synthetic list so the retiring-table acceptance path
+ * and the foreign-table rejection path can both be exercised directly,
+ * independent of whatever this deployment's manifest currently publishes.
  */
 export async function resolveSignedVsolFillTransaction(
   raw: Buffer,
   connection: Connection,
+  trustedLookupTables: readonly (PublicKey | null)[] = [
+    VSOL_ADDRESS_LOOKUP_TABLE,
+    ...VSOL_RETIRING_LOOKUP_TABLES.map((entry) => entry.address),
+  ],
 ): Promise<ResolvedFillTransaction | null> {
   if (!isVersionedVsolTransactionBytes(raw)) {
     let transaction: Transaction;
@@ -1468,14 +1494,18 @@ export async function resolveSignedVsolFillTransaction(
   const lookups = message.addressTableLookups;
   let lookupTableAccount: AddressLookupTableAccount | null = null;
   if (lookups.length > 0) {
-    // Fail closed: no pinned table published means nothing can be trusted to
-    // resolve against, and any reference to a table other than the pinned
-    // one is rejected regardless of how many lookups are present.
-    const pinnedTable = VSOL_ADDRESS_LOOKUP_TABLE;
-    if (!pinnedTable) return null;
-    const referencesForeignTable = lookups.some((lookup) => !lookup.accountKey.equals(pinnedTable));
-    if (referencesForeignTable) return null;
-    lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
+    // Fail closed: a transaction must reference exactly one table (the shape
+    // every table composeVsolFillTransaction ever produces), and that table
+    // must be either the current active one or a still-published retiring
+    // one -- anything else (a foreign table, or a mix of more than one
+    // distinct table address) is rejected before a single account key is
+    // resolved.
+    const referencedTableKeys = new Set(lookups.map((lookup) => lookup.accountKey.toBase58()));
+    if (referencedTableKeys.size !== 1) return null;
+    const referencedTable = lookups[0].accountKey;
+    const isTrusted = trustedLookupTables.some((table) => table?.equals(referencedTable) ?? false);
+    if (!isTrusted) return null;
+    lookupTableAccount = await getVsolAddressLookupTableAccount(connection, Date.now(), referencedTable);
     if (!lookupTableAccount) return null;
   }
 

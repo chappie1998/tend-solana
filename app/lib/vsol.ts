@@ -18,6 +18,48 @@ type LiquidityDeployment = {
   manager?: string;
 };
 
+// A single retired address lookup table: rotated out of active service by
+// vsol/scripts/create-lookup-table.ts (see its rotation path) but not yet
+// safe to deactivate/close, because not-yet-settled positions quoted moments
+// before rotation may still reference it. vsol/scripts/keeper.ts advances
+// each entry toward deactivation and, once its onchain cooldown elapses,
+// closure -- see vsol/scripts/lib/lookup-table.ts's RetiringLookupTableEntry
+// (the authoritative type both scripts share) for the exact same shape.
+type RetiringLookupTableDeployment = {
+  address: string;
+  // Unix-seconds instant after which every market that was live in this
+  // table at rotation time has both expired and cleared its settlement
+  // grace/staleness window -- i.e. every position that could reference this
+  // table's indices has had a chance to settle onchain.
+  outliveExpiry: number;
+  // ISO timestamp this table was retired from active service (informational).
+  retiredAt: string;
+};
+
+// ---------------------------------------------------------------------------
+// Manifest shape for the address lookup table (ALT) rotation scheme:
+//
+//   `addressLookupTable` ALWAYS means "the CURRENT active table" -- the one
+//   the app compiles brand-new fill transactions against (see
+//   VSOL_ADDRESS_LOOKUP_TABLE and app/lib/vsol-server.ts's
+//   getVsolAddressLookupTableAccount). This is unchanged from before rotation
+//   existed, so every existing single-table consumer keeps working.
+//
+//   `retiringLookupTables` lists tables rotated OUT of that role but not yet
+//   safe to close: not-yet-settled positions quoted moments before a
+//   rotation may still name one of these in a signed transaction the app
+//   must still be able to verify/resolve (never compile new fills against).
+//   See app/lib/vsol-server.ts's resolveSignedVsolFillTransaction, which
+//   accepts the current table OR any published retiring table, and rejects
+//   anything else -- a foreign table must never resolve.
+//
+// An ALT is append-only with a hard 256-address cap (11 stable addresses +
+// 2 per minted market fills it in ~120 markets at this grid's mint rate), so
+// there is no way to delete individual entries -- rotation to a fresh table
+// is the only way forward. See vsol/scripts/lib/lookup-table.ts for the
+// rotation threshold and vsol/scripts/keeper.ts for the deactivate/close
+// lifecycle.
+// ---------------------------------------------------------------------------
 type ExtendedDeployment = typeof deployment & {
   liquidityPools?: LiquidityDeployment[];
   // Published once the ALT that collapses VSOL fill transactions (both the
@@ -27,6 +69,10 @@ type ExtendedDeployment = typeof deployment & {
   // getVsolAddressLookupTableAccount, which must keep building legacy
   // transactions exactly as before whenever this is missing.
   addressLookupTable?: string;
+  // Absent on manifests that predate rotation, and whenever no table has
+  // been rotated out yet -- treated identically to an empty array everywhere
+  // this is read (see VSOL_RETIRING_LOOKUP_TABLES below).
+  retiringLookupTables?: RetiringLookupTableDeployment[];
 };
 
 const deployed = deployment as ExtendedDeployment;
@@ -57,6 +103,19 @@ export const VSOL_WRITER_TOKEN = new PublicKey(deployment.writerToken);
 export const VSOL_ADDRESS_LOOKUP_TABLE = deployed.addressLookupTable
   ? new PublicKey(deployed.addressLookupTable)
   : null;
+export type VsolRetiringLookupTable = { address: PublicKey; outliveExpiry: number; retiredAt: string };
+// Tables rotated out of active service but not yet closed (see the manifest
+// shape comment above). Empty whenever the manifest omits the field or has
+// never rotated. app/lib/vsol-server.ts's resolveSignedVsolFillTransaction
+// treats every one of these, plus VSOL_ADDRESS_LOOKUP_TABLE, as a trusted
+// table a signed v0 transaction may reference -- any other table is rejected.
+export const VSOL_RETIRING_LOOKUP_TABLES: readonly VsolRetiringLookupTable[] = Object.freeze(
+  (deployed.retiringLookupTables ?? []).map((entry) => ({
+    address: new PublicKey(entry.address),
+    outliveExpiry: entry.outliveExpiry,
+    retiredAt: entry.retiredAt,
+  })),
+);
 // The manifest's own `markets` array (bootstrap-time evidence of the series
 // that were minted during setup) is intentionally NOT read here anymore. A
 // keeper mints fresh grid rungs continuously, so a checked-in snapshot goes

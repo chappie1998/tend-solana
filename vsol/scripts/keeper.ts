@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { AnchorError, AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
@@ -16,7 +16,13 @@ import {
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
-import { missingAddresses } from "./lib/lookup-table.ts";
+import {
+  ALT_NOT_DEACTIVATED_SENTINEL,
+  isLookupTableReadyToClose,
+  isLookupTableSafeToDeactivate,
+  missingAddresses,
+  type RetiringLookupTableEntry,
+} from "./lib/lookup-table.ts";
 import {
   deriveConfig,
   deriveLiquidityPool,
@@ -48,6 +54,7 @@ const commitment = "confirmed" as const;
 const connection = new Connection(rpcUrl, commitment);
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
+const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
 
 // Mirrors bootstrap.ts's rolling-catalog parameters exactly. These are not
 // re-derived from the deployment manifest because the keeper must never
@@ -65,7 +72,14 @@ const MARKET_SYMBOL = "NVDA";
 // never mint a rung the app derives a different market address for.
 const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v3`;
 
-type Counters = { created: number; authorized: number; skipped: number; altExtended: number };
+type Counters = {
+  created: number;
+  authorized: number;
+  skipped: number;
+  altExtended: number;
+  altDeactivated: number;
+  altClosed: number;
+};
 
 async function loadRequiredKeypair(name: string): Promise<Keypair> {
   const path = resolve(devnetDir, `${name}.json`);
@@ -130,7 +144,6 @@ function anchorErrorCode(error: unknown): string | undefined {
  */
 async function readAddressLookupTable(): Promise<PublicKey | undefined> {
   try {
-    const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
     const deployment = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
     return typeof deployment.addressLookupTable === "string" ? new PublicKey(deployment.addressLookupTable) : undefined;
   } catch {
@@ -172,6 +185,100 @@ async function extendLookupTableWithMarket(params: {
     params.counters.altExtended += toAdd.length;
   } catch (error) {
     console.log(`warn: failed to extend ALT for ${params.code} market ${params.market.toBase58()} -- market creation still succeeded (${describeError(error)})`);
+  }
+}
+
+/**
+ * Progresses every table in the manifest's `retiringLookupTables` array
+ * toward deactivation and, once its mandatory cooldown has elapsed, closure
+ * (reclaiming rent to `authority`). A table only ever moves into this array
+ * from vsol/scripts/create-lookup-table.ts's rotation path -- see
+ * app/lib/vsol.ts's ExtendedDeployment comment for the manifest shape.
+ *
+ * Deactivate -> close has a mandatory onchain slot cooldown
+ * (isLookupTableReadyToClose); a table that has just been deactivated (or
+ * whose cooldown has not yet elapsed) is left in the manifest for a later
+ * keeper pass to finish. A table is only deactivated once
+ * isLookupTableSafeToDeactivate confirms every market that was live in it at
+ * rotation time has expired and cleared its settlement window.
+ *
+ * Every failure here (RPC error, a lost race with a manual close, etc.) is
+ * caught and logged, never thrown -- market maintenance (ensureMarkets /
+ * ensurePoolAuthorizations) is the keeper's priority and must never be failed
+ * by ALT lifecycle bookkeeping. This is the one place the keeper writes the
+ * deployment manifest; it only ever rewrites `retiringLookupTables`, never
+ * touches `addressLookupTable` or any market-creation state.
+ */
+async function processRetiringLookupTables(params: { authority: Keypair; counters: Counters }): Promise<void> {
+  try {
+    const raw = await readFile(manifestPath, "utf8");
+    const deployment = JSON.parse(raw) as Record<string, unknown>;
+    const retiring = Array.isArray(deployment.retiringLookupTables)
+      ? (deployment.retiringLookupTables as RetiringLookupTableEntry[])
+      : [];
+    if (retiring.length === 0) return;
+
+    const now = await clusterUnixTime();
+    const remaining: RetiringLookupTableEntry[] = [];
+
+    for (const entry of retiring) {
+      try {
+        const tableKey = new PublicKey(entry.address);
+        const lookup = await connection.getAddressLookupTable(tableKey, { commitment });
+        const table = lookup.value;
+        if (!table) {
+          // Already closed (by this keeper or a manual operation) -- drop it.
+          console.log(`alt-retire: ${entry.address} no longer exists onchain; removing from retiringLookupTables`);
+          continue;
+        }
+
+        if (table.state.deactivationSlot === ALT_NOT_DEACTIVATED_SENTINEL) {
+          if (!isLookupTableSafeToDeactivate(entry, now)) {
+            console.log(
+              `skip: retiring ALT ${entry.address} not yet safe to deactivate (must outlive until ${new Date(entry.outliveExpiry * 1000).toISOString()})`,
+            );
+            remaining.push(entry);
+            continue;
+          }
+          const instruction = AddressLookupTableProgram.deactivateLookupTable({
+            lookupTable: tableKey,
+            authority: params.authority.publicKey,
+          });
+          await sendAndConfirmTransaction(connection, new Transaction().add(instruction), [params.authority], { commitment });
+          console.log(`deactivated: retiring ALT ${entry.address}`);
+          params.counters.altDeactivated += 1;
+          remaining.push(entry);
+          continue;
+        }
+
+        const currentSlot = await connection.getSlot(commitment);
+        if (!isLookupTableReadyToClose(table.state.deactivationSlot, currentSlot)) {
+          console.log(`skip: retiring ALT ${entry.address} deactivated but its close cooldown has not elapsed yet`);
+          remaining.push(entry);
+          continue;
+        }
+
+        const instruction = AddressLookupTableProgram.closeLookupTable({
+          lookupTable: tableKey,
+          authority: params.authority.publicKey,
+          recipient: params.authority.publicKey,
+        });
+        await sendAndConfirmTransaction(connection, new Transaction().add(instruction), [params.authority], { commitment });
+        console.log(`closed: retiring ALT ${entry.address} (rent reclaimed to ${params.authority.publicKey.toBase58()})`);
+        params.counters.altClosed += 1;
+        // Not pushed to `remaining`: closed tables are dropped from the manifest.
+      } catch (error) {
+        console.log(`warn: failed to progress retiring ALT ${entry.address} -- will retry next keeper pass (${describeError(error)})`);
+        remaining.push(entry);
+      }
+    }
+
+    if (remaining.length !== retiring.length) {
+      deployment.retiringLookupTables = remaining;
+      await writeFile(manifestPath, `${JSON.stringify(deployment, null, 2)}\n`);
+    }
+  } catch (error) {
+    console.log(`warn: failed to process retiring lookup tables -- market maintenance still succeeded (${describeError(error)})`);
   }
 }
 
@@ -392,7 +499,7 @@ async function main(): Promise<void> {
   // Bounded by construction: rollingMarketSchedule always returns exactly
   // the five current rungs, so this run can never create more than five
   // markets or authorize more than five series.
-  const counters: Counters = { created: 0, authorized: 0, skipped: 0, altExtended: 0 };
+  const counters: Counters = { created: 0, authorized: 0, skipped: 0, altExtended: 0, altDeactivated: 0, altClosed: 0 };
 
   // Read-only, best-effort: the keeper's market creation must not depend on
   // the manifest existing at all, let alone publishing an ALT yet.
@@ -419,9 +526,16 @@ async function main(): Promise<void> {
     counters,
   });
 
+  // ALT lifecycle bookkeeping runs last and is best-effort (see
+  // processRetiringLookupTables's docstring): a failure here must never mask
+  // the market-creation/authorization work above, which is the keeper's
+  // priority and has already completed by this point.
+  await processRetiringLookupTables({ authority: creator, counters });
+
   console.log(
     `Keeper summary: created ${counters.created} markets, authorized ${counters.authorized} series, ` +
-      `ALT-extended ${counters.altExtended} addresses, skipped ${counters.skipped}`,
+      `ALT-extended ${counters.altExtended} addresses, ALT-deactivated ${counters.altDeactivated}, ` +
+      `ALT-closed ${counters.altClosed}, skipped ${counters.skipped}`,
   );
 }
 

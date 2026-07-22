@@ -8,7 +8,7 @@ import {
   deriveLiquidityPoolToken,
   deriveMarketId,
 } from "../sdk/index.ts";
-import { stableFillAddresses } from "./lib/lookup-table.ts";
+import { type RetiringLookupTableEntry, stableFillAddresses } from "./lib/lookup-table.ts";
 
 const cluster = process.env.VSOL_CLUSTER ?? "devnet";
 const path = resolve(import.meta.dirname, "..", "deployments", `${cluster}.json`);
@@ -118,6 +118,11 @@ for (const poolManifest of liquidityPools) {
 const addressLookupTable = typeof deployment.addressLookupTable === "string" ? deployment.addressLookupTable : undefined;
 const lookupTableAddress = addressLookupTable ? new PublicKey(addressLookupTable) : undefined;
 if (lookupTableAddress) accountAddresses.push(lookupTableAddress);
+const retiringLookupTables = Array.isArray(deployment.retiringLookupTables)
+  ? (deployment.retiringLookupTables as RetiringLookupTableEntry[])
+  : [];
+const retiringLookupTableAddresses = retiringLookupTables.map((entry) => new PublicKey(entry.address));
+accountAddresses.push(...retiringLookupTableAddresses);
 const uniqueAccountAddresses = [...new Map(accountAddresses.map((address) => [address.toBase58(), address])).values()];
 const accountInfos = await connection.getMultipleAccountsInfo(uniqueAccountAddresses, "confirmed");
 const accounts = new Map(uniqueAccountAddresses.map((address, index) => [address.toBase58(), accountInfos[index]]));
@@ -410,6 +415,25 @@ if (lookupTableAddress) {
   }
 }
 
+// Tables rotated out of active service (see
+// scripts/create-lookup-table.ts's rotation path) stay published in
+// retiringLookupTables until vsol/scripts/keeper.ts closes them onchain once
+// their positions have settled and the mandatory deactivation cooldown has
+// elapsed. Every entry still in the manifest must still exist onchain --
+// once keeper.ts closes one, it removes the entry from the manifest in the
+// same write, so a manifest entry with no matching onchain account is a
+// verification failure (a stale/incorrect manifest), not a silent skip.
+for (const entry of retiringLookupTables) {
+  const retiringTableAddress = new PublicKey(entry.address);
+  const retiringTableAccountInfo = accountInfo(retiringTableAddress);
+  if (!retiringTableAccountInfo) {
+    throw new Error(`Retiring address lookup table ${entry.address} is recorded in the manifest but does not exist onchain`);
+  }
+  if (!retiringTableAccountInfo.owner.equals(AddressLookupTableProgram.programId)) {
+    throw new Error(`Retiring address lookup table ${entry.address} is not owned by the AddressLookupTable program`);
+  }
+}
+
 console.log(JSON.stringify({
   ok: true,
   cluster,
@@ -420,5 +444,6 @@ console.log(JSON.stringify({
   pythFeedId: deployment.pythFeedId,
   smokePythFeedId: deployment.smokePythFeedId,
   addressLookupTable: deployment.addressLookupTable ?? null,
+  retiringLookupTables: retiringLookupTables.map((entry) => entry.address),
   verifiedAt: new Date().toISOString(),
 }, null, 2));

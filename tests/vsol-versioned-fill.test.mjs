@@ -273,6 +273,122 @@ test("resolveSignedVsolFillTransaction rejects a v0 transaction whose addressTab
   assert.equal(resolved, null, "a v0 transaction naming a foreign lookup table must be rejected outright");
 });
 
+// ALT rotation (see vsol/scripts/create-lookup-table.ts and
+// vsol/scripts/lib/lookup-table.ts): once the active table nears the ALT
+// program's 256-address cap, a fresh table becomes the CURRENT active one and
+// the old table moves to `retiringLookupTables`. A quote issued moments
+// before that rotation may already be compiled against the old (now
+// retiring) table, so resolveSignedVsolFillTransaction must still accept a
+// signed transaction that references it -- while continuing to reject any
+// table that isn't the current one or a published retiring one. This test
+// exercises that exact trust boundary via resolveSignedVsolFillTransaction's
+// optional `trustedLookupTables` override (defaults to
+// {VSOL_ADDRESS_LOOKUP_TABLE} ∪ {every VSOL_RETIRING_LOOKUP_TABLES address}
+// in production; overridden here only so the test does not depend on this
+// deployment's manifest actually having a table mid-rotation).
+test("resolveSignedVsolFillTransaction accepts a v0 transaction referencing a published RETIRING table, and still rejects a table outside {current} ∪ {retiring}", async () => {
+  const { server, resolver, vsol, sdk } = await loadModules();
+  const series = await resolveLiveNvda30D(resolver);
+  const buyer = Keypair.generate();
+
+  const { instructions } = await buildPlainFillInstructions({ server, vsol, sdk, series, buyer, nonce: 666_666_666n });
+  const retiringTableKey = Keypair.generate().publicKey;
+  assert.ok(
+    !retiringTableKey.equals(vsol.VSOL_ADDRESS_LOOKUP_TABLE),
+    "the retiring table's key must actually differ from the current active one",
+  );
+  const retiringTable = buildStubLookupTable(retiringTableKey, collectCandidateLookupAddresses(instructions));
+  const trustedLookupTables = [vsol.VSOL_ADDRESS_LOOKUP_TABLE, retiringTableKey];
+
+  const versionedTransaction = server.composeVsolFillTransaction({
+    feePayer: buyer.publicKey,
+    blockhash: Keypair.generate().publicKey.toBase58(),
+    lastValidBlockHeight: 1_000_000,
+    instructions,
+    lookupTableAccount: retiringTable,
+  });
+  versionedTransaction.sign([buyer]);
+  const raw = Buffer.from(versionedTransaction.serialize());
+
+  let queriedAddress = null;
+  const connection = {
+    getAddressLookupTable: async (address) => {
+      queriedAddress = address;
+      return { value: retiringTable };
+    },
+  };
+
+  const resolved = await server.resolveSignedVsolFillTransaction(raw, connection, trustedLookupTables);
+  assert.ok(resolved, "a v0 fill referencing a published retiring table must still resolve");
+  assert.ok(queriedAddress.equals(retiringTableKey), "resolution must fetch exactly the referenced retiring table, not the current one");
+  assert.equal(resolved.feePayer.toBase58(), buyer.publicKey.toBase58());
+
+  // The exact same trust list still rejects a table that is neither current
+  // nor retiring -- rotation widens the trusted set, it does not remove the
+  // foreign-table rejection this test file already covers above.
+  const foreignTableKey = Keypair.generate().publicKey;
+  const foreignTable = buildStubLookupTable(foreignTableKey, collectCandidateLookupAddresses(instructions));
+  const foreignTransaction = server.composeVsolFillTransaction({
+    feePayer: buyer.publicKey,
+    blockhash: Keypair.generate().publicKey.toBase58(),
+    lastValidBlockHeight: 1_000_000,
+    instructions,
+    lookupTableAccount: foreignTable,
+  });
+  foreignTransaction.sign([buyer]);
+  const foreignRaw = Buffer.from(foreignTransaction.serialize());
+  const connectionThatMustNotBeQueried = {
+    getAddressLookupTable: async () => {
+      throw new Error("SECURITY REGRESSION: a foreign table must never be queried, even with a widened trusted set");
+    },
+  };
+  const rejected = await server.resolveSignedVsolFillTransaction(foreignRaw, connectionThatMustNotBeQueried, trustedLookupTables);
+  assert.equal(rejected, null, "a table outside {current} ∪ {retiring} must still be rejected outright");
+});
+
+test("resolveSignedVsolFillTransaction rejects a v0 transaction whose addressTableLookups mix more than one distinct table, even if every named table is individually trusted", async () => {
+  const { server, resolver, vsol, sdk } = await loadModules();
+  const series = await resolveLiveNvda30D(resolver);
+  const buyer = Keypair.generate();
+
+  const { instructions } = await buildPlainFillInstructions({ server, vsol, sdk, series, buyer, nonce: 777_777_777n });
+  const candidateAddresses = collectCandidateLookupAddresses(instructions);
+  const tableA = Keypair.generate().publicKey;
+  const tableB = Keypair.generate().publicKey;
+  const stubA = buildStubLookupTable(tableA, candidateAddresses.slice(0, Math.ceil(candidateAddresses.length / 2)));
+  const stubB = buildStubLookupTable(tableB, candidateAddresses.slice(Math.ceil(candidateAddresses.length / 2)));
+
+  // composeVsolFillTransaction only ever compiles against a single table;
+  // build the mixed-table message directly to simulate a client that hand-
+  // crafted a transaction naming two distinct (even if both individually
+  // trusted) tables -- a shape this deployment's own composer never
+  // produces and which resolveSignedVsolFillTransaction must still refuse.
+  const v0Message = new TransactionMessage({
+    payerKey: buyer.publicKey,
+    recentBlockhash: Keypair.generate().publicKey.toBase58(),
+    instructions,
+  }).compileToV0Message([stubA, stubB]);
+  const versionedTransaction = new VersionedTransaction(v0Message);
+  versionedTransaction.sign([buyer]);
+  const raw = Buffer.from(versionedTransaction.serialize());
+
+  if (versionedTransaction.message.addressTableLookups.length < 2) {
+    // The two stub tables didn't end up splitting any eligible accounts
+    // (compileToV0Message may resolve everything from just one) -- nothing
+    // to assert in that case, but this should not happen given the fill
+    // instruction's account count comfortably exceeds one table's share.
+    assert.fail("test setup did not produce a transaction referencing more than one lookup table");
+  }
+
+  const connectionThatMustNotBeQueried = {
+    getAddressLookupTable: async () => {
+      throw new Error("SECURITY REGRESSION: a mixed-table transaction must be rejected before any table is queried");
+    },
+  };
+  const resolved = await server.resolveSignedVsolFillTransaction(raw, connectionThatMustNotBeQueried, [vsol.VSOL_ADDRESS_LOOKUP_TABLE, tableA, tableB]);
+  assert.equal(resolved, null, "a transaction referencing more than one distinct lookup table must be rejected outright");
+});
+
 test("resolveSignedVsolFillTransaction and inspectVsolFillTransaction accept and fully validate a correct v0 fill compiled against the pinned lookup table", async () => {
   const { server, resolver, vsol, sdk } = await loadModules();
   const series = await resolveLiveNvda30D(resolver);

@@ -23,6 +23,30 @@ import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
  */
 export const MAX_ADDRESSES_PER_EXTEND = 30;
 
+/**
+ * The address lookup table (ALT) program enforces a hard 256-address cap and
+ * has no way to delete individual entries. This deployment holds 11 stable
+ * addresses plus 2 per minted market, so at the grid's continuous mint rate
+ * the table fills in roughly 120 markets. scripts/create-lookup-table.ts
+ * rotates to a fresh table once the active one's stored-address count reaches
+ * this threshold, leaving headroom (256 - 230 = 26 slots, i.e. ~13 more
+ * markets) to finish any in-flight quotes before the old table is fully
+ * retired -- see ROTATION_ADDRESS_THRESHOLD's usage in
+ * shouldRotateLookupTable below.
+ */
+export const ROTATION_ADDRESS_THRESHOLD = 230;
+
+/**
+ * The AddressLookupTable program will not accept close_lookup_table until the
+ * deactivation slot has aged out of the runtime's 512-entry SlotHashes
+ * history (current_slot >= deactivation_slot + 512). scripts/keeper.ts must
+ * not attempt a close before this elapses -- see isLookupTableReadyToClose.
+ */
+export const ALT_DEACTIVATION_COOLDOWN_SLOTS = 512;
+
+/** Sentinel `deactivationSlot` value an ALT account holds while still active (never deactivated). Mirrors @solana/web3.js's AddressLookupTableAccount.isActive(). */
+export const ALT_NOT_DEACTIVATED_SENTINEL = 0xffffffffffffffffn;
+
 export type StableAddressEntry = {
   label: string;
   address: PublicKey;
@@ -75,4 +99,101 @@ export function stableFillAddresses(deployment: Record<string, unknown>): Stable
 export function missingAddresses(existing: PublicKey[], candidates: PublicKey[]): PublicKey[] {
   const existingSet = new Set(existing.map((address) => address.toBase58()));
   return candidates.filter((address) => !existingSet.has(address.toBase58()));
+}
+
+/**
+ * The subset of `deployment.markets` fields rotation cares about. Deliberately
+ * a structural (not nominal) type so callers can pass the manifest's raw
+ * `markets` array entries directly without a cast.
+ */
+export type ManifestMarketEntry = {
+  code: string;
+  address: string;
+  oracle: string;
+  expiry: number;
+  settlementGraceSeconds?: number;
+  maxSettlementStalenessSeconds?: number;
+};
+
+/**
+ * A table rotated out of active service (see create-lookup-table.ts) but not
+ * yet safe to deactivate/close: not-yet-settled positions quoted moments
+ * before rotation may still resolve indices against it. Stored in the
+ * manifest's `retiringLookupTables` array (see the ExtendedDeployment comment
+ * in app/lib/vsol.ts for the full manifest-shape documentation) alongside
+ * `addressLookupTable`, which always means "the CURRENT active table".
+ */
+export type RetiringLookupTableEntry = {
+  address: string;
+  /**
+   * The unix-seconds instant after which every market that was live in this
+   * table at rotation time has both expired and cleared its settlement grace
+   * and max-staleness window -- i.e. every position that could still
+   * reference this table's indices has had a chance to settle. Computed as
+   * the maximum of (expiry + settlementGraceSeconds + maxSettlementStalenessSeconds)
+   * across every market that was live at rotation time (see
+   * latestLiveMarketOutliveDeadline below); NOT merely the bare expiry.
+   */
+  outliveExpiry: number;
+  /** ISO timestamp this table was retired from active service (informational). */
+  retiredAt: string;
+};
+
+/** A market's absolute settlement deadline: the latest instant its onchain settlement could still land. */
+function marketSettlementDeadline(market: ManifestMarketEntry): number {
+  return market.expiry + (market.settlementGraceSeconds ?? 0) + (market.maxSettlementStalenessSeconds ?? 0);
+}
+
+/**
+ * Market+oracle addresses for every manifest market entry that has not yet
+ * expired as of `nowUnixSeconds`. Used to seed a freshly rotated ALT so it
+ * carries forward every rung that can still legitimately trade -- markets
+ * that have already expired are never trade targets again and are
+ * intentionally excluded, keeping the fresh table as small as possible.
+ */
+export function liveMarketFillAddresses(markets: ManifestMarketEntry[], nowUnixSeconds: number): PublicKey[] {
+  const addresses: PublicKey[] = [];
+  for (const market of markets) {
+    if (market.expiry > nowUnixSeconds) {
+      addresses.push(new PublicKey(market.address), new PublicKey(market.oracle));
+    }
+  }
+  return addresses;
+}
+
+/**
+ * The latest settlement deadline (see marketSettlementDeadline) among markets
+ * that are live as of `nowUnixSeconds` -- i.e. the instant a table being
+ * rotated out right now must outlive before every position that could
+ * reference it has had a chance to settle. Returns `nowUnixSeconds` itself
+ * (nothing to outlive) when no market is currently live.
+ */
+export function latestLiveMarketOutliveDeadline(markets: ManifestMarketEntry[], nowUnixSeconds: number): number {
+  const deadlines = markets.filter((market) => market.expiry > nowUnixSeconds).map(marketSettlementDeadline);
+  return deadlines.length > 0 ? Math.max(...deadlines) : nowUnixSeconds;
+}
+
+/** True once the active table's stored-address count has reached the rotation threshold. */
+export function shouldRotateLookupTable(storedAddressCount: number, threshold: number = ROTATION_ADDRESS_THRESHOLD): boolean {
+  return storedAddressCount >= threshold;
+}
+
+/** True once every market that could still reference `retiring` has had a chance to settle. */
+export function isLookupTableSafeToDeactivate(retiring: Pick<RetiringLookupTableEntry, "outliveExpiry">, nowUnixSeconds: number): boolean {
+  return nowUnixSeconds > retiring.outliveExpiry;
+}
+
+/**
+ * True once an already-deactivated table's mandatory cooldown has elapsed and
+ * close_lookup_table will be accepted onchain. `deactivationSlot` must be a
+ * real (non-sentinel) slot -- callers should check
+ * `deactivationSlot !== ALT_NOT_DEACTIVATED_SENTINEL` (or AddressLookupTableAccount.isActive())
+ * first.
+ */
+export function isLookupTableReadyToClose(
+  deactivationSlot: bigint,
+  currentSlot: number | bigint,
+  cooldownSlots: number = ALT_DEACTIVATION_COOLDOWN_SLOTS,
+): boolean {
+  return BigInt(currentSlot) >= deactivationSlot + BigInt(cooldownSlots);
 }
