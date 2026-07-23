@@ -1,0 +1,124 @@
+name: VSOL Keeper
+
+# Runs the VSOL rolling-grid keeper on a schedule so the short-dated 15M/1H
+# markets that the rolling grid needs get minted and authorized without a
+# human running `npm --prefix vsol run keeper` by hand.
+#
+# DEVNET ONLY. See docs/OPERATIONS.md for the full runbook, required
+# secrets, and the manual local-cron alternative to this workflow.
+
+on:
+  schedule:
+    # Every 10 minutes, offset off the hour to avoid the top-of-hour crush
+    # of scheduled jobs across all of GitHub Actions.
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: vsol-keeper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  keeper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: vsol/package-lock.json
+
+      # vsol/ is its own npm package with its own package-lock.json (it is
+      # not an npm workspace of the repo root, and the keeper script only
+      # ever imports files under vsol/ via relative paths), so only its own
+      # dependencies need to be installed here. The repo-root package.json
+      # is unrelated to running the keeper and is intentionally not touched.
+      - name: Install vsol dependencies
+        run: npm --prefix vsol ci
+
+      # Materialize the signer keypairs the keeper needs from GitHub
+      # secrets. Each secret holds a JSON array of secret-key bytes and is
+      # written to disk only via `env:` -> file redirection, never inlined
+      # into a command line and never echoed. vsol/.devnet/ is gitignored,
+      # and this job never commits, so nothing here can leak into git.
+      - name: Write devnet signer keypairs
+        working-directory: vsol
+        env:
+          CREATOR_KEY: ${{ secrets.VSOL_DEVNET_CREATOR_KEY }}
+          USDC_MINT_KEY: ${{ secrets.VSOL_DEVNET_USDC_MINT_KEY }}
+          RWA_MINT_KEY: ${{ secrets.VSOL_DEVNET_RWA_MINT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CREATOR_KEY:-}" ] || [ -z "${USDC_MINT_KEY:-}" ] || [ -z "${RWA_MINT_KEY:-}" ]; then
+            echo "Missing one or more required secrets: VSOL_DEVNET_CREATOR_KEY, VSOL_DEVNET_USDC_MINT_KEY, VSOL_DEVNET_RWA_MINT_KEY." >&2
+            echo "Set them in repo Settings -> Secrets and variables -> Actions. See docs/OPERATIONS.md." >&2
+            exit 1
+          fi
+          mkdir -p .devnet
+          printf '%s' "$CREATOR_KEY" > .devnet/devnet-creator.json
+          printf '%s' "$USDC_MINT_KEY" > .devnet/devnet-mock-usdc-mint.json
+          printf '%s' "$RWA_MINT_KEY" > .devnet/devnet-mock-rwa-mint.json
+
+      # The creator key pays rent for every market it mints and fees for
+      # settlement/cleanup, so it drains over time. Warn loudly when low;
+      # refuse to run (rather than spam failing transactions) when it's
+      # essentially empty. Funding it back up is a manual operator task --
+      # see docs/OPERATIONS.md. This never attempts to auto-airdrop.
+      - name: Check creator funding
+        working-directory: vsol
+        env:
+          VSOL_RPC_URL: ${{ secrets.VSOL_RPC_URL }}
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const { Connection, Keypair, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+
+          const WARN_SOL = 0.5;
+          const HALT_SOL = 0.01;
+
+          async function main() {
+            const rpcUrl = process.env.VSOL_RPC_URL;
+            if (!rpcUrl) {
+              console.error('VSOL_RPC_URL is not set; cannot check creator funding.');
+              process.exit(1);
+            }
+
+            const keyPath = path.resolve('.devnet/devnet-creator.json');
+            const secret = Uint8Array.from(JSON.parse(fs.readFileSync(keyPath, 'utf8')));
+            const creator = Keypair.fromSecretKey(secret);
+
+            const connection = new Connection(rpcUrl, 'confirmed');
+            const lamports = await connection.getBalance(creator.publicKey, 'confirmed');
+            const sol = lamports / LAMPORTS_PER_SOL;
+
+            console.log(`devnet-creator ${creator.publicKey.toBase58()} balance: ${sol.toFixed(4)} SOL`);
+
+            if (sol < HALT_SOL) {
+              console.error(`FATAL: devnet-creator balance (${sol.toFixed(4)} SOL) is essentially zero. Refusing to run the keeper and spam failing transactions -- fund this key before retrying. See docs/OPERATIONS.md.`);
+              process.exit(1);
+            }
+
+            if (sol < WARN_SOL) {
+              console.warn(`WARNING: devnet-creator balance (${sol.toFixed(4)} SOL) is below the ${WARN_SOL} SOL threshold. Top it up soon -- minting rent will keep draining it. Continuing anyway; a low balance may still allow the keeper to skip work safely. See docs/OPERATIONS.md.`);
+            }
+          }
+
+          main().catch((err) => {
+            console.error('Funding check failed: ' + (err && err.stack ? err.stack : String(err)));
+            process.exit(1);
+          });
+          JS
+
+      - name: Run keeper
+        run: npm --prefix vsol run keeper
+        env:
+          VSOL_RPC_URL: ${{ secrets.VSOL_RPC_URL }}
