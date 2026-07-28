@@ -72,6 +72,51 @@ const MARKET_SYMBOL = "NVDA";
 // never mint a rung the app derives a different market address for.
 const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v3`;
 
+/**
+ * Mirrors `MIN_MARKET_LEAD_SECONDS` in vsol/programs/vsol/src/lib.rs exactly
+ * (the on-chain constant is not exported through the SDK, so this is a
+ * hardcoded copy in the same spirit as PYTH_FEED_ID/MARKET_SYMBOL above --
+ * the keeper must agree with the program's own check, never re-derive it).
+ * `set_liquidity_pool_market` rejects with InvalidLastTradeCutoff unless
+ * `last_trade_at >= now + MIN_MARKET_LEAD_SECONDS && last_trade_at < expiry`.
+ */
+const MIN_MARKET_LEAD_SECONDS = 15;
+
+/**
+ * Extra headroom (beyond MIN_MARKET_LEAD_SECONDS) required before the keeper
+ * will bother creating a rung at all. Creating a market costs at least one
+ * confirmed transaction (plus an ALT extend), and this rung is authorized
+ * immediately afterward in the same pass -- so the cutoff must still be
+ * comfortably ahead of the lead window by the time that second transaction
+ * lands, not just at the instant the create decision is made. 60 seconds is
+ * generous relative to a single confirmed-commitment transaction's typical
+ * latency, while still tiny next to the shortest (15M) rung's own cadence.
+ */
+const CREATE_AUTHORIZE_MARGIN_SECONDS = 60;
+
+/**
+ * Pure mirror of the on-chain `set_liquidity_pool_market` cutoff check: true
+ * while `lastTradeAt` is still at least `minLeadSeconds` in the future and
+ * strictly before `expiry`. Exported so vsol/tests/keeper.test.ts can assert
+ * this in isolation -- no live RPC, no Connection, no Program instance.
+ *
+ * Used two ways here: (1) with the default (bare) lead, right before
+ * submitting an authorization, to proactively skip a rung that has aged out
+ * instead of sending a transaction the program will reject; and (2) with
+ * `minLeadSeconds` inflated by CREATE_AUTHORIZE_MARGIN_SECONDS, before ever
+ * creating a rung, so the keeper never mints a market that could not survive
+ * long enough to be authorized in the same pass.
+ */
+export function isRungAuthorizable(params: {
+  now: number;
+  lastTradeAt: number;
+  expiry: number;
+  minLeadSeconds?: number;
+}): boolean {
+  const minLead = params.minLeadSeconds ?? MIN_MARKET_LEAD_SECONDS;
+  return params.lastTradeAt >= params.now + minLead && params.lastTradeAt < params.expiry;
+}
+
 type Counters = {
   created: number;
   authorized: number;
@@ -203,11 +248,12 @@ async function extendLookupTableWithMarket(params: {
  * rotation time has expired and cleared its settlement window.
  *
  * Every failure here (RPC error, a lost race with a manual close, etc.) is
- * caught and logged, never thrown -- market maintenance (ensureMarkets /
- * ensurePoolAuthorizations) is the keeper's priority and must never be failed
- * by ALT lifecycle bookkeeping. This is the one place the keeper writes the
- * deployment manifest; it only ever rewrites `retiringLookupTables`, never
- * touches `addressLookupTable` or any market-creation state.
+ * caught and logged, never thrown -- market maintenance (processRungs's
+ * ensureMarketRung / authorizeRung pass) is the keeper's priority and must
+ * never be failed by ALT lifecycle bookkeeping. This is the one place the
+ * keeper writes the deployment manifest; it only ever rewrites
+ * `retiringLookupTables`, never touches `addressLookupTable` or any
+ * market-creation state.
  */
 async function processRetiringLookupTables(params: { authority: Keypair; counters: Counters }): Promise<void> {
   try {
@@ -282,116 +328,159 @@ async function processRetiringLookupTables(params: { authority: Keypair; counter
   }
 }
 
-type MarketRung = {
-  series: ScheduledSeries;
-  id: Buffer;
+type CreatedMarketRung = {
   market: PublicKey;
   oracle: PublicKey;
 };
 
-async function ensureMarkets(params: {
+/**
+ * Ensures a single rung's market exists (creating it if missing) and returns
+ * its address so the caller can immediately attempt authorization -- this is
+ * the interleaving that replaces the old create-all-then-authorize-all
+ * structure. On a cold start where all five rungs are missing at once, this
+ * keeps the create->authorize gap for any one rung down to roughly one
+ * transaction (this create) plus one best-effort ALT extend, instead of the
+ * full batch of up to ten transactions the previous two-pass design incurred.
+ *
+ * Returns undefined when there is (and will be) no market to authorize:
+ * either the rung is already too close to its own trade cutoff to be worth
+ * minting at all (see isRungAuthorizable/CREATE_AUTHORIZE_MARGIN_SECONDS), in
+ * which case it is about to roll onto the next boundary anyway.
+ */
+async function ensureMarketRung(params: {
   creatorProgram: Program<Vsol>;
   creator: Keypair;
   config: PublicKey;
   settlementMint: PublicKey;
   underlyingMint: PublicKey;
-  schedule: ScheduledSeries[];
+  series: ScheduledSeries;
   counters: Counters;
   addressLookupTable?: PublicKey;
-}): Promise<MarketRung[]> {
-  const rungs: MarketRung[] = [];
-  for (const series of params.schedule) {
-    const symbol = symbolBytes(MARKET_SYMBOL);
-    const id = await deriveMarketId({
-      pythFeedId: PYTH_FEED_BYTES,
-      settlementMint: params.settlementMint,
-      expiry: BigInt(series.expiry),
-      observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-      settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-      priceScale: PRICE_SCALE,
-      maxConfidenceBps: MAX_CONFIDENCE_BPS,
-      symbol,
-      maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
-    });
-    const market = deriveMarket(params.config, id);
-    const oracle = deriveOracle(market);
-    rungs.push({ series, id, market, oracle });
+  now: number;
+}): Promise<CreatedMarketRung | undefined> {
+  const { series } = params;
+  const symbol = symbolBytes(MARKET_SYMBOL);
+  const id = await deriveMarketId({
+    pythFeedId: PYTH_FEED_BYTES,
+    settlementMint: params.settlementMint,
+    expiry: BigInt(series.expiry),
+    observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+    settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+    priceScale: PRICE_SCALE,
+    maxConfidenceBps: MAX_CONFIDENCE_BPS,
+    symbol,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  });
+  const market = deriveMarket(params.config, id);
+  const oracle = deriveOracle(market);
 
-    if (await accountExists(market)) {
-      console.log(`skip: ${series.code} market already exists at ${market.toBase58()}`);
-      params.counters.skipped += 1;
-      continue;
-    }
-
-    try {
-      await params.creatorProgram.methods
-        .createMarket({
-          marketId: [...id],
-          underlyingMint: params.underlyingMint,
-          symbol,
-          priceScale: new BN(PRICE_SCALE.toString()),
-          expiry: new BN(series.expiry),
-          observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-          settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-          maxConfidenceBps: MAX_CONFIDENCE_BPS,
-          pythFeedId: PYTH_FEED_BYTES,
-          maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
-        })
-        .accountsStrict({
-          creator: params.creator.publicKey,
-          config: params.config,
-          market,
-          oracle,
-          settlementMint: params.settlementMint,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      console.log(
-        `created: ${series.code} market ${market.toBase58()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
-      );
-      params.counters.created += 1;
-
-      if (params.addressLookupTable) {
-        await extendLookupTableWithMarket({
-          authority: params.creator,
-          lookupTable: params.addressLookupTable,
-          code: series.code,
-          market,
-          oracle,
-          counters: params.counters,
-        });
-      } else {
-        console.log(`skip: ALT extension for ${series.code} -- no addressLookupTable is published in the manifest`);
-      }
-    } catch (error) {
-      if (isLostCreateRace(error) || (await accountExists(market))) {
-        console.log(`skip: ${series.code} market creation lost a create race at ${market.toBase58()}`);
-        params.counters.skipped += 1;
-        continue;
-      }
-      throw new Error(`Failed to create ${series.code} market ${market.toBase58()}: ${describeError(error)}`);
-    }
+  if (await accountExists(market)) {
+    console.log(`skip: ${series.code} market already exists at ${market.toBase58()}`);
+    params.counters.skipped += 1;
+    return { market, oracle };
   }
-  return rungs;
+
+  // Don't mint a rung that can never be authorized: if its trade cutoff is
+  // already inside (or within CREATE_AUTHORIZE_MARGIN_SECONDS of) the
+  // program's minimum lead window, creating it now would only produce a
+  // market this same pass's authorization attempt is guaranteed to reject.
+  if (
+    !isRungAuthorizable({
+      now: params.now,
+      lastTradeAt: series.lastTradeAt,
+      expiry: series.expiry,
+      minLeadSeconds: MIN_MARKET_LEAD_SECONDS + CREATE_AUTHORIZE_MARGIN_SECONDS,
+    })
+  ) {
+    console.log(
+      `skip: ${series.code} market not created -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is already within the ${MIN_MARKET_LEAD_SECONDS + CREATE_AUTHORIZE_MARGIN_SECONDS}s minimum-lead-plus-margin window of the current cluster time; it would only fail authorization and this rung is about to roll onto the next boundary`,
+    );
+    params.counters.skipped += 1;
+    return undefined;
+  }
+
+  try {
+    await params.creatorProgram.methods
+      .createMarket({
+        marketId: [...id],
+        underlyingMint: params.underlyingMint,
+        symbol,
+        priceScale: new BN(PRICE_SCALE.toString()),
+        expiry: new BN(series.expiry),
+        observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+        settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+        maxConfidenceBps: MAX_CONFIDENCE_BPS,
+        pythFeedId: PYTH_FEED_BYTES,
+        maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+      })
+      .accountsStrict({
+        creator: params.creator.publicKey,
+        config: params.config,
+        market,
+        oracle,
+        settlementMint: params.settlementMint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log(
+      `created: ${series.code} market ${market.toBase58()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
+    );
+    params.counters.created += 1;
+
+    if (params.addressLookupTable) {
+      await extendLookupTableWithMarket({
+        authority: params.creator,
+        lookupTable: params.addressLookupTable,
+        code: series.code,
+        market,
+        oracle,
+        counters: params.counters,
+      });
+    } else {
+      console.log(`skip: ALT extension for ${series.code} -- no addressLookupTable is published in the manifest`);
+    }
+    return { market, oracle };
+  } catch (error) {
+    if (isLostCreateRace(error) || (await accountExists(market))) {
+      console.log(`skip: ${series.code} market creation lost a create race at ${market.toBase58()}`);
+      params.counters.skipped += 1;
+      return { market, oracle };
+    }
+    throw new Error(`Failed to create ${series.code} market ${market.toBase58()}: ${describeError(error)}`);
+  }
 }
 
-async function ensurePoolAuthorizations(params: {
-  managerProgram: Program<Vsol>;
-  manager: Keypair;
+/**
+ * The outcome of the one-time (not per-rung) pool existence + manager-key
+ * check: `canAuthorize: false` means every rung's authorization attempt must
+ * be skipped for this run, but market creation (permissionless, checked
+ * separately) still proceeds normally. `poolBusy` mirrors the pool's
+ * open-positions/locked-collateral snapshot taken at the same time.
+ */
+type PoolAuthorizationContext =
+  | { canAuthorize: false }
+  | { canAuthorize: true; poolBusy: boolean; openPositions: string; lockedCollateral: string };
+
+/**
+ * Resolves the pool-level prerequisites for authorization exactly once per
+ * run (not once per rung): does the pool exist yet, and is the persisted key
+ * actually its manager. Both are one-time, whole-pool facts -- checking them
+ * per rung would just repeat the same RPC round trips five times for the
+ * same answer. Logs the existing skip lines when authorization cannot
+ * proceed at all; callers still create markets regardless of this result.
+ */
+async function resolvePoolAuthorizationContext(params: {
   creatorProgram: Program<Vsol>;
-  config: PublicKey;
+  manager: Keypair;
   pool: PublicKey;
-  rungs: MarketRung[];
-  counters: Counters;
-}): Promise<void> {
+}): Promise<PoolAuthorizationContext> {
   const poolInfo = await connection.getAccountInfo(params.pool, commitment);
   if (!poolInfo) {
     console.log(
       `skip: liquidity pool ${params.pool.toBase58()} does not exist yet; run "npm run devnet:bootstrap" before the keeper can authorize series on it`,
     );
-    params.counters.skipped += params.rungs.length;
-    return;
+    return { canAuthorize: false };
   }
 
   const poolAccount = await params.creatorProgram.account.liquidityPool.fetch(params.pool);
@@ -399,8 +488,7 @@ async function ensurePoolAuthorizations(params: {
     console.log(
       `skip: persisted key ${params.manager.publicKey.toBase58()} is not the manager of pool ${params.pool.toBase58()} (onchain manager is ${poolAccount.manager.toBase58()}); cannot authorize series`,
     );
-    params.counters.skipped += params.rungs.length;
-    return;
+    return { canAuthorize: false };
   }
 
   // set_liquidity_pool_market reverts (PoolHasOpenPositions) while the pool
@@ -410,53 +498,174 @@ async function ensurePoolAuthorizations(params: {
   // per-rung try/catch below still handles the case where the pool's state
   // flips between this check and the actual submit.
   const poolBusy = !poolAccount.openPositions.isZero() || !poolAccount.lockedCollateral.isZero();
+  return {
+    canAuthorize: true,
+    poolBusy,
+    openPositions: poolAccount.openPositions.toString(),
+    lockedCollateral: poolAccount.lockedCollateral.toString(),
+  };
+}
 
-  for (const { series, market } of params.rungs) {
-    const poolMarket = deriveLiquidityPoolMarket(params.pool, market);
-    const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
-    if (existing && existing.enabled && existing.lastTradeAt.toNumber() === series.lastTradeAt) {
-      console.log(`skip: ${series.code} pool authorization already current on ${params.pool.toBase58()}`);
-      params.counters.skipped += 1;
-      continue;
-    }
+/**
+ * Authorizes a single rung on the pool immediately after ensureMarketRung
+ * creates (or confirms) it -- the interleaved counterpart to the old
+ * ensurePoolAuthorizations batch loop. A timing-related rejection here must
+ * never abort the run (see the module docstring on this file's cold-start
+ * bug): it is always a logged skip, counted in `counters.skipped`, exactly
+ * like the pre-existing idempotent-skip and pool-busy cases. Only genuinely
+ * unexpected errors (e.g. Unauthorized, a missing/undeployed program) are
+ * still allowed to throw and fail the run.
+ */
+async function authorizeRung(params: {
+  series: ScheduledSeries;
+  market: PublicKey;
+  managerProgram: Program<Vsol>;
+  manager: Keypair;
+  config: PublicKey;
+  pool: PublicKey;
+  authContext: PoolAuthorizationContext;
+  counters: Counters;
+}): Promise<void> {
+  const { series, market, pool, authContext, counters } = params;
 
-    if (poolBusy) {
+  if (!authContext.canAuthorize) {
+    // The one-time pool-missing/wrong-manager line was already logged by
+    // resolvePoolAuthorizationContext; repeating it per rung would just spam
+    // the same fact five times.
+    counters.skipped += 1;
+    return;
+  }
+
+  const poolMarket = deriveLiquidityPoolMarket(pool, market);
+  const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
+  if (existing && existing.enabled && existing.lastTradeAt.toNumber() === series.lastTradeAt) {
+    console.log(`skip: ${series.code} pool authorization already current on ${pool.toBase58()}`);
+    counters.skipped += 1;
+    return;
+  }
+
+  if (authContext.poolBusy) {
+    console.log(
+      `skip: ${series.code} pool authorization deferred -- pool ${pool.toBase58()} has open positions (${authContext.openPositions}) or locked collateral (${authContext.lockedCollateral}); will retry once positions settle`,
+    );
+    counters.skipped += 1;
+    return;
+  }
+
+  // Proactive timing check against a freshly read cluster clock (not the
+  // `now` captured at the top of main -- earlier rungs in this same pass may
+  // have taken long enough that it is stale): mirrors set_liquidity_pool_market's
+  // own last_trade_at >= now + MIN_MARKET_LEAD_SECONDS && last_trade_at <
+  // expiry check, so an already-doomed transaction is never even sent.
+  const authorizeNow = await clusterUnixTime();
+  if (!isRungAuthorizable({ now: authorizeNow, lastTradeAt: series.lastTradeAt, expiry: series.expiry })) {
+    console.log(
+      `skip: ${series.code} pool authorization deferred -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of the cluster clock (or has passed expiry); this rung aged out during this keeper run and will be retried (or superseded by the next rolling rung) on the next pass`,
+    );
+    counters.skipped += 1;
+    return;
+  }
+
+  try {
+    await params.managerProgram.methods
+      .setLiquidityPoolMarket({ lastTradeAt: new BN(series.lastTradeAt), enabled: true })
+      .accountsStrict({
+        manager: params.manager.publicKey,
+        config: params.config,
+        pool,
+        market,
+        poolMarket,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log(`authorized: ${series.code} series on pool ${pool.toBase58()} (lastTradeAt ${series.lastTradeAt})`);
+    counters.authorized += 1;
+  } catch (error) {
+    if (anchorErrorCode(error) === "PoolHasOpenPositions") {
       console.log(
-        `skip: ${series.code} pool authorization deferred -- pool ${params.pool.toBase58()} has open positions (${poolAccount.openPositions.toString()}) or locked collateral (${poolAccount.lockedCollateral.toString()}); will retry once positions settle`,
+        `skip: ${series.code} pool authorization deferred -- pool ${pool.toBase58()} reported open positions at submit time; will retry once positions settle`,
       );
-      params.counters.skipped += 1;
-      continue;
+      counters.skipped += 1;
+      return;
     }
+    // The same timing rejection the proactive check above guards against,
+    // caught here as a backstop for the (much smaller, now that create and
+    // authorize are interleaved) race between that check and this submit
+    // landing onchain. This -- not a thrown, run-aborting error -- is the
+    // fix for the cold-start bug: one rung aging out must never take down
+    // the other four with it.
+    if (anchorErrorCode(error) === "InvalidLastTradeCutoff") {
+      console.log(
+        `skip: ${series.code} pool authorization rejected onchain (InvalidLastTradeCutoff) -- its trade cutoff is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of (or has passed) the cluster clock; will retry (or be superseded) on the next keeper pass (${describeError(error)})`,
+      );
+      counters.skipped += 1;
+      return;
+    }
+    if (isLostCreateRace(error)) {
+      console.log(`skip: ${series.code} pool authorization lost a race on ${pool.toBase58()}`);
+      counters.skipped += 1;
+      return;
+    }
+    throw new Error(`Failed to authorize ${series.code} series on pool ${pool.toBase58()}: ${describeError(error)}`);
+  }
+}
 
-    try {
-      await params.managerProgram.methods
-        .setLiquidityPoolMarket({ lastTradeAt: new BN(series.lastTradeAt), enabled: true })
-        .accountsStrict({
-          manager: params.manager.publicKey,
-          config: params.config,
-          pool: params.pool,
-          market,
-          poolMarket,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      console.log(`authorized: ${series.code} series on pool ${params.pool.toBase58()} (lastTradeAt ${series.lastTradeAt})`);
-      params.counters.authorized += 1;
-    } catch (error) {
-      if (anchorErrorCode(error) === "PoolHasOpenPositions") {
-        console.log(
-          `skip: ${series.code} pool authorization deferred -- pool ${params.pool.toBase58()} reported open positions at submit time; will retry once positions settle`,
-        );
-        params.counters.skipped += 1;
-        continue;
-      }
-      if (isLostCreateRace(error)) {
-        console.log(`skip: ${series.code} pool authorization lost a race on ${params.pool.toBase58()}`);
-        params.counters.skipped += 1;
-        continue;
-      }
-      throw new Error(`Failed to authorize ${series.code} series on pool ${params.pool.toBase58()}: ${describeError(error)}`);
-    }
+/**
+ * Drives the full per-rung pass: for every scheduled rung, in order (15M
+ * first -- the most time-critical), ensure its market exists and then
+ * immediately attempt its pool authorization, before moving on to the next
+ * rung. This is the interleaving fix for the cold-start bug: previously all
+ * five markets were created first and only then were all five
+ * authorizations attempted, so by the time the loop reached the 15M rung's
+ * authorization its trade cutoff (barely a quarter-hour out to begin with)
+ * had often already aged past the program's minimum lead window. The pool
+ * existence/manager-key check happens exactly once, up front, and never
+ * blocks market creation (which is permissionless).
+ */
+async function processRungs(params: {
+  creatorProgram: Program<Vsol>;
+  creator: Keypair;
+  managerProgram: Program<Vsol>;
+  manager: Keypair;
+  config: PublicKey;
+  pool: PublicKey;
+  settlementMint: PublicKey;
+  underlyingMint: PublicKey;
+  schedule: ScheduledSeries[];
+  counters: Counters;
+  addressLookupTable?: PublicKey;
+  now: number;
+}): Promise<void> {
+  const authContext = await resolvePoolAuthorizationContext({
+    creatorProgram: params.creatorProgram,
+    manager: params.manager,
+    pool: params.pool,
+  });
+
+  for (const series of params.schedule) {
+    const rung = await ensureMarketRung({
+      creatorProgram: params.creatorProgram,
+      creator: params.creator,
+      config: params.config,
+      settlementMint: params.settlementMint,
+      underlyingMint: params.underlyingMint,
+      series,
+      counters: params.counters,
+      addressLookupTable: params.addressLookupTable,
+      now: params.now,
+    });
+    if (!rung) continue; // No market exists (and none was worth creating) -- nothing to authorize.
+
+    await authorizeRung({
+      series,
+      market: rung.market,
+      managerProgram: params.managerProgram,
+      manager: params.manager,
+      config: params.config,
+      pool: params.pool,
+      authContext,
+      counters: params.counters,
+    });
   }
 }
 
@@ -473,7 +682,7 @@ async function main(): Promise<void> {
   // creates the passive pool with the same "creator" signer as its manager
   // (see bootstrap.ts's ensureLiquidityPool), so reusing that one persisted
   // key for both roles keeps the keeper aligned with the existing
-  // deployment without minting a new key file. ensurePoolAuthorizations
+  // deployment without minting a new key file. resolvePoolAuthorizationContext
   // still verifies this on-chain before authorizing anything.
   const creator = await loadRequiredKeypair(`${cluster}-creator`);
   const poolManager = creator;
@@ -505,25 +714,22 @@ async function main(): Promise<void> {
   // the manifest existing at all, let alone publishing an ALT yet.
   const addressLookupTable = await readAddressLookupTable();
 
-  const rungs = await ensureMarkets({
+  // Interleaved per-rung pass (create, then immediately authorize) -- see
+  // processRungs's docstring for why this replaced the old
+  // create-all-then-authorize-all two-pass structure.
+  await processRungs({
     creatorProgram,
     creator,
+    managerProgram,
+    manager: poolManager,
     config,
+    pool,
     settlementMint,
     underlyingMint,
     schedule,
     counters,
     addressLookupTable,
-  });
-
-  await ensurePoolAuthorizations({
-    managerProgram,
-    manager: poolManager,
-    creatorProgram,
-    config,
-    pool,
-    rungs,
-    counters,
+    now,
   });
 
   // ALT lifecycle bookkeeping runs last and is best-effort (see
@@ -539,7 +745,13 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((error: unknown) => {
-  console.error(describeError(error));
-  process.exitCode = 1;
-});
+// Guarded so vsol/tests/keeper.test.ts can import this module's pure
+// decision helpers (isRungAuthorizable) without triggering a live run --
+// import.meta.main is only true when this file is executed directly (e.g.
+// via "npm run keeper"), never when another module imports from it.
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    console.error(describeError(error));
+    process.exitCode = 1;
+  });
+}
