@@ -48,16 +48,36 @@ pub fn calculate_fee(premium: u64, fee_bps: u16) -> Result<u64> {
 
 /// Mints pool shares conservatively. Deposits round down so a depositor cannot
 /// dilute existing liquidity providers through integer division.
+///
+/// Both `calculate_deposit_shares` and `calculate_withdraw_amount` add a
+/// virtual offset of 1 share and 1 asset to every conversion (OpenZeppelin
+/// ERC-4626's `_decimalsOffset() == 0` convention: `shares = assets *
+/// (totalSupply + 1) / (totalAssets + 1)`, and the inverse for withdrawals).
+/// This is belt-and-braces on top of `LiquidityPool::total_assets` (the
+/// internal ledger callers now pass as `total_assets`, never the raw SPL
+/// token balance -- see `deposit_liquidity`/`withdraw_liquidity` in lib.rs):
+/// the ledger is what stops a donated-token balance from ever being used as
+/// the share-price denominator in the first place; the virtual offset is a
+/// second, independent bound that keeps the *very first* depositor from
+/// obtaining a cheap 1-share position that a later attacker could exploit
+/// through rounding even if the ledger were somehow wrong or bypassed. A
+/// phantom "1 share : 1 asset" position that nobody holds and nobody can
+/// withdraw is folded into every conversion, which costs real depositors a
+/// negligible amount of rounding dust and in exchange makes the classic
+/// first-depositor inflation attack unprofitable at any donation size.
 pub fn calculate_deposit_shares(amount: u64, total_shares: u64, total_assets: u64) -> Result<u64> {
     require!(amount > 0, VsolError::InvalidAmount);
-    if total_shares == 0 {
-        return Ok(amount);
-    }
-    require!(total_assets > 0, VsolError::PoolInsolvent);
+    // total_shares == 0 no longer needs a special-cased early return: with
+    // the virtual offset, shares = amount * 1 / 1 = amount when both are
+    // zero, identical to the old first-deposit behavior. What still needs
+    // guarding is genuine insolvency -- shares outstanding against zero
+    // ledger assets -- which is a distinct, real error state, not "pool not
+    // yet seeded".
+    require!(total_assets > 0 || total_shares == 0, VsolError::PoolInsolvent);
     let shares = (amount as u128)
-        .checked_mul(total_shares as u128)
+        .checked_mul((total_shares as u128) + 1)
         .ok_or(VsolError::MathOverflow)?
-        .checked_div(total_assets as u128)
+        .checked_div((total_assets as u128) + 1)
         .ok_or(VsolError::MathOverflow)?;
     let shares = u64::try_from(shares).map_err(|_| error!(VsolError::MathOverflow))?;
     require!(shares > 0, VsolError::DepositTooSmall);
@@ -65,15 +85,18 @@ pub fn calculate_deposit_shares(amount: u64, total_shares: u64, total_assets: u6
 }
 
 /// Returns underlying assets conservatively. Withdrawals round down and leave
-/// any division dust in the pool for remaining providers.
+/// any division dust in the pool for remaining providers. See
+/// `calculate_deposit_shares` for what the virtual offset (+1 share, +1
+/// asset) is doing here and why it's separate from the `total_assets` ledger
+/// fix.
 pub fn calculate_withdraw_amount(shares: u64, total_shares: u64, total_assets: u64) -> Result<u64> {
     require!(shares > 0, VsolError::InvalidAmount);
     require!(total_shares > 0, VsolError::InvalidPoolShares);
     require!(shares <= total_shares, VsolError::InvalidPoolShares);
     let amount = (shares as u128)
-        .checked_mul(total_assets as u128)
+        .checked_mul((total_assets as u128) + 1)
         .ok_or(VsolError::MathOverflow)?
-        .checked_div(total_shares as u128)
+        .checked_div((total_shares as u128) + 1)
         .ok_or(VsolError::MathOverflow)?;
     let amount = u64::try_from(amount).map_err(|_| error!(VsolError::MathOverflow))?;
     require!(amount > 0, VsolError::DepositTooSmall);
@@ -114,7 +137,13 @@ mod tests {
     fn pool_share_math_rounds_against_value_extraction() {
         assert_eq!(calculate_deposit_shares(1_000, 0, 0).unwrap(), 1_000);
         assert_eq!(calculate_deposit_shares(333, 1_000, 3_000).unwrap(), 111);
-        assert_eq!(calculate_withdraw_amount(111, 1_000, 3_001).unwrap(), 333);
+        // Pre-virtual-offset this was 333 (111 * 3_001 / 1_000, exact). With
+        // the +1/+1 virtual offset the conversion is
+        // 111 * (3_001 + 1) / (1_000 + 1) = 333_222 / 1_001 = 332 (floor) --
+        // one unit of extra rounding dust left behind in the pool, which is
+        // the deliberate cost of closing the first-depositor inflation
+        // attack (see calculate_deposit_shares's doc comment).
+        assert_eq!(calculate_withdraw_amount(111, 1_000, 3_001).unwrap(), 332);
         assert!(calculate_deposit_shares(1, 1, u64::MAX).is_err());
         assert!(calculate_deposit_shares(1, 1, 0).is_err());
         assert_eq!(calculate_bps_limit(10_000, 7_500).unwrap(), 7_500);

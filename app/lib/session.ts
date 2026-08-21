@@ -1,7 +1,8 @@
 // Shared server-side request helpers: wallet session resolution, origin
 // checks, and the JSON/log utilities that were previously duplicated across
 // API routes. Session resolution order is: valid wallet session cookie →
-// ChatGPT header identity (optional alternate) → localhost dev fallback.
+// ChatGPT header identity (ONLY when explicitly trusted, see
+// chatGptHeaderIdentityTrusted below) → localhost dev fallback.
 
 import { getChatGPTUser } from "../chatgpt-auth";
 import { runtimeEnv } from "./runtime-env";
@@ -19,6 +20,32 @@ import {
 // user data exists. Production requests fail closed without SESSION_SECRET.
 const LOCALHOST_DEV_SECRET = "tend-localhost-dev-session-secret";
 export const LOCAL_PREVIEW_USER = "local-preview@tend.local";
+
+/**
+ * Whether the `oai-authenticated-user-email` request header may be trusted as
+ * an identity.
+ *
+ * `getChatGPTUser()` reads that header with NO verification — it is an
+ * ordinary inbound HTTP header. That is safe only when the deployment sits
+ * behind the ChatGPT Apps proxy, which sets it and strips any client-supplied
+ * copy. On ANY other deployment (a standalone Cloudflare Worker, a preview
+ * URL, a custom domain) the header is fully attacker-controlled: sending
+ * `oai-authenticated-user-email: victim@example.com` with no cookie would
+ * otherwise let anyone read that user's positions, liquidity history, and
+ * simulation logs.
+ *
+ * So it is now OPT-IN and defaults to OFF: a deployment must explicitly set
+ * TRUST_CHATGPT_IDENTITY_HEADER=1, which should only ever be done for the
+ * ChatGPT-proxied deployment. Everywhere else, wallet sessions (SIWS) are the
+ * only identity — which is the intended end state anyway.
+ *
+ * Funds were never at risk through this path: every money-moving route
+ * independently verifies the caller's own signature over a server-pinned
+ * transaction. The exposure was read access to other users' financial data.
+ */
+function chatGptHeaderIdentityTrusted(): boolean {
+  return runtimeEnv("TRUST_CHATGPT_IDENTITY_HEADER") === "1";
+}
 
 export function json(body: unknown, status = 200, headers?: Record<string, string>) {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store", ...headers } });
@@ -62,8 +89,10 @@ export async function readSessionWallet(request: Request) {
 export async function resolveUserKey(request: Request) {
   const wallet = await readSessionWallet(request);
   if (wallet) return `wallet:${wallet}`;
-  const user = await getChatGPTUser();
-  if (user?.email) return user.email;
+  if (chatGptHeaderIdentityTrusted()) {
+    const user = await getChatGPTUser();
+    if (user?.email) return user.email;
+  }
   return isLocalhostRequest(request) ? LOCAL_PREVIEW_USER : null;
 }
 

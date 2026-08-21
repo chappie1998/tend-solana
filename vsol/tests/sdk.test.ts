@@ -18,9 +18,16 @@ import {
   derivePoolPositionVault,
   derivePosition,
   derivePositionVault,
+  isPoolUpdatePending,
+  isPoolUpdateTightening,
   liquidityPoolId,
   MARKET_SEED,
+  MARKET_CLEANUP_BUFFER_SECONDS,
   marketCloseableAfter,
+  MAX_POOL_UTILIZATION_BPS,
+  POOL_UPDATE_TIMELOCK_SECONDS,
+  poolUpdateEffectiveAt,
+  settlementDeadline,
   POOL_BUYBACK_DOMAIN,
   poolBuybackMessage,
   poolQuoteMessage,
@@ -196,15 +203,30 @@ test("factory market PDA derives from the deterministic market id", async () => 
 });
 
 test("marketCloseableAfter mirrors the on-chain close_settled_market deadline", () => {
-  // Same formula the Rust program uses (see `close_settled_market` and
-  // `refund_pool_position` in src/lib.rs): expiry + observation window +
-  // settlement grace, all in seconds.
+  // Same formula the Rust program uses (see `close_settled_market` in
+  // src/lib.rs): the settlement deadline (expiry + observation window +
+  // settlement grace) PLUS MARKET_CLEANUP_BUFFER_SECONDS.
   const expiry = 1_800_000_000n;
   const observationWindowSeconds = 30;
   const settlementGraceSeconds = 900;
+  const settlement = settlementDeadline({ expiry, observationWindowSeconds, settlementGraceSeconds });
+  assert.equal(settlement, expiry + BigInt(observationWindowSeconds) + BigInt(settlementGraceSeconds));
+  assert.equal(settlement, 1_800_000_930n);
+
   const deadline = marketCloseableAfter({ expiry, observationWindowSeconds, settlementGraceSeconds });
-  assert.equal(deadline, expiry + BigInt(observationWindowSeconds) + BigInt(settlementGraceSeconds));
-  assert.equal(deadline, 1_800_000_930n);
+  assert.equal(deadline, settlement + MARKET_CLEANUP_BUFFER_SECONDS);
+  assert.equal(deadline, 1_800_605_730n);
+});
+
+// The whole point of the buffer: a market must NOT become closeable at the
+// instant a stranded position first becomes refundable, or cleanup races the
+// refund and strands the escrow permanently.
+test("a market is not closeable until well after its positions become refundable", () => {
+  const params = { expiry: 1_800_000_000n, observationWindowSeconds: 30, settlementGraceSeconds: 900 };
+  const settlement = settlementDeadline(params);
+  const closeable = marketCloseableAfter(params);
+  assert.ok(closeable > settlement, "close deadline must be strictly after the refund deadline");
+  assert.equal(closeable - settlement, MARKET_CLEANUP_BUFFER_SECONDS);
 });
 
 test("marketCloseableAfter is strictly after expiry whenever either window is positive", () => {
@@ -222,7 +244,89 @@ test("marketCloseableAfter is strictly after expiry whenever either window is po
 test("pool share math rounds down and rejects insolvent or dust operations", () => {
   assert.equal(calculateDepositShares(1_000n, 0n, 0n), 1_000n);
   assert.equal(calculateDepositShares(333n, 1_000n, 3_000n), 111n);
-  assert.equal(calculateWithdrawAmount(111n, 1_000n, 3_001n), 333n);
+  // Pre-virtual-offset this was 333n (111 * 3_001 / 1_000, exact). The +1/+1
+  // virtual shares/assets offset (mirrors math.rs's calculate_withdraw_amount,
+  // OpenZeppelin ERC-4626 style) makes this 111 * 3_002 / 1_001 = 332n
+  // (floor) -- one unit of extra rounding dust, the deliberate cost of
+  // closing the first-depositor inflation attack.
+  assert.equal(calculateWithdrawAmount(111n, 1_000n, 3_001n), 332n);
   assert.throws(() => calculateDepositShares(1n, 1n, 0n), /insolvent/);
   assert.throws(() => calculateDepositShares(1n, 1n, 10n), /too small/);
+});
+
+// MAX_POOL_UTILIZATION_BPS / POOL_UPDATE_TIMELOCK_SECONDS: SDK-side mirrors of
+// the on-chain pool-drain fix (see vsol/programs/vsol/src/lib.rs). No pool can
+// be configured above 80% utilization, and raising a cap or rotating
+// quoteAuthority is timelocked 24h before it can be applied.
+
+test("MAX_POOL_UTILIZATION_BPS mirrors the on-chain protocol ceiling", () => {
+  assert.equal(MAX_POOL_UTILIZATION_BPS, 8_000);
+  assert.ok(MAX_POOL_UTILIZATION_BPS < 10_000, "must be strictly below 100% -- the whole point of the ceiling");
+});
+
+test("poolUpdateEffectiveAt mirrors the on-chain timelock computation", () => {
+  const now = 1_800_000_000n;
+  assert.equal(POOL_UPDATE_TIMELOCK_SECONDS, 86_400n);
+  assert.equal(poolUpdateEffectiveAt(now), now + 86_400n);
+});
+
+test("isPoolUpdatePending treats the zero sentinel as no pending change", () => {
+  assert.equal(isPoolUpdatePending(0n), false);
+  assert.equal(isPoolUpdatePending(1_800_000_000n), true);
+});
+
+test("isPoolUpdateTightening: lowering caps with the same authority is immediate", () => {
+  const authority = VSOL_PROGRAM_ID;
+  assert.equal(
+    isPoolUpdateTightening({
+      currentQuoteAuthority: authority,
+      currentMaxUtilizationBps: 8_000,
+      currentMaxPositionBps: 2_000,
+      nextQuoteAuthority: authority,
+      nextMaxUtilizationBps: 5_000,
+      nextMaxPositionBps: 1_000,
+    }),
+    true,
+  );
+  // Leaving both caps unchanged (same authority) is trivially safe too.
+  assert.equal(
+    isPoolUpdateTightening({
+      currentQuoteAuthority: authority,
+      currentMaxUtilizationBps: 8_000,
+      currentMaxPositionBps: 2_000,
+      nextQuoteAuthority: authority,
+      nextMaxUtilizationBps: 8_000,
+      nextMaxPositionBps: 2_000,
+    }),
+    true,
+  );
+});
+
+test("isPoolUpdateTightening: raising a cap or rotating the authority is timelocked", () => {
+  const authority = VSOL_PROGRAM_ID;
+  const otherAuthority = deriveConfig(); // any distinct pubkey
+  // Raising max_position_bps, authority unchanged.
+  assert.equal(
+    isPoolUpdateTightening({
+      currentQuoteAuthority: authority,
+      currentMaxUtilizationBps: 8_000,
+      currentMaxPositionBps: 2_000,
+      nextQuoteAuthority: authority,
+      nextMaxUtilizationBps: 8_000,
+      nextMaxPositionBps: 3_000,
+    }),
+    false,
+  );
+  // Rotating quoteAuthority even while lowering both caps.
+  assert.equal(
+    isPoolUpdateTightening({
+      currentQuoteAuthority: authority,
+      currentMaxUtilizationBps: 8_000,
+      currentMaxPositionBps: 2_000,
+      nextQuoteAuthority: otherAuthority,
+      nextMaxUtilizationBps: 1_000,
+      nextMaxPositionBps: 500,
+    }),
+    false,
+  );
 });

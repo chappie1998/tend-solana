@@ -70,7 +70,17 @@ const MARKET_SYMBOL = "NVDA";
 // ../sdk/index.ts (see the import above) — the single shared home with
 // vsol/scripts/bootstrap.ts and app/lib/launch-params.ts, so the keeper can
 // never mint a rung the app derives a different market address for.
-const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v3`;
+// MUST match the pool label in scripts/bootstrap.ts. The label is versioned
+// because a change to the LiquidityPool account layout requires a NEW PDA —
+// the program cannot grow an existing account, so bootstrap mints a fresh
+// pool at a new label and the old one is abandoned.
+//
+// Bumped v3 -> v4 on 2026-08-19 when `total_assets` and the pending_* timelock
+// fields took the struct from 214 to 266 bytes. Leaving this at v3 pointed the
+// keeper at the abandoned 214-byte pool and it died decoding it
+// ("offset out of range: 238 > 204") before minting a single rung, so the app
+// had no tradable series at all.
+const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v4`;
 
 /**
  * Mirrors `MIN_MARKET_LEAD_SECONDS` in vsol/programs/vsol/src/lib.rs exactly
@@ -603,6 +613,30 @@ async function authorizeRung(params: {
     }
     if (isLostCreateRace(error)) {
       console.log(`skip: ${series.code} pool authorization lost a race on ${pool.toBase58()}`);
+      counters.skipped += 1;
+      return;
+    }
+    // A disabled market is a DELIBERATE guardian action (set_market_enabled
+    // false), and authorize_pool_market refuses to enable a series on one --
+    // correctly. But it is not a reason to abandon the other rungs, for the
+    // same reason InvalidLastTradeCutoff above is not: one bad rung must
+    // never take down the other four.
+    //
+    // This bites on a real, recurring path rather than a hypothetical one:
+    // bootstrap disables the PREVIOUS deployment's uiMarket after an upgrade
+    // (see scripts/bootstrap.ts), and because market ids are a deterministic
+    // hash of their parameters, a later rung on the same expiry grid can
+    // derive that exact disabled account and inherit its state. Observed
+    // 2026-08-20: the EOD rung hit a disabled market and aborted the run
+    // before 7D and 30D were ever minted, leaving the app with no tradable
+    // series at those tenors at all. Skip and carry on; the rung recovers by
+    // itself at the next expiry boundary, when it derives a fresh address.
+    if (anchorErrorCode(error) === "MarketDisabled") {
+      console.log(
+        `skip: ${series.code} market is disabled onchain -- it was retired by the guardian (or by a prior ` +
+          `bootstrap) and cannot be authorized. The remaining rungs continue; this one recovers on its own ` +
+          `once the grid rolls to a fresh expiry. (${describeError(error)})`,
+      );
       counters.skipped += 1;
       return;
     }

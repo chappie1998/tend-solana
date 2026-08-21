@@ -199,7 +199,20 @@ export async function getPythRealizedVolatility(market: Market): Promise<Realize
   const returns = prices.slice(1).map((price, index) => Math.log(price / prices[index]));
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
   const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
-  const annualized = Math.sqrt(variance) * Math.sqrt(252) * 100;
+  // The annualization factor MUST match the cadence of the bars above, not
+  // the calendar. These are daily bars, and every market in app/lib/markets.ts
+  // is currently a US equity (NVDA), whose bars exist only on the ~252 trading
+  // days a year — so 252 is correct here, and NOT a "market hours" assumption
+  // about when Tend itself trades (Tend is 24/7; that is a separate concern
+  // from how many observations a year this feed actually produces).
+  //
+  // >>> Adding a CRYPTO market makes this wrong: crypto bars exist all 365
+  // >>> days, so sampling 365 returns/year and annualizing by sqrt(252)
+  // >>> understates realized vol by ~sqrt(365/252) = 1.20x, i.e. ~20% too
+  // >>> cheap. When the first non-equity market lands, derive this per-market
+  // >>> from the feed's own bar cadence instead of hardcoding it.
+  const barsPerYear = 252;
+  const annualized = Math.sqrt(variance) * Math.sqrt(barsPerYear) * 100;
   if (!Number.isFinite(annualized) || annualized < 1 || annualized > 400) throw new Error("Pyth volatility result is outside risk bounds");
   const value = {
     value: annualized,

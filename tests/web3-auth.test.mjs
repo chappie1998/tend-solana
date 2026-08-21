@@ -22,8 +22,18 @@ test("session cookie HMAC tokens round-trip and reject tampering", async () => {
   })).toString("base64url");
   assert.equal(await tokens.verifySessionToken(`${version}.${forgedPayload}.${signature}`, secret), null);
 
-  // Tampered signature.
-  const flipped = signature.slice(0, -1) + (signature.at(-1) === "A" ? "B" : "A");
+  // Tampered signature. Flip a bit in the DECODED bytes, not in the base64url
+  // text: an HMAC-SHA256 signature is 32 bytes, so its base64url form carries
+  // two unused padding bits in the final character. Flipping that character
+  // between "A" and "B" changes only padding and decodes to the identical
+  // bytes — nothing is tampered, verification correctly succeeds, and this
+  // assertion then fails. That happened for roughly 1 signature in 16 (the
+  // odds the last character is "A" or "B"), which is exactly the intermittent
+  // failure this suite used to show.
+  const signatureBytes = Buffer.from(signature, "base64url");
+  signatureBytes[0] ^= 0x01;
+  const flipped = signatureBytes.toString("base64url");
+  assert.notEqual(flipped, signature, "the tampered signature must actually differ");
   assert.equal(await tokens.verifySessionToken(`${version}.${payload}.${flipped}`, secret), null);
 
   // Wrong secret, expiry in the past, structural garbage.
@@ -234,7 +244,22 @@ test("wallet-native auth surfaces exist and keep the audited patterns", async ()
   assert.match(signoutRoute, /signOutCookie/);
   assert.match(sessionLib, /SESSION_SECRET/);
   assert.match(sessionLib, /wallet:\$\{wallet\}/, "session wallet is the primary user key");
-  assert.match(sessionLib, /getChatGPTUser/, "ChatGPT header identity stays as optional alternate");
+  // The `oai-authenticated-user-email` header is an unverified inbound header.
+  // It is only safe behind the ChatGPT Apps proxy, so trusting it must be
+  // OPT-IN — a standalone deployment (Cloudflare Worker, preview URL, custom
+  // domain) would otherwise let anyone forge it and read another user's
+  // positions, liquidity history and simulation logs.
+  assert.match(sessionLib, /getChatGPTUser/, "ChatGPT header identity remains available behind the opt-in flag");
+  assert.match(
+    sessionLib,
+    /chatGptHeaderIdentityTrusted\(\)/,
+    "the ChatGPT header must be gated behind an explicit trust check, never read unconditionally",
+  );
+  assert.match(
+    sessionLib,
+    /TRUST_CHATGPT_IDENTITY_HEADER"\) === "1"/,
+    "the trust flag must default to OFF (explicit opt-in only)",
+  );
   assert.match(chainRoute, /readSessionWallet/);
   assert.match(chainRoute, /describeRpcFailure/);
   assert.doesNotMatch(chainRoute, /resolveUserKey/, "chain reads require the wallet session, not weaker fallbacks");

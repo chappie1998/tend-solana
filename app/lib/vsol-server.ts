@@ -270,6 +270,23 @@ type DecodedPool = {
   maxUtilizationBps: number;
   maxPositionBps: number;
   manager: PublicKey;
+  pendingQuoteAuthority: PublicKey;
+  pendingMaxUtilizationBps: number;
+  pendingMaxPositionBps: number;
+  /// 0n means no pending change; otherwise the unix second the manager's
+  /// proposed config becomes applyable.
+  pendingEffectiveAt: bigint;
+  /// The pool's own internal ledger of free (unlocked) settlement tokens --
+  /// NOT the raw SPL `pool_token` balance. Anyone can inflate the raw
+  /// balance with a plain `spl-token transfer` that never goes through
+  /// `deposit_liquidity` (a token account's owner cannot refuse incoming
+  /// transfers), so the program tracks its own ledger and uses THIS value,
+  /// not the physical balance, as the share-price denominator. See
+  /// `total_assets` on `LiquidityPool` in vsol/programs/vsol/src/lib.rs.
+  /// In ordinary operation (no donation) this equals the raw balance
+  /// exactly; a donation makes the raw balance exceed this by the donated
+  /// amount, which becomes inert dust never counted by any share math.
+  totalAssets: bigint;
 };
 
 type PoolCore = {
@@ -363,8 +380,16 @@ export function decodeOracleAccount(data: Buffer) {
   };
 }
 
+// 266 bytes, not 258: the program appended `total_assets: u64` to
+// `LiquidityPool` for the donation/first-depositor-inflation fix (see
+// `total_assets`'s doc comment on `LiquidityPool` in
+// vsol/programs/vsol/src/lib.rs). The length check here is EXACT, so it is a
+// hard failure -- not a silent degradation -- if this drifts from the
+// on-chain struct. Existing byte offsets are unchanged because the new field
+// was appended at the end; verified against `8 + LiquidityPool::INIT_SPACE`
+// (the real, compiled account size), not just arithmetic.
 export function decodePoolAccount(data: Buffer): DecodedPool {
-  expectAccount(data, 214, POOL_ACCOUNT_DISCRIMINATOR, "VSOL liquidity pool");
+  expectAccount(data, 266, POOL_ACCOUNT_DISCRIMINATOR, "VSOL liquidity pool");
   return {
     bump: data[8],
     tokenBump: data[9],
@@ -380,6 +405,14 @@ export function decodePoolAccount(data: Buffer): DecodedPool {
     maxUtilizationBps: data.readUInt16LE(178),
     maxPositionBps: data.readUInt16LE(180),
     manager: publicKeyAt(data, 182),
+    // A pending manager-proposed config change, visible to LPs so they can
+    // withdraw before it takes effect -- the entire point of the timelock.
+    // `pendingEffectiveAt === 0n` means "nothing pending".
+    pendingQuoteAuthority: publicKeyAt(data, 214),
+    pendingMaxUtilizationBps: data.readUInt16LE(246),
+    pendingMaxPositionBps: data.readUInt16LE(248),
+    pendingEffectiveAt: data.readBigInt64LE(250),
+    totalAssets: data.readBigUInt64LE(258),
   };
 }
 
@@ -603,7 +636,17 @@ async function getPoolCore(connection: Connection): Promise<PoolCore> {
     && config.domainVersion === deployment.domainVersion;
   if (!exactBinding) throw new Error("The published V2 liquidity manifest does not match verified onchain state");
   if (config.paused) throw new Error("The VSOL protocol is paused onchain");
-  return { config, pool, poolAssets: poolToken.amount, decimals: mint.decimals };
+  // `pool.totalAssets` (the program's own ledger), NOT `poolToken.amount`
+  // (the raw SPL balance): the two diverge exactly when someone has donated
+  // tokens directly to the vault, and every on-chain share-price/utilization
+  // calculation this app must mirror (buildVsolQuoteTransaction below, and
+  // calculateDepositShares/calculateWithdrawAmount in
+  // app/api/vsol/liquidity/prepare/route.ts) now uses the ledger. Using the
+  // raw balance here would silently drift from what the program actually
+  // computes -- with `minimumOutputAtoms` set to an exact (zero-tolerance)
+  // prediction in the prepare route, that drift would fail every deposit/
+  // withdrawal on-chain with SlippageExceeded, not just misreport a number.
+  return { config, pool, poolAssets: pool.totalAssets, decimals: mint.decimals };
 }
 
 // Authorization for a (pool, market) pair is verified entirely on-chain here,
@@ -899,8 +942,14 @@ export async function getVsolLiquidityState(owner?: PublicKey, connection = getV
     }
     walletAssets = wallet.amount;
   }
+  // Same +1/+1 virtual-offset conversion as calculateWithdrawAmount below,
+  // inlined (rather than calling it) because this is a best-effort display
+  // estimate for a dust-sized holding shares could legitimately round to
+  // zero here, and this call site must not throw for that -- unlike the
+  // prepare route, nothing downstream depends on this being an exact,
+  // zero-tolerance prediction.
   const redeemable = shares > 0n && core.pool.totalShares > 0n
-    ? shares * core.poolAssets / core.pool.totalShares
+    ? (shares * (core.poolAssets + 1n)) / (core.pool.totalShares + 1n)
     : 0n;
   state.provider = {
     address: providerAddress.toBase58(),
@@ -1539,18 +1588,25 @@ export async function resolveSignedVsolFillTransaction(
   return { feePayer, instructions };
 }
 
+// Mirrors the on-chain `calculate_deposit_shares`/`calculate_withdraw_amount`
+// (vsol/programs/vsol/src/math.rs) EXACTLY, including the +1/+1 virtual
+// shares/assets offset -- this is the "prepare" API route's only source for
+// `minimumOutputAtoms` (app/api/vsol/liquidity/prepare/route.ts), which is
+// passed on-chain as `min_shares_out`/`min_amount_out` with ZERO slippage
+// tolerance (set to the predicted value itself, not a buffered floor). Any
+// drift from the on-chain formula here does not just misreport a number --
+// it fails every deposit/withdrawal on-chain with SlippageExceeded.
 export function calculateDepositShares(amount: bigint, totalShares: bigint, totalAssets: bigint) {
   if (amount <= 0n || totalShares < 0n || totalAssets < 0n) throw new RangeError("Invalid pool share parameters");
-  if (totalShares === 0n) return amount;
-  if (totalAssets === 0n) throw new RangeError("The liquidity pool is insolvent");
-  const result = amount * totalShares / totalAssets;
+  if (totalAssets === 0n && totalShares > 0n) throw new RangeError("The liquidity pool is insolvent");
+  const result = amount * (totalShares + 1n) / (totalAssets + 1n);
   if (result === 0n) throw new RangeError("The deposit is too small to mint a pool share");
   return result;
 }
 
 export function calculateWithdrawAmount(shares: bigint, totalShares: bigint, totalAssets: bigint) {
   if (shares <= 0n || totalShares <= 0n || shares > totalShares || totalAssets < 0n) throw new RangeError("Invalid pool share parameters");
-  const result = shares * totalAssets / totalShares;
+  const result = shares * (totalAssets + 1n) / (totalShares + 1n);
   if (result === 0n) throw new RangeError("The withdrawal is too small");
   return result;
 }

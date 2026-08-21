@@ -8,15 +8,16 @@
   },
   "scripts": {
     "build:program": "anchor build",
-    "test:rust": "cargo test --workspace --all-targets",
+    "test:rust": "npm run build:program && cargo test --workspace --all-targets",
     "test:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "test:sdk": "node --import tsx --test tests/*.test.ts",
-    "check": "npm run build:program && npm run test:rust && npm run test:lint && npm run test:sdk",
+    "check": "npm run test:rust && npm run test:lint && npm run test:sdk",
     "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
     "devnet:verify": "node --import tsx scripts/verify-deployment.ts",
     "keeper": "node --import tsx scripts/keeper.ts",
     "cranker": "node --import tsx scripts/cranker.ts",
-    "lookup-table": "node --import tsx scripts/create-lookup-table.ts"
+    "lookup-table": "node --import tsx scripts/create-lookup-table.ts",
+    "test:rust:only": "cargo test --workspace --all-targets"
   },
   "dependencies": {
     "@anchor-lang/core": "1.0.2",

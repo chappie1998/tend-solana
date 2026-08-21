@@ -224,6 +224,27 @@ impl Harness {
         .unwrap();
         self.send_ok(payer, &[ix], &[mint_authority]);
     }
+
+    /// A raw SPL Token `transfer` from `source` (owned by `owner`) straight
+    /// to `destination`, bypassing every vsol instruction. Used to simulate
+    /// a "donation attack": a token account's owner cannot refuse incoming
+    /// transfers, so anyone holding tokens can push them into e.g. a pool's
+    /// `pool_token` vault without ever calling `deposit_liquidity`. Tests use
+    /// this to prove `LiquidityPool::total_assets` (the program's internal
+    /// ledger) is immune to exactly this -- see its doc comment in
+    /// `vsol/programs/vsol/src/lib.rs`.
+    pub fn transfer_tokens(&mut self, owner: &Keypair, source: &Pubkey, destination: &Pubkey, amount: u64) {
+        let ix = spl_token::instruction::transfer(
+            &spl_token::ID,
+            source,
+            destination,
+            &owner.pubkey(),
+            &[],
+            amount,
+        )
+        .unwrap();
+        self.send_ok(owner, &[ix], &[]);
+    }
 }
 
 /// Extracts the Anchor custom error code (e.g. `u32::from(VsolError::X)`)

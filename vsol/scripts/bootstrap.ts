@@ -790,7 +790,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:tUSDC:main-v3`,
+    label: `${cluster}:tUSDC:main-v4`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 2_500,
   });
@@ -837,6 +837,13 @@ async function main(): Promise<void> {
 
   const smokeExpiry = (await clusterUnixTime()) + (cluster === "localnet" ? 30 : 75);
   const runId = `${Date.now()}`;
+  // Staleness must respect the program's MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO
+  // (create_market): max_staleness <= (observation_window + settlement_grace) * 100.
+  // The smoke markets deliberately use tiny windows so the adversarial lifecycle
+  // runs in seconds rather than 15 minutes, so the 24h production staleness would
+  // exceed the ratio by 1.2x and 43x respectively and be rejected. Scale it to the
+  // window instead of pinning it — these markets never need a long last-known-price
+  // fallback, they expire within the run.
   const successMarket = await createMarket({
     creatorProgram,
     creator,
@@ -847,7 +854,8 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
     observationWindowSeconds: 120,
     settlementGraceSeconds: 600,
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+    // (120 + 600) * 10 — well inside the ratio bound. See the note above.
+    maxSettlementStalenessSeconds: 7_200,
     pythFeedId: smokePythFeedBytes,
   });
   const refundMarket = await createMarket({
@@ -860,7 +868,8 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
     observationWindowSeconds: 5,
     settlementGraceSeconds: 15,
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+    // (5 + 15) * 10 — well inside the ratio bound. See the note above.
+    maxSettlementStalenessSeconds: 200,
     pythFeedId: smokePythFeedBytes,
   });
 
@@ -870,7 +879,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:smoke-v3:${runId}`,
+    label: `${cluster}:smoke-v4:${runId}`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 5_000,
   });
@@ -1152,7 +1161,8 @@ async function main(): Promise<void> {
     expiry: closeExpiry,
     observationWindowSeconds: 120,
     settlementGraceSeconds: 600,
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+    // (120 + 600) * 10 — well inside the ratio bound. See the note above.
+    maxSettlementStalenessSeconds: 7_200,
     pythFeedId: smokePythFeedBytes,
   });
   const closePoolMarket = await authorizePoolMarket({
@@ -1315,9 +1325,26 @@ async function main(): Promise<void> {
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .rpc();
-  if ((await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount !== 0n) {
-    throw new Error("Pool withdrawal did not return all realized assets to the provider");
+  // The pool cannot drain to exactly zero any more, and that is deliberate.
+  // calculate_deposit_shares / calculate_withdraw_amount carry a virtual +1
+  // offset on both shares and assets (OpenZeppelin ERC-4626 style), so a full
+  // withdrawal rounds down and leaves a few base units behind. That residue is
+  // exactly what makes the first-depositor inflation attack unprofitable — an
+  // attacker who deposits 1 unit and donates a large amount can no longer
+  // recover more than they put in. Asserting == 0n here would be asserting the
+  // absence of that protection.
+  //
+  // So bound the dust instead of demanding zero: it must be small and
+  // non-increasing in the pool's size, never a material fraction of deposits.
+  const poolDust = (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount;
+  const MAX_POOL_DUST = 1_000n; // base units (tUSDC has 6 decimals => <= 0.001 tUSDC)
+  if (poolDust > MAX_POOL_DUST) {
+    throw new Error(
+      `Pool withdrawal left ${poolDust} base units behind, above the ${MAX_POOL_DUST} rounding-dust bound — ` +
+        "that is real value stranded, not the virtual-offset residue.",
+    );
   }
+  console.log(`  pool residue after full withdrawal: ${poolDust} base units (virtual-offset dust, bound ${MAX_POOL_DUST})`);
 
   const deployment: Deployment = {
     cluster,
@@ -1398,7 +1425,12 @@ async function main(): Promise<void> {
       smokeProvider: smokeProvider.toBase58(),
       poolConservationVerified: settledPoolAssets === expectedPoolAssets,
       poolObligationsCleared: poolAccount.openPositions.isZero() && poolAccount.lockedCollateral.isZero(),
-      poolWithdrawalCleared: (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount === 0n,
+      // "Cleared" now means "drained to within the virtual-offset rounding
+      // dust", not "exactly zero" — a full withdrawal deliberately strands a
+      // few base units, which is what makes the first-depositor inflation
+      // attack unprofitable. Bound must match verify-deployment.ts.
+      poolWithdrawalCleared:
+        (await getAccount(connection, smokePool.poolToken, commitment, TOKEN_PROGRAM_ID)).amount <= MAX_POOL_DUST,
       closeEarlyFillSignature: closeFillSignature,
       closeEarlySignature,
       closeEarlyPosition: closeFill.position.toBase58(),

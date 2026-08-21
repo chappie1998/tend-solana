@@ -352,10 +352,16 @@ if (
   !smokePoolAccount?.owner.equals(programId)
   || smokePoolAccount.data.length < 214
   || new PublicKey(smokePoolAccount.data.subarray(182, 214)).equals(PublicKey.default)
-  || smokePoolAccount.data.readBigUInt64LE(138) !== 0n
+  || smokePoolAccount.data.readBigUInt64LE(138) > 1_000n // totalShares: dust, see below
   || smokePoolAccount.data.readBigUInt64LE(146) !== 0n
   || smokePoolAccount.data.readBigUInt64LE(154) !== 0n
-  || smokePoolToken.amount !== 0n
+  // NOT `!== 0n`: the share math carries a virtual +1 offset on both shares
+  // and assets, so a full withdrawal rounds down and deliberately strands a
+  // few base units. That residue is what makes the first-depositor inflation
+  // attack unprofitable, so demanding an exactly-empty pool would be asserting
+  // the absence of that protection. Bound the dust instead (tUSDC has 6
+  // decimals, so 1_000 base units is 0.001 tUSDC).
+  || smokePoolToken.amount > 1_000n
   || smokePoolToken.owner.toBase58() !== smokePoolAddress.toBase58()
   || !smokeProvider?.owner.equals(programId)
   || smokeProvider.data.length < 97

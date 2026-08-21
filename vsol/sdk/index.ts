@@ -39,6 +39,16 @@ export const MARKET_MAX_CONFIDENCE_BPS = 500;
 // Tier 2's last-known-price fallback window: 24h is generous enough to cover
 // a full overnight/weekend gap in the Pyth equities feed while still keeping
 // a hard ceiling on how old a settlement print can be.
+//
+// `create_market` additionally rejects any market where this is
+// disproportionately large relative to
+// `MARKET_OBSERVATION_WINDOW_SECONDS + MARKET_SETTLEMENT_GRACE_SECONDS` (see
+// `MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO` in vsol/programs/vsol/src/lib.rs).
+// This configuration's ratio is 86_400 / (30 + 900) ≈ 93, comfortably under
+// the on-chain cap of 100 -- if either of the three constants above ever
+// changes, re-check that ratio still holds before deploying, or
+// `initialize`/`create_market` calls using these values will start
+// reverting with `InvalidSettlementStaleness`.
 export const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
 
 export type Quote = {
@@ -353,11 +363,22 @@ export function derivePoolPositionVault(position: PublicKey, programId = VSOL_PR
   return PublicKey.findProgramAddressSync([POOL_POSITION_VAULT_SEED, position.toBuffer()], programId)[0];
 }
 
+// Mirrors the on-chain `calculate_deposit_shares`/`calculate_withdraw_amount`
+// (vsol/programs/vsol/src/math.rs) byte-for-byte, including the virtual
+// shares/assets offset: every conversion adds 1 to both `totalShares` and
+// `totalAssets` (OpenZeppelin ERC-4626's `_decimalsOffset() == 0`
+// convention). This is belt-and-braces on top of the on-chain
+// `LiquidityPool.totalAssets` ledger, which is the primary fix for the
+// donation/first-depositor inflation attack -- `totalAssets` tracks only
+// what actually moved through `depositLiquidity`/`withdrawLiquidity`/etc,
+// never the raw (donation-inflatable) SPL token balance. The virtual offset
+// additionally bounds the very first depositor's exposure to rounding, even
+// if the ledger were somehow wrong. See `calculate_deposit_shares`'s doc
+// comment in math.rs for the full rationale.
 export function calculateDepositShares(amount: bigint, totalShares: bigint, totalAssets: bigint): bigint {
   if (amount <= 0n || totalShares < 0n || totalAssets < 0n) throw new RangeError("invalid pool share parameters");
-  if (totalShares === 0n) return amount;
-  if (totalAssets === 0n) throw new RangeError("pool is insolvent");
-  const shares = (amount * totalShares) / totalAssets;
+  if (totalAssets === 0n && totalShares > 0n) throw new RangeError("pool is insolvent");
+  const shares = (amount * (totalShares + 1n)) / (totalAssets + 1n);
   if (shares === 0n) throw new RangeError("deposit is too small");
   return shares;
 }
@@ -366,18 +387,23 @@ export function calculateWithdrawAmount(shares: bigint, totalShares: bigint, tot
   if (shares <= 0n || totalShares <= 0n || shares > totalShares || totalAssets < 0n) {
     throw new RangeError("invalid pool share parameters");
   }
-  const amount = (shares * totalAssets) / totalShares;
+  const amount = (shares * (totalAssets + 1n)) / (totalShares + 1n);
   if (amount === 0n) throw new RangeError("withdrawal is too small");
   return amount;
 }
 
-// Mirrors the on-chain `close_settled_market` (and `refund_pool_position`)
-// deadline computation byte-for-byte: `expiry + observation_window_seconds +
-// settlement_grace_seconds`. The instruction requires `now > deadline`
-// (strictly), so an off-chain cleaner should treat this value as "not yet
-// safe to close" and only call `close_settled_market` once the cluster
-// clock has moved *past* it.
-export function marketCloseableAfter(params: {
+/// MUST match `MARKET_CLEANUP_BUFFER_SECONDS` in
+/// vsol/programs/vsol/src/lib.rs (and the copy in scripts/lib/settlement.ts).
+export const MARKET_CLEANUP_BUFFER_SECONDS = 604_800n;
+
+// Mirrors the on-chain `refund_unsettled`/`refund_pool_position` deadline
+// byte-for-byte: `expiry + observation_window_seconds +
+// settlement_grace_seconds`. This is when a position whose oracle never
+// finalized first becomes refundable.
+//
+// NOTE this is NOT when a market becomes closeable -- see
+// `marketCloseableAfter` below, which adds the cleanup buffer on top.
+export function settlementDeadline(params: {
   expiry: bigint;
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
@@ -385,9 +411,86 @@ export function marketCloseableAfter(params: {
   return params.expiry + BigInt(params.observationWindowSeconds) + BigInt(params.settlementGraceSeconds);
 }
 
+// Mirrors the on-chain `close_settled_market` deadline: the settlement
+// deadline PLUS `MARKET_CLEANUP_BUFFER_SECONDS`. The instruction requires
+// `now > deadline` (strictly), so an off-chain cleaner should treat this
+// value as "not yet safe to close" and only call `close_settled_market` once
+// the cluster clock has moved *past* it.
+//
+// The buffer exists because closing a market makes `settle`/`refund_*`
+// permanently unconstructible for any position still referencing it. Closing
+// at the settlement deadline itself -- which this function used to return --
+// races in-flight refunds and strands their escrow forever.
+export function marketCloseableAfter(params: {
+  expiry: bigint;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+}): bigint {
+  return settlementDeadline(params) + MARKET_CLEANUP_BUFFER_SECONDS;
+}
+
 export function calculatePayout(quote: Pick<Quote, "direction" | "strike" | "width" | "maxPayout">, price: bigint): bigint {
   if (quote.width <= 0n || quote.maxPayout <= 0n) throw new RangeError("invalid payout parameters");
   const rawDelta = quote.direction === 0 ? price - quote.strike : quote.strike - price;
   const delta = rawDelta <= 0n ? 0n : rawDelta >= quote.width ? quote.width : rawDelta;
   return (quote.maxPayout * delta) / quote.width;
+}
+
+// MUST match MAX_POOL_UTILIZATION_BPS in vsol/programs/vsol/src/lib.rs.
+//
+// Hard ceiling on `maxUtilizationBps` for every liquidity pool, regardless of
+// what its (permissionless, therefore untrusted) manager configures: no pool
+// can ever be set up to back positions with more than 80% of its capital.
+//
+// This is blast-radius reduction, NOT a fix -- it stops a single fill from
+// draining the whole pool in one shot, but a manager who controls
+// `quoteAuthority` can still drain it geometrically across repeated
+// fill/close cycles. The real defense against a hostile config change is
+// the timelock below.
+export const MAX_POOL_UTILIZATION_BPS = 8_000;
+
+// MUST match POOL_UPDATE_TIMELOCK_SECONDS in vsol/programs/vsol/src/lib.rs.
+//
+// How long after `updateLiquidityPool` proposes raising a risk cap or
+// rotating `quoteAuthority` before `applyLiquidityPoolUpdate` may commit it.
+// Lowering a cap with `quoteAuthority` unchanged is exempt from this delay
+// and applies immediately -- see `isPoolUpdateTightening` below, which
+// mirrors that branch condition.
+export const POOL_UPDATE_TIMELOCK_SECONDS = 86_400n;
+
+// Mirrors `update_liquidity_pool`'s immediate-vs-timelocked branch condition
+// byte-for-byte: lowering (or leaving unchanged) both caps, with
+// `quoteAuthority` left unchanged, applies immediately; anything else --
+// raising either cap, or rotating `quoteAuthority` at all -- is timelocked.
+// Lets an off-chain caller predict which path a proposed change will take
+// before submitting `updateLiquidityPool`.
+export function isPoolUpdateTightening(params: {
+  currentQuoteAuthority: PublicKey;
+  currentMaxUtilizationBps: number;
+  currentMaxPositionBps: number;
+  nextQuoteAuthority: PublicKey;
+  nextMaxUtilizationBps: number;
+  nextMaxPositionBps: number;
+}): boolean {
+  return (
+    params.nextQuoteAuthority.equals(params.currentQuoteAuthority) &&
+    params.nextMaxUtilizationBps <= params.currentMaxUtilizationBps &&
+    params.nextMaxPositionBps <= params.currentMaxPositionBps
+  );
+}
+
+// Mirrors the on-chain "no pending change" sentinel used throughout
+// `LiquidityPool.pendingEffectiveAt`: Anchor zero-initializes new pool
+// accounts to exactly this state, and both `applyLiquidityPoolUpdate` and
+// `cancelPendingPoolUpdate` reset back to it.
+export function isPoolUpdatePending(pendingEffectiveAt: bigint): boolean {
+  return pendingEffectiveAt !== 0n;
+}
+
+// Mirrors `update_liquidity_pool`'s timelock computation byte-for-byte:
+// `now + POOL_UPDATE_TIMELOCK_SECONDS`. Useful for predicting
+// `pendingEffectiveAt` before submitting the transaction, or for rendering
+// "unlocks at" UI copy from a pending change already observed on-chain.
+export function poolUpdateEffectiveAt(now: bigint): bigint {
+  return now + POOL_UPDATE_TIMELOCK_SECONDS;
 }

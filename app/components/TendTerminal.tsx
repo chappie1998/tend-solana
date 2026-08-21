@@ -54,6 +54,10 @@ type MakerQuote = {
   latencyMs: number;
   badge: string;
   expiresAt: number;
+  /** P(finishing in the money) at the solved strike -- the honest counterweight to the payoff multiple. */
+  probabilityItm: number;
+  /** The gap-risk-adjusted annualized vol actually priced into `premium` (can run above `pricingVolatility` when the reference is stale). */
+  impliedVolatility: number;
 };
 
 type SeriesState = {
@@ -578,10 +582,16 @@ function TradeView({
           <div className="field-group"><label htmlFor="amount">Position size</label><div className="amount-input"><span>$</span><input id="amount" type="number" inputMode="decimal" min="100" max="5000" step="100" value={amount} onChange={(event) => { setAmount(event.target.value); invalidateQuote(); }} autoComplete="off" aria-describedby="amount-note" /><span>tUSDC</span></div><div id="amount-note" className="input-note"><span>Min $100</span><span>Devnet max $5,000</span></div></div>
 
           <div className="economics">
-            <div><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
-            <div><span>Signed premium</span><strong>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div><span>Maximum loss</span><strong className="risk">{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
+            <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Signed premium</span><strong>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Maximum loss</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
+            {/* Honest counterweight to the payoff multiple, and the vol
+                actually priced into the premium above (can run hotter than
+                "Realized volatility" when the reference is stale and the
+                gap-risk bump kicks in) -- additive, next to the payoff dial. */}
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Win probability</span><strong>{bestQuote ? `${(bestQuote.probabilityItm * 100).toFixed(1)}%` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Implied volatility</span><strong>{bestQuote ? `${bestQuote.impliedVolatility.toFixed(1)}%` : "—"}</strong></div>
             <div className="economics-total"><span>Maximum payout</span><strong>${notional.toLocaleString()}</strong></div>
           </div>
 

@@ -255,7 +255,12 @@ async function runSettlementPhase(params: {
       settlementGraceSeconds: marketState.settlementGraceSeconds,
     };
 
-    const publishDecision = decideMarketPublishAction({ now, oracleFinalized: finalized, ...window });
+    const publishDecision = decideMarketPublishAction({
+      now,
+      oracleFinalized: finalized,
+      ...window,
+      maxSettlementStalenessSeconds: marketState.maxSettlementStalenessSeconds,
+    });
     if (publishDecision.kind === "skip") {
       console.log(`skip: publish for market ${marketAddress} -- ${publishDecision.reason}`);
     } else {

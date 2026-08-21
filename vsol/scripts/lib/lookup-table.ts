@@ -75,7 +75,7 @@ export function stableFillAddresses(deployment: Record<string, unknown>): Stable
     );
   }
   // The deployment currently maintains exactly one passive liquidity pool
-  // ("main-v3"); every fill against it touches that pool and its token
+  // ("main-v4"); every fill against it touches that pool and its token
   // vault. If a second pool is ever launched, this should be revisited to
   // decide which pool(s) are actually load-bearing for the ALT.
   const mainPool = liquidityPools[0];

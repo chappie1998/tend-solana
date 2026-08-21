@@ -174,6 +174,14 @@ export async function POST(request: Request) {
     latencyMs: quote.latencyMs,
     badge: quote.badge,
     expiresAt: quote.expiresAt.getTime(),
+    // Not persisted (no schema column) -- these come straight from the
+    // pricing engine's own return value for this single quote, the honest
+    // counterweight to the payoff multiple: P(finishing ITM) at the solved
+    // strike, and the gap-risk-adjusted vol actually priced into `premium`
+    // (which can run above `pricingVolatility`, the raw Pyth realized-vol
+    // reading, when the reference is stale).
+    probabilityItm: economics.probabilityItm,
+    impliedVolatility: economics.impliedVolatility,
   }));
 
   return json({

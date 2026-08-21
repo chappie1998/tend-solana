@@ -53,6 +53,89 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "applyLiquidityPoolUpdate",
+      "docs": [
+        "Commits a pending `update_liquidity_pool` proposal once its timelock",
+        "has elapsed. Requires the pool idle for the same reason",
+        "`update_liquidity_pool` does: applying while `open_positions > 0`",
+        "would change the risk backing an already-open position out from",
+        "under it. See `update_liquidity_pool`'s doc comment for the residual",
+        "gap this does not close."
+      ],
+      "discriminator": [
+        41,
+        56,
+        18,
+        175,
+        110,
+        35,
+        131,
+        87
+      ],
+      "accounts": [
+        {
+          "name": "manager",
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "pool.settlement_mint",
+                "account": "liquidityPool"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "cancelNonce",
       "discriminator": [
         75,
@@ -129,6 +212,88 @@ export type Vsol = {
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "cancelPendingPoolUpdate",
+      "docs": [
+        "Lets the manager clear a pending `update_liquidity_pool` proposal",
+        "before its timelock elapses, so a mistaken or stale proposal is not",
+        "stuck sitting there for `POOL_UPDATE_TIMELOCK_SECONDS`. Cancelling",
+        "never touches the pool's live configuration -- there is nothing",
+        "unsafe about allowing it regardless of whether the pool is idle."
+      ],
+      "discriminator": [
+        239,
+        238,
+        72,
+        105,
+        31,
+        66,
+        74,
+        144
+      ],
+      "accounts": [
+        {
+          "name": "manager",
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "pool.settlement_mint",
+                "account": "liquidityPool"
+              },
+              {
+                "kind": "account",
+                "path": "pool.pool_id",
+                "account": "liquidityPool"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "closePoolPosition",
@@ -391,14 +556,32 @@ export type Vsol = {
         "",
         "Safety argument -- why this cannot strand or double-spend anything:",
         "",
-        "1. `now > expiry + observation_window_seconds + settlement_grace_seconds`",
-        "is exactly the deadline `refund_pool_position` already uses as \"the",
+        "1. `expiry + observation_window_seconds + settlement_grace_seconds` is",
+        "exactly the deadline `refund_pool_position` already uses as \"the",
         "settlement fallback window is closed\" (`VsolError::SettlementWindowOpen`).",
-        "Past this point `publish_pyth_settlement` can never publish a new",
-        "settlement (neither tier 1 nor the tier-2 last-known-price",
-        "fallback), so the oracle's `finalized`/`price` state is frozen",
-        "forever -- there is no future event that could still need this",
-        "market or oracle to exist.",
+        "NOTE (updated alongside the tier-2 timing fix): `publish_pyth_settlement`",
+        "can still publish for a while past this exact point -- tier 1",
+        "always, tier 2 after a short additional buffer (see",
+        "`SETTLEMENT_REFUND_PRIORITY_SECONDS`) -- but never past",
+        "`deadline + max_settlement_staleness_seconds`, which",
+        "`create_market`'s cross-parameter bound",
+        "(`MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO`) guarantees is always",
+        "`<= deadline + MARKET_CLEANUP_BUFFER_SECONDS` (both",
+        "`max_settlement_staleness_seconds` and `MARKET_CLEANUP_BUFFER_SECONDS`",
+        "are capped at the same 7-day ceiling). So by the time THIS",
+        "instruction's own cutoff below is reached, `publish_pyth_settlement`",
+        "is guaranteed to already be permanently closed and the oracle's",
+        "`finalized`/`price` state frozen forever -- there is no future",
+        "event that could still need this market or oracle to exist.",
+        "",
+        "This instruction nonetheless requires a FURTHER",
+        "`MARKET_CLEANUP_BUFFER_SECONDS` on top of that deadline. Freezing",
+        "the oracle is not the same as sweeping the positions: the deadline",
+        "is the instant `refund_unsettled`/`refund_pool_position` first",
+        "become callable, so closing the market at that same instant races",
+        "every in-flight refund with no margin at all. The buffer is what",
+        "makes point 3's off-chain assumption survivable rather than a",
+        "coin-flip against the cleaner.",
         "2. `fill_quote` and `fill_pool_quote` both hard-require",
         "`now < market.expiry` before opening a new position. Since the",
         "deadline above is strictly after `expiry`, by the time it has",
@@ -426,6 +609,14 @@ export type Vsol = {
         "before calling `close_settled_market`. This is the documented gap",
         "the task that added this instruction explicitly flagged and",
         "accepted, given positions are not cheaply enumerable on-chain.",
+        "`MARKET_CLEANUP_BUFFER_SECONDS` bounds the damage when that",
+        "assumption is violated (a stranded position stays refundable for a",
+        "week after settlement closes) but does NOT discharge it: a caller",
+        "that closes a market with an open position still strands it",
+        "permanently. Enumerating positions on-chain -- e.g. an",
+        "`open_position_count` on `Market`, maintained by fill/settle/refund",
+        "-- is the only way to actually enforce this, and remains the right",
+        "fix before real money.",
         "4. As a cheap, *additional* on-chain check (defense-in-depth, not the",
         "primary safety argument above, which already holds regardless): if",
         "the caller passes a `pool`/`pool_market` pair, it must be the",
@@ -2955,6 +3146,50 @@ export type Vsol = {
     },
     {
       "name": "updateLiquidityPool",
+      "docs": [
+        "Updates a liquidity pool's risk configuration. Split into an",
+        "immediate path for LP-safe tightening and a timelocked path for",
+        "everything else, because pool creation is permissionless -- a",
+        "pool's `manager` is an untrusted role, not an insider. Before this",
+        "split, a manager could raise `max_utilization_bps` to 100% and",
+        "rotate `quote_authority` to a key they control in a single",
+        "instruction with zero notice, then self-sign a `fill_pool_quote`",
+        "for (almost) the whole pool and extract it via `close_pool_position`",
+        "in the same transaction. `MAX_POOL_UTILIZATION_BPS` closes the",
+        "\"whole pool in one fill\" half of that; this timelock closes the",
+        "\"zero notice\" half, which is the half that actually matters --",
+        "see `POOL_UPDATE_TIMELOCK_SECONDS`.",
+        "",
+        "- Lowering `max_utilization_bps` and/or `max_position_bps`, with",
+        "`quote_authority` left unchanged, applies immediately in this same",
+        "instruction: it can only shrink what the pool is exposed to, so LPs",
+        "never need advance notice of their own protection getting stricter.",
+        "- Anything else -- raising either cap above its current value, or",
+        "rotating `quote_authority` at all, even alongside a lowered cap --",
+        "is recorded as a pending change (`pending_*` fields) with",
+        "`pending_effective_at = now + POOL_UPDATE_TIMELOCK_SECONDS`, and an",
+        "`LiquidityPoolUpdateProposed` event carrying `effective_at` so LPs",
+        "and indexers can observe it and choose to withdraw. Nothing about",
+        "the pool's *live*, currently-effective configuration changes until",
+        "`apply_liquidity_pool_update` commits it. `cancel_pending_pool_update`",
+        "lets the manager clear a mistaken proposal before that.",
+        "",
+        "RESIDUAL HOLE (documented, not fixed here): both this instruction and",
+        "`apply_liquidity_pool_update` require the pool be idle",
+        "(`open_positions == 0 && locked_collateral == 0`), the same gate",
+        "`withdraw_liquidity` uses. During the timelock window a malicious",
+        "manager can self-sign a `fill_pool_quote` to open a position, which",
+        "blocks LP withdrawals for as long as it stays open, then close it",
+        "again right before calling `apply_liquidity_pool_update` (which also",
+        "requires idle). This does not make the window unbounded -- returning",
+        "the pool to idle to apply the change is itself observable and gives",
+        "LPs another chance to react between \"position closed\" and \"update",
+        "applied\" -- but it is not guaranteed to give LPs a long clear window",
+        "either. The complete fix is letting LPs withdraw *unlocked* capital",
+        "while positions remain open, which is a larger redesign of",
+        "`withdraw_liquidity`'s idle gate than this pass makes, and remains",
+        "the right next step before real money."
+      ],
       "discriminator": [
         255,
         60,
@@ -3566,6 +3801,32 @@ export type Vsol = {
       ]
     },
     {
+      "name": "liquidityPoolUpdateCancelled",
+      "discriminator": [
+        100,
+        173,
+        9,
+        54,
+        104,
+        220,
+        248,
+        69
+      ]
+    },
+    {
+      "name": "liquidityPoolUpdateProposed",
+      "discriminator": [
+        132,
+        219,
+        43,
+        236,
+        198,
+        107,
+        180,
+        255
+      ]
+    },
+    {
       "name": "liquidityPoolUpdated",
       "discriminator": [
         127,
@@ -4100,6 +4361,16 @@ export type Vsol = {
       "code": 6059,
       "name": "invalidPoolMarket",
       "msg": "The supplied pool/pool-market pair is invalid or inconsistent."
+    },
+    {
+      "code": 6060,
+      "name": "noPendingPoolUpdate",
+      "msg": "There is no pending liquidity pool update to apply or cancel."
+    },
+    {
+      "code": 6061,
+      "name": "poolUpdateTimelocked",
+      "msg": "The pending liquidity pool update's timelock has not yet elapsed."
     }
   ],
   "types": [
@@ -4494,6 +4765,26 @@ export type Vsol = {
           {
             "name": "manager",
             "type": "pubkey"
+          },
+          {
+            "name": "pendingQuoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingMaxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "pendingMaxPositionBps",
+            "type": "u16"
+          },
+          {
+            "name": "pendingEffectiveAt",
+            "type": "i64"
+          },
+          {
+            "name": "totalAssets",
+            "type": "u64"
           }
         ]
       }
@@ -4570,6 +4861,57 @@ export type Vsol = {
           {
             "name": "enabled",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolUpdateCancelled",
+      "docs": [
+        "Emitted by `cancel_pending_pool_update` when a manager discards a pending",
+        "proposal before its timelock elapses."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "liquidityPoolUpdateProposed",
+      "docs": [
+        "Emitted by `update_liquidity_pool` whenever a change is timelocked rather",
+        "than applied immediately (raising a cap, or rotating `quote_authority`).",
+        "Carries `effective_at` so LPs and indexers can observe a pending change",
+        "and its deadline -- the timelock is worthless as a defense if nobody can",
+        "see it coming. See `POOL_UPDATE_TIMELOCK_SECONDS`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingQuoteAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingMaxUtilizationBps",
+            "type": "u16"
+          },
+          {
+            "name": "pendingMaxPositionBps",
+            "type": "u16"
+          },
+          {
+            "name": "effectiveAt",
+            "type": "i64"
           }
         ]
       }

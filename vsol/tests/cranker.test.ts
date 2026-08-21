@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { PublicKey } from "@solana/web3.js";
 import {
+  computeFinalSettlementDeadline,
+  computeMarketCloseDeadline,
   computeSettlementDeadline,
+  computeTierTwoOpenAt,
   decideMarketPublishAction,
   decidePositionAction,
   decodeDirectPositionMarket,
@@ -20,6 +23,7 @@ import {
   POOL_POSITION_DISCRIMINATOR,
   redact,
   selectMarketCloseCandidates,
+  SETTLEMENT_REFUND_PRIORITY_SECONDS,
   type DecodedMarketForCleanup,
   type DecodedPoolPosition,
 } from "../scripts/lib/settlement.ts";
@@ -149,28 +153,51 @@ test("groupPositionsByMarket groups by market and preserves order within a group
 });
 
 const WINDOW = { expiry: 1_000, observationWindowSeconds: 30, settlementGraceSeconds: 900 };
+const PUBLISH_WINDOW = { ...WINDOW, maxSettlementStalenessSeconds: 86_400 };
 
 test("computeSettlementDeadline is expiry + observation window + settlement grace", () => {
   assert.equal(computeSettlementDeadline(WINDOW), 1_000 + 30 + 900);
 });
 
+test("computeTierTwoOpenAt is computeSettlementDeadline plus SETTLEMENT_REFUND_PRIORITY_SECONDS", () => {
+  assert.equal(computeTierTwoOpenAt(WINDOW), 1_000 + 30 + 900 + SETTLEMENT_REFUND_PRIORITY_SECONDS);
+  // Deliberately later than the refund deadline -- see the "refund wins the
+  // tie" tests below.
+  assert.ok(computeTierTwoOpenAt(WINDOW) > computeSettlementDeadline(WINDOW));
+});
+
+test("computeFinalSettlementDeadline is computeSettlementDeadline plus maxSettlementStalenessSeconds (NOT computeTierTwoOpenAt plus staleness)", () => {
+  assert.equal(computeFinalSettlementDeadline(PUBLISH_WINDOW), 1_000 + 30 + 900 + 86_400);
+});
+
 test("decideMarketPublishAction: skips when the oracle is already finalized", () => {
-  const decision = decideMarketPublishAction({ ...WINDOW, now: 1_500, oracleFinalized: true });
+  const decision = decideMarketPublishAction({ ...PUBLISH_WINDOW, now: 1_500, oracleFinalized: true });
   assert.equal(decision.kind, "skip");
 });
 
 test("decideMarketPublishAction: skips before expiry", () => {
-  const decision = decideMarketPublishAction({ ...WINDOW, now: 500, oracleFinalized: false });
+  const decision = decideMarketPublishAction({ ...PUBLISH_WINDOW, now: 500, oracleFinalized: false });
   assert.equal(decision.kind, "skip");
 });
 
-test("decideMarketPublishAction: skips once the settlement deadline has passed (refund path applies)", () => {
-  const decision = decideMarketPublishAction({ ...WINDOW, now: 1_000 + 30 + 900 + 1, oracleFinalized: false });
+test("decideMarketPublishAction: still attempts publish just past the settlement deadline -- tier 2 might apply once its own gate opens", () => {
+  // Before the tier-2 timing fix, the cranker gave up here (the bare
+  // settlement deadline). Tier 2 by definition only ever becomes reachable
+  // AFTER this instant, so stopping here would mean the cranker could never
+  // land a legitimate tier-2 settlement at all.
+  const deadline = computeSettlementDeadline(PUBLISH_WINDOW);
+  const decision = decideMarketPublishAction({ ...PUBLISH_WINDOW, now: deadline + 1, oracleFinalized: false });
+  assert.equal(decision.kind, "publish");
+});
+
+test("decideMarketPublishAction: skips once the final settlement deadline (deadline + staleness) has passed", () => {
+  const finalDeadline = computeFinalSettlementDeadline(PUBLISH_WINDOW);
+  const decision = decideMarketPublishAction({ ...PUBLISH_WINDOW, now: finalDeadline + 1, oracleFinalized: false });
   assert.equal(decision.kind, "skip");
 });
 
 test("decideMarketPublishAction: publishes when expired, unfinalized, and within the settlement window", () => {
-  const decision = decideMarketPublishAction({ ...WINDOW, now: 1_050, oracleFinalized: false });
+  const decision = decideMarketPublishAction({ ...PUBLISH_WINDOW, now: 1_050, oracleFinalized: false });
   assert.equal(decision.kind, "publish");
 });
 
@@ -189,8 +216,13 @@ test("decidePositionAction: waits (skips) once expired with an unfinalized oracl
   assert.equal(decision.kind, "skip");
 });
 
-test("decidePositionAction: refunds once past the settlement deadline with no finalized oracle", () => {
+test("decidePositionAction: refunds once past the settlement deadline with no finalized oracle -- refund wins the tie against tier 2 (see SETTLEMENT_REFUND_PRIORITY_SECONDS)", () => {
   const deadline = computeSettlementDeadline(WINDOW);
+  // Refund is available here even though tier 2's own gate has not opened
+  // yet (computeTierTwoOpenAt(WINDOW) is still SETTLEMENT_REFUND_PRIORITY_SECONDS
+  // away) -- decidePositionAction deliberately does not wait around for the
+  // mere possibility of a later tier-2 settlement once refunding is legal.
+  assert.ok(deadline + 1 < computeTierTwoOpenAt(WINDOW));
   assert.equal(decidePositionAction({ ...WINDOW, now: deadline + 1, oracleFinalized: false }).kind, "refund");
   // A finalized oracle always wins over the refund path, even past the deadline.
   assert.equal(decidePositionAction({ ...WINDOW, now: deadline + 1, oracleFinalized: true }).kind, "settle");
@@ -270,7 +302,10 @@ function marketFixture(
 }
 
 const CLOSE_WINDOW = { expiry: 1_000, observationWindowSeconds: 30, settlementGraceSeconds: 900 };
-const CLOSE_DEADLINE = computeSettlementDeadline(CLOSE_WINDOW);
+// The CLOSE deadline, not the settlement/refund deadline — closing is gated a
+// further MARKET_CLEANUP_BUFFER_SECONDS out so cleanup can never race an
+// in-flight refund. See computeMarketCloseDeadline in scripts/lib/settlement.ts.
+const CLOSE_DEADLINE = computeMarketCloseDeadline(CLOSE_WINDOW);
 
 test("selectMarketCloseCandidates returns exactly the markets past their close deadline with no open position", () => {
   const pastDeadlineNoPosition = marketFixture(0x41, CLOSE_WINDOW);

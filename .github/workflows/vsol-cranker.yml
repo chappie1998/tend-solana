@@ -9,9 +9,29 @@ name: VSOL Cranker
 
 on:
   schedule:
-    # Every 30 minutes, offset off the hour to avoid the top-of-hour crush
-    # of scheduled jobs across all of GitHub Actions.
-    - cron: "17,47 * * * *"
+    # Every 10 minutes. This cadence is a SECURITY parameter, not a
+    # convenience one, and must stay strictly under the settlement
+    # exclusivity window.
+    #
+    # `publish_pyth_settlement`'s tier 2 (the last-known-price fallback for a
+    # feed that has gone dark) only opens at
+    # `expiry + observation_window + settlement_grace +
+    # SETTLEMENT_REFUND_PRIORITY_SECONDS` — 990s (16m30s) at the SDK's
+    # configured 30s/900s/60s. Before that instant only a fresh tier-1 print
+    # can settle, so an honest settler that runs inside the window always
+    # settles at the correct price and closes the oracle before a
+    # cherry-picked stale print can ever be submitted.
+    #
+    # At the previous 30-minute cadence that guarantee did not hold: expiry
+    # lands uniformly against the schedule, so the cranker arrived after tier
+    # 2 had already opened for ~45% of expiries, leaving a real window in
+    # which a stale, favourable print could be published instead. Ten minutes
+    # is strictly below 990s with margin for a delayed run (GitHub's
+    # scheduler is best-effort), which restores the guarantee to ~100%.
+    #
+    # >>> If SETTLEMENT_REFUND_PRIORITY_SECONDS, observation_window_seconds
+    # >>> or settlement_grace_seconds ever shrink, re-derive this cadence.
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 concurrency:

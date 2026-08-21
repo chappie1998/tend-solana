@@ -989,13 +989,114 @@ fn setup_pool(harness: &mut Harness, fixture: &ConfigFixture) -> PoolFixture {
     }
 }
 
+// =====================================================================
+// update_liquidity_pool / apply_liquidity_pool_update / cancel_pending_pool_update
+//
+// A pool's `manager` is an untrusted, permissionless role: anyone can create
+// a pool and attract LP deposits. Before the timelock below existed, a
+// manager could raise `max_utilization_bps` to 100% and rotate
+// `quote_authority` to a key they control in one instruction with zero LP
+// notice, then immediately self-sign a `fill_pool_quote` for (almost) the
+// whole pool. These tests exercise both halves of the fix:
+//   - MAX_POOL_UTILIZATION_BPS: no pool can ever be configured above 80%
+//     utilization, so a single fill cannot drain the whole pool.
+//   - The propose/apply/cancel timelock: raising a cap, or rotating
+//     `quote_authority` at all, cannot take effect before
+//     POOL_UPDATE_TIMELOCK_SECONDS has elapsed and `apply_liquidity_pool_update`
+//     is called. Lowering a cap with the authority unchanged remains
+//     immediate, since that can only make LPs safer.
+// =====================================================================
+
 #[test]
-fn update_liquidity_pool_applies_new_authority_and_limits() {
+fn update_liquidity_pool_rejects_utilization_above_the_protocol_ceiling() {
     let mut harness = Harness::new();
     let fixture = setup_config(&mut harness);
     let pool = setup_pool(&mut harness, &fixture);
 
+    // Even though this is otherwise a valid-looking request (quote_authority
+    // unchanged), 100% utilization is never representable: the pool cannot
+    // be configured to back positions with its entire balance.
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: pool.quote_authority.pubkey(),
+        max_utilization_bps: 10_000,
+        max_position_bps: 10_000,
+    };
+    let ix = update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args);
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidPoolRiskLimits);
+
+    let unchanged: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(unchanged.max_utilization_bps, 8_000);
+    assert_eq!(unchanged.pending_effective_at, 0);
+}
+
+#[test]
+fn update_liquidity_pool_lowering_caps_with_unchanged_authority_applies_immediately() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture); // starts at 8_000 / 2_000
+
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: pool.quote_authority.pubkey(),
+        max_utilization_bps: 5_000,
+        max_position_bps: 1_000,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+
+    // Applied immediately: no pending change was ever recorded.
+    let updated: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(updated.quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(updated.max_utilization_bps, 5_000);
+    assert_eq!(updated.max_position_bps, 1_000);
+    assert_eq!(updated.pending_effective_at, 0);
+    assert_eq!(updated.pending_quote_authority, Pubkey::default());
+}
+
+#[test]
+fn update_liquidity_pool_raising_a_cap_is_timelocked_not_applied_immediately() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture); // starts at 8_000 / 2_000
+
+    // Lower max_utilization_bps first so there's room to raise max_position_bps
+    // while keeping max_utilization_bps at the protocol ceiling.
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: pool.quote_authority.pubkey(),
+        max_utilization_bps: 8_000,
+        max_position_bps: 3_000, // raised from 2_000
+    };
+    let before = harness.now();
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+
+    // The live config must NOT have changed yet.
+    let after_propose: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(after_propose.max_position_bps, 2_000);
+    assert_eq!(after_propose.quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(after_propose.pending_max_position_bps, 3_000);
+    assert_eq!(after_propose.pending_max_utilization_bps, 8_000);
+    assert_eq!(after_propose.pending_quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(
+        after_propose.pending_effective_at,
+        before + vsol::POOL_UPDATE_TIMELOCK_SECONDS
+    );
+}
+
+#[test]
+fn update_liquidity_pool_rotating_quote_authority_is_timelocked() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
     let new_quote_authority = Pubkey::new_unique();
+
+    // Even lowering both caps does not make an authority rotation immediate.
     let args = vsol::UpdateLiquidityPoolArgs {
         quote_authority: new_quote_authority,
         max_utilization_bps: 5_000,
@@ -1007,10 +1108,269 @@ fn update_liquidity_pool_applies_new_authority_and_limits() {
         &[],
     );
 
-    let updated: vsol::LiquidityPool = harness.read_account(&pool.pool);
-    assert_eq!(updated.quote_authority, new_quote_authority);
-    assert_eq!(updated.max_utilization_bps, 5_000);
-    assert_eq!(updated.max_position_bps, 1_000);
+    let after_propose: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(after_propose.quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(after_propose.max_utilization_bps, 8_000);
+    assert_eq!(after_propose.max_position_bps, 2_000);
+    assert_eq!(after_propose.pending_quote_authority, new_quote_authority);
+    assert!(after_propose.pending_effective_at > 0);
+}
+
+#[test]
+fn apply_liquidity_pool_update_rejects_before_timelock_elapses() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let new_quote_authority = Pubkey::new_unique();
+
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: new_quote_authority,
+        max_utilization_bps: 6_000,
+        max_position_bps: 1_500,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+
+    // Warp forward, but not all the way to the timelock deadline.
+    harness.warp_to_timestamp(harness.now() + vsol::POOL_UPDATE_TIMELOCK_SECONDS - 1);
+
+    let ix = apply_liquidity_pool_update_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool);
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::PoolUpdateTimelocked);
+}
+
+#[test]
+fn apply_liquidity_pool_update_succeeds_at_or_after_timelock() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let new_quote_authority = Pubkey::new_unique();
+
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: new_quote_authority,
+        max_utilization_bps: 6_000,
+        max_position_bps: 1_500,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+    let pending: vsol::LiquidityPool = harness.read_account(&pool.pool);
+
+    harness.warp_to_timestamp(pending.pending_effective_at);
+    harness.send_ok(
+        &pool.manager,
+        &[apply_liquidity_pool_update_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool)],
+        &[],
+    );
+
+    let applied: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(applied.quote_authority, new_quote_authority);
+    assert_eq!(applied.max_utilization_bps, 6_000);
+    assert_eq!(applied.max_position_bps, 1_500);
+    // Pending fields reset back to the "nothing pending" sentinel.
+    assert_eq!(applied.pending_quote_authority, Pubkey::default());
+    assert_eq!(applied.pending_max_utilization_bps, 0);
+    assert_eq!(applied.pending_max_position_bps, 0);
+    assert_eq!(applied.pending_effective_at, 0);
+}
+
+#[test]
+fn apply_liquidity_pool_update_rejects_when_nothing_is_pending() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+
+    let ix = apply_liquidity_pool_update_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool);
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::NoPendingPoolUpdate);
+}
+
+#[test]
+fn cancel_pending_pool_update_clears_the_pending_change() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let new_quote_authority = Pubkey::new_unique();
+
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: new_quote_authority,
+        max_utilization_bps: 6_000,
+        max_position_bps: 1_500,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+
+    harness.send_ok(
+        &pool.manager,
+        &[cancel_pending_pool_update_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool)],
+        &[],
+    );
+
+    let cancelled: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(cancelled.pending_quote_authority, Pubkey::default());
+    assert_eq!(cancelled.pending_max_utilization_bps, 0);
+    assert_eq!(cancelled.pending_max_position_bps, 0);
+    assert_eq!(cancelled.pending_effective_at, 0);
+    // Live config never moved.
+    assert_eq!(cancelled.quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(cancelled.max_utilization_bps, 8_000);
+
+    // Applying now (even after warping past what would have been the
+    // deadline) fails: cancel really did discard the proposal, not just
+    // hide it.
+    harness.warp_to_timestamp(harness.now() + vsol::POOL_UPDATE_TIMELOCK_SECONDS + 1);
+    let ix = apply_liquidity_pool_update_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool);
+    let failed = harness.send_err(&pool.manager, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::NoPendingPoolUpdate);
+}
+
+#[test]
+fn cancel_pending_pool_update_rejects_non_manager_signer() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let impostor = harness.funded_keypair();
+
+    let args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: Pubkey::new_unique(),
+        max_utilization_bps: 6_000,
+        max_position_bps: 1_500,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, args)],
+        &[],
+    );
+
+    let ix = cancel_pending_pool_update_ix(&impostor.pubkey(), &fixture.config, &pool.pool);
+    let failed = harness.send_err(&impostor, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::Unauthorized);
+}
+
+/// The end-to-end regression test: this is the exact attack from the
+/// vulnerability report, replayed against the fixed program. A pool manager
+/// (an untrusted, permissionless role) proposes a hostile config change --
+/// rotating `quote_authority` to a key only they control -- and then, in the
+/// very next instruction, tries to self-sign a `fill_pool_quote` for the
+/// entire pool balance using that new authority. Before this fix, both steps
+/// could be one transaction with `max_utilization_bps` at 100%. Now: the
+/// rotation is still pending (the timelock has not elapsed), so the pool's
+/// live `quote_authority` is still the old one, and the fill is rejected.
+#[test]
+fn hostile_manager_cannot_immediately_self_fill_after_proposing_a_rotated_quote_authority() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
+
+    // LPs deposit real capital into the pool.
+    let provider = harness.funded_keypair();
+    let provider_position = provider_position_pda(&pool.pool, &provider.pubkey());
+    let provider_source = harness.create_token_account(&provider, &pool.settlement_mint, &provider.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &provider,
+        &[deposit_liquidity_ix(
+            &provider.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider_position,
+            &provider_source,
+            100 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    // The manager authorizes the market for trading (additive, always
+    // allowed) and proposes a hostile config change: rotate quote_authority
+    // to a key they alone hold, and raise max_utilization_bps to the highest
+    // value the protocol will ever allow (MAX_POOL_UTILIZATION_BPS).
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let attacker_authority = harness.funded_keypair();
+    let hostile_args = vsol::UpdateLiquidityPoolArgs {
+        quote_authority: attacker_authority.pubkey(),
+        max_utilization_bps: vsol::MAX_POOL_UTILIZATION_BPS,
+        max_position_bps: vsol::MAX_POOL_UTILIZATION_BPS,
+    };
+    harness.send_ok(
+        &pool.manager,
+        &[update_liquidity_pool_ix(&pool.manager.pubkey(), &fixture.config, &pool.pool, hostile_args)],
+        &[],
+    );
+
+    // The proposal is recorded, but the live pool is untouched.
+    let after_propose: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(after_propose.quote_authority, pool.quote_authority.pubkey());
+    assert_eq!(after_propose.pending_quote_authority, attacker_authority.pubkey());
+    assert!(after_propose.pending_effective_at > harness.now());
+
+    // The manager (wearing the buyer hat too, exactly as the original
+    // vulnerability describes) immediately tries to self-fill against the
+    // whole pool, signing with the not-yet-live attacker authority.
+    let buyer_source = harness.create_token_account(&pool.manager, &market.settlement_mint, &pool.manager.pubkey());
+    harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
+
+    let quote = vsol::PoolQuoteArgs {
+        nonce: 1,
+        direction: 0,
+        strike: 100,
+        width: 10,
+        premium: 1,
+        max_payout: 100 * ONE_TOKEN, // the entire pool balance
+        quote_expiry: harness.now() + 30,
+    };
+    let pool_nonce_record = pool_nonce_pda(&pool.pool, &attacker_authority.pubkey(), quote.nonce);
+    let pool_position = pool_position_pda(&pool_nonce_record);
+    let pool_position_vault = pool_position_vault_pda(&pool_position);
+    let fill_accounts = FillPoolQuoteAccounts {
+        buyer: pool.manager.pubkey(),
+        quote_authority: attacker_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        pool_market,
+        settlement_mint: market.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_pool_quote_ixs(&attacker_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    let failed = harness.send_err(&pool.manager, &ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::Unauthorized);
+
+    // The pool never lost a cent: it still has every LP-deposited token.
+    assert_eq!(harness.token_balance(&pool.pool_token), 100 * ONE_TOKEN);
 }
 
 #[test]
@@ -1761,6 +2121,568 @@ fn refund_pool_position_returns_funds_when_settlement_window_closes_unfinalized(
 }
 
 // =====================================================================
+// LiquidityPool::total_assets: the pool's own internal ledger of free
+// (unlocked) settlement tokens, immune to donations. Before this field
+// existed, deposit_liquidity/withdraw_liquidity used `pool_token.amount`
+// (the raw SPL balance) directly as the share-price denominator -- and a
+// token account's owner cannot refuse incoming transfers, so anyone could
+// donate tokens straight into `pool_token` to skew that price. This is the
+// classic first-depositor share-inflation attack.
+//
+// These tests exercise the fix:
+//   - `liquidity_pool_account_size_...`: the account grew by exactly the
+//     appended u64, verified against the real compiled size.
+//   - `donation_attack_cannot_extract_value_from_the_pool`: the exact
+//     4-step attack reproduced end to end -- it must no longer profit.
+//   - `pool_total_assets_ledger_...`: across a full deposit/fill/settle/
+//     fill/refund/withdraw lifecycle, the ledger tracks the physical
+//     balance exactly, and a mid-lifecycle donation becomes permanently
+//     inert dust (balance == ledger + donated) rather than corrupting any
+//     later calculation.
+//   - `donation_does_not_change_...`: a donation between two deposits must
+//     not move the second depositor's share price at all.
+// =====================================================================
+
+#[test]
+fn liquidity_pool_account_size_is_8_plus_init_space_after_appending_total_assets() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+
+    // The real, compiled account size -- not just arithmetic -- is the
+    // source of truth every off-chain decoder (app/lib/vsol-server.ts's
+    // decodePoolAccount does an EXACT length check) must match precisely.
+    let account = harness.get_account(&pool.pool);
+    assert_eq!(
+        account.data.len(),
+        8 + <vsol::LiquidityPool as anchor_lang::Space>::INIT_SPACE
+    );
+    assert_eq!(account.data.len(), 266);
+}
+
+#[test]
+fn donation_attack_cannot_extract_value_from_the_pool() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+
+    let attacker = harness.funded_keypair();
+    let attacker_position = provider_position_pda(&pool.pool, &attacker.pubkey());
+    let attacker_source = harness.create_token_account(&attacker, &pool.settlement_mint, &attacker.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &attacker_source, 10_000_000);
+
+    // Step 1: attacker deposits 1 base unit -- the smallest possible first
+    // deposit, for the cheapest possible first share.
+    harness.send_ok(
+        &attacker,
+        &[deposit_liquidity_ix(
+            &attacker.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &attacker_position,
+            &attacker_source,
+            1,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let attacker_after_deposit: vsol::LiquidityProvider = harness.read_account(&attacker_position);
+    assert_eq!(attacker_after_deposit.shares, 1);
+    let pool_after_deposit: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(pool_after_deposit.total_assets, 1);
+
+    // Step 2: attacker donates 1_000_000 directly into pool_token via a raw
+    // SPL transfer -- never touching deposit_liquidity. Before the ledger
+    // fix, this alone would make the *next* depositor's shares computed
+    // against a balance of 1_000_001, not the true 1.
+    harness.transfer_tokens(&attacker, &attacker_source, &pool.pool_token, 1_000_000);
+    assert_eq!(harness.token_balance(&pool.pool_token), 1_000_001);
+    let pool_after_donation: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(
+        pool_after_donation.total_assets, 1,
+        "the ledger must be completely untouched by a donation that bypasses deposit_liquidity"
+    );
+
+    // Step 3: victim deposits 2_000_000. Under the vulnerable code this
+    // rounded down to 1 share (calculate_deposit_shares(2_000_000, 1,
+    // 1_000_001)); with the fix it is computed against total_assets == 1,
+    // never the donation-inflated raw balance.
+    let victim = harness.funded_keypair();
+    let victim_position = provider_position_pda(&pool.pool, &victim.pubkey());
+    let victim_source = harness.create_token_account(&victim, &pool.settlement_mint, &victim.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &victim_source, 2_000_000);
+    harness.send_ok(
+        &victim,
+        &[deposit_liquidity_ix(
+            &victim.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &victim_position,
+            &victim_source,
+            2_000_000,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let victim_after_deposit: vsol::LiquidityProvider = harness.read_account(&victim_position);
+    assert_eq!(
+        victim_after_deposit.shares, 2_000_000,
+        "the victim's shares must be computed against the ledger, not the donation-inflated balance"
+    );
+
+    // Step 4: attacker withdraws their 1 share. The vulnerable code paid out
+    // 1_500_000 here (calculate_withdraw_amount(1, 2, 3_000_001)) -- a
+    // +499_999 profit funded entirely by diluting the victim. The fix must
+    // return only what the attacker actually put into the ledger: 1.
+    let attacker_destination = harness.create_token_account(&attacker, &pool.settlement_mint, &attacker.pubkey());
+    harness.send_ok(
+        &attacker,
+        &[withdraw_liquidity_ix(
+            &attacker.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &attacker_position,
+            &attacker_destination,
+            1,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let attacker_withdrawn = harness.token_balance(&attacker_destination);
+    assert_eq!(
+        attacker_withdrawn, 1,
+        "attacker must not profit from a donation they made themselves, got {attacker_withdrawn}"
+    );
+
+    // The victim must not be diluted: withdrawing every share they hold
+    // recovers their full deposit.
+    let victim_destination = harness.create_token_account(&victim, &pool.settlement_mint, &victim.pubkey());
+    harness.send_ok(
+        &victim,
+        &[withdraw_liquidity_ix(
+            &victim.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &victim_position,
+            &victim_destination,
+            victim_after_deposit.shares,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let victim_withdrawn = harness.token_balance(&victim_destination);
+    assert_eq!(
+        victim_withdrawn, 2_000_000,
+        "victim must recover their full deposit, undiluted by the attacker's donation"
+    );
+
+    // The donation is now inert dust: physically present in pool_token
+    // forever, but never counted by the ledger.
+    let pool_final: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(pool_final.total_assets, 0);
+    assert_eq!(harness.token_balance(&pool.pool_token), 1_000_000);
+}
+
+/// Asserts the ledger-vs-balance invariant that must hold whenever no
+/// donation has (yet) landed in `pool_token`.
+fn assert_pool_ledger_matches_balance(harness: &Harness, pool: &Pubkey, pool_token: &Pubkey, label: &str) {
+    let state: vsol::LiquidityPool = harness.read_account(pool);
+    assert_eq!(
+        state.total_assets,
+        harness.token_balance(pool_token),
+        "ledger != token balance at: {label}"
+    );
+}
+
+/// Asserts the weaker invariant that must hold once a donation of `donated`
+/// has landed in `pool_token`: the physical balance forever runs exactly
+/// `donated` ahead of the ledger, no matter what legitimate activity
+/// happens around it.
+fn assert_pool_ledger_offset_by(harness: &Harness, pool: &Pubkey, pool_token: &Pubkey, donated: u64, label: &str) {
+    let state: vsol::LiquidityPool = harness.read_account(pool);
+    assert_eq!(
+        harness.token_balance(pool_token),
+        state.total_assets + donated,
+        "token balance != ledger + donated at: {label}"
+    );
+}
+
+#[test]
+fn pool_total_assets_ledger_matches_token_balance_across_a_full_lifecycle_and_survives_a_donation() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+
+    // --- deposit, deposit ---
+    let provider1 = harness.funded_keypair();
+    let provider1_position = provider_position_pda(&pool.pool, &provider1.pubkey());
+    let provider1_source = harness.create_token_account(&provider1, &pool.settlement_mint, &provider1.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider1_source, 300 * ONE_TOKEN);
+    harness.send_ok(
+        &provider1,
+        &[deposit_liquidity_ix(
+            &provider1.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider1_position,
+            &provider1_source,
+            300 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    assert_pool_ledger_matches_balance(&harness, &pool.pool, &pool.pool_token, "after first deposit");
+
+    let provider2 = harness.funded_keypair();
+    let provider2_position = provider_position_pda(&pool.pool, &provider2.pubkey());
+    let provider2_source = harness.create_token_account(&provider2, &pool.settlement_mint, &provider2.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider2_source, 200 * ONE_TOKEN);
+    harness.send_ok(
+        &provider2,
+        &[deposit_liquidity_ix(
+            &provider2.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider2_position,
+            &provider2_source,
+            200 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    assert_pool_ledger_matches_balance(&harness, &pool.pool, &pool.pool_token, "after second deposit");
+
+    // --- fill (position A) ---
+    let market_settle = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
+    let pool_market_settle = pool_market_pda(&pool.pool, &market_settle.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market_settle.market,
+            &pool_market_settle,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market_settle.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    let buyer1 = harness.funded_keypair();
+    let buyer1_source = harness.create_token_account(&buyer1, &market_settle.settlement_mint, &buyer1.pubkey());
+    harness.mint_to(&pool.manager, &market_settle.settlement_mint, &pool.manager, &buyer1_source, 10 * ONE_TOKEN);
+    let quote_a = default_pool_quote(1, harness.now() + 30);
+    let nonce_record_a = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote_a.nonce);
+    let position_a = pool_position_pda(&nonce_record_a);
+    let position_vault_a = pool_position_vault_pda(&position_a);
+    let fill_a_accounts = FillPoolQuoteAccounts {
+        buyer: buyer1.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market_settle.market,
+        pool_market: pool_market_settle,
+        settlement_mint: market_settle.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source: buyer1_source,
+        nonce_record: nonce_record_a,
+        position: position_a,
+        position_vault: position_vault_a,
+        eligibility: None,
+    };
+    harness.send_ok(
+        &buyer1,
+        &fill_pool_quote_ixs(&pool.quote_authority, &fill_a_accounts, &fixture.domain_separator, 1, quote_a),
+        &[],
+    );
+    assert_pool_ledger_matches_balance(&harness, &pool.pool, &pool.pool_token, "after fill A");
+
+    // --- settle (position A) ---
+    harness.warp_to_timestamp(market_settle.expiry);
+    finalize_oracle(&mut harness, &market_settle, 200 * ONE_TOKEN);
+    let buyer1_destination = harness.create_token_account(&buyer1, &market_settle.settlement_mint, &buyer1.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&pool.manager, &market_settle.settlement_mint, &fixture.treasury_owner);
+    let settle_accounts = SettlePoolPositionAccounts {
+        cranker: buyer1.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market_settle.market,
+        oracle: market_settle.oracle,
+        nonce_record: nonce_record_a,
+        position: position_a,
+        position_vault: position_vault_a,
+        settlement_mint: market_settle.settlement_mint,
+        buyer_destination: buyer1_destination,
+        pool_token: pool.pool_token,
+        treasury_destination,
+        rent_recipient: buyer1.pubkey(),
+    };
+    harness.send_ok(&buyer1, &[settle_pool_position_ix(&settle_accounts)], &[]);
+    assert_pool_ledger_matches_balance(&harness, &pool.pool, &pool.pool_token, "after settle A");
+
+    // --- donation ---
+    // An attacker donates directly into pool_token, bypassing
+    // deposit_liquidity entirely. From here on the ledger and the raw token
+    // balance must diverge by exactly this amount, forever (there is no
+    // instruction that sweeps this dust) -- that is the whole point of
+    // tracking a ledger instead of the raw balance.
+    let donated = 777_777u64;
+    let donor = harness.funded_keypair();
+    let donor_source = harness.create_token_account(&donor, &pool.settlement_mint, &donor.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &donor_source, donated);
+    harness.transfer_tokens(&donor, &donor_source, &pool.pool_token, donated);
+    assert_pool_ledger_offset_by(&harness, &pool.pool, &pool.pool_token, donated, "immediately after donation");
+
+    // --- fill (position B) ---
+    let market_refund = setup_market_variant(&mut harness, &fixture, &pool.manager, pool.settlement_mint, 0x22);
+    let pool_market_refund = pool_market_pda(&pool.pool, &market_refund.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market_refund.market,
+            &pool_market_refund,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market_refund.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    let buyer2 = harness.funded_keypair();
+    let buyer2_source = harness.create_token_account(&buyer2, &market_refund.settlement_mint, &buyer2.pubkey());
+    harness.mint_to(&pool.manager, &market_refund.settlement_mint, &pool.manager, &buyer2_source, 10 * ONE_TOKEN);
+    let quote_b = default_pool_quote(2, harness.now() + 30);
+    let nonce_record_b = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote_b.nonce);
+    let position_b = pool_position_pda(&nonce_record_b);
+    let position_vault_b = pool_position_vault_pda(&position_b);
+    let fill_b_accounts = FillPoolQuoteAccounts {
+        buyer: buyer2.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market_refund.market,
+        pool_market: pool_market_refund,
+        settlement_mint: market_refund.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source: buyer2_source,
+        nonce_record: nonce_record_b,
+        position: position_b,
+        position_vault: position_vault_b,
+        eligibility: None,
+    };
+    harness.send_ok(
+        &buyer2,
+        &fill_pool_quote_ixs(&pool.quote_authority, &fill_b_accounts, &fixture.domain_separator, 1, quote_b),
+        &[],
+    );
+    assert_pool_ledger_offset_by(&harness, &pool.pool, &pool.pool_token, donated, "after fill B");
+
+    // --- refund (position B) ---
+    let refund_deadline = market_refund.expiry
+        + i64::from(market_refund.observation_window_seconds)
+        + i64::from(market_refund.settlement_grace_seconds)
+        + 1;
+    harness.warp_to_timestamp(refund_deadline);
+    let buyer2_destination = harness.create_token_account(&buyer2, &market_refund.settlement_mint, &buyer2.pubkey());
+    let refund_accounts = RefundPoolPositionAccounts {
+        cranker: buyer2.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market_refund.market,
+        oracle: market_refund.oracle,
+        nonce_record: nonce_record_b,
+        position: position_b,
+        position_vault: position_vault_b,
+        settlement_mint: market_refund.settlement_mint,
+        buyer_destination: buyer2_destination,
+        pool_token: pool.pool_token,
+        rent_recipient: buyer2.pubkey(),
+    };
+    harness.send_ok(&buyer2, &[refund_pool_position_ix(&refund_accounts)], &[]);
+    assert_pool_ledger_offset_by(&harness, &pool.pool, &pool.pool_token, donated, "after refund B");
+
+    // --- withdraw ---
+    let pool_before_withdrawals: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(pool_before_withdrawals.open_positions, 0);
+    assert_eq!(pool_before_withdrawals.locked_collateral, 0);
+
+    let provider1_state: vsol::LiquidityProvider = harness.read_account(&provider1_position);
+    let provider1_destination = harness.create_token_account(&provider1, &pool.settlement_mint, &provider1.pubkey());
+    harness.send_ok(
+        &provider1,
+        &[withdraw_liquidity_ix(
+            &provider1.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider1_position,
+            &provider1_destination,
+            provider1_state.shares,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    assert_pool_ledger_offset_by(&harness, &pool.pool, &pool.pool_token, donated, "after first withdrawal");
+
+    let provider2_state: vsol::LiquidityProvider = harness.read_account(&provider2_position);
+    let provider2_destination = harness.create_token_account(&provider2, &pool.settlement_mint, &provider2.pubkey());
+    harness.send_ok(
+        &provider2,
+        &[withdraw_liquidity_ix(
+            &provider2.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider2_position,
+            &provider2_destination,
+            provider2_state.shares,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    assert_pool_ledger_offset_by(&harness, &pool.pool, &pool.pool_token, donated, "after second withdrawal");
+}
+
+#[test]
+fn donation_does_not_change_a_later_depositors_share_price() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+
+    let first_deposit = 50 * ONE_TOKEN;
+    let second_deposit = 30 * ONE_TOKEN;
+    let donation = 1_000 * ONE_TOKEN;
+
+    // Scenario A: no donation.
+    let pool_a = setup_pool(&mut harness, &fixture);
+    let depositor_a1 = harness.funded_keypair();
+    let position_a1 = provider_position_pda(&pool_a.pool, &depositor_a1.pubkey());
+    let source_a1 = harness.create_token_account(&depositor_a1, &pool_a.settlement_mint, &depositor_a1.pubkey());
+    harness.mint_to(&pool_a.manager, &pool_a.settlement_mint, &pool_a.manager, &source_a1, first_deposit);
+    harness.send_ok(
+        &depositor_a1,
+        &[deposit_liquidity_ix(
+            &depositor_a1.pubkey(),
+            &fixture.config,
+            &pool_a.settlement_mint,
+            &pool_a.pool,
+            &pool_a.pool_token,
+            &position_a1,
+            &source_a1,
+            first_deposit,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    let depositor_a2 = harness.funded_keypair();
+    let position_a2 = provider_position_pda(&pool_a.pool, &depositor_a2.pubkey());
+    let source_a2 = harness.create_token_account(&depositor_a2, &pool_a.settlement_mint, &depositor_a2.pubkey());
+    harness.mint_to(&pool_a.manager, &pool_a.settlement_mint, &pool_a.manager, &source_a2, second_deposit);
+    harness.send_ok(
+        &depositor_a2,
+        &[deposit_liquidity_ix(
+            &depositor_a2.pubkey(),
+            &fixture.config,
+            &pool_a.settlement_mint,
+            &pool_a.pool,
+            &pool_a.pool_token,
+            &position_a2,
+            &source_a2,
+            second_deposit,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let shares_a2: vsol::LiquidityProvider = harness.read_account(&position_a2);
+
+    // Scenario B: identical, except a large donation lands between the two
+    // deposits.
+    let pool_b = setup_pool(&mut harness, &fixture);
+    let depositor_b1 = harness.funded_keypair();
+    let position_b1 = provider_position_pda(&pool_b.pool, &depositor_b1.pubkey());
+    let source_b1 = harness.create_token_account(&depositor_b1, &pool_b.settlement_mint, &depositor_b1.pubkey());
+    harness.mint_to(&pool_b.manager, &pool_b.settlement_mint, &pool_b.manager, &source_b1, first_deposit + donation);
+    harness.send_ok(
+        &depositor_b1,
+        &[deposit_liquidity_ix(
+            &depositor_b1.pubkey(),
+            &fixture.config,
+            &pool_b.settlement_mint,
+            &pool_b.pool,
+            &pool_b.pool_token,
+            &position_b1,
+            &source_b1,
+            first_deposit,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    // The donation: a raw SPL transfer from the first depositor's own
+    // (already-funded) source account into pool_token, bypassing
+    // deposit_liquidity entirely.
+    harness.transfer_tokens(&depositor_b1, &source_b1, &pool_b.pool_token, donation);
+    assert_eq!(harness.token_balance(&pool_b.pool_token), first_deposit + donation);
+
+    let depositor_b2 = harness.funded_keypair();
+    let position_b2 = provider_position_pda(&pool_b.pool, &depositor_b2.pubkey());
+    let source_b2 = harness.create_token_account(&depositor_b2, &pool_b.settlement_mint, &depositor_b2.pubkey());
+    harness.mint_to(&pool_b.manager, &pool_b.settlement_mint, &pool_b.manager, &source_b2, second_deposit);
+    harness.send_ok(
+        &depositor_b2,
+        &[deposit_liquidity_ix(
+            &depositor_b2.pubkey(),
+            &fixture.config,
+            &pool_b.settlement_mint,
+            &pool_b.pool,
+            &pool_b.pool_token,
+            &position_b2,
+            &source_b2,
+            second_deposit,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+    let shares_b2: vsol::LiquidityProvider = harness.read_account(&position_b2);
+
+    assert_eq!(
+        shares_a2.shares, shares_b2.shares,
+        "a donation between the two deposits must not change the second depositor's share price"
+    );
+}
+
+// =====================================================================
 // close_pool_position: early exit for a pool-backed buyer, before expiry.
 // The counterparty is the pool itself, and the pool's `quote_authority`
 // signs a one-shot buyback quote exactly like it signs fills -- same
@@ -2135,13 +3057,21 @@ fn close_pool_position_succeeds_while_protocol_is_paused() {
 // publish_pyth_settlement: two-tier settlement.
 //
 // Tier 1 (unchanged): a fresh print inside [expiry, observation_end]
-// settles exactly as before. Tier 2 (new fallback): once the primary
-// window has fully elapsed with nothing acceptable published, a
-// last-known price at or before `expiry` is accepted provided it is no
-// staler than `max_settlement_staleness_seconds`. This is what lets
-// options on Pyth equity feeds -- which go dark overnight and on
-// weekends -- settle 24/7 instead of always falling through to a
-// timeout refund.
+// settles exactly as before, and remains valid at any time afterward (there
+// is no upper bound on `now` for tier 1 beyond the instruction's own hard
+// close). Tier 2 (last-resort fallback -- FIXED, see `SETTLEMENT_REFUND_PRIORITY_SECONDS`
+// and `MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO` in lib.rs): a last-known
+// price at or before `expiry`, no staler than `max_settlement_staleness_seconds`,
+// is accepted ONLY once `now` is past the FULL settlement deadline
+// (`expiry + observation_window_seconds + settlement_grace_seconds`) PLUS a
+// small additional tie-break buffer against `refund_unsettled` --
+// `observation_end` alone (the pre-fix gate) is not enough: it made tier 2
+// reachable moments after every single expiry rather than a genuine
+// fallback for feeds that have gone dark overnight or on weekends, letting
+// a settler cherry-pick any acceptable historical price for the entire
+// `settlement_grace_seconds` window (and beyond). See
+// `publish_pyth_settlement_rejects_tier_two_print_immediately_after_observation_window`
+// below for the regression this fix closes.
 // =====================================================================
 
 const TIER_TEST_OBSERVATION_WINDOW: u32 = 30;
@@ -2229,6 +3159,61 @@ fn publish_pyth_settlement_rejects_tier_two_price_before_observation_window_elap
     assert_vsol_error(&failed, vsol::VsolError::InvalidObservationTime);
 }
 
+/// THE regression that matters: reproduces the audit's exact scenario. At an
+/// instant just past `observation_end` (the pre-fix tier-2 gate --
+/// `now > observation_end`, without the fix in this commit), a stale
+/// pre-expiry print must now be REJECTED, while a genuinely fresh tier-1
+/// print published within [expiry, observation_end] is still accepted at
+/// that exact same instant.
+///
+/// Pre-fix, the first assertion below fails: `now > observation_end` was
+/// tier 2's entire gate, so with the SDK's real 30-second observation
+/// window this is the steady state starting 30 seconds after every single
+/// expiry, not a rare fallback -- the stale print would have settled
+/// immediately. Gating tier 2 on the FULL settlement deadline (see
+/// `SETTLEMENT_REFUND_PRIORITY_SECONDS`) closes that: the same stale print,
+/// at the same instant, is now rejected, while a real print continues to
+/// settle exactly as before -- gating tier 2 never takes anything away from
+/// a settler who actually has a fresh print.
+#[test]
+fn publish_pyth_settlement_rejects_tier_two_print_immediately_after_observation_window() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let now = observation_end + 1;
+    harness.warp_to_timestamp(now);
+
+    // A stale, pre-expiry print, comfortably within the staleness bound --
+    // exactly the kind of print the original vulnerability let a settler
+    // cherry-pick moments after expiry.
+    let stale_publish_time = market.expiry - 1_800;
+    assert!(market.expiry - stale_publish_time <= i64::from(market.max_settlement_staleness_seconds));
+    let stale_price_update = plant_price_update(&mut harness, stale_publish_time);
+    let stale_ix =
+        publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &stale_price_update);
+    let failed = harness.send_err(&creator, &[stale_ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidObservationTime);
+
+    // A fresh, in-window tier-1 print at the exact same instant settles
+    // without any friction from this fix -- the oracle is still
+    // unfinalized (the attempt above failed), so this is the same market.
+    let fresh_publish_time = market.expiry + 5;
+    assert!(fresh_publish_time <= observation_end && fresh_publish_time <= now);
+    let fresh_price_update = plant_price_update(&mut harness, fresh_publish_time);
+    let fresh_ix =
+        publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &fresh_price_update);
+    harness.send_ok(&creator, &[fresh_ix], &[]);
+
+    let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
+    assert!(oracle.finalized);
+    assert!(!oracle.settled_from_stale_price);
+    assert_eq!(oracle.observed_at, fresh_publish_time);
+}
+
 #[test]
 fn publish_pyth_settlement_tier_two_succeeds_after_window_elapses_and_pays_out() {
     let mut harness = Harness::new();
@@ -2297,12 +3282,17 @@ fn publish_pyth_settlement_tier_two_succeeds_after_window_elapses_and_pays_out()
     assert!(market.expiry - publish_time <= i64::from(market.max_settlement_staleness_seconds));
     let price_update = plant_price_update(&mut harness, publish_time);
 
-    // Warp past the primary observation window, but still inside the
-    // settlement deadline, before publishing.
+    // Warp all the way past the FULL settlement deadline (expiry +
+    // observation window + settlement grace) AND the additional
+    // `SETTLEMENT_REFUND_PRIORITY_SECONDS` tie-break buffer against
+    // `refund_unsettled` -- tier 2 is not reachable any earlier than this
+    // (see `publish_pyth_settlement_rejects_tier_two_print_immediately_after_observation_window`
+    // for the regression proving it is rejected before this instant).
     let observation_end = market.expiry + i64::from(market.observation_window_seconds);
     let settlement_deadline = observation_end + i64::from(market.settlement_grace_seconds);
-    let publish_now = observation_end + 1;
-    assert!(publish_now <= settlement_deadline);
+    let tier_two_open_at = settlement_deadline + vsol::SETTLEMENT_REFUND_PRIORITY_SECONDS;
+    let publish_now = tier_two_open_at + 1;
+    assert!(publish_now <= settlement_deadline + i64::from(market.max_settlement_staleness_seconds));
     harness.warp_to_timestamp(publish_now);
 
     let publish_ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
@@ -2353,8 +3343,16 @@ fn publish_pyth_settlement_rejects_pre_expiry_price_older_than_staleness_bound()
     let publish_time = market.expiry - i64::from(market.max_settlement_staleness_seconds) - 1;
     let price_update = plant_price_update(&mut harness, publish_time);
 
+    // Warp to when tier 2 is actually open (past the full deadline AND the
+    // `SETTLEMENT_REFUND_PRIORITY_SECONDS` tie-break buffer), so this test
+    // isolates the staleness check itself -- rejection here can only be
+    // about the print's age, not about tier 2 not having opened yet (that
+    // case is covered separately by
+    // `publish_pyth_settlement_rejects_tier_two_print_immediately_after_observation_window`).
     let observation_end = market.expiry + i64::from(market.observation_window_seconds);
-    harness.warp_to_timestamp(observation_end + 1);
+    let settlement_deadline = observation_end + i64::from(market.settlement_grace_seconds);
+    let tier_two_open_at = settlement_deadline + vsol::SETTLEMENT_REFUND_PRIORITY_SECONDS;
+    harness.warp_to_timestamp(tier_two_open_at + 1);
 
     let ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
     let failed = harness.send_err(&creator, &[ix], &[]);
@@ -2461,17 +3459,260 @@ fn refund_unsettled_still_works_when_no_acceptable_settlement_price_exists() {
     assert_eq!(harness.token_balance(&maker_destination), quote.max_payout);
 }
 
+/// Pins the settle/refund race decision documented on
+/// `SETTLEMENT_REFUND_PRIORITY_SECONDS`: `refund_unsettled` opens exactly AT
+/// the full settlement deadline (unchanged), while tier 2 does not open
+/// until `SETTLEMENT_REFUND_PRIORITY_SECONDS` after that same deadline --
+/// refund deliberately wins the tie. This is not a "nothing is available"
+/// scenario: a perfectly valid tier-2 print exists the entire time, and
+/// `publish_pyth_settlement` still rejects it at the instant refund already
+/// succeeds.
+#[test]
+fn refund_unsettled_wins_the_tie_against_tier_two_at_the_settlement_deadline() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let maker = harness.funded_keypair();
+    let buyer = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&maker, &maker.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_tier_test_market(&mut harness, &fixture, &maker, settlement_mint);
+
+    let writer_vault = writer_vault_pda(&fixture.config, &maker.pubkey(), &market.settlement_mint);
+    let writer_token = writer_token_pda(&writer_vault);
+    harness.send_ok(
+        &maker,
+        &[initialize_writer_vault_ix(
+            &maker.pubkey(),
+            &fixture.config,
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+        )],
+        &[],
+    );
+    let maker_source = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &maker_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &maker,
+        &[deposit_writer_ix(
+            &fixture.config,
+            &maker.pubkey(),
+            &market.settlement_mint,
+            &writer_vault,
+            &writer_token,
+            &maker_source,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&maker, &market.settlement_mint, &maker, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_quote(1, harness.now() + 30);
+    let nonce_record = nonce_pda(&fixture.config, &maker.pubkey(), quote.nonce);
+    let position = position_pda(&nonce_record);
+    let position_vault = position_vault_pda(&position);
+    let fill_accounts = FillQuoteAccounts {
+        buyer: buyer.pubkey(),
+        maker: maker.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        settlement_mint: market.settlement_mint,
+        writer_vault,
+        writer_token,
+        buyer_source,
+        nonce_record,
+        position,
+        position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_quote_ixs(&maker, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    // A perfectly valid tier-2 print -- well within the staleness bound --
+    // is available the entire time. If tier 2 opened at the same instant as
+    // refund (the pre-tiebreak behavior), this settlement could race the
+    // refund below on identical timing.
+    let publish_time = market.expiry - 1_800;
+    assert!(market.expiry - publish_time <= i64::from(market.max_settlement_staleness_seconds));
+    let price_update = plant_price_update(&mut harness, publish_time);
+
+    let observation_end = market.expiry + i64::from(market.observation_window_seconds);
+    let settlement_deadline = observation_end + i64::from(market.settlement_grace_seconds);
+    let tier_two_open_at = settlement_deadline + vsol::SETTLEMENT_REFUND_PRIORITY_SECONDS;
+    assert!(settlement_deadline < tier_two_open_at);
+
+    // Land exactly where refund_unsettled is callable but tier 2 is not.
+    harness.warp_to_timestamp(settlement_deadline + 1);
+
+    // Tier 2 is still gated: the same, otherwise-perfectly-valid print is
+    // rejected here.
+    let publish_ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    let publish_failed = harness.send_err(&buyer, &[publish_ix], &[]);
+    assert_vsol_error(&publish_failed, vsol::VsolError::InvalidObservationTime);
+
+    // Refund succeeds at this exact instant: refund wins the tie.
+    let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    let maker_destination = harness.create_token_account(&maker, &market.settlement_mint, &maker.pubkey());
+    let refund_accounts = RefundUnsettledAccounts {
+        cranker: buyer.pubkey(),
+        market: market.market,
+        oracle: market.oracle,
+        nonce_record,
+        position,
+        position_vault,
+        settlement_mint: market.settlement_mint,
+        buyer_destination,
+        maker_destination,
+        rent_recipient: buyer.pubkey(),
+    };
+    harness.send_ok(&buyer, &[refund_unsettled_ix(&refund_accounts)], &[]);
+    assert_eq!(harness.token_balance(&buyer_destination), quote.premium);
+    assert_eq!(harness.token_balance(&maker_destination), quote.max_payout);
+
+    // The refunded position is gone, but the market-wide oracle is
+    // untouched by that refund -- once tier 2's own gate opens, the same
+    // print can still finalize the oracle for the market as a whole (e.g.
+    // for other positions that did not race to refund). Refund winning the
+    // tie for one position never permanently disables tier 2 for the
+    // market.
+    harness.warp_to_timestamp(tier_two_open_at + 1);
+    let late_publish_ix = publish_pyth_settlement_ix(&fixture.config, &market.market, &market.oracle, &price_update);
+    harness.send_ok(&buyer, &[late_publish_ix], &[]);
+    let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
+    assert!(oracle.finalized);
+    assert!(oracle.settled_from_stale_price);
+}
+
+// =====================================================================
+// create_market: cross-parameter bound on `max_settlement_staleness_seconds`
+// relative to `observation_window_seconds + settlement_grace_seconds`. See
+// `MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO` in lib.rs.
+// =====================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn create_market_args_with_terms(
+    settlement_mint: Pubkey,
+    expiry: i64,
+    feed_salt: u8,
+    observation_window_seconds: u32,
+    settlement_grace_seconds: u32,
+    max_settlement_staleness_seconds: u32,
+) -> vsol::CreateMarketArgs {
+    let mut args = vsol::CreateMarketArgs {
+        market_id: [0u8; 32],
+        underlying_mint: Pubkey::new_unique(),
+        symbol: symbol_bytes("NVDA"),
+        price_scale: 1_000_000,
+        expiry,
+        observation_window_seconds,
+        settlement_grace_seconds,
+        max_confidence_bps: 100,
+        pyth_feed_id: [feed_salt; 32],
+        max_settlement_staleness_seconds,
+    };
+    args.market_id = expected_market_id(&args, settlement_mint);
+    args
+}
+
+/// The audit's exact pathological example: a tiny observation window and
+/// grace period (so the full settlement deadline arrives almost
+/// immediately) paired with the maximum legal absolute staleness allowance.
+/// Before this bound existed, this market would open tier 2 with a full
+/// week of historical prices to choose from roughly a minute after expiry
+/// -- the amplifier on top of the timing fix (see
+/// `MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO`'s doc comment).
+#[test]
+fn create_market_rejects_disproportionate_settlement_staleness() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+
+    let expiry = harness.now() + MARKET_LEAD_SECONDS + 3600;
+    let args = create_market_args_with_terms(settlement_mint, expiry, 0x51, 1, 1, 604_800);
+    let market = market_pda(&fixture.config, &args.market_id);
+    let oracle = oracle_pda(&market);
+    let ix = create_market_ix(&creator.pubkey(), &fixture.config, &market, &oracle, &settlement_mint, args);
+    let failed = harness.send_err(&creator, &[ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidSettlementStaleness);
+}
+
+/// The real configuration this program ships with (30s observation window,
+/// 900s grace, 86_400s staleness -- ratio ~93) must remain legal under the
+/// new bound.
+#[test]
+fn create_market_accepts_the_sdk_configured_staleness_ratio() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+
+    let expiry = harness.now() + MARKET_LEAD_SECONDS + 3600;
+    let args = create_market_args_with_terms(
+        settlement_mint,
+        expiry,
+        0x52,
+        OBSERVATION_WINDOW,
+        SETTLEMENT_GRACE,
+        MAX_SETTLEMENT_STALENESS,
+    );
+    let market = market_pda(&fixture.config, &args.market_id);
+    let oracle = oracle_pda(&market);
+    let ix = create_market_ix(&creator.pubkey(), &fixture.config, &market, &oracle, &settlement_mint, args);
+    harness.send_ok(&creator, &[ix], &[]);
+
+    let market_account: vsol::Market = harness.read_account(&market);
+    assert_eq!(
+        market_account.max_settlement_staleness_seconds,
+        MAX_SETTLEMENT_STALENESS
+    );
+}
+
+/// Exercises the exact boundary of the 100x ratio: `window(10) + grace(10) =
+/// 20`, so `2_000` is the last legal staleness value and `2_001` is the
+/// first illegal one.
+#[test]
+fn create_market_ratio_bound_is_exact_at_its_boundary() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let expiry = harness.now() + MARKET_LEAD_SECONDS + 3600;
+
+    let ok_args = create_market_args_with_terms(settlement_mint, expiry, 0x53, 10, 10, 2_000);
+    let ok_market = market_pda(&fixture.config, &ok_args.market_id);
+    let ok_oracle = oracle_pda(&ok_market);
+    let ok_ix =
+        create_market_ix(&creator.pubkey(), &fixture.config, &ok_market, &ok_oracle, &settlement_mint, ok_args);
+    harness.send_ok(&creator, &[ok_ix], &[]);
+
+    let bad_args = create_market_args_with_terms(settlement_mint, expiry, 0x54, 10, 10, 2_001);
+    let bad_market = market_pda(&fixture.config, &bad_args.market_id);
+    let bad_oracle = oracle_pda(&bad_market);
+    let bad_ix =
+        create_market_ix(&creator.pubkey(), &fixture.config, &bad_market, &bad_oracle, &settlement_mint, bad_args);
+    let failed = harness.send_err(&creator, &[bad_ix], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidSettlementStaleness);
+}
+
 // =====================================================================
 // close_settled_market
 // =====================================================================
 
-/// The exact deadline `close_settled_market` (and `refund_pool_position`)
-/// require `now` to be strictly greater than: the entire two-tier settlement
-/// window, counted from `expiry`.
+/// The exact deadline `refund_unsettled`/`refund_pool_position` require `now`
+/// to be strictly greater than: the entire two-tier settlement window, counted
+/// from `expiry`. This is when a stranded position first becomes refundable.
 fn full_settlement_deadline(market: &MarketFixture) -> i64 {
     market.expiry
         + i64::from(market.observation_window_seconds)
         + i64::from(market.settlement_grace_seconds)
+}
+
+/// The deadline `close_settled_market` requires: the settlement deadline plus
+/// `MARKET_CLEANUP_BUFFER_SECONDS`. Deliberately LATER than
+/// `full_settlement_deadline` so cleanup can never race an in-flight refund —
+/// see `close_settled_market_cannot_close_at_the_refund_deadline`.
+fn market_cleanup_deadline(market: &MarketFixture) -> i64 {
+    full_settlement_deadline(market) + vsol::MARKET_CLEANUP_BUFFER_SECONDS
 }
 
 #[test]
@@ -2519,7 +3760,7 @@ fn close_settled_market_closes_market_and_oracle_and_returns_rent_to_creator() {
         &[],
     );
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     let creator_lamports_before = harness.get_account(&creator.pubkey()).lamports;
     let market_lamports = harness.get_account(&market.market).lamports;
@@ -2557,7 +3798,7 @@ fn close_settled_market_succeeds_with_no_pool_ever_authorized() {
     let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
     let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     let close_accounts = CloseSettledMarketAccounts {
         authority: creator.pubkey(),
@@ -2603,6 +3844,57 @@ fn close_settled_market_rejects_before_settlement_window_fully_elapses() {
     assert!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0) > 0);
 }
 
+/// REGRESSION: `close_settled_market` used to share the settlement deadline
+/// exactly, with no buffer — the same instant `refund_unsettled` first becomes
+/// callable. An automated cleaner (scripts/cranker.ts) racing a late-but-valid
+/// refund could therefore close the market first and strand that position's
+/// escrowed `premium + max_payout` forever, with no attacker and no bug in
+/// either caller.
+///
+/// This test pins the buffer: for the entire week between the refund deadline
+/// and the cleanup deadline, closing is refused. Against the pre-fix contract
+/// the first `send_err` below would have SUCCEEDED, so this fails loudly if
+/// the buffer is ever removed or reduced to zero.
+#[test]
+fn close_settled_market_cannot_close_at_the_refund_deadline() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+
+    // The instant a stranded position first becomes refundable. Pre-fix this
+    // was ALSO the instant the market became closeable — the race.
+    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+
+    // Still refused one second before the cleanup deadline elapses.
+    harness.warp_to_timestamp(market_cleanup_deadline(&market));
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+
+    // The market and oracle survived the whole refund window, so any position
+    // stranded by an over-eager cleaner stayed recoverable throughout.
+    assert!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0) > 0);
+    assert!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0) > 0);
+
+    // Past the buffer, cleanup proceeds as before.
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0) == 0);
+}
+
 #[test]
 fn close_settled_market_rejects_while_pool_market_still_enabled() {
     let mut harness = Harness::new();
@@ -2628,7 +3920,7 @@ fn close_settled_market_rejects_while_pool_market_still_enabled() {
         &[],
     );
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     let close_accounts = CloseSettledMarketAccounts {
         authority: creator.pubkey(),
@@ -2652,7 +3944,7 @@ fn close_settled_market_rejects_signer_that_is_neither_creator_nor_admin() {
     let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
     let impostor = harness.funded_keypair();
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     let close_accounts = CloseSettledMarketAccounts {
         authority: impostor.pubkey(),
@@ -2675,7 +3967,7 @@ fn close_settled_market_allows_admin_as_well_as_creator() {
     let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
     let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     // The admin did not create this market, but is still permitted to close
     // it; rent still returns to the market's own creator, not the admin.
@@ -2701,7 +3993,7 @@ fn close_settled_market_rejects_rent_recipient_other_than_creator() {
     let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
     let outsider = harness.funded_keypair();
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
 
     let close_accounts = CloseSettledMarketAccounts {
         authority: creator.pubkey(),
@@ -2729,7 +4021,7 @@ fn close_settled_market_is_maintenance_and_succeeds_while_protocol_paused() {
     let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
     let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
 
-    harness.warp_to_timestamp(full_settlement_deadline(&market) + 1);
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
     harness.send_ok(
         &fixture.pause_authority,
         &[set_pause_ix(&fixture.pause_authority.pubkey(), &fixture.config, true)],
@@ -2800,9 +4092,12 @@ fn closed_market_pda_can_be_reinitialized_by_create_market() {
     let create_ix = || create_market_ix(&creator.pubkey(), &fixture.config, &market, &oracle, &settlement_mint, args);
     harness.send_ok(&creator, &[create_ix()], &[]);
 
+    // Closing also requires MARKET_CLEANUP_BUFFER_SECONDS past the settlement
+    // deadline (see close_settled_market_cannot_close_at_the_refund_deadline).
     let deadline = args.expiry
         + i64::from(args.observation_window_seconds)
-        + i64::from(args.settlement_grace_seconds);
+        + i64::from(args.settlement_grace_seconds)
+        + vsol::MARKET_CLEANUP_BUFFER_SECONDS;
     harness.warp_to_timestamp(deadline + 1);
     let close_accounts = CloseSettledMarketAccounts {
         authority: creator.pubkey(),

@@ -492,6 +492,34 @@ pub fn update_liquidity_pool_ix(
     }
 }
 
+/// Same account shape as `update_liquidity_pool_ix`: `apply_liquidity_pool_update`
+/// commits a pending proposal once its timelock has elapsed.
+pub fn apply_liquidity_pool_update_ix(manager: &Pubkey, config: &Pubkey, pool: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*manager, true),
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new(*pool, false),
+        ],
+        data: vsol::instruction::ApplyLiquidityPoolUpdate.data(),
+    }
+}
+
+/// Same account shape again: `cancel_pending_pool_update` discards a pending
+/// proposal before its timelock elapses.
+pub fn cancel_pending_pool_update_ix(manager: &Pubkey, config: &Pubkey, pool: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*manager, true),
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new(*pool, false),
+        ],
+        data: vsol::instruction::CancelPendingPoolUpdate.data(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn deposit_liquidity_ix(
     provider: &Pubkey,

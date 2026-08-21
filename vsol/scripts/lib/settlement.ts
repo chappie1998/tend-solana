@@ -271,9 +271,81 @@ export type MarketWindow = {
   settlementGraceSeconds: number;
 };
 
-/** Tier-1/tier-2 aside, a market can no longer accept a fresh oracle publish once expiry + observation window + settlement grace has elapsed -- past that, only refund_pool_position applies. */
+/**
+ * The FULL settlement deadline: expiry + observation window + settlement
+ * grace. This is exactly the instant `refund_unsettled`/`refund_pool_position`
+ * first become callable on-chain, and the base `computeMarketCloseDeadline`
+ * builds on.
+ *
+ * This is NOT, on its own, "the instant publish_pyth_settlement stops
+ * accepting" -- tier 1 remains acceptable at any time up to
+ * `computeFinalSettlementDeadline`, and tier 2 (the last-known-price
+ * fallback) only opens `SETTLEMENT_REFUND_PRIORITY_SECONDS` after this
+ * instant (see `computeTierTwoOpenAt`) and stays open until that same final
+ * deadline. `decideMarketPublishAction` uses the wider bound so the cranker
+ * keeps attempting `publish_pyth_settlement` for as long as the on-chain
+ * instruction could still accept it, not just up to this earlier instant.
+ */
 export function computeSettlementDeadline(market: MarketWindow): number {
   return market.expiry + market.observationWindowSeconds + market.settlementGraceSeconds;
+}
+
+/**
+ * MUST match `SETTLEMENT_REFUND_PRIORITY_SECONDS` in
+ * vsol/programs/vsol/src/lib.rs. Deliberately separates tier 2's on-chain
+ * gate from `refund_unsettled`/`refund_pool_position`'s deadline
+ * (`computeSettlementDeadline`), which both become callable at exactly that
+ * instant: without this buffer, tier 2 would become eligible in the exact
+ * same instant as the refund path, making the outcome for a position still
+ * open at that boundary depend on ambiguous same-slot transaction-ordering
+ * luck. Refund deliberately wins the tie -- see the on-chain constant's doc
+ * comment for the full rationale.
+ */
+export const SETTLEMENT_REFUND_PRIORITY_SECONDS = 60;
+
+export type PublishWindow = MarketWindow & { maxSettlementStalenessSeconds: number };
+
+/**
+ * The instant tier 2 (the last-known-price fallback) may first be used
+ * on-chain. Mirrors `tier_two_open_at` in `publish_pyth_settlement`.
+ */
+export function computeTierTwoOpenAt(market: MarketWindow): number {
+  return computeSettlementDeadline(market) + SETTLEMENT_REFUND_PRIORITY_SECONDS;
+}
+
+/**
+ * The instant `publish_pyth_settlement` closes for good -- neither tier can
+ * publish past this. Mirrors `final_deadline` on-chain:
+ * `computeSettlementDeadline` PLUS the market's own
+ * `maxSettlementStalenessSeconds`. Deliberately NOT
+ * `computeTierTwoOpenAt(market) + maxSettlementStalenessSeconds` -- the
+ * priority buffer trims tier 2's window from the front only, so it never
+ * pushes this back edge later (see the on-chain doc comment for why that
+ * matters: it keeps this within `MARKET_CLEANUP_BUFFER_SECONDS` of
+ * `computeSettlementDeadline` for every legal market).
+ */
+export function computeFinalSettlementDeadline(market: PublishWindow): number {
+  return computeSettlementDeadline(market) + market.maxSettlementStalenessSeconds;
+}
+
+/**
+ * MUST match `MARKET_CLEANUP_BUFFER_SECONDS` in
+ * vsol/programs/vsol/src/lib.rs. The on-chain instruction refuses to close a
+ * market until this much time has passed BEYOND the settlement deadline, so a
+ * cleaner that used the bare deadline would just burn fees on transactions
+ * that revert with `MarketNotCloseable` for a week.
+ */
+export const MARKET_CLEANUP_BUFFER_SECONDS = 604_800;
+
+/**
+ * The instant `close_settled_market` will actually accept, as opposed to the
+ * instant a stranded position becomes refundable
+ * (`computeSettlementDeadline`). These are deliberately NOT the same moment:
+ * closing at the refund deadline races in-flight refunds and permanently
+ * strands their escrow.
+ */
+export function computeMarketCloseDeadline(market: MarketWindow): number {
+  return computeSettlementDeadline(market) + MARKET_CLEANUP_BUFFER_SECONDS;
 }
 
 /** Filters decoded positions down to those whose market has passed expiry, given a map of market address -> expiry (unix seconds) and the current clock. Positions whose market is absent from the map are excluded (caller logs those separately as "market unreadable"). */
@@ -331,10 +403,13 @@ export function marketsWithOpenPositions(params: {
  * the only thing standing between a candidate market and a permanently
  * stranded position. A market is a close candidate ONLY IF, ALL of:
  *
- *   1. Its close deadline has fully elapsed: `now > computeSettlementDeadline(market)`
- *      (`expiry + observationWindowSeconds + settlementGraceSeconds`), using
- *      the same strict `>` the on-chain instruction itself requires -- this
- *      mirrors sdk/index.ts's `marketCloseableAfter` byte-for-byte.
+ *   1. Its close deadline has fully elapsed: `now > computeMarketCloseDeadline(market)`
+ *      (`expiry + observationWindowSeconds + settlementGraceSeconds +
+ *      MARKET_CLEANUP_BUFFER_SECONDS`), using the same strict `>` the
+ *      on-chain instruction itself requires. NOTE this is deliberately LATER
+ *      than `computeSettlementDeadline` -- that earlier instant is when a
+ *      stranded position first becomes refundable, and closing there would
+ *      race the refund and strand its escrow forever.
  *   2. Its address is NOT in `marketsWithOpenPositions` -- the
  *      stranding-prevention check. This set MUST be built from a position
  *      scan the caller took at or after the moment it decided to run
@@ -359,7 +434,7 @@ export function selectMarketCloseCandidates(params: {
   maxPerRun: number;
 }): DecodedMarketForCleanup[] {
   const candidates = params.markets.filter((market) => {
-    if (params.now <= computeSettlementDeadline(market)) return false;
+    if (params.now <= computeMarketCloseDeadline(market)) return false;
     if (params.marketsWithOpenPositions.has(market.address)) return false;
     return true;
   });
@@ -374,13 +449,25 @@ export type MarketPublishDecision = { kind: "publish" } | { kind: "skip"; reason
  * only after this says "publish"). The program itself decides tier-1 vs
  * tier-2 acceptability once a real price update is presented; this just
  * rules out the cases that are certain to fail or are unnecessary.
+ *
+ * Uses `computeFinalSettlementDeadline`, NOT the earlier
+ * `computeSettlementDeadline`: the on-chain instruction keeps accepting
+ * tier-1 prints (and, after `computeTierTwoOpenAt`, tier-2 prints) all the
+ * way out to the final deadline, so stopping at the earlier bound would
+ * make the cranker give up on legitimate settlements it could still land --
+ * in particular every tier-2 case, which by definition only becomes
+ * reachable after `computeSettlementDeadline`. Attempting `publish` inside
+ * that window when nothing is actually acceptable yet is not a correctness
+ * problem: the on-chain program rejects with `InvalidObservationTime`,
+ * which the caller already treats as an ordinary skip (see
+ * `describeSettlementError`).
  */
 export function decideMarketPublishAction(
-  params: MarketWindow & { now: number; oracleFinalized: boolean },
+  params: PublishWindow & { now: number; oracleFinalized: boolean },
 ): MarketPublishDecision {
   if (params.oracleFinalized) return { kind: "skip", reason: "oracle already finalized" };
   if (params.now < params.expiry) return { kind: "skip", reason: "market has not expired yet" };
-  if (params.now > computeSettlementDeadline(params)) {
+  if (params.now > computeFinalSettlementDeadline(params)) {
     return { kind: "skip", reason: "settlement window has closed; refund_pool_position applies instead" };
   }
   return { kind: "publish" };
@@ -388,7 +475,22 @@ export function decideMarketPublishAction(
 
 export type PoolPositionDecision = { kind: "settle" } | { kind: "refund" } | { kind: "skip"; reason: string };
 
-/** Decides the action for a single expired open position given the oracle's current finalized state and the market's settlement deadline. */
+/**
+ * Decides the action for a single expired open position given the oracle's
+ * current finalized state and the market's settlement deadline.
+ *
+ * Deliberately still gates "refund" on the bare `computeSettlementDeadline`
+ * (unchanged), not on `computeTierTwoOpenAt` or `computeFinalSettlementDeadline`:
+ * this is the "refund wins the tie" half of the settle/refund race decision
+ * described on `SETTLEMENT_REFUND_PRIORITY_SECONDS`. The on-chain refund
+ * path opens at exactly `computeSettlementDeadline` regardless of whether a
+ * tier-2 print might show up later, so this cranker mirrors that: it does
+ * not hold a position open waiting on the mere possibility of a tier-2
+ * settlement once refunding is already legal. A finalized oracle (tier 1 or
+ * tier 2, from this cranker's own publish attempt or anyone else's) always
+ * takes priority over a refund, at any time -- see the `oracleFinalized`
+ * check ordered first below.
+ */
 export function decidePositionAction(
   params: MarketWindow & { now: number; oracleFinalized: boolean },
 ): PoolPositionDecision {

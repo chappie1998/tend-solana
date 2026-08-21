@@ -56,6 +56,117 @@ pub const MAX_PYTH_EXPONENT_ABS: u32 = 18;
 // settlement grace period is.
 pub const MAX_SETTLEMENT_STALENESS_SECONDS: u32 = 604_800;
 
+/// Extra buffer, layered on top of the full settlement deadline
+/// (`expiry + observation_window_seconds + settlement_grace_seconds`), that
+/// tier 2 must additionally wait past before `publish_pyth_settlement` will
+/// accept it. Exists solely to break an exact-instant tie against
+/// `refund_unsettled` / `refund_pool_position`, which both become callable
+/// at precisely that deadline (see their own `deadline` computation --
+/// deliberately untouched by this constant, so the invariant
+/// `close_settled_market`'s doc comment depends on keeps holding exactly as
+/// documented there). Without this buffer, tier 2's gate and the refund
+/// gate would share the identical boundary second, so whether a given
+/// still-open position gets a stale-price settlement or a clean refund
+/// would depend on ambiguous same-slot transaction-ordering luck instead of
+/// a deliberate protocol choice.
+///
+/// Refund deliberately wins the tie: for the whole window
+/// `(deadline, deadline + SETTLEMENT_REFUND_PRIORITY_SECONDS]`, refund is
+/// callable and tier 2 is not. A refund returns every escrowed token to
+/// exactly where it came from -- no wealth transfer, no exposure to a stale
+/// price -- so when both a refund and a first-ever tier-2 settlement would
+/// otherwise be simultaneously "correct" outcomes, the protocol prefers the
+/// one that cannot be gamed by either counterparty racing to submit first.
+/// 60 seconds is generous slack over any realistic clock/slot ambiguity
+/// while staying negligible against every other duration here
+/// (`settlement_grace_seconds` defaults to 900s,
+/// `max_settlement_staleness_seconds` to 86,400s): it does not make tier 2
+/// meaningfully less useful as a fallback, it just removes the ambiguous
+/// instant.
+pub const SETTLEMENT_REFUND_PRIORITY_SECONDS: i64 = 60;
+
+/// Cross-parameter bound enforced at `create_market`: how large
+/// `max_settlement_staleness_seconds` may be relative to
+/// `observation_window_seconds + settlement_grace_seconds`, i.e. how long a
+/// tier-2 print's lookback may reach relative to how long the market must
+/// wait before tier 2 opens at all.
+///
+/// Without this, a permissionless creator can pick a tiny
+/// `(observation_window_seconds, settlement_grace_seconds)` -- as low as
+/// `(1, 1)` -- completely independently of `max_settlement_staleness_seconds`,
+/// which can go all the way up to the global 7-day ceiling
+/// (`MAX_SETTLEMENT_STALENESS_SECONDS`). Gating tier 2 on the full deadline
+/// (`SETTLEMENT_REFUND_PRIORITY_SECONDS` above) closes the *timing*
+/// half of the original vulnerability -- tier 2 is no longer a free early
+/// option -- but does nothing to stop a creator who controls their own
+/// market's own timing parameters from making that deadline arrive almost
+/// immediately anyway. A `(1, 1, 604_800)` market would still open tier 2
+/// roughly a minute after `expiry` with a full week of historical prices to
+/// choose from. This ratio is the other half of the fix: it ties how far
+/// back tier 2 may look to how long the market actually made everyone wait
+/// first.
+///
+/// 100x keeps the SDK's real configuration legal with headroom (30s window +
+/// 900s grace = 930s wait, 86,400s staleness -- ratio ~93) while rejecting
+/// the audit's degenerate `(1, 1, 604_800)` example by roughly three orders
+/// of magnitude (ratio 302,400 against a cap of 100).
+pub const MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO: u64 = 100;
+
+/// How long AFTER the settlement deadline a market must sit before
+/// `close_settled_market` may reclaim its rent.
+///
+/// `settle`, `refund_unsettled`, `settle_pool_position` and
+/// `refund_pool_position` all load `Market`/`SettlementOracle` via `has_one`,
+/// so closing those accounts makes every one of them permanently
+/// unconstructible — an open position's escrowed `premium + max_payout` would
+/// be stranded in its vault with no instruction left that can move it.
+///
+/// Before this constant existed, `close_settled_market` used the settlement
+/// deadline *itself*, with zero buffer — the exact same instant at which
+/// `refund_unsettled` first becomes callable. A late-but-valid refund racing
+/// the automated cleaner (scripts/cranker.ts calls this instruction) could
+/// therefore lose funds with no attacker involved and no bug in either caller.
+///
+/// This buffer does not make closing safe on its own — see point 3 of
+/// `close_settled_market`'s doc comment for the enumeration gap that remains
+/// the caller's responsibility. It converts a zero-margin race into a 7-day
+/// window during which any stranded position can still be refunded, which is
+/// what makes that off-chain assumption survivable in practice.
+pub const MARKET_CLEANUP_BUFFER_SECONDS: i64 = 604_800;
+
+/// Hard ceiling on `max_utilization_bps` for every liquidity pool, regardless
+/// of what its (permissionless, therefore untrusted) manager configures.
+/// `validate_pool_risk_limits` rejects anything above this, so a single
+/// `fill_pool_quote` can never lock more than 80% of a pool's collateral --
+/// "the entire pool in one fill" is no longer representable.
+///
+/// Be honest about what this is and is not: it is blast-radius reduction,
+/// NOT a fix. A manager who controls `quote_authority` can still drain a
+/// pool geometrically -- fill up to 80%, close/settle to realize it, fill
+/// 80% of what remains, repeat -- across as many transactions as they like.
+/// The actual defense against a hostile manager is the timelock on raising
+/// this cap or rotating `quote_authority` at all; see
+/// `POOL_UPDATE_TIMELOCK_SECONDS` and `update_liquidity_pool`.
+pub const MAX_POOL_UTILIZATION_BPS: u16 = 8_000;
+
+/// How long a manager must wait after proposing to raise `max_utilization_bps`
+/// and/or `max_position_bps`, or rotate `quote_authority`, before
+/// `apply_liquidity_pool_update` may commit the change. `update_liquidity_pool`
+/// records the proposal and emits `LiquidityPoolUpdateProposed` with the
+/// `effective_at` timestamp so LPs and indexers can actually observe it --
+/// the delay is worthless if nobody can see it coming. 24h is meant to give
+/// LPs a realistic window to notice a hostile change and call
+/// `withdraw_liquidity` before it takes effect.
+///
+/// This is the real defense against a permissionless pool manager rotating
+/// `quote_authority` to a key they control and self-filling for a large
+/// fraction of the pool: without this delay, propose-then-self-fill can
+/// happen in a single transaction with zero notice. See
+/// `update_liquidity_pool`'s doc comment for the residual gap this does NOT
+/// close (a manager can still open a position mid-window to block
+/// `withdraw_liquidity`, which requires the pool be idle).
+pub const POOL_UPDATE_TIMELOCK_SECONDS: i64 = 86_400;
+
 #[program]
 pub mod vsol {
     use super::*;
@@ -193,6 +304,21 @@ pub mod vsol {
         require!(
             args.max_settlement_staleness_seconds > 0
                 && args.max_settlement_staleness_seconds <= MAX_SETTLEMENT_STALENESS_SECONDS,
+            VsolError::InvalidSettlementStaleness
+        );
+        // Cross-parameter bound: see `MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO`
+        // for why the absolute cap just above is not enough on its own -- a
+        // creator can still pick an arbitrarily tiny
+        // `(observation_window_seconds, settlement_grace_seconds)` and pair
+        // it with the full 7-day staleness allowance.
+        let tier_one_window = u64::from(args.observation_window_seconds)
+            .checked_add(u64::from(args.settlement_grace_seconds))
+            .ok_or(VsolError::MathOverflow)?;
+        let max_allowed_staleness = tier_one_window
+            .checked_mul(MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(
+            u64::from(args.max_settlement_staleness_seconds) <= max_allowed_staleness,
             VsolError::InvalidSettlementStaleness
         );
         require!(
@@ -535,13 +661,38 @@ pub mod vsol {
             .expiry
             .checked_add(i64::from(market.observation_window_seconds))
             .ok_or(VsolError::MathOverflow)?;
+        // The FULL settlement deadline: exactly the instant
+        // `refund_unsettled` / `refund_pool_position` first become callable
+        // (see their own, deliberately-untouched `deadline` computation).
+        // Tier 1 has no separate upper bound on `now` of its own -- a
+        // tier-1-eligible print stays tier-1-valid all the way out to
+        // `final_deadline` below. This variable's only other job is gating
+        // tier 2, immediately below.
         let settlement_deadline = observation_end
             .checked_add(i64::from(market.settlement_grace_seconds))
             .ok_or(VsolError::MathOverflow)?;
-        require!(
-            now <= settlement_deadline,
-            VsolError::SettlementWindowClosed
-        );
+        // The instant tier 2 may first be used. See
+        // `SETTLEMENT_REFUND_PRIORITY_SECONDS` for why this is
+        // `settlement_deadline` PLUS a buffer rather than
+        // `settlement_deadline` itself -- in short, so tier 2 never becomes
+        // eligible in the exact same instant `refund_unsettled` does.
+        let tier_two_open_at = settlement_deadline
+            .checked_add(SETTLEMENT_REFUND_PRIORITY_SECONDS)
+            .ok_or(VsolError::MathOverflow)?;
+        // The instruction's own hard close: past this, NEITHER tier can ever
+        // publish again. Deliberately `settlement_deadline + staleness`, NOT
+        // `tier_two_open_at + staleness` -- the priority buffer above trims
+        // tier 2's window from the front only, so it never pushes this back
+        // edge later. That keeps this within `MARKET_CLEANUP_BUFFER_SECONDS`
+        // of `settlement_deadline` for every legal market (staleness is
+        // capped at `MAX_SETTLEMENT_STALENESS_SECONDS`, which is exactly
+        // `MARKET_CLEANUP_BUFFER_SECONDS`), which is what lets
+        // `close_settled_market`'s doc comment claim that nothing can ever
+        // publish past its own cleanup cutoff.
+        let final_deadline = settlement_deadline
+            .checked_add(i64::from(market.max_settlement_staleness_seconds))
+            .ok_or(VsolError::MathOverflow)?;
+        require!(now <= final_deadline, VsolError::SettlementWindowClosed);
 
         let pyth_price = parse_fully_verified_price_update(
             &ctx.accounts.price_update.to_account_info(),
@@ -549,26 +700,41 @@ pub mod vsol {
         )?;
 
         // Tier 1 (preferred, unchanged): a print inside the primary
-        // observation window settles exactly as before. This is the only
-        // path used while Pyth equities are actively publishing.
+        // observation window settles exactly as before, at any point up to
+        // `final_deadline`. This is the only path used while Pyth equities
+        // are actively publishing, and -- because it has no upper bound on
+        // `now` beyond the instruction's own hard close -- anyone holding a
+        // genuine tier-1 print can always publish it right up until tier 2
+        // (or refund) would otherwise apply, so a real print always wins the
+        // race against a stale one.
         let tier_one_ok = pyth_price.publish_time >= market.expiry
             && pyth_price.publish_time <= observation_end
             && pyth_price.publish_time <= now;
 
-        // Tier 2 (last-known price, fallback): once the primary window has
-        // fully elapsed with no acceptable fresh print, accept a print at or
-        // before `expiry` provided it is not staler than
-        // `max_settlement_staleness_seconds`. Gating tier 2 behind
-        // `now > observation_end` stops anyone racing to finalize at a stale
-        // pre-expiry mark while a fresh post-expiry print could still
-        // arrive; the update itself is still cryptographically verified by
-        // the Pyth receiver and the confidence-bound check below still
-        // applies, so tier 2 only widens *when* a legitimate price is
-        // acceptable, never *who* may supply one. This is what lets options
-        // on equities settle overnight and on weekends, when the underlying
-        // feed has gone dark, instead of always falling through to a
-        // timeout refund.
-        let tier_two_ok = now > observation_end
+        // Tier 2 (last-known price, fallback -- FIXED): gated on the FULL
+        // settlement deadline (`tier_two_open_at`, i.e.
+        // `expiry + observation_window_seconds + settlement_grace_seconds +
+        // SETTLEMENT_REFUND_PRIORITY_SECONDS`), not on `observation_end`.
+        // Before this fix, tier 2 opened moments after `observation_end` --
+        // with the SDK's 30s observation window, that is the steady state
+        // starting 30 seconds after every single expiry, not a rare
+        // fallback. Because a tier-1-eligible print stays valid forever
+        // after (see `tier_one_ok` above), both branches of
+        // `tier_one_ok || tier_two_ok` were simultaneously satisfiable for
+        // the entire multi-hundred-second `settlement_grace_seconds` window
+        // (and beyond), and the settler could simply pick whichever
+        // historical price, within `max_settlement_staleness_seconds`,
+        // produced the payout they wanted. Requiring the ENTIRE tier-1
+        // window AND grace period (plus the small tie-breaking buffer) to
+        // have elapsed with nobody settling makes tier 2 an actual last
+        // resort: it is now unreachable for as long as any real print could
+        // still be published, and only becomes usable once the feed has
+        // genuinely gone dark for the equities overnight/weekend case this
+        // exists for. The update itself remains cryptographically verified
+        // by the Pyth receiver and the confidence-bound check below still
+        // applies, so this only widens *when* a legitimate price is
+        // acceptable, never *who* may supply one.
+        let tier_two_ok = now > tier_two_open_at
             && pyth_price.publish_time <= market.expiry
             && market
                 .expiry
@@ -582,15 +748,24 @@ pub mod vsol {
         // Bounds the update's absolute staleness (publish_time -> now). This
         // must not defeat a legitimate tier-2 print, so it is widened to
         // cover the worst case across both tiers: a tier-1 print can be as
-        // old as `expiry` when `now` reaches `settlement_deadline`
-        // (observation_window + settlement_grace after expiry), and a
-        // tier-2 print can additionally be up to `max_settlement_staleness_seconds`
-        // older than `expiry`. The configured staleness bound remains the
-        // operative limit on how stale a tier-2 price may be; this check is
-        // a secondary sanity bound on the gap between publish time and now.
+        // old as `expiry` when `now` reaches `final_deadline`, and a tier-2
+        // print can additionally be published as late as `final_deadline`
+        // while being as old as `expiry - max_settlement_staleness_seconds`
+        // -- a gap of `final_deadline - (expiry - max_settlement_staleness_seconds)`,
+        // i.e. `observation_window + settlement_grace + 2 * staleness` (the
+        // staleness term appears twice: once bounding how old the print may
+        // be, once more bounding how much later than `settlement_deadline`
+        // it may still be published). The configured staleness bound remains
+        // the operative limit on how stale a tier-2 price may be relative to
+        // `expiry`; this check is a secondary sanity bound on the gap
+        // between publish time and `now`.
         let maximum_age = i64::from(market.observation_window_seconds)
             .checked_add(i64::from(market.settlement_grace_seconds))
-            .and_then(|value| value.checked_add(i64::from(market.max_settlement_staleness_seconds)))
+            .and_then(|value| {
+                i64::from(market.max_settlement_staleness_seconds)
+                    .checked_mul(2)
+                    .and_then(|doubled_staleness| value.checked_add(doubled_staleness))
+            })
             .ok_or(VsolError::MathOverflow)?;
         require!(
             pyth_price.publish_time.saturating_add(maximum_age) >= now,
@@ -816,12 +991,21 @@ pub mod vsol {
         pool.pool_id = args.pool_id;
         pool.total_shares = 0;
         pool.locked_collateral = 0;
+        pool.total_assets = 0;
         pool.open_positions = 0;
         pool.cumulative_premium = 0;
         pool.cumulative_payout = 0;
         pool.max_utilization_bps = args.max_utilization_bps;
         pool.max_position_bps = args.max_position_bps;
         pool.manager = ctx.accounts.creator.key();
+        // No pending change on creation. `pending_effective_at == 0` is the
+        // sentinel for "nothing pending" throughout update/apply/cancel
+        // below; Anchor already zero-initializes this, but it's set
+        // explicitly here for the same reason every other field above is.
+        pool.pending_quote_authority = Pubkey::default();
+        pool.pending_max_utilization_bps = 0;
+        pool.pending_max_position_bps = 0;
+        pool.pending_effective_at = 0;
 
         emit!(LiquidityPoolInitialized {
             pool: pool.key(),
@@ -895,6 +1079,48 @@ pub mod vsol {
         Ok(())
     }
 
+    /// Updates a liquidity pool's risk configuration. Split into an
+    /// immediate path for LP-safe tightening and a timelocked path for
+    /// everything else, because pool creation is permissionless -- a
+    /// pool's `manager` is an untrusted role, not an insider. Before this
+    /// split, a manager could raise `max_utilization_bps` to 100% and
+    /// rotate `quote_authority` to a key they control in a single
+    /// instruction with zero notice, then self-sign a `fill_pool_quote`
+    /// for (almost) the whole pool and extract it via `close_pool_position`
+    /// in the same transaction. `MAX_POOL_UTILIZATION_BPS` closes the
+    /// "whole pool in one fill" half of that; this timelock closes the
+    /// "zero notice" half, which is the half that actually matters --
+    /// see `POOL_UPDATE_TIMELOCK_SECONDS`.
+    ///
+    /// - Lowering `max_utilization_bps` and/or `max_position_bps`, with
+    ///   `quote_authority` left unchanged, applies immediately in this same
+    ///   instruction: it can only shrink what the pool is exposed to, so LPs
+    ///   never need advance notice of their own protection getting stricter.
+    /// - Anything else -- raising either cap above its current value, or
+    ///   rotating `quote_authority` at all, even alongside a lowered cap --
+    ///   is recorded as a pending change (`pending_*` fields) with
+    ///   `pending_effective_at = now + POOL_UPDATE_TIMELOCK_SECONDS`, and an
+    ///   `LiquidityPoolUpdateProposed` event carrying `effective_at` so LPs
+    ///   and indexers can observe it and choose to withdraw. Nothing about
+    ///   the pool's *live*, currently-effective configuration changes until
+    ///   `apply_liquidity_pool_update` commits it. `cancel_pending_pool_update`
+    ///   lets the manager clear a mistaken proposal before that.
+    ///
+    /// RESIDUAL HOLE (documented, not fixed here): both this instruction and
+    /// `apply_liquidity_pool_update` require the pool be idle
+    /// (`open_positions == 0 && locked_collateral == 0`), the same gate
+    /// `withdraw_liquidity` uses. During the timelock window a malicious
+    /// manager can self-sign a `fill_pool_quote` to open a position, which
+    /// blocks LP withdrawals for as long as it stays open, then close it
+    /// again right before calling `apply_liquidity_pool_update` (which also
+    /// requires idle). This does not make the window unbounded -- returning
+    /// the pool to idle to apply the change is itself observable and gives
+    /// LPs another chance to react between "position closed" and "update
+    /// applied" -- but it is not guaranteed to give LPs a long clear window
+    /// either. The complete fix is letting LPs withdraw *unlocked* capital
+    /// while positions remain open, which is a larger redesign of
+    /// `withdraw_liquidity`'s idle gate than this pass makes, and remains
+    /// the right next step before real money.
     pub fn update_liquidity_pool(
         ctx: Context<UpdateLiquidityPool>,
         args: UpdateLiquidityPoolArgs,
@@ -908,16 +1134,98 @@ pub mod vsol {
             VsolError::InvalidAuthority
         );
         validate_pool_risk_limits(args.max_utilization_bps, args.max_position_bps)?;
+
         let pool = &mut ctx.accounts.pool;
-        pool.quote_authority = args.quote_authority;
-        pool.max_utilization_bps = args.max_utilization_bps;
-        pool.max_position_bps = args.max_position_bps;
+        let is_tightening_only = args.quote_authority == pool.quote_authority
+            && args.max_utilization_bps <= pool.max_utilization_bps
+            && args.max_position_bps <= pool.max_position_bps;
+
+        if is_tightening_only {
+            pool.max_utilization_bps = args.max_utilization_bps;
+            pool.max_position_bps = args.max_position_bps;
+            emit!(LiquidityPoolUpdated {
+                pool: pool.key(),
+                quote_authority: pool.quote_authority,
+                max_utilization_bps: pool.max_utilization_bps,
+                max_position_bps: pool.max_position_bps,
+            });
+            return Ok(());
+        }
+
+        let now = Clock::get()?.unix_timestamp;
+        let effective_at = now
+            .checked_add(POOL_UPDATE_TIMELOCK_SECONDS)
+            .ok_or(VsolError::MathOverflow)?;
+        pool.pending_quote_authority = args.quote_authority;
+        pool.pending_max_utilization_bps = args.max_utilization_bps;
+        pool.pending_max_position_bps = args.max_position_bps;
+        pool.pending_effective_at = effective_at;
+
+        emit!(LiquidityPoolUpdateProposed {
+            pool: pool.key(),
+            pending_quote_authority: pool.pending_quote_authority,
+            pending_max_utilization_bps: pool.pending_max_utilization_bps,
+            pending_max_position_bps: pool.pending_max_position_bps,
+            effective_at,
+        });
+        Ok(())
+    }
+
+    /// Commits a pending `update_liquidity_pool` proposal once its timelock
+    /// has elapsed. Requires the pool idle for the same reason
+    /// `update_liquidity_pool` does: applying while `open_positions > 0`
+    /// would change the risk backing an already-open position out from
+    /// under it. See `update_liquidity_pool`'s doc comment for the residual
+    /// gap this does not close.
+    pub fn apply_liquidity_pool_update(ctx: Context<ApplyLiquidityPoolUpdate>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let pool = &mut ctx.accounts.pool;
+        require!(
+            pool.open_positions == 0 && pool.locked_collateral == 0,
+            VsolError::PoolHasOpenPositions
+        );
+        require!(pool.pending_effective_at != 0, VsolError::NoPendingPoolUpdate);
+        require!(
+            now >= pool.pending_effective_at,
+            VsolError::PoolUpdateTimelocked
+        );
+        // Re-validate at APPLY time, not just at propose time. A proposal can
+        // sit pending indefinitely, so if a program upgrade ever tightens
+        // MAX_POOL_UTILIZATION_BPS, a proposal made under the old ceiling
+        // must not be able to sail past the new one just because it was
+        // recorded first.
+        validate_pool_risk_limits(pool.pending_max_utilization_bps, pool.pending_max_position_bps)?;
+
+        pool.quote_authority = pool.pending_quote_authority;
+        pool.max_utilization_bps = pool.pending_max_utilization_bps;
+        pool.max_position_bps = pool.pending_max_position_bps;
+        pool.pending_quote_authority = Pubkey::default();
+        pool.pending_max_utilization_bps = 0;
+        pool.pending_max_position_bps = 0;
+        pool.pending_effective_at = 0;
+
         emit!(LiquidityPoolUpdated {
             pool: pool.key(),
             quote_authority: pool.quote_authority,
             max_utilization_bps: pool.max_utilization_bps,
             max_position_bps: pool.max_position_bps,
         });
+        Ok(())
+    }
+
+    /// Lets the manager clear a pending `update_liquidity_pool` proposal
+    /// before its timelock elapses, so a mistaken or stale proposal is not
+    /// stuck sitting there for `POOL_UPDATE_TIMELOCK_SECONDS`. Cancelling
+    /// never touches the pool's live configuration -- there is nothing
+    /// unsafe about allowing it regardless of whether the pool is idle.
+    pub fn cancel_pending_pool_update(ctx: Context<CancelPendingPoolUpdate>) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        require!(pool.pending_effective_at != 0, VsolError::NoPendingPoolUpdate);
+        pool.pending_quote_authority = Pubkey::default();
+        pool.pending_max_utilization_bps = 0;
+        pool.pending_max_position_bps = 0;
+        pool.pending_effective_at = 0;
+        emit!(LiquidityPoolUpdateCancelled { pool: pool.key() });
         Ok(())
     }
 
@@ -934,10 +1242,29 @@ pub mod vsol {
             ctx.accounts.pool.open_positions == 0 && ctx.accounts.pool.locked_collateral == 0,
             VsolError::PoolHasOpenPositions
         );
-        let assets_before = ctx.accounts.pool_token.amount;
-        let shares =
-            calculate_deposit_shares(amount, ctx.accounts.pool.total_shares, assets_before)?;
+        // Share-price denominator: the pool's own ledger, NOT the raw SPL
+        // balance below. `pool_token.amount` can be inflated by anyone via a
+        // plain `spl-token transfer` (a token account's owner cannot refuse
+        // incoming transfers), which would otherwise let an attacker donate
+        // funds to skew the price a victim's deposit is quoted against --
+        // the classic first-depositor inflation attack. See `total_assets`'s
+        // doc comment on `LiquidityPool`.
+        let ledger_assets_before = ctx.accounts.pool.total_assets;
+        let shares = calculate_deposit_shares(
+            amount,
+            ctx.accounts.pool.total_shares,
+            ledger_assets_before,
+        )?;
         require!(shares >= min_shares_out, VsolError::SlippageExceeded);
+
+        // Separately, the raw pre-transfer balance -- used only to confirm
+        // this specific transfer actually moved `amount` (below), which is
+        // an orthogonal concern from what the share price is computed
+        // against. This is deliberately NOT `ledger_assets_before`: an
+        // intervening donation between the last ledger update and this
+        // instruction would make them diverge, and the mismatch check must
+        // still pass in that ordinary (if unusual) case.
+        let token_balance_before = ctx.accounts.pool_token.amount;
 
         transfer_checked(
             ctx.accounts.token_program.key(),
@@ -951,7 +1278,7 @@ pub mod vsol {
         ctx.accounts.pool_token.reload()?;
         require!(
             ctx.accounts.pool_token.amount
-                == assets_before
+                == token_balance_before
                     .checked_add(amount)
                     .ok_or(VsolError::MathOverflow)?,
             VsolError::CollateralMismatch
@@ -976,6 +1303,12 @@ pub mod vsol {
             .pool
             .total_shares
             .checked_add(shares)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_add(amount)
             .ok_or(VsolError::MathOverflow)?;
 
         emit!(LiquidityDeposited {
@@ -1005,10 +1338,12 @@ pub mod vsol {
             ctx.accounts.provider_position.shares >= shares,
             VsolError::InvalidPoolShares
         );
+        // Ledger, not raw SPL balance -- see `total_assets`'s doc comment on
+        // `LiquidityPool` and the matching note in `deposit_liquidity`.
         let amount = calculate_withdraw_amount(
             shares,
             ctx.accounts.pool.total_shares,
-            ctx.accounts.pool_token.amount,
+            ctx.accounts.pool.total_assets,
         )?;
         require!(amount >= min_amount_out, VsolError::SlippageExceeded);
 
@@ -1029,6 +1364,12 @@ pub mod vsol {
             .pool
             .total_shares
             .checked_sub(shares)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_sub(amount)
             .ok_or(VsolError::MathOverflow)?;
 
         let config_key = ctx.accounts.config.key();
@@ -1136,10 +1477,13 @@ pub mod vsol {
             &message,
         )?;
 
-        let total_collateral = ctx
-            .accounts
-            .pool_token
-            .amount
+        // Ledger, not raw SPL balance -- see `total_assets`'s doc comment on
+        // `LiquidityPool`. Using the donation-inflatable `pool_token.amount`
+        // here would let anyone puff up the pool's apparent utilization
+        // headroom (and the sufficiency check just below) without
+        // depositing anything real.
+        let total_collateral = pool
+            .total_assets
             .checked_add(pool.locked_collateral)
             .ok_or(VsolError::MathOverflow)?;
         let utilization_limit = calculate_bps_limit(total_collateral, pool.max_utilization_bps)?;
@@ -1157,7 +1501,7 @@ pub mod vsol {
             VsolError::PoolPositionLimitExceeded
         );
         require!(
-            ctx.accounts.pool_token.amount >= quote.max_payout,
+            pool.total_assets >= quote.max_payout,
             VsolError::InsufficientWriterLiquidity
         );
 
@@ -1232,6 +1576,12 @@ pub mod vsol {
             .pool
             .open_positions
             .checked_add(1)
+            .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_sub(quote.max_payout)
             .ok_or(VsolError::MathOverflow)?;
         emit!(PoolQuoteFilled {
             position: position.key(),
@@ -1309,6 +1659,14 @@ pub mod vsol {
             .pool
             .cumulative_payout
             .checked_add(payout)
+            .ok_or(VsolError::MathOverflow)?;
+        // `pool_amount` is what actually lands back in `pool_token` below --
+        // see `total_assets`'s doc comment on `LiquidityPool`.
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_add(pool_amount)
             .ok_or(VsolError::MathOverflow)?;
 
         let nonce_record_key = ctx.accounts.nonce_record.key();
@@ -1408,6 +1766,15 @@ pub mod vsol {
             .pool
             .open_positions
             .checked_sub(1)
+            .ok_or(VsolError::MathOverflow)?;
+        // `position.max_payout` is what actually lands back in `pool_token`
+        // below (the premium goes to the buyer, not the pool) -- see
+        // `total_assets`'s doc comment on `LiquidityPool`.
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_add(position.max_payout)
             .ok_or(VsolError::MathOverflow)?;
 
         let nonce_record_key = ctx.accounts.nonce_record.key();
@@ -1552,6 +1919,14 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        // `pool_amount` is what actually lands back in `pool_token` below --
+        // see `total_assets`'s doc comment on `LiquidityPool`.
+        ctx.accounts.pool.total_assets = ctx
+            .accounts
+            .pool
+            .total_assets
+            .checked_add(pool_amount)
+            .ok_or(VsolError::MathOverflow)?;
 
         let nonce_record_key = position.nonce_record;
         let position_seeds: &[&[u8]] = &[
@@ -1622,14 +1997,32 @@ pub mod vsol {
     ///
     /// Safety argument -- why this cannot strand or double-spend anything:
     ///
-    /// 1. `now > expiry + observation_window_seconds + settlement_grace_seconds`
-    ///    is exactly the deadline `refund_pool_position` already uses as "the
+    /// 1. `expiry + observation_window_seconds + settlement_grace_seconds` is
+    ///    exactly the deadline `refund_pool_position` already uses as "the
     ///    settlement fallback window is closed" (`VsolError::SettlementWindowOpen`).
-    ///    Past this point `publish_pyth_settlement` can never publish a new
-    ///    settlement (neither tier 1 nor the tier-2 last-known-price
-    ///    fallback), so the oracle's `finalized`/`price` state is frozen
-    ///    forever -- there is no future event that could still need this
-    ///    market or oracle to exist.
+    ///    NOTE (updated alongside the tier-2 timing fix): `publish_pyth_settlement`
+    ///    can still publish for a while past this exact point -- tier 1
+    ///    always, tier 2 after a short additional buffer (see
+    ///    `SETTLEMENT_REFUND_PRIORITY_SECONDS`) -- but never past
+    ///    `deadline + max_settlement_staleness_seconds`, which
+    ///    `create_market`'s cross-parameter bound
+    ///    (`MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO`) guarantees is always
+    ///    `<= deadline + MARKET_CLEANUP_BUFFER_SECONDS` (both
+    ///    `max_settlement_staleness_seconds` and `MARKET_CLEANUP_BUFFER_SECONDS`
+    ///    are capped at the same 7-day ceiling). So by the time THIS
+    ///    instruction's own cutoff below is reached, `publish_pyth_settlement`
+    ///    is guaranteed to already be permanently closed and the oracle's
+    ///    `finalized`/`price` state frozen forever -- there is no future
+    ///    event that could still need this market or oracle to exist.
+    ///
+    ///    This instruction nonetheless requires a FURTHER
+    ///    `MARKET_CLEANUP_BUFFER_SECONDS` on top of that deadline. Freezing
+    ///    the oracle is not the same as sweeping the positions: the deadline
+    ///    is the instant `refund_unsettled`/`refund_pool_position` first
+    ///    become callable, so closing the market at that same instant races
+    ///    every in-flight refund with no margin at all. The buffer is what
+    ///    makes point 3's off-chain assumption survivable rather than a
+    ///    coin-flip against the cleaner.
     /// 2. `fill_quote` and `fill_pool_quote` both hard-require
     ///    `now < market.expiry` before opening a new position. Since the
     ///    deadline above is strictly after `expiry`, by the time it has
@@ -1657,6 +2050,14 @@ pub mod vsol {
     ///    before calling `close_settled_market`. This is the documented gap
     ///    the task that added this instruction explicitly flagged and
     ///    accepted, given positions are not cheaply enumerable on-chain.
+    ///    `MARKET_CLEANUP_BUFFER_SECONDS` bounds the damage when that
+    ///    assumption is violated (a stranded position stays refundable for a
+    ///    week after settlement closes) but does NOT discharge it: a caller
+    ///    that closes a market with an open position still strands it
+    ///    permanently. Enumerating positions on-chain -- e.g. an
+    ///    `open_position_count` on `Market`, maintained by fill/settle/refund
+    ///    -- is the only way to actually enforce this, and remains the right
+    ///    fix before real money.
     /// 4. As a cheap, *additional* on-chain check (defense-in-depth, not the
     ///    primary safety argument above, which already holds regardless): if
     ///    the caller passes a `pool`/`pool_market` pair, it must be the
@@ -1676,12 +2077,19 @@ pub mod vsol {
         let now = Clock::get()?.unix_timestamp;
         let market = &ctx.accounts.market;
 
+        // NOT the bare settlement deadline: that is the same instant
+        // `refund_unsettled`/`refund_pool_position` first become callable, so
+        // closing there races in-flight refunds with zero margin. See
+        // MARKET_CLEANUP_BUFFER_SECONDS.
         let deadline = market
             .expiry
             .checked_add(i64::from(market.observation_window_seconds))
             .and_then(|value| value.checked_add(i64::from(market.settlement_grace_seconds)))
             .ok_or(VsolError::MathOverflow)?;
-        require!(now > deadline, VsolError::MarketNotCloseable);
+        let cleanup_deadline = deadline
+            .checked_add(MARKET_CLEANUP_BUFFER_SECONDS)
+            .ok_or(VsolError::MathOverflow)?;
+        require!(now > cleanup_deadline, VsolError::MarketNotCloseable);
 
         match (ctx.accounts.pool.as_ref(), ctx.accounts.pool_market.as_ref()) {
             (Some(pool), Some(pool_market)) => {
@@ -2054,6 +2462,26 @@ pub struct UpdateLiquidityPool<'info> {
     pub pool: Account<'info, LiquidityPool>,
 }
 
+/// Same account shape as `UpdateLiquidityPool`: only the pool's own manager
+/// may commit or cancel a pending change they proposed.
+#[derive(Accounts)]
+pub struct ApplyLiquidityPoolUpdate<'info> {
+    pub manager: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), pool.settlement_mint.as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = manager @ VsolError::Unauthorized)]
+    pub pool: Account<'info, LiquidityPool>,
+}
+
+#[derive(Accounts)]
+pub struct CancelPendingPoolUpdate<'info> {
+    pub manager: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [POOL_SEED, config.key().as_ref(), pool.settlement_mint.as_ref(), pool.pool_id.as_ref()], bump = pool.bump, has_one = config, has_one = manager @ VsolError::Unauthorized)]
+    pub pool: Account<'info, LiquidityPool>,
+}
+
 #[derive(Accounts)]
 pub struct DepositLiquidity<'info> {
     #[account(mut)]
@@ -2396,6 +2824,50 @@ pub struct LiquidityPool {
     pub max_position_bps: u16,
     // Appended after launch: keep at the end so existing byte offsets stay valid.
     pub manager: Pubkey,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. Pending `update_liquidity_pool` proposal, committed by
+    // `apply_liquidity_pool_update` once `pending_effective_at` elapses, or
+    // discarded by `cancel_pending_pool_update`. `pending_effective_at == 0`
+    // is the sentinel for "no pending change" -- Anchor zero-initializes new
+    // pool accounts to exactly this state, and every path that clears a
+    // pending change (apply, cancel) resets all four fields back to it.
+    pub pending_quote_authority: Pubkey,
+    pub pending_max_utilization_bps: u16,
+    pub pending_max_position_bps: u16,
+    pub pending_effective_at: i64,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. The pool's own internal ledger of free (unlocked) settlement
+    // tokens it holds -- maintained by deposit_liquidity, withdraw_liquidity,
+    // fill_pool_quote, settle_pool_position, close_pool_position, and
+    // refund_pool_position, the only six places that ever move tokens into
+    // or out of `pool_token`.
+    //
+    // This exists because `pool_token.amount` (the raw SPL token balance) is
+    // NOT safe to use as an accounting value: a token account's owner cannot
+    // refuse incoming transfers, so anyone can inflate `pool_token.amount`
+    // with a plain `spl-token transfer` that never goes through
+    // `deposit_liquidity`. Before this field existed, `deposit_liquidity`
+    // and `withdraw_liquidity` used `pool_token.amount` directly as the
+    // share-price denominator -- a textbook first-depositor share-inflation
+    // attack: deposit a tiny amount for a cheap 1-share position, donate a
+    // large amount directly to `pool_token` to inflate the price per share,
+    // then let a victim's deposit round down to a share count worth far less
+    // than they put in.
+    //
+    // `total_assets` tracks only what the program itself has moved through
+    // those six instructions, so a donation changes `pool_token.amount` but
+    // never `total_assets` -- it becomes inert dust, physically present in
+    // the vault but never counted by any share-price calculation. In
+    // ordinary operation (no donation) `total_assets == pool_token.amount`
+    // exactly; with a donation, `pool_token.amount == total_assets +
+    // (cumulative donations)`.
+    //
+    // Belt and braces: `calculate_deposit_shares`/`calculate_withdraw_amount`
+    // (see math.rs) additionally apply a virtual-shares offset so that even
+    // a correct ledger's very first deposit cannot be leveraged into an
+    // exploitable rounding edge. This field is the primary fix; the virtual
+    // offset is the secondary one.
+    pub total_assets: u64,
 }
 
 #[account]
@@ -2599,6 +3071,27 @@ pub struct LiquidityPoolUpdated {
     pub max_position_bps: u16,
 }
 
+/// Emitted by `update_liquidity_pool` whenever a change is timelocked rather
+/// than applied immediately (raising a cap, or rotating `quote_authority`).
+/// Carries `effective_at` so LPs and indexers can observe a pending change
+/// and its deadline -- the timelock is worthless as a defense if nobody can
+/// see it coming. See `POOL_UPDATE_TIMELOCK_SECONDS`.
+#[event]
+pub struct LiquidityPoolUpdateProposed {
+    pub pool: Pubkey,
+    pub pending_quote_authority: Pubkey,
+    pub pending_max_utilization_bps: u16,
+    pub pending_max_position_bps: u16,
+    pub effective_at: i64,
+}
+
+/// Emitted by `cancel_pending_pool_update` when a manager discards a pending
+/// proposal before its timelock elapses.
+#[event]
+pub struct LiquidityPoolUpdateCancelled {
+    pub pool: Pubkey,
+}
+
 #[event]
 pub struct LiquidityPoolMarketUpdated {
     pub pool: Pubkey,
@@ -2790,6 +3283,10 @@ pub enum VsolError {
     MarketNotCloseable,
     #[msg("The supplied pool/pool-market pair is invalid or inconsistent.")]
     InvalidPoolMarket,
+    #[msg("There is no pending liquidity pool update to apply or cancel.")]
+    NoPendingPoolUpdate,
+    #[msg("The pending liquidity pool update's timelock has not yet elapsed.")]
+    PoolUpdateTimelocked,
 }
 
 /// Deterministic market id: identical series parameters bind to one PDA, so
@@ -2813,7 +3310,7 @@ fn expected_market_id(args: &CreateMarketArgs, settlement_mint: Pubkey) -> [u8; 
 fn validate_pool_risk_limits(max_utilization_bps: u16, max_position_bps: u16) -> Result<()> {
     require!(
         max_utilization_bps > 0
-            && u64::from(max_utilization_bps) <= BPS_DENOMINATOR
+            && max_utilization_bps <= MAX_POOL_UTILIZATION_BPS
             && max_position_bps > 0
             && max_position_bps <= max_utilization_bps,
         VsolError::InvalidPoolRiskLimits
@@ -3072,3 +3569,4 @@ mod factory_tests {
         assert_eq!(args_with_correct_id.market_id, correct_id);
     }
 }
+

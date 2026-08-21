@@ -103,6 +103,19 @@ function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+/**
+ * Reads a design token straight from :root at chart-mount time, the same
+ * runtime hand-off the Chromium palette uses on Tend's Monad sibling (see
+ * brand.md there: "PriceChart.tsx reads them at runtime via
+ * getComputedStyle") -- the hex fallbacks below only cover SSR/no-DOM, they
+ * are never what actually renders in a browser.
+ */
+function cssVar(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
 export function TradingViewMarketChart({
   direction,
   target,
@@ -291,22 +304,34 @@ export function TradingViewMarketChart({
     const container = containerRef.current;
     if (!container) return;
     container.replaceChildren();
+
+    // Read the Chromium tokens once at mount (see cssVar above) so the
+    // canvas fills with the same --surface/--ink-muted/--border/--positive/
+    // --negative as the rest of the app instead of a separately hardcoded
+    // palette. Same chart library, same data, same behavior -- only the
+    // color inputs passed to it change.
+    const tokenSurface = cssVar("--surface", "#161616");
+    const tokenInkMuted = cssVar("--ink-muted", "#8a8a8a");
+    const tokenBorder = cssVar("--border", "#242424");
+    const tokenPositive = cssVar("--positive", "#62d67f");
+    const tokenNegative = cssVar("--negative", "#ff6b6b");
+
     const chart = createChart(container, {
       width: Math.max(1, container.clientWidth),
       height: Math.max(270, container.clientHeight),
       layout: {
         attributionLogo: true,
-        background: { type: ColorType.Solid, color: "#0d151d" },
-        textColor: "#82909d",
+        background: { type: ColorType.Solid, color: tokenSurface },
+        textColor: tokenInkMuted,
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       },
       grid: {
-        vertLines: { color: "rgba(62, 75, 86, 0.24)" },
-        horzLines: { color: "rgba(62, 75, 86, 0.24)" },
+        vertLines: { color: tokenBorder },
+        horzLines: { color: tokenBorder },
       },
-      rightPriceScale: { borderColor: "rgba(62, 75, 86, 0.55)" },
+      rightPriceScale: { borderColor: tokenBorder },
       timeScale: {
-        borderColor: "rgba(62, 75, 86, 0.55)",
+        borderColor: tokenBorder,
         timeVisible: true,
         secondsVisible: false,
         tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => chartTickLabel(time, tickMarkType, resolutionRef.current),
@@ -320,11 +345,11 @@ export function TradingViewMarketChart({
       },
     });
     const series = chart.addSeries(CandlestickSeries, {
-      upColor: "#68c6a1",
-      downColor: "#e06d63",
+      upColor: tokenPositive,
+      downColor: tokenNegative,
       borderVisible: false,
-      wickUpColor: "#68c6a1",
-      wickDownColor: "#e06d63",
+      wickUpColor: tokenPositive,
+      wickDownColor: tokenNegative,
       priceLineVisible: true,
       lastValueVisible: true,
     });
@@ -392,7 +417,7 @@ export function TradingViewMarketChart({
     if (target === null) return;
     targetLineRef.current = series.createPriceLine({
       price: target,
-      color: direction === "up" ? "#68c6a1" : "#e06d63",
+      color: direction === "up" ? cssVar("--positive", "#62d67f") : cssVar("--negative", "#ff6b6b"),
       lineStyle: LineStyle.Dashed,
       lineWidth: 1,
       axisLabelVisible: true,
