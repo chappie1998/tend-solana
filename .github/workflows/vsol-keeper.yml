@@ -42,7 +42,17 @@ jobs:
       # dependencies need to be installed here. The repo-root package.json
       # is unrelated to running the keeper and is intentionally not touched.
       - name: Install vsol dependencies
-        run: npm --prefix vsol ci
+      # NOT `npm ci`. That requires the lockfile to match the resolved tree
+      # exactly, but this lockfile is generated on macOS/arm64 while CI runs
+      # Linux/x64, and optional native deps resolve differently per platform.
+      # `npm ci` aborts with "Missing: utf-8-validate@6.0.6 from lock file"
+      # before the job does anything at all — which is why every scheduled run
+      # failed in ~13s without ever reaching the keeper. (`npm ci --dry-run`
+      # passes locally on macOS, so this is genuinely platform drift, not a
+      # stale lockfile.) `npm install` resolves per platform. Byte-exact
+      # reproducibility is traded for a job that actually runs; the same
+      # tradeoff, with the same reasoning, as the Monad keeper.
+        run: npm --prefix vsol install --no-audit --no-fund
 
       # Materialize the signer keypairs the keeper needs from GitHub
       # secrets. Each secret holds a JSON array of secret-key bytes and is
