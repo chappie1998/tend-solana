@@ -23,6 +23,7 @@ pub fn expected_market_id(args: &vsol::CreateMarketArgs, settlement_mint: Pubkey
         &args.max_confidence_bps.to_le_bytes(),
         &args.symbol,
         &args.max_settlement_staleness_seconds.to_le_bytes(),
+        &args.strike.to_le_bytes(),
     ])
     .to_bytes()
 }
@@ -114,6 +115,22 @@ pub fn create_market_ix(
             AccountMeta::new_readonly(system_program_id(), false),
         ],
         data: vsol::instruction::CreateMarket { args }.data(),
+    }
+}
+
+/// Admin per-market kill switch. Needed here (rather than only via
+/// scripts/bootstrap.ts, which already covers it against devnet) so
+/// `mint_complete_set_rejects_disabled_market` can exercise the
+/// `market.enabled` gate this task added to `mint_complete_set`.
+pub fn set_market_enabled_ix(admin: &Pubkey, config: &Pubkey, market: &Pubkey, enabled: bool) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new(*market, false),
+        ],
+        data: vsol::instruction::SetMarketEnabled { enabled }.data(),
     }
 }
 
@@ -792,6 +809,12 @@ pub struct CloseSettledMarketAccounts {
     pub config: Pubkey,
     pub market: Pubkey,
     pub oracle: Pubkey,
+    /// The market's complete-set collateral vault PDA (`COMPLETE_SET_VAULT_SEED`,
+    /// keyed by `market.key()`). Always required -- see
+    /// `CloseSettledMarket::collateral_vault`'s doc comment in `src/lib.rs`:
+    /// the handler treats an account with no data as "no complete set was
+    /// ever minted here" (fine), and otherwise requires `amount == 0`.
+    pub collateral_vault: Pubkey,
     /// `Some` only when demonstrating that a specific pool's authorization
     /// for this market has been disabled; `None` when no pool ever traded
     /// this market (or the caller relies solely on the elapsed-window
@@ -809,11 +832,149 @@ pub fn close_settled_market_ix(a: &CloseSettledMarketAccounts) -> Instruction {
             AccountMeta::new_readonly(a.config, false),
             AccountMeta::new(a.market, false),
             AccountMeta::new(a.oracle, false),
+            AccountMeta::new_readonly(a.collateral_vault, false),
             AccountMeta::new_readonly(a.pool.unwrap_or_else(no_pool), false),
             AccountMeta::new_readonly(a.pool_market.unwrap_or_else(no_pool_market), false),
             AccountMeta::new(a.rent_recipient, false),
         ],
         data: vsol::instruction::CloseSettledMarket.data(),
+    }
+}
+
+// --- Conditional tokens ("complete sets") ---
+
+#[allow(clippy::too_many_arguments)]
+pub struct MintCompleteSetAccounts {
+    pub minter: Pubkey,
+    pub config: Pubkey,
+    pub market: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub up_mint: Pubkey,
+    pub down_mint: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub minter_source: Pubkey,
+    pub minter_up_token: Pubkey,
+    pub minter_down_token: Pubkey,
+}
+
+pub fn mint_complete_set_ix(a: &MintCompleteSetAccounts, amount: u64) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new(a.minter, true),
+            AccountMeta::new_readonly(a.config, false),
+            AccountMeta::new_readonly(a.market, false),
+            AccountMeta::new_readonly(a.settlement_mint, false),
+            AccountMeta::new(a.up_mint, false),
+            AccountMeta::new(a.down_mint, false),
+            AccountMeta::new(a.collateral_vault, false),
+            AccountMeta::new(a.minter_source, false),
+            AccountMeta::new(a.minter_up_token, false),
+            AccountMeta::new(a.minter_down_token, false),
+            AccountMeta::new_readonly(token_program_id(), false),
+            AccountMeta::new_readonly(system_program_id(), false),
+            AccountMeta::new_readonly(rent_sysvar_id(), false),
+        ],
+        data: vsol::instruction::MintCompleteSet { amount }.data(),
+    }
+}
+
+pub struct BurnCompleteSetAccounts {
+    pub burner: Pubkey,
+    pub config: Pubkey,
+    pub market: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub up_mint: Pubkey,
+    pub down_mint: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub burner_up_token: Pubkey,
+    pub burner_down_token: Pubkey,
+    pub burner_destination: Pubkey,
+}
+
+pub fn burn_complete_set_ix(a: &BurnCompleteSetAccounts, amount: u64) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(a.burner, true),
+            AccountMeta::new_readonly(a.config, false),
+            AccountMeta::new_readonly(a.market, false),
+            AccountMeta::new_readonly(a.settlement_mint, false),
+            AccountMeta::new(a.up_mint, false),
+            AccountMeta::new(a.down_mint, false),
+            AccountMeta::new(a.collateral_vault, false),
+            AccountMeta::new(a.burner_up_token, false),
+            AccountMeta::new(a.burner_down_token, false),
+            AccountMeta::new(a.burner_destination, false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vsol::instruction::BurnCompleteSet { amount }.data(),
+    }
+}
+
+pub struct RedeemWinningAccounts {
+    pub redeemer: Pubkey,
+    pub config: Pubkey,
+    pub market: Pubkey,
+    pub oracle: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub up_mint: Pubkey,
+    pub down_mint: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub redeemer_token: Pubkey,
+    pub redeemer_destination: Pubkey,
+}
+
+pub fn redeem_winning_ix(a: &RedeemWinningAccounts, amount: u64) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(a.redeemer, true),
+            AccountMeta::new_readonly(a.config, false),
+            AccountMeta::new_readonly(a.market, false),
+            AccountMeta::new_readonly(a.oracle, false),
+            AccountMeta::new_readonly(a.settlement_mint, false),
+            AccountMeta::new(a.up_mint, false),
+            AccountMeta::new(a.down_mint, false),
+            AccountMeta::new(a.collateral_vault, false),
+            AccountMeta::new(a.redeemer_token, false),
+            AccountMeta::new(a.redeemer_destination, false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vsol::instruction::RedeemWinning { amount }.data(),
+    }
+}
+
+pub struct RedeemUnresolvedAccounts {
+    pub redeemer: Pubkey,
+    pub config: Pubkey,
+    pub market: Pubkey,
+    pub oracle: Pubkey,
+    pub settlement_mint: Pubkey,
+    pub up_mint: Pubkey,
+    pub down_mint: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub redeemer_token: Pubkey,
+    pub redeemer_destination: Pubkey,
+}
+
+pub fn redeem_unresolved_ix(a: &RedeemUnresolvedAccounts, amount: u64) -> Instruction {
+    Instruction {
+        program_id: vsol::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(a.redeemer, true),
+            AccountMeta::new_readonly(a.config, false),
+            AccountMeta::new_readonly(a.market, false),
+            AccountMeta::new_readonly(a.oracle, false),
+            AccountMeta::new_readonly(a.settlement_mint, false),
+            AccountMeta::new(a.up_mint, false),
+            AccountMeta::new(a.down_mint, false),
+            AccountMeta::new(a.collateral_vault, false),
+            AccountMeta::new(a.redeemer_token, false),
+            AccountMeta::new(a.redeemer_destination, false),
+            AccountMeta::new_readonly(token_program_id(), false),
+        ],
+        data: vsol::instruction::RedeemUnresolved { amount }.data(),
     }
 }
 

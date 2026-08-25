@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY, TransactionInstruction } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import BN from "bn.js";
 
 export const VSOL_PROGRAM_ID = new PublicKey("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
@@ -19,6 +20,20 @@ export const POOL_MARKET_SEED = Buffer.from("pool-market");
 export const POOL_NONCE_SEED = Buffer.from("pool-nonce");
 export const POOL_POSITION_SEED = Buffer.from("pool-position");
 export const POOL_POSITION_VAULT_SEED = Buffer.from("pool-position-vault");
+// Conditional-token ("complete set") PDAs -- see the matching constants in
+// vsol/programs/vsol/src/lib.rs for the full rationale. All three of
+// UP_MINT_SEED/DOWN_MINT_SEED/COMPLETE_SET_VAULT_SEED derive solely from a
+// market's own address, so they need no separate manifest account.
+// COMPLETE_SET_TOKEN_SEED is different: it derives a *minter's own* UP/DOWN
+// token account from (mint, owner), and exists only to solve
+// `mint_complete_set`'s bootstrap problem (a fresh market's UP/DOWN mints
+// don't exist yet, so a minter cannot pre-create a standard ATA for them).
+// `burn_complete_set`/`redeem_winning` accept ANY token account the caller
+// holds a balance in -- they do not require this specific derivation.
+export const UP_MINT_SEED = Buffer.from("up-mint");
+export const DOWN_MINT_SEED = Buffer.from("down-mint");
+export const COMPLETE_SET_VAULT_SEED = Buffer.from("cs-vault");
+export const COMPLETE_SET_TOKEN_SEED = Buffer.from("cs-token");
 export const QUOTE_DOMAIN = Buffer.from("VSOLRFQ1", "ascii");
 export const POOL_QUOTE_DOMAIN = Buffer.from("VSOLPLP1", "ascii");
 // Distinct from the fill domains above so a signed early-close buyback quote
@@ -50,6 +65,41 @@ export const MARKET_MAX_CONFIDENCE_BPS = 500;
 // `initialize`/`create_market` calls using these values will start
 // reverting with `InvalidSettlementStaleness`.
 export const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
+
+// --- Conditional-token strike ladder ----------------------------------------
+//
+// `strike` is a LISTED parameter on a fixed ladder, not one derived fresh
+// from live spot on every pass. The market id is a hash of its parameters,
+// `strike` included (see `MarketIdParams`/`deriveMarketId` below and
+// `expected_market_id` in vsol/programs/vsol/src/lib.rs) -- so a strike that
+// tracked spot continuously would mint a brand-new market on every keeper
+// pass, one per tick, thousands of dust markets. Listed options venues solve
+// this by publishing a FIXED strike ladder and adding new rungs only as spot
+// moves across a step: two strikes at the same expiry are DIFFERENT
+// contracts, not duplicates of one "true" strike. Tend does the same. See
+// vsol/scripts/keeper.ts's discover-first `ensureMarketRung` for how this is
+// applied statelessly: an already-listed rung's strike is read back from
+// chain, never re-derived from spot, and `ladderStrike` is only ever called
+// once, at the moment a genuinely new expiry is first minted.
+export const STRIKE_LADDER_STEP = 5n * PRICE_SCALE; // $5.00
+
+/**
+ * Rounds `referencePrice` to the nearest `STRIKE_LADDER_STEP`, clamped to a
+ * minimum of one step -- `create_market` requires `strike > 0` (see
+ * `VsolError::InvalidStrike` in lib.rs), so a reference price inside the
+ * first half-step above zero must not round down to a rejected zero strike.
+ * Pure, no I/O: callers own fetching `referencePrice` (e.g. the latest Pyth
+ * price for the market's feed, converted to `PRICE_SCALE` atoms) and must
+ * call this at most once per newly discovered expiry -- see the module note
+ * above for why calling it on every pass would drift and mint duplicate
+ * ladder rungs.
+ */
+export function ladderStrike(referencePrice: bigint): bigint {
+  if (referencePrice <= 0n) return STRIKE_LADDER_STEP;
+  const halfStep = STRIKE_LADDER_STEP / 2n;
+  const rounded = ((referencePrice + halfStep) / STRIKE_LADDER_STEP) * STRIKE_LADDER_STEP;
+  return rounded < STRIKE_LADDER_STEP ? STRIKE_LADDER_STEP : rounded;
+}
 
 export type Quote = {
   nonce: bigint;
@@ -248,6 +298,11 @@ export type MarketIdParams = {
   maxConfidenceBps: number;
   symbol: Uint8Array | number[];
   maxSettlementStalenessSeconds: number;
+  // The conditional-token winner threshold (see `upWins` below and
+  // `CreateMarketArgs::strike` in src/lib.rs). Part of the id hash so two
+  // markets identical in every other parameter but a different strike are
+  // distinct series, not the same PDA.
+  strike: bigint;
 };
 
 // Mirrors the on-chain `expected_market_id` check byte-for-byte, so identical
@@ -268,6 +323,7 @@ export async function deriveMarketId(params: MarketIdParams): Promise<Buffer> {
     u16(params.maxConfidenceBps),
     symbol,
     u32(params.maxSettlementStalenessSeconds),
+    u64(params.strike),
   ]);
   const digest = await crypto.subtle.digest("SHA-256", message);
   return Buffer.from(digest);
@@ -363,6 +419,219 @@ export function derivePoolPositionVault(position: PublicKey, programId = VSOL_PR
   return PublicKey.findProgramAddressSync([POOL_POSITION_VAULT_SEED, position.toBuffer()], programId)[0];
 }
 
+// --- Conditional tokens ("complete sets") ---
+
+export function deriveUpMint(market: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([UP_MINT_SEED, market.toBuffer()], programId)[0];
+}
+
+export function deriveDownMint(market: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([DOWN_MINT_SEED, market.toBuffer()], programId)[0];
+}
+
+export function deriveCompleteSetVault(market: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([COMPLETE_SET_VAULT_SEED, market.toBuffer()], programId)[0];
+}
+
+/// The deterministic address `mintCompleteSet` mints a minter's own UP/DOWN
+/// tokens into (see `COMPLETE_SET_TOKEN_SEED`'s doc comment above).
+/// `burnCompleteSet`/`redeemWinning` accept this OR any other token account
+/// the caller holds a balance in -- it is not the only valid source/target
+/// for those two.
+export function deriveCompleteSetToken(mint: PublicKey, owner: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([COMPLETE_SET_TOKEN_SEED, mint.toBuffer(), owner.toBuffer()], programId)[0];
+}
+
+// The conditional-token winner rule, mirroring `math::up_wins` in
+// vsol/programs/vsol/src/math.rs byte-for-byte: UP wins if the finalized
+// price is *strictly* above the market's strike, DOWN otherwise (an exact
+// tie resolves to DOWN). Lets a client predict the winner -- and therefore
+// which mint `redeemWinning` will accept -- from a market/oracle account it
+// has already fetched, without waiting on-chain for the actual redemption
+// attempt.
+export function upWins(settlementPrice: bigint, strike: bigint): boolean {
+  return settlementPrice > strike;
+}
+
+async function anchorInstructionDiscriminator(name: string): Promise<Buffer> {
+  const digest = await crypto.subtle.digest("SHA-256", Buffer.from(`global:${name}`, "utf8"));
+  return Buffer.from(digest).subarray(0, 8);
+}
+
+export type MintCompleteSetAccounts = {
+  minter: PublicKey;
+  config: PublicKey;
+  market: PublicKey;
+  settlementMint: PublicKey;
+  upMint: PublicKey;
+  downMint: PublicKey;
+  collateralVault: PublicKey;
+  minterSource: PublicKey;
+  minterUpToken: PublicKey;
+  minterDownToken: PublicKey;
+};
+
+// Builds a `mint_complete_set` instruction. Account order and writability
+// mirror the `MintCompleteSet` Anchor context in src/lib.rs exactly --
+// Solana matches accounts by position, not name -- and the 8-byte
+// discriminator is Anchor's own convention (`sha256("global:<name>")[..8]`),
+// verified against the program's own generated IDL
+// (`target/idl/vsol.json`) for this exact instruction.
+export async function buildMintCompleteSetInstruction(
+  accounts: MintCompleteSetAccounts,
+  amount: bigint,
+  programId = VSOL_PROGRAM_ID,
+): Promise<TransactionInstruction> {
+  const data = Buffer.concat([await anchorInstructionDiscriminator("mint_complete_set"), u64(amount)]);
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: accounts.minter, isSigner: true, isWritable: true },
+      { pubkey: accounts.config, isSigner: false, isWritable: false },
+      { pubkey: accounts.market, isSigner: false, isWritable: false },
+      { pubkey: accounts.settlementMint, isSigner: false, isWritable: false },
+      { pubkey: accounts.upMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.downMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.collateralVault, isSigner: false, isWritable: true },
+      { pubkey: accounts.minterSource, isSigner: false, isWritable: true },
+      { pubkey: accounts.minterUpToken, isSigner: false, isWritable: true },
+      { pubkey: accounts.minterDownToken, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+export type BurnCompleteSetAccounts = {
+  burner: PublicKey;
+  config: PublicKey;
+  market: PublicKey;
+  settlementMint: PublicKey;
+  upMint: PublicKey;
+  downMint: PublicKey;
+  collateralVault: PublicKey;
+  burnerUpToken: PublicKey;
+  burnerDownToken: PublicKey;
+  burnerDestination: PublicKey;
+};
+
+// Mirrors the `BurnCompleteSet` Anchor context exactly. Callable before OR
+// after settlement -- see `burn_complete_set`'s doc comment in src/lib.rs.
+export async function buildBurnCompleteSetInstruction(
+  accounts: BurnCompleteSetAccounts,
+  amount: bigint,
+  programId = VSOL_PROGRAM_ID,
+): Promise<TransactionInstruction> {
+  const data = Buffer.concat([await anchorInstructionDiscriminator("burn_complete_set"), u64(amount)]);
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: accounts.burner, isSigner: true, isWritable: false },
+      { pubkey: accounts.config, isSigner: false, isWritable: false },
+      { pubkey: accounts.market, isSigner: false, isWritable: false },
+      { pubkey: accounts.settlementMint, isSigner: false, isWritable: false },
+      { pubkey: accounts.upMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.downMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.collateralVault, isSigner: false, isWritable: true },
+      { pubkey: accounts.burnerUpToken, isSigner: false, isWritable: true },
+      { pubkey: accounts.burnerDownToken, isSigner: false, isWritable: true },
+      { pubkey: accounts.burnerDestination, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+export type RedeemWinningAccounts = {
+  redeemer: PublicKey;
+  config: PublicKey;
+  market: PublicKey;
+  oracle: PublicKey;
+  settlementMint: PublicKey;
+  upMint: PublicKey;
+  downMint: PublicKey;
+  collateralVault: PublicKey;
+  redeemerToken: PublicKey;
+  redeemerDestination: PublicKey;
+};
+
+// Mirrors the `RedeemWinning` Anchor context exactly. `redeemerToken` must
+// hold the WINNING side (see `upWins`) -- the program rejects the losing
+// side with `LosingSideNotRedeemable`, and rejects any redemption at all
+// before the oracle finalizes with `OracleNotFinalized`.
+export async function buildRedeemWinningInstruction(
+  accounts: RedeemWinningAccounts,
+  amount: bigint,
+  programId = VSOL_PROGRAM_ID,
+): Promise<TransactionInstruction> {
+  const data = Buffer.concat([await anchorInstructionDiscriminator("redeem_winning"), u64(amount)]);
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: accounts.redeemer, isSigner: true, isWritable: false },
+      { pubkey: accounts.config, isSigner: false, isWritable: false },
+      { pubkey: accounts.market, isSigner: false, isWritable: false },
+      { pubkey: accounts.oracle, isSigner: false, isWritable: false },
+      { pubkey: accounts.settlementMint, isSigner: false, isWritable: false },
+      { pubkey: accounts.upMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.downMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.collateralVault, isSigner: false, isWritable: true },
+      { pubkey: accounts.redeemerToken, isSigner: false, isWritable: true },
+      { pubkey: accounts.redeemerDestination, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+export type RedeemUnresolvedAccounts = {
+  redeemer: PublicKey;
+  config: PublicKey;
+  market: PublicKey;
+  oracle: PublicKey;
+  settlementMint: PublicKey;
+  upMint: PublicKey;
+  downMint: PublicKey;
+  collateralVault: PublicKey;
+  redeemerToken: PublicKey;
+  redeemerDestination: PublicKey;
+};
+
+// Mirrors the `RedeemUnresolved` Anchor context exactly (same account order
+// as `RedeemWinning` -- see `redeem_unresolved`'s doc comment in src/lib.rs).
+// `redeemerToken` may hold EITHER side; the program validates it belongs to
+// `upMint` or `downMint` itself and rejects anything else with
+// `InvalidConditionalTokenMint`. Only callable once
+// `finalSettlementDeadline` has passed AND the oracle is still unfinalized
+// -- see that function's doc comment for why this is the exact complement
+// of `publishPythSettlement`'s own acceptance window, not merely close to it.
+export async function buildRedeemUnresolvedInstruction(
+  accounts: RedeemUnresolvedAccounts,
+  amount: bigint,
+  programId = VSOL_PROGRAM_ID,
+): Promise<TransactionInstruction> {
+  const data = Buffer.concat([await anchorInstructionDiscriminator("redeem_unresolved"), u64(amount)]);
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: accounts.redeemer, isSigner: true, isWritable: false },
+      { pubkey: accounts.config, isSigner: false, isWritable: false },
+      { pubkey: accounts.market, isSigner: false, isWritable: false },
+      { pubkey: accounts.oracle, isSigner: false, isWritable: false },
+      { pubkey: accounts.settlementMint, isSigner: false, isWritable: false },
+      { pubkey: accounts.upMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.downMint, isSigner: false, isWritable: true },
+      { pubkey: accounts.collateralVault, isSigner: false, isWritable: true },
+      { pubkey: accounts.redeemerToken, isSigner: false, isWritable: true },
+      { pubkey: accounts.redeemerDestination, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
 // Mirrors the on-chain `calculate_deposit_shares`/`calculate_withdraw_amount`
 // (vsol/programs/vsol/src/math.rs) byte-for-byte, including the virtual
 // shares/assets offset: every conversion adds 1 to both `totalShares` and
@@ -427,6 +696,24 @@ export function marketCloseableAfter(params: {
   settlementGraceSeconds: number;
 }): bigint {
   return settlementDeadline(params) + MARKET_CLEANUP_BUFFER_SECONDS;
+}
+
+// Mirrors the on-chain `final_settlement_deadline` (vsol/programs/vsol/src/lib.rs)
+// byte-for-byte: `settlementDeadline` PLUS `maxSettlementStalenessSeconds`.
+// This is the exact instant `publishPythSettlement` can no longer ever
+// finalize the oracle again, and therefore the exact instant
+// `redeemUnresolved`'s pro-rata escape hatch opens (on-chain:
+// `now > finalSettlementDeadline`). These two conditions MUST be exact
+// complements -- see `redeemUnresolved`'s doc comment in src/lib.rs for what
+// goes wrong (a real insolvency, not just a race) if a caller uses the
+// earlier `settlementDeadline` instead.
+export function finalSettlementDeadline(params: {
+  expiry: bigint;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+  maxSettlementStalenessSeconds: number;
+}): bigint {
+  return settlementDeadline(params) + BigInt(params.maxSettlementStalenessSeconds);
 }
 
 export function calculatePayout(quote: Pick<Quote, "direction" | "strike" | "width" | "maxPayout">, price: bigint): bigint {

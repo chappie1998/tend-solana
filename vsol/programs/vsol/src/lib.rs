@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, TransferChecked};
+use anchor_spl::token::{self, Burn, CloseAccount, Mint, MintTo, Token, TokenAccount, TransferChecked};
 
 mod math;
 mod pyth;
@@ -7,7 +7,7 @@ mod signature;
 
 use math::{
     calculate_bps_limit, calculate_deposit_shares, calculate_fee, calculate_payout,
-    calculate_withdraw_amount,
+    calculate_pro_rata_redemption, calculate_withdraw_amount, up_wins,
 };
 use pyth::{parse_fully_verified_price_update, PythPrice};
 // Re-exported purely so the LiteSVM integration test suite (a separate crate
@@ -37,6 +37,23 @@ pub const POOL_MARKET_SEED: &[u8] = b"pool-market";
 pub const POOL_NONCE_SEED: &[u8] = b"pool-nonce";
 pub const POOL_POSITION_SEED: &[u8] = b"pool-position";
 pub const POOL_POSITION_VAULT_SEED: &[u8] = b"pool-position-vault";
+// Conditional-token ("complete set") PDAs: two SPL mints and one collateral
+// vault, all derived solely from `market.key()` so they need no separate
+// manifest/registry account -- see `mint_complete_set`.
+pub const UP_MINT_SEED: &[u8] = b"up-mint";
+pub const DOWN_MINT_SEED: &[u8] = b"down-mint";
+pub const COMPLETE_SET_VAULT_SEED: &[u8] = b"cs-vault";
+// A minter's own UP/DOWN token account, keyed by (mint, minter) so it is
+// derivable off-chain with no bookkeeping and -- critically -- so
+// `mint_complete_set` can `init_if_needed` it without an extra throwaway
+// signer: on a brand-new market, `up_mint`/`down_mint` do not exist until
+// that same instruction's own `init_if_needed` creates them a few accounts
+// earlier, so the very first minter cannot have pre-created a standard SPL
+// token account (e.g. an ATA) for a mint that didn't exist yet. Only
+// `mint_complete_set` uses this seed; `burn_complete_set`/`redeem_winning`
+// accept any token account the caller already holds a balance in (see their
+// own doc comments).
+pub const COMPLETE_SET_TOKEN_SEED: &[u8] = b"cs-token";
 pub const QUOTE_DOMAIN: &[u8; 8] = b"VSOLRFQ1";
 pub const POOL_QUOTE_DOMAIN: &[u8; 8] = b"VSOLPLP1";
 // Distinct from the fill domains above so a signed early-close buyback quote
@@ -338,6 +355,7 @@ pub mod vsol {
             args.underlying_mint != Pubkey::default(),
             VsolError::InvalidUnderlyingMint
         );
+        require!(args.strike > 0, VsolError::InvalidStrike);
         require!(
             args.market_id == expected_market_id(&args, ctx.accounts.settlement_mint.key()),
             VsolError::InvalidMarketId
@@ -361,6 +379,7 @@ pub mod vsol {
         market.enabled = true;
         market.creator = ctx.accounts.creator.key();
         market.max_settlement_staleness_seconds = args.max_settlement_staleness_seconds;
+        market.strike = args.strike;
 
         let oracle = &mut ctx.accounts.oracle;
         oracle.bump = ctx.bumps.oracle;
@@ -689,9 +708,13 @@ pub mod vsol {
         // `MARKET_CLEANUP_BUFFER_SECONDS`), which is what lets
         // `close_settled_market`'s doc comment claim that nothing can ever
         // publish past its own cleanup cutoff.
-        let final_deadline = settlement_deadline
-            .checked_add(i64::from(market.max_settlement_staleness_seconds))
-            .ok_or(VsolError::MathOverflow)?;
+        //
+        // Computed via the shared `final_settlement_deadline` helper, not
+        // inline: `redeem_unresolved`'s escape hatch opens at exactly this
+        // instant (`now > final_settlement_deadline(market)`), and the two
+        // paths must stay strictly mutually exclusive -- see that function's
+        // own doc comment.
+        let final_deadline = final_settlement_deadline(market)?;
         require!(now <= final_deadline, VsolError::SettlementWindowClosed);
 
         let pyth_price = parse_fully_verified_price_update(
@@ -2058,18 +2081,34 @@ pub mod vsol {
     ///    `open_position_count` on `Market`, maintained by fill/settle/refund
     ///    -- is the only way to actually enforce this, and remains the right
     ///    fix before real money.
-    /// 4. As a cheap, *additional* on-chain check (defense-in-depth, not the
+    /// 4. UNLIKE point 3, the conditional-token ("complete set") collateral
+    ///    vault IS cheaply, fully enumerable from the market alone: it is a
+    ///    single deterministic PDA (`COMPLETE_SET_VAULT_SEED`, keyed only by
+    ///    `market.key()`), not a per-nonce record like `Position`/
+    ///    `PoolPosition`. `burn_complete_set` and `redeem_winning` both load
+    ///    `market: Box<Account<'info, Market>>`, so once this account is
+    ///    closed neither can ever execute again -- any balance still in the
+    ///    vault at that point is unrecoverable forever. Because this check
+    ///    IS cheap, it is a HARD on-chain requirement, not an off-chain
+    ///    assumption like point 3: the handler requires the vault to be
+    ///    either never created (nobody ever called `mint_complete_set`
+    ///    against this market) or fully drained (`amount == 0`) before
+    ///    allowing the close. See `CloseSettledMarket::collateral_vault`'s
+    ///    own doc comment for why checking the vault balance alone --
+    ///    without also inspecting `up_mint`/`down_mint` supply -- is
+    ///    sufficient.
+    /// 5. As a cheap, *additional* on-chain check (defense-in-depth, not the
     ///    primary safety argument above, which already holds regardless): if
     ///    the caller passes a `pool`/`pool_market` pair, it must be the
     ///    authorization record for *this* market and pool, and it must have
     ///    `enabled == false`. Passing `None` for both is accepted (an
     ///    omitted pair is not proof no pool was ever authorized, but no
     ///    cheaper on-chain check exists -- see point 3).
-    /// 5. Permission: the caller must be `market.creator` or `config.admin`.
+    /// 6. Permission: the caller must be `market.creator` or `config.admin`.
     ///    Rent always returns to `market.creator` (`rent_recipient` is
     ///    address-constrained to it), never to an arbitrary caller-supplied
     ///    account.
-    /// 6. Deliberately *not* gated on `config.paused`: this is maintenance
+    /// 7. Deliberately *not* gated on `config.paused`: this is maintenance
     ///    cleanup, not a trading action, so it must remain callable while
     ///    the protocol is paused (mirrors `close_pool_position`'s guardian
     ///    rationale for staying pause-independent).
@@ -2091,6 +2130,22 @@ pub mod vsol {
             .ok_or(VsolError::MathOverflow)?;
         require!(now > cleanup_deadline, VsolError::MarketNotCloseable);
 
+        // See point 4 of this instruction's doc comment, and
+        // `CloseSettledMarket::collateral_vault`'s own doc comment for why
+        // checking ONLY the vault's balance (not also `up_mint`/`down_mint`
+        // supply) is sufficient. `data_is_empty()` is true both for a PDA
+        // that was never created (nobody ever called `mint_complete_set`
+        // against this market) and, defensively, for one the runtime has
+        // reset to empty/system-owned after being closed elsewhere -- either
+        // way, "no data" means "no complete set was ever outstanding here",
+        // so there is nothing to check.
+        let vault_info = ctx.accounts.collateral_vault.to_account_info();
+        if !vault_info.data_is_empty() {
+            let vault_data = vault_info.try_borrow_data()?;
+            let vault = TokenAccount::try_deserialize(&mut &vault_data[..])?;
+            require!(vault.amount == 0, VsolError::MarketHasOutstandingCollateral);
+        }
+
         match (ctx.accounts.pool.as_ref(), ctx.accounts.pool_market.as_ref()) {
             (Some(pool), Some(pool_market)) => {
                 require_keys_eq!(pool_market.pool, pool.key(), VsolError::InvalidPoolMarket);
@@ -2104,6 +2159,433 @@ pub mod vsol {
         emit!(MarketClosed {
             market: market.key(),
             creator: market.creator,
+        });
+        Ok(())
+    }
+
+    /// Mints a "complete set": pulls `amount` of the market's settlement
+    /// token into a per-market collateral vault PDA and mints `amount` of
+    /// BOTH the UP and DOWN conditional tokens to the caller. Fully
+    /// collateralized by construction -- `up_mint`/`down_mint`'s mint
+    /// authority is the market PDA, which never signs a `mint_to` CPI
+    /// anywhere except here, and this instruction always moves the vault and
+    /// both supplies by the identical `amount` in one transaction, verified
+    /// below by reloading all three and checking the exact expected delta
+    /// (the same defensive "reload and compare" pattern `fill_quote` and
+    /// `deposit_liquidity` already use elsewhere in this file).
+    ///
+    /// Gated on `!config.paused` AND `market.enabled`: like
+    /// `fill_quote`/`fill_pool_quote`, this creates new economic exposure,
+    /// so both the global pause guardian and the market's own admin kill
+    /// switch (`set_market_enabled`) block it. `burn_complete_set` and
+    /// `redeem_winning` are deliberately gated on NEITHER -- see their own
+    /// doc comments for why (same reason `settle`/`refund_unsettled`/etc.
+    /// never check `market.enabled` either: it only ever blocks new
+    /// exposure, never an exit).
+    pub fn mint_complete_set(ctx: Context<MintCompleteSet>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
+        require!(ctx.accounts.market.enabled, VsolError::MarketDisabled);
+        require!(amount > 0, VsolError::InvalidAmount);
+
+        let vault_before = ctx.accounts.collateral_vault.amount;
+        let up_supply_before = ctx.accounts.up_mint.supply;
+        let down_supply_before = ctx.accounts.down_mint.supply;
+
+        transfer_checked(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.minter_source.to_account_info(),
+            ctx.accounts.collateral_vault.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.minter.to_account_info(),
+            amount,
+            ctx.accounts.settlement_mint.decimals,
+        )?;
+
+        let config_key = ctx.accounts.config.key();
+        let market_id = ctx.accounts.market.market_id;
+        let market_seeds: &[&[u8]] = &[
+            MARKET_SEED,
+            config_key.as_ref(),
+            market_id.as_ref(),
+            &[ctx.accounts.market.bump],
+        ];
+        mint_to_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.up_mint.to_account_info(),
+            ctx.accounts.minter_up_token.to_account_info(),
+            ctx.accounts.market.to_account_info(),
+            amount,
+            market_seeds,
+        )?;
+        mint_to_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.down_mint.to_account_info(),
+            ctx.accounts.minter_down_token.to_account_info(),
+            ctx.accounts.market.to_account_info(),
+            amount,
+            market_seeds,
+        )?;
+
+        ctx.accounts.collateral_vault.reload()?;
+        ctx.accounts.up_mint.reload()?;
+        ctx.accounts.down_mint.reload()?;
+        require!(
+            ctx.accounts.collateral_vault.amount
+                == vault_before
+                    .checked_add(amount)
+                    .ok_or(VsolError::MathOverflow)?
+                && ctx.accounts.up_mint.supply
+                    == up_supply_before
+                        .checked_add(amount)
+                        .ok_or(VsolError::MathOverflow)?
+                && ctx.accounts.down_mint.supply
+                    == down_supply_before
+                        .checked_add(amount)
+                        .ok_or(VsolError::MathOverflow)?,
+            VsolError::CollateralMismatch
+        );
+
+        emit!(CompleteSetMinted {
+            market: ctx.accounts.market.key(),
+            minter: ctx.accounts.minter.key(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Burns `amount` of BOTH the UP and DOWN conditional tokens and returns
+    /// `amount` collateral from the vault. This is the arbitrage that keeps
+    /// UP + DOWN priced at ~1 unit of collateral, so it must work identically
+    /// before AND after settlement -- it is deliberately never gated on
+    /// `oracle.finalized` in either direction.
+    ///
+    /// Guardian: like `settle`/`close_pool_position`, this is a holder's exit
+    /// path, so -- unlike `mint_complete_set` -- it must keep working even
+    /// while the protocol is paused. Deliberately NOT gated on
+    /// `config.paused`.
+    pub fn burn_complete_set(ctx: Context<BurnCompleteSet>, amount: u64) -> Result<()> {
+        require!(amount > 0, VsolError::InvalidAmount);
+
+        let vault_before = ctx.accounts.collateral_vault.amount;
+        let up_supply_before = ctx.accounts.up_mint.supply;
+        let down_supply_before = ctx.accounts.down_mint.supply;
+
+        burn_tokens(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.up_mint.to_account_info(),
+            ctx.accounts.burner_up_token.to_account_info(),
+            ctx.accounts.burner.to_account_info(),
+            amount,
+        )?;
+        burn_tokens(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.down_mint.to_account_info(),
+            ctx.accounts.burner_down_token.to_account_info(),
+            ctx.accounts.burner.to_account_info(),
+            amount,
+        )?;
+
+        let config_key = ctx.accounts.config.key();
+        let market_id = ctx.accounts.market.market_id;
+        let market_seeds: &[&[u8]] = &[
+            MARKET_SEED,
+            config_key.as_ref(),
+            market_id.as_ref(),
+            &[ctx.accounts.market.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.collateral_vault.to_account_info(),
+            ctx.accounts.burner_destination.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.market.to_account_info(),
+            amount,
+            ctx.accounts.settlement_mint.decimals,
+            market_seeds,
+        )?;
+
+        ctx.accounts.collateral_vault.reload()?;
+        ctx.accounts.up_mint.reload()?;
+        ctx.accounts.down_mint.reload()?;
+        require!(
+            ctx.accounts.collateral_vault.amount
+                == vault_before
+                    .checked_sub(amount)
+                    .ok_or(VsolError::MathOverflow)?
+                && ctx.accounts.up_mint.supply
+                    == up_supply_before
+                        .checked_sub(amount)
+                        .ok_or(VsolError::MathOverflow)?
+                && ctx.accounts.down_mint.supply
+                    == down_supply_before
+                        .checked_sub(amount)
+                        .ok_or(VsolError::MathOverflow)?,
+            VsolError::CollateralMismatch
+        );
+
+        emit!(CompleteSetBurned {
+            market: ctx.accounts.market.key(),
+            burner: ctx.accounts.burner.key(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Redeems `amount` of the market's WINNING conditional token for
+    /// `amount` collateral, once the oracle has finalized. The winner rule:
+    /// UP wins if the finalized price is *strictly* above `market.strike`,
+    /// DOWN otherwise (an exact tie goes to DOWN) -- see `math::up_wins`.
+    /// The losing side can never redeem: `redeemer_token.mint` is checked
+    /// against whichever side actually won.
+    ///
+    /// Guardian: like `burn_complete_set`, deliberately NOT gated on
+    /// `config.paused` -- a winner must always be able to claim their
+    /// payout, exactly the same rationale `settle`/`close_pool_position`
+    /// document for staying pause-independent.
+    pub fn redeem_winning(ctx: Context<RedeemWinning>, amount: u64) -> Result<()> {
+        require!(amount > 0, VsolError::InvalidAmount);
+        require!(ctx.accounts.oracle.finalized, VsolError::OracleNotFinalized);
+        require_keys_eq!(
+            ctx.accounts.redeemer_token.owner,
+            ctx.accounts.redeemer.key(),
+            VsolError::InvalidDestination
+        );
+
+        let winner_is_up = up_wins(ctx.accounts.oracle.price, ctx.accounts.market.strike);
+        let winning_mint_key = if winner_is_up {
+            ctx.accounts.up_mint.key()
+        } else {
+            ctx.accounts.down_mint.key()
+        };
+        require_keys_eq!(
+            ctx.accounts.redeemer_token.mint,
+            winning_mint_key,
+            VsolError::LosingSideNotRedeemable
+        );
+
+        let vault_before = ctx.accounts.collateral_vault.amount;
+        let winning_supply_before = if winner_is_up {
+            ctx.accounts.up_mint.supply
+        } else {
+            ctx.accounts.down_mint.supply
+        };
+        let winning_mint_info = if winner_is_up {
+            ctx.accounts.up_mint.to_account_info()
+        } else {
+            ctx.accounts.down_mint.to_account_info()
+        };
+        burn_tokens(
+            ctx.accounts.token_program.key(),
+            winning_mint_info,
+            ctx.accounts.redeemer_token.to_account_info(),
+            ctx.accounts.redeemer.to_account_info(),
+            amount,
+        )?;
+
+        let config_key = ctx.accounts.config.key();
+        let market_id = ctx.accounts.market.market_id;
+        let market_seeds: &[&[u8]] = &[
+            MARKET_SEED,
+            config_key.as_ref(),
+            market_id.as_ref(),
+            &[ctx.accounts.market.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.collateral_vault.to_account_info(),
+            ctx.accounts.redeemer_destination.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.market.to_account_info(),
+            amount,
+            ctx.accounts.settlement_mint.decimals,
+            market_seeds,
+        )?;
+
+        ctx.accounts.collateral_vault.reload()?;
+        let winning_supply_after = if winner_is_up {
+            ctx.accounts.up_mint.reload()?;
+            ctx.accounts.up_mint.supply
+        } else {
+            ctx.accounts.down_mint.reload()?;
+            ctx.accounts.down_mint.supply
+        };
+        require!(
+            ctx.accounts.collateral_vault.amount
+                == vault_before
+                    .checked_sub(amount)
+                    .ok_or(VsolError::MathOverflow)?
+                && winning_supply_after
+                    == winning_supply_before
+                        .checked_sub(amount)
+                        .ok_or(VsolError::MathOverflow)?,
+            VsolError::CollateralMismatch
+        );
+
+        emit!(WinningRedeemed {
+            market: ctx.accounts.market.key(),
+            redeemer: ctx.accounts.redeemer.key(),
+            amount,
+            up_won: winner_is_up,
+        });
+        Ok(())
+    }
+
+    /// Escape hatch for a market whose oracle never finalizes: once
+    /// `publish_pyth_settlement` can no longer ever succeed again (see
+    /// `final_settlement_deadline`), burns `amount` of EITHER conditional
+    /// token for a pro-rata share of the collateral vault --
+    /// `amount * vault_balance / (up_mint.supply + down_mint.supply)`
+    /// (`math::calculate_pro_rata_redemption`) -- rather than requiring a
+    /// winner that will never be determined. This is the conditional-token
+    /// path's analogue of `refund_unsettled` for the older per-position
+    /// path: without it, a holder of only one side of a market whose oracle
+    /// is permanently dead has no way to ever recover anything, and
+    /// `burn_complete_set` does not help them (it requires holding BOTH
+    /// sides).
+    ///
+    /// Timing -- why the gate is `now > final_settlement_deadline(market)`,
+    /// exactly, and not the earlier `settlement_deadline`
+    /// `refund_unsettled`/`redeem_winning`'s sibling paths might suggest:
+    /// `redeem_winning` requires `oracle.finalized`, and
+    /// `publish_pyth_settlement` can still finalize the oracle for any
+    /// `now <= final_settlement_deadline(market)` (tier 1 the whole way;
+    /// tier 2 after its own additional `tier_two_open_at` gate). Opening
+    /// THIS hatch any earlier makes the two payout paths simultaneously
+    /// satisfiable, which is a real insolvency, not just a race: collateral
+    /// could be paid out pro-rata AND the market could later settle with a
+    /// real winner who is then owed more than the vault has left. Concretely,
+    /// with `S = 100` outstanding complete sets: if the hatch opened at the
+    /// bare `settlement_deadline`, Alice could pro-rata-redeem 50 UP for 25
+    /// (vault: 100 -> 75), the oracle could then finalize DOWN, and Bob --
+    /// holding 100 DOWN, owed 100 -- would find only 75 left; his
+    /// `checked_sub` fails and he can never redeem at all, a strictly worse
+    /// outcome (total lockup) than the bug this instruction exists to fix.
+    /// Gating on `final_settlement_deadline` instead makes `redeem_unresolved`
+    /// and `redeem_winning` strictly mutually exclusive: by the time this
+    /// hatch can open, `publish_pyth_settlement` is guaranteed to already be
+    /// permanently closed (see its own doc comment), so `oracle.finalized`
+    /// can never subsequently flip from false to true underneath a
+    /// redemption that already happened.
+    ///
+    /// Payout formula -- why pro-rata rather than a hardcoded `amount / 2`:
+    /// - At the instant the hatch first opens, `vault == up_mint.supply ==
+    ///   down_mint.supply` always holds (`mint_complete_set`/
+    ///   `burn_complete_set` move all three by the identical amount every
+    ///   time -- see their own `require!` checks), so `total == 2 * vault`
+    ///   and the formula reduces to exactly `amount / 2` -- the standard
+    ///   "unresolvable market resolves 50/50" convention (the same rule
+    ///   Polymarket applies to markets UMA cannot resolve).
+    /// - It stays exact under ANY redemption order, unlike a hardcoded half:
+    ///   floor division leaves rounding dust in the vault after most
+    ///   individual redemptions, but the FINAL redemption -- whichever side
+    ///   still has supply once the other side has fully burned/redeemed to
+    ///   zero -- always has `amount == total_supply`, so its payout is
+    ///   `amount * vault / amount == vault` exactly, draining the vault to
+    ///   zero with no dust left over (see `math::calculate_pro_rata_redemption`'s
+    ///   own doc comment and tests). A flat `amount / 2` would leave dust in
+    ///   the vault forever, and with `close_settled_market` now requiring an
+    ///   empty vault (see `CloseSettledMarket::collateral_vault`), permanent
+    ///   dust would mean the market -- and its rent -- could never be closed.
+    /// - It cannot be manipulated by minting/burning around a redemption:
+    ///   `mint_complete_set` moves `vault += a` and `total_supply += 2a`;
+    ///   `burn_complete_set` moves `vault -= a` and `total_supply -= 2a`.
+    ///   Both preserve `vault / total_supply` exactly, so nobody can shift
+    ///   the ratio in their favor before redeeming.
+    ///
+    /// Guardian: like `burn_complete_set`/`redeem_winning`, this is an exit
+    /// path -- deliberately NOT gated on `config.paused` or `market.enabled`.
+    pub fn redeem_unresolved(ctx: Context<RedeemUnresolved>, amount: u64) -> Result<()> {
+        require!(amount > 0, VsolError::InvalidAmount);
+        require!(
+            !ctx.accounts.oracle.finalized,
+            VsolError::OracleAlreadyFinalized
+        );
+        let now = Clock::get()?.unix_timestamp;
+        let final_deadline = final_settlement_deadline(&ctx.accounts.market)?;
+        require!(now > final_deadline, VsolError::SettlementWindowOpen);
+        require_keys_eq!(
+            ctx.accounts.redeemer_token.owner,
+            ctx.accounts.redeemer.key(),
+            VsolError::InvalidDestination
+        );
+
+        let up_mint_key = ctx.accounts.up_mint.key();
+        let down_mint_key = ctx.accounts.down_mint.key();
+        let redeemer_token_mint = ctx.accounts.redeemer_token.mint;
+        require!(
+            redeemer_token_mint == up_mint_key || redeemer_token_mint == down_mint_key,
+            VsolError::InvalidConditionalTokenMint
+        );
+        let redeeming_up = redeemer_token_mint == up_mint_key;
+
+        let vault_before = ctx.accounts.collateral_vault.amount;
+        let up_supply_before = ctx.accounts.up_mint.supply;
+        let down_supply_before = ctx.accounts.down_mint.supply;
+        let total_supply_before = (up_supply_before as u128)
+            .checked_add(down_supply_before as u128)
+            .ok_or(VsolError::MathOverflow)?;
+
+        let payout = calculate_pro_rata_redemption(amount, vault_before, total_supply_before)?;
+
+        let mint_info = if redeeming_up {
+            ctx.accounts.up_mint.to_account_info()
+        } else {
+            ctx.accounts.down_mint.to_account_info()
+        };
+        burn_tokens(
+            ctx.accounts.token_program.key(),
+            mint_info,
+            ctx.accounts.redeemer_token.to_account_info(),
+            ctx.accounts.redeemer.to_account_info(),
+            amount,
+        )?;
+
+        let config_key = ctx.accounts.config.key();
+        let market_id = ctx.accounts.market.market_id;
+        let market_seeds: &[&[u8]] = &[
+            MARKET_SEED,
+            config_key.as_ref(),
+            market_id.as_ref(),
+            &[ctx.accounts.market.bump],
+        ];
+        transfer_checked_signed(
+            ctx.accounts.token_program.key(),
+            ctx.accounts.collateral_vault.to_account_info(),
+            ctx.accounts.redeemer_destination.to_account_info(),
+            ctx.accounts.settlement_mint.to_account_info(),
+            ctx.accounts.market.to_account_info(),
+            payout,
+            ctx.accounts.settlement_mint.decimals,
+            market_seeds,
+        )?;
+
+        ctx.accounts.collateral_vault.reload()?;
+        let redeemed_supply_before = if redeeming_up { up_supply_before } else { down_supply_before };
+        let redeemed_supply_after = if redeeming_up {
+            ctx.accounts.up_mint.reload()?;
+            ctx.accounts.up_mint.supply
+        } else {
+            ctx.accounts.down_mint.reload()?;
+            ctx.accounts.down_mint.supply
+        };
+        require!(
+            ctx.accounts.collateral_vault.amount
+                == vault_before
+                    .checked_sub(payout)
+                    .ok_or(VsolError::MathOverflow)?
+                && redeemed_supply_after
+                    == redeemed_supply_before
+                        .checked_sub(amount)
+                        .ok_or(VsolError::MathOverflow)?,
+            VsolError::CollateralMismatch
+        );
+
+        emit!(UnresolvedRedeemed {
+            market: ctx.accounts.market.key(),
+            redeemer: ctx.accounts.redeemer.key(),
+            amount,
+            payout,
+            redeemed_up: redeeming_up,
         });
         Ok(())
     }
@@ -2142,6 +2624,17 @@ pub struct CreateMarketArgs {
     pub max_confidence_bps: u16,
     pub pyth_feed_id: [u8; 32],
     pub max_settlement_staleness_seconds: u32,
+    // Added for the conditional-token complete-set path (mint_complete_set /
+    // burn_complete_set / redeem_winning): the single threshold the market's
+    // finalized oracle price is compared against to pick a winner. Part of
+    // `expected_market_id`'s hash (see that function) so two markets that
+    // differ only in strike are distinct series, not the same PDA. Unrelated
+    // to -- and never read by -- the older per-position strike+width spread
+    // payoff (`fill_quote`/`fill_pool_quote`/`calculate_payout`), which keeps
+    // its own strike on each `Position`/`PoolPosition` instead. See this
+    // module's top-level report for why `Market` did not already have a
+    // single strike field before this change.
+    pub strike: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -2655,7 +3148,7 @@ pub struct ClosePoolPosition<'info> {
 /// `pool`/`pool_market` are optional and must be supplied together (both
 /// `Some` or both `None`): they let the caller demonstrate that a specific
 /// pool authorization for this market has been disabled, but omitting them
-/// is accepted too (see point 3/4 of the safety argument -- this cannot be
+/// is accepted too (see point 3/5 of the safety argument -- this cannot be
 /// made a hard on-chain requirement because positions/authorizations are not
 /// cheaply enumerable from the market alone).
 #[derive(Accounts)]
@@ -2682,6 +3175,34 @@ pub struct CloseSettledMarket<'info> {
         has_one = market @ VsolError::InvalidOracle
     )]
     pub oracle: Box<Account<'info, SettlementOracle>>,
+    /// CHECK: address-constrained to the market's complete-set collateral
+    /// vault PDA by `seeds =`/`bump`, so a caller can neither omit it nor
+    /// substitute a different (e.g. always-empty) account to dodge the
+    /// balance check in the handler. Deliberately an `UncheckedAccount`, not
+    /// `Box<Account<'info, TokenAccount>>` like `BurnCompleteSet`/
+    /// `RedeemWinning`'s own `collateral_vault`: THIS vault may legitimately
+    /// never have been created at all (a market nobody ever called
+    /// `mint_complete_set` against), and `Account<TokenAccount>`
+    /// deserialization fails closed on an empty/uninitialized account with
+    /// no `init_if_needed` escape hatch available on a `close`-adjacent
+    /// read-only check. The handler distinguishes "never created" (empty
+    /// account data) from "created but still holds a balance" (blocked)
+    /// itself, by inspecting the raw account.
+    ///
+    /// Checking ONLY this vault's balance -- not also `up_mint.supply`/
+    /// `down_mint.supply` -- is sufficient, and deliberately not "hardened"
+    /// with those two extra accounts: `vault.amount == 0` already implies
+    /// every winning conditional token has been redeemed (`redeem_winning`
+    /// is the only path that debits the vault post-settlement, and it always
+    /// debits the vault and the winning mint's supply by the identical
+    /// amount -- see its own `require!` check), so whatever supply remains
+    /// outstanding on either mint at that point is entirely losing-side
+    /// tokens, which are worthless by construction and carry no claim on
+    /// anything. Checking the vault is checking the one number that
+    /// actually matters; the mint supplies would be two more accounts for
+    /// no additional safety.
+    #[account(seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump)]
+    pub collateral_vault: UncheckedAccount<'info>,
     pub pool: Option<Box<Account<'info, LiquidityPool>>>,
     pub pool_market: Option<Box<Account<'info, LiquidityPoolMarket>>>,
     /// CHECK: Receives the market's and oracle's reclaimed rent. Address-
@@ -2689,6 +3210,191 @@ pub struct CloseSettledMarket<'info> {
     /// redirected to an arbitrary caller-supplied account.
     #[account(mut, address = market.creator)]
     pub rent_recipient: UncheckedAccount<'info>,
+}
+
+/// Mints a complete set: `amount` of the market's settlement token moves into
+/// `collateral_vault`, and `amount` of both `up_mint` and `down_mint` is
+/// minted to the caller. `up_mint`/`down_mint`/`collateral_vault` are
+/// `init_if_needed` here (rather than requiring a separate initialize
+/// instruction) because they are pure PDAs of `market.key()` with no
+/// additional state of their own to set up -- the first `mint_complete_set`
+/// call against a given market creates them, every subsequent call just
+/// verifies the existing accounts match. This mirrors `init_if_needed`
+/// already in use elsewhere in this file (`SetEligibility::eligibility`,
+/// `SetLiquidityPoolMarket::pool_market`, `DepositLiquidity::provider_position`).
+///
+/// `market` itself signs the two `mint_to` CPIs and the vault-inbound
+/// transfer via its own PDA seeds -- it is never mutated by this
+/// instruction, so it does not need `#[account(mut)]` (same pattern as
+/// `WithdrawWriter::writer_vault` signing `transfer_checked_signed` without
+/// being `mut`).
+#[derive(Accounts)]
+pub struct MintCompleteSet<'info> {
+    #[account(mut)]
+    pub minter: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed,
+        payer = minter,
+        mint::decimals = settlement_mint.decimals,
+        mint::authority = market,
+        seeds = [UP_MINT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub up_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed,
+        payer = minter,
+        mint::decimals = settlement_mint.decimals,
+        mint::authority = market,
+        seeds = [DOWN_MINT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub down_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed,
+        payer = minter,
+        token::mint = settlement_mint,
+        token::authority = market,
+        seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, token::authority = minter)]
+    pub minter_source: Box<Account<'info, TokenAccount>>,
+    // `init_if_needed` AND seeded (`COMPLETE_SET_TOKEN_SEED`), unlike
+    // `burner_up_token`/`down_token`/`redeemer_token` in the two structs
+    // below: see `COMPLETE_SET_TOKEN_SEED`'s doc comment for why a seeded
+    // address (not a plain caller-supplied account, and not a standard ATA)
+    // is what solves the bootstrap problem here specifically.
+    #[account(
+        init_if_needed,
+        payer = minter,
+        token::mint = up_mint,
+        token::authority = minter,
+        seeds = [COMPLETE_SET_TOKEN_SEED, up_mint.key().as_ref(), minter.key().as_ref()],
+        bump,
+    )]
+    pub minter_up_token: Box<Account<'info, TokenAccount>>,
+    #[account(
+        init_if_needed,
+        payer = minter,
+        token::mint = down_mint,
+        token::authority = minter,
+        seeds = [COMPLETE_SET_TOKEN_SEED, down_mint.key().as_ref(), minter.key().as_ref()],
+        bump,
+    )]
+    pub minter_down_token: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// Burns `amount` of both `up_mint` and `down_mint`, returning `amount`
+/// collateral. `up_mint`/`down_mint`/`collateral_vault` are NOT
+/// `init_if_needed` here: burning requires the accounts (and a caller
+/// balance to burn) to already exist, so a plain `seeds =/bump`
+/// re-derivation is all that's needed -- Anchor recomputes and validates the
+/// PDA on every call rather than reading a stored bump off `Market` (which
+/// has no field for one; none of these three PDAs do -- see
+/// `mint_complete_set`'s doc comment).
+///
+/// `burner_up_token`/`burner_down_token` are deliberately plain
+/// `token::mint =/token::authority =`-constrained accounts, NOT seeded to
+/// `COMPLETE_SET_TOKEN_SEED` like `mint_complete_set`'s `minter_up_token`/
+/// `minter_down_token`: there is no bootstrap problem here (burning requires
+/// already holding a balance somewhere), so the caller is free to burn from
+/// whichever token account actually holds their tokens -- the seeded
+/// account `mint_complete_set` created for them, a standard ATA they
+/// consolidated into, or wherever an AMM/transfer left the tokens.
+#[derive(Accounts)]
+pub struct BurnCompleteSet<'info> {
+    pub burner: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
+    pub up_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
+    pub down_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = up_mint, token::authority = burner)]
+    pub burner_up_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = down_mint, token::authority = burner)]
+    pub burner_down_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, constraint = burner_destination.owner == burner.key() @ VsolError::InvalidDestination)]
+    pub burner_destination: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Redeems `amount` of the market's WINNING conditional token for `amount`
+/// collateral. Which side is winning is computed in the handler
+/// (`oracle.price > market.strike` => up) and checked against
+/// `redeemer_token.mint` there -- deliberately a `require_keys_eq!` in the
+/// handler body, not an `#[account(...)]` constraint, matching how
+/// `settle`/`refund_unsettled` keep their own business-logic checks
+/// (`oracle.finalized`, escrow equality) in the handler rather than the
+/// account-validation layer. `redeemer_token` is therefore a plain
+/// `TokenAccount` here with no `token::mint =` constraint at all: which mint
+/// is correct depends on the finalized price, which isn't known until the
+/// handler runs.
+#[derive(Accounts)]
+pub struct RedeemWinning<'info> {
+    pub redeemer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
+    pub up_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
+    pub down_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub redeemer_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, constraint = redeemer_destination.owner == redeemer.key() @ VsolError::InvalidDestination)]
+    pub redeemer_destination: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for `redeem_unresolved` -- modeled directly on `RedeemWinning`
+/// above, with one difference: `redeemer_token` may hold EITHER side (there
+/// is no winner yet), so which mint it belongs to is validated in the
+/// handler (`redeemer_token.mint == up_mint.key() || == down_mint.key()`),
+/// the same "business logic in the handler, not the account-validation
+/// layer" pattern `RedeemWinning` already uses for its own winner check.
+#[derive(Accounts)]
+pub struct RedeemUnresolved<'info> {
+    pub redeemer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
+    pub oracle: Box<Account<'info, SettlementOracle>>,
+    pub settlement_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
+    pub up_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
+    pub down_mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub redeemer_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = settlement_mint, constraint = redeemer_destination.owner == redeemer.key() @ VsolError::InvalidDestination)]
+    pub redeemer_destination: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[account]
@@ -2732,6 +3438,11 @@ pub struct Market {
     // valid. Bounds how old a tier-2 last-known price may be relative to
     // `expiry` (see `publish_pyth_settlement`).
     pub max_settlement_staleness_seconds: u32,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. The conditional-token winner threshold -- see
+    // `CreateMarketArgs::strike` and `redeem_winning`. Unused by, and has no
+    // effect on, the older per-position spread-payoff path.
+    pub strike: u64,
 }
 
 #[account]
@@ -3161,6 +3872,37 @@ pub struct MarketClosed {
     pub creator: Pubkey,
 }
 
+#[event]
+pub struct CompleteSetMinted {
+    pub market: Pubkey,
+    pub minter: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct CompleteSetBurned {
+    pub market: Pubkey,
+    pub burner: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct WinningRedeemed {
+    pub market: Pubkey,
+    pub redeemer: Pubkey,
+    pub amount: u64,
+    pub up_won: bool,
+}
+
+#[event]
+pub struct UnresolvedRedeemed {
+    pub market: Pubkey,
+    pub redeemer: Pubkey,
+    pub amount: u64,
+    pub payout: u64,
+    pub redeemed_up: bool,
+}
+
 #[error_code]
 pub enum VsolError {
     #[msg("The protocol is paused.")]
@@ -3287,10 +4029,26 @@ pub enum VsolError {
     NoPendingPoolUpdate,
     #[msg("The pending liquidity pool update's timelock has not yet elapsed.")]
     PoolUpdateTimelocked,
+    #[msg("The market strike must be positive.")]
+    InvalidStrike,
+    #[msg("The supplied token account does not match the market's winning side.")]
+    LosingSideNotRedeemable,
+    #[msg("The market's collateral vault still holds outstanding complete-set collateral: redeem or burn every outstanding complete set before closing this market.")]
+    MarketHasOutstandingCollateral,
+    #[msg("The supplied token account does not belong to either the UP or DOWN mint.")]
+    InvalidConditionalTokenMint,
+    #[msg("There is no outstanding conditional-token supply left to redeem.")]
+    NothingToRedeem,
 }
 
 /// Deterministic market id: identical series parameters bind to one PDA, so
 /// factory creation cannot fragment the same market across duplicate accounts.
+///
+/// Includes `args.strike`: two markets identical in every other parameter but
+/// a different conditional-token strike must be distinct series (distinct
+/// PDAs), not the same market re-created twice -- otherwise "will BTC finish
+/// above $50k" and "above $60k" at the same expiry/feed would collide onto
+/// one account.
 fn expected_market_id(args: &CreateMarketArgs, settlement_mint: Pubkey) -> [u8; 32] {
     solana_sha256_hasher::hashv(&[
         MARKET_ID_DOMAIN,
@@ -3303,8 +4061,47 @@ fn expected_market_id(args: &CreateMarketArgs, settlement_mint: Pubkey) -> [u8; 
         &args.max_confidence_bps.to_le_bytes(),
         &args.symbol,
         &args.max_settlement_staleness_seconds.to_le_bytes(),
+        &args.strike.to_le_bytes(),
     ])
     .to_bytes()
+}
+
+/// The instant no settlement can ever occur again for `market`:
+/// `expiry + observation_window_seconds + settlement_grace_seconds +
+/// max_settlement_staleness_seconds`. Shared by the two instructions that
+/// must agree on it exactly:
+///
+/// - `publish_pyth_settlement` requires `now <= final_settlement_deadline(market)`
+///   to publish (tier 1 the whole way out to this instant; tier 2 after its
+///   own additional `tier_two_open_at` gate -- see that function's own doc
+///   comment for the full two-tier derivation).
+/// - `redeem_unresolved` requires `now > final_settlement_deadline(market)`
+///   to open its pro-rata escape hatch (see its own doc comment for why it
+///   is this instant specifically, not the earlier `settlement_deadline`
+///   `refund_unsettled` uses).
+///
+/// These two conditions are exact complements of `now <= final_settlement_deadline`,
+/// which is what makes `publish_pyth_settlement` and `redeem_unresolved`
+/// strictly mutually exclusive: at any given `now`, either the oracle could
+/// still possibly finalize, or the escape hatch is open -- never both, never
+/// neither. If this function's arithmetic ever diverges from either caller's
+/// own understanding of it, that mutual exclusivity breaks: an overlap lets
+/// a pro-rata payout be handed out while the oracle can still later finalize
+/// with a real winner (see `redeem_unresolved`'s doc comment for the exact
+/// insolvency this produces), while a gap freezes the market in a state
+/// where neither path is callable. Both callers MUST call this function
+/// rather than re-deriving the arithmetic inline.
+fn final_settlement_deadline(market: &Market) -> Result<i64> {
+    let observation_end = market
+        .expiry
+        .checked_add(i64::from(market.observation_window_seconds))
+        .ok_or(VsolError::MathOverflow)?;
+    let settlement_deadline = observation_end
+        .checked_add(i64::from(market.settlement_grace_seconds))
+        .ok_or(VsolError::MathOverflow)?;
+    settlement_deadline
+        .checked_add(i64::from(market.max_settlement_staleness_seconds))
+        .ok_or(VsolError::MathOverflow.into())
 }
 
 fn validate_pool_risk_limits(max_utilization_bps: u16, max_position_bps: u16) -> Result<()> {
@@ -3411,6 +4208,43 @@ fn transfer_checked_signed<'info>(
     )
 }
 
+/// Mints `amount` of `mint` to `to`, signed by a PDA (the market, for the
+/// conditional-token mints -- their `mint::authority`).
+fn mint_to_signed<'info>(
+    token_program: Pubkey,
+    mint: AccountInfo<'info>,
+    to: AccountInfo<'info>,
+    authority: AccountInfo<'info>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> Result<()> {
+    token::mint_to(
+        CpiContext::new_with_signer(
+            token_program,
+            MintTo { mint, to, authority },
+            &[signer_seeds],
+        ),
+        amount,
+    )
+}
+
+/// Burns `amount` of `mint` from `from`. Unlike the transfer/mint helpers
+/// above, every caller of this so far burns from an account the burner
+/// themself owns (never a PDA-owned vault), so it takes no signer seeds --
+/// `authority` is always a real `Signer` in the current CPI contexts.
+fn burn_tokens<'info>(
+    token_program: Pubkey,
+    mint: AccountInfo<'info>,
+    from: AccountInfo<'info>,
+    authority: AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    token::burn(
+        CpiContext::new(token_program, Burn { mint, from, authority }),
+        amount,
+    )
+}
+
 fn close_token_account<'info>(
     token_program: Pubkey,
     account: AccountInfo<'info>,
@@ -3499,6 +4333,7 @@ mod factory_tests {
             max_confidence_bps: 100,
             pyth_feed_id: [0x11; 32],
             max_settlement_staleness_seconds: 86_400,
+            strike: 100_000_000,
         }
     }
 
@@ -3512,7 +4347,7 @@ mod factory_tests {
         let id = expected_market_id(&args, fixture_settlement_mint());
         assert_eq!(
             to_hex(&id),
-            "37cb5a119ad74934cd1d9254aef808898eefa3240e1862b9ce89df67dcb86c86"
+            "305841fbbb6aaefcf048870bda425066777d12e82d8b74f358f13d43caf66adf"
         );
     }
 
@@ -3554,6 +4389,10 @@ mod factory_tests {
         different_staleness.max_settlement_staleness_seconds += 1;
         assert_ne!(expected_market_id(&different_staleness, mint), base_id);
 
+        let mut different_strike = base;
+        different_strike.strike += 1;
+        assert_ne!(expected_market_id(&different_strike, mint), base_id);
+
         let different_mint = Pubkey::new_from_array([0x44; 32]);
         assert_ne!(expected_market_id(&base, different_mint), base_id);
     }
@@ -3569,4 +4408,5 @@ mod factory_tests {
         assert_eq!(args_with_correct_id.market_id, correct_id);
     }
 }
+
 

@@ -17,6 +17,11 @@ const MARKET_LEAD_SECONDS: i64 = 60;
 const OBSERVATION_WINDOW: u32 = 30;
 const SETTLEMENT_GRACE: u32 = 900;
 const MAX_SETTLEMENT_STALENESS: u32 = 86_400;
+// The conditional-token winner threshold every fixture market is created
+// with by default. Irrelevant to the older per-position spread-payoff tests
+// (they carry their own strike+width on the quote), but every market now
+// requires one regardless of which path it's used for.
+const DEFAULT_STRIKE: u64 = 100 * ONE_TOKEN;
 
 /// A config plus every keypair that controls it, wired up in one call so
 /// individual tests can read straight past setup to the behavior under test.
@@ -78,6 +83,7 @@ struct MarketFixture {
     observation_window_seconds: u32,
     settlement_grace_seconds: u32,
     max_settlement_staleness_seconds: u32,
+    strike: u64,
 }
 
 fn setup_market(harness: &mut Harness, fixture: &ConfigFixture, creator: &Keypair, settlement_mint: Pubkey) -> MarketFixture {
@@ -134,6 +140,7 @@ fn setup_market_with_terms(
         max_confidence_bps: 100,
         pyth_feed_id: [feed_salt; 32],
         max_settlement_staleness_seconds,
+        strike: DEFAULT_STRIKE,
     };
     args.market_id = expected_market_id(&args, settlement_mint);
 
@@ -150,6 +157,7 @@ fn setup_market_with_terms(
         observation_window_seconds,
         settlement_grace_seconds,
         max_settlement_staleness_seconds,
+        strike: args.strike,
     }
 }
 
@@ -175,7 +183,7 @@ fn default_quote(nonce: u64, quote_expiry: i64) -> vsol::QuoteArgs {
     vsol::QuoteArgs {
         nonce,
         direction: 0, // Up
-        strike: 100 * ONE_TOKEN,
+        strike: DEFAULT_STRIKE,
         width: 20 * ONE_TOKEN,
         premium: ONE_TOKEN,
         max_payout: 5 * ONE_TOKEN,
@@ -187,7 +195,7 @@ fn default_pool_quote(nonce: u64, quote_expiry: i64) -> vsol::PoolQuoteArgs {
     vsol::PoolQuoteArgs {
         nonce,
         direction: 0,
-        strike: 100 * ONE_TOKEN,
+        strike: DEFAULT_STRIKE,
         width: 20 * ONE_TOKEN,
         premium: ONE_TOKEN,
         max_payout: 5 * ONE_TOKEN,
@@ -3608,6 +3616,7 @@ fn create_market_args_with_terms(
         max_confidence_bps: 100,
         pyth_feed_id: [feed_salt; 32],
         max_settlement_staleness_seconds,
+        strike: DEFAULT_STRIKE,
     };
     args.market_id = expected_market_id(&args, settlement_mint);
     args
@@ -3715,6 +3724,16 @@ fn market_cleanup_deadline(market: &MarketFixture) -> i64 {
     full_settlement_deadline(market) + vsol::MARKET_CLEANUP_BUFFER_SECONDS
 }
 
+/// Mirrors the on-chain `final_settlement_deadline` (lib.rs) byte-for-byte:
+/// `full_settlement_deadline` plus `max_settlement_staleness_seconds`. This
+/// is the exact instant `publish_pyth_settlement` can no longer ever succeed
+/// again, and therefore the exact instant `redeem_unresolved`'s escape hatch
+/// opens (`now > final_settlement_deadline`) -- see that instruction's doc
+/// comment for why the two are deliberately the same boundary.
+fn final_settlement_deadline(market: &MarketFixture) -> i64 {
+    full_settlement_deadline(market) + i64::from(market.max_settlement_staleness_seconds)
+}
+
 #[test]
 fn close_settled_market_closes_market_and_oracle_and_returns_rent_to_creator() {
     let mut harness = Harness::new();
@@ -3771,6 +3790,7 @@ fn close_settled_market_closes_market_and_oracle_and_returns_rent_to_creator() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: Some(pool.pool),
         pool_market: Some(pool_market),
         rent_recipient: creator.pubkey(),
@@ -3805,6 +3825,7 @@ fn close_settled_market_succeeds_with_no_pool_ever_authorized() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -3832,6 +3853,7 @@ fn close_settled_market_rejects_before_settlement_window_fully_elapses() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -3868,6 +3890,7 @@ fn close_settled_market_cannot_close_at_the_refund_deadline() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -3927,6 +3950,7 @@ fn close_settled_market_rejects_while_pool_market_still_enabled() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: Some(pool.pool),
         pool_market: Some(pool_market),
         rent_recipient: creator.pubkey(),
@@ -3951,6 +3975,7 @@ fn close_settled_market_rejects_signer_that_is_neither_creator_nor_admin() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -3976,6 +4001,7 @@ fn close_settled_market_allows_admin_as_well_as_creator() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -4000,6 +4026,7 @@ fn close_settled_market_rejects_rent_recipient_other_than_creator() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: outsider.pubkey(),
@@ -4035,6 +4062,7 @@ fn close_settled_market_is_maintenance_and_succeeds_while_protocol_paused() {
         config: fixture.config,
         market: market.market,
         oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -4084,6 +4112,7 @@ fn closed_market_pda_can_be_reinitialized_by_create_market() {
         max_confidence_bps: 100,
         pyth_feed_id: [0x77u8; 32],
         max_settlement_staleness_seconds: MAX_SETTLEMENT_STALENESS,
+        strike: DEFAULT_STRIKE,
     };
     args.market_id = expected_market_id(&args, settlement_mint);
     let market = market_pda(&fixture.config, &args.market_id);
@@ -4104,6 +4133,7 @@ fn closed_market_pda_can_be_reinitialized_by_create_market() {
         config: fixture.config,
         market,
         oracle,
+        collateral_vault: complete_set_vault_pda(&market),
         pool: None,
         pool_market: None,
         rent_recipient: creator.pubkey(),
@@ -4126,4 +4156,1222 @@ fn closed_market_pda_can_be_reinitialized_by_create_market() {
     let recreated_oracle: vsol::SettlementOracle = harness.read_account(&oracle);
     assert!(!recreated_oracle.finalized);
     assert_eq!(recreated_oracle.price, 0);
+}
+
+/// FINDING 1 regression: `close_settled_market` used to close the `Market`
+/// account with no regard at all for the conditional-token collateral vault.
+/// `burn_complete_set`/`redeem_winning` both load `market: Box<Account<'info,
+/// Market>>`, so once the market is gone neither can ever execute again --
+/// any balance still in the vault at that point is permanently stranded.
+/// This test pins the fix: closing is refused, loudly, while the vault still
+/// holds collateral, even though every other close precondition (the
+/// deadline, the pool authorization) is satisfied.
+#[test]
+fn close_settled_market_blocked_while_vault_has_outstanding_collateral() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 100 * ONE_TOKEN)], &[]);
+    assert_eq!(harness.token_balance(&vault), 100 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        collateral_vault: vault,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketHasOutstandingCollateral);
+
+    // Nothing was closed -- the market, oracle, and vault all survive.
+    assert!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0) > 0);
+    assert_eq!(harness.token_balance(&vault), 100 * ONE_TOKEN);
+}
+
+/// The mirror image: once the vault is fully drained (via any mix of
+/// `burn_complete_set`/`redeem_winning`), `close_settled_market` succeeds.
+#[test]
+fn close_settled_market_succeeds_once_the_vault_is_drained() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 100 * ONE_TOKEN)], &[]);
+    harness.send_ok(
+        &minter.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            minter.keypair.pubkey(),
+            minter.up_token,
+            minter.down_token,
+            minter.destination,
+            100 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&vault), 0);
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        collateral_vault: vault,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+/// A market nobody ever called `mint_complete_set` against: the vault PDA
+/// was never created, so `collateral_vault.data_is_empty()` is true and the
+/// handler treats that as "nothing was ever minted here, nothing to check" --
+/// closing proceeds exactly as it did before this fix existed.
+#[test]
+fn close_settled_market_succeeds_for_a_market_that_never_minted_a_complete_set() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let vault = complete_set_vault_pda(&market.market);
+    assert!(harness.svm.get_account(&vault).is_none(), "the vault PDA must not exist yet");
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        collateral_vault: vault,
+        pool: None,
+        pool_market: None,
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+}
+
+// =====================================================================
+// Conditional tokens ("complete sets"): mint_complete_set /
+// burn_complete_set / redeem_winning
+// =====================================================================
+
+/// A participant who calls `mint_complete_set` themselves: a settlement-
+/// token source/destination (pre-created and pre-funded like every other
+/// `*_source` in this file) plus the deterministic `COMPLETE_SET_TOKEN_SEED`
+/// PDAs `mint_complete_set` auto-creates on their first call -- see that
+/// constant's doc comment in src/lib.rs for why a *minter's own* UP/DOWN
+/// accounts must be seeded rather than a plain caller-supplied account (a
+/// bootstrap problem `burn_complete_set`/`redeem_winning` do not share,
+/// since burning/redeeming requires already holding a balance somewhere;
+/// several tests below deliberately use plain, non-seeded accounts for those
+/// two instead, to prove that flexibility).
+struct CompleteSetMinter {
+    keypair: Keypair,
+    source: Pubkey,
+    destination: Pubkey,
+    up_token: Pubkey,
+    down_token: Pubkey,
+}
+
+fn setup_complete_set_minter(
+    harness: &mut Harness,
+    market: &MarketFixture,
+    mint_authority: &Keypair,
+    funding: u64,
+) -> CompleteSetMinter {
+    let keypair = harness.funded_keypair();
+    let source = harness.create_token_account(&keypair, &market.settlement_mint, &keypair.pubkey());
+    if funding > 0 {
+        harness.mint_to(mint_authority, &market.settlement_mint, mint_authority, &source, funding);
+    }
+    let destination = harness.create_token_account(&keypair, &market.settlement_mint, &keypair.pubkey());
+    let owner = keypair.pubkey();
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    CompleteSetMinter {
+        keypair,
+        source,
+        destination,
+        up_token: complete_set_token_pda(&up_mint, &owner),
+        down_token: complete_set_token_pda(&down_mint, &owner),
+    }
+}
+
+fn mint_complete_set_ix_for(
+    fixture: &ConfigFixture,
+    market: &MarketFixture,
+    minter: &CompleteSetMinter,
+    amount: u64,
+) -> Instruction {
+    let accounts = MintCompleteSetAccounts {
+        minter: minter.keypair.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        settlement_mint: market.settlement_mint,
+        up_mint: up_mint_pda(&market.market),
+        down_mint: down_mint_pda(&market.market),
+        collateral_vault: complete_set_vault_pda(&market.market),
+        minter_source: minter.source,
+        minter_up_token: minter.up_token,
+        minter_down_token: minter.down_token,
+    };
+    mint_complete_set_ix(&accounts, amount)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn burn_complete_set_ix_for(
+    fixture: &ConfigFixture,
+    market: &MarketFixture,
+    burner: Pubkey,
+    up_token: Pubkey,
+    down_token: Pubkey,
+    destination: Pubkey,
+    amount: u64,
+) -> Instruction {
+    let accounts = BurnCompleteSetAccounts {
+        burner,
+        config: fixture.config,
+        market: market.market,
+        settlement_mint: market.settlement_mint,
+        up_mint: up_mint_pda(&market.market),
+        down_mint: down_mint_pda(&market.market),
+        collateral_vault: complete_set_vault_pda(&market.market),
+        burner_up_token: up_token,
+        burner_down_token: down_token,
+        burner_destination: destination,
+    };
+    burn_complete_set_ix(&accounts, amount)
+}
+
+fn redeem_winning_ix_for(
+    fixture: &ConfigFixture,
+    market: &MarketFixture,
+    redeemer: Pubkey,
+    redeemer_token: Pubkey,
+    destination: Pubkey,
+    amount: u64,
+) -> Instruction {
+    let accounts = RedeemWinningAccounts {
+        redeemer,
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        settlement_mint: market.settlement_mint,
+        up_mint: up_mint_pda(&market.market),
+        down_mint: down_mint_pda(&market.market),
+        collateral_vault: complete_set_vault_pda(&market.market),
+        redeemer_token,
+        redeemer_destination: destination,
+    };
+    redeem_winning_ix(&accounts, amount)
+}
+
+fn redeem_unresolved_ix_for(
+    fixture: &ConfigFixture,
+    market: &MarketFixture,
+    redeemer: Pubkey,
+    redeemer_token: Pubkey,
+    destination: Pubkey,
+    amount: u64,
+) -> Instruction {
+    let accounts = RedeemUnresolvedAccounts {
+        redeemer,
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        settlement_mint: market.settlement_mint,
+        up_mint: up_mint_pda(&market.market),
+        down_mint: down_mint_pda(&market.market),
+        collateral_vault: complete_set_vault_pda(&market.market),
+        redeemer_token,
+        redeemer_destination: destination,
+    };
+    redeem_unresolved_ix(&accounts, amount)
+}
+
+#[test]
+fn mint_complete_set_creates_matching_up_and_down_supply_backed_by_the_vault() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 1_000 * ONE_TOKEN);
+    harness.send_ok(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 100 * ONE_TOKEN)], &[]);
+
+    assert_eq!(harness.token_balance(&vault), 100 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&up_mint), 100 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&down_mint), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&minter.up_token), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&minter.down_token), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&minter.source), 900 * ONE_TOKEN);
+
+    // A second mint from a DIFFERENT minter adds to (rather than
+    // reinitializes) the same up/down mints and vault -- `init_if_needed`
+    // must be idempotent across every caller, not just repeat calls by one.
+    let second_minter = setup_complete_set_minter(&mut harness, &market, &creator, 1_000 * ONE_TOKEN);
+    harness.send_ok(
+        &second_minter.keypair,
+        &[mint_complete_set_ix_for(&fixture, &market, &second_minter, 25 * ONE_TOKEN)],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&vault), 125 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&up_mint), 125 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&down_mint), 125 * ONE_TOKEN);
+}
+
+#[test]
+fn mint_complete_set_rejects_zero_amount() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+
+    let failed = harness.send_err(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 0)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidAmount);
+}
+
+/// `mint_complete_set` creates new exposure, exactly like `fill_quote`/
+/// `fill_pool_quote` -- so it must respect the same per-market admin kill
+/// switch those two already do (`set_market_enabled`), not just the global
+/// pause. `burn_complete_set`/`redeem_winning` deliberately do NOT check
+/// this (see `mint_complete_set`'s doc comment in src/lib.rs) -- exit paths
+/// stay open regardless of whether the market is enabled, mirroring how
+/// `settle`/`refund_unsettled` already ignore `market.enabled` today.
+#[test]
+fn mint_complete_set_rejects_disabled_market() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+
+    harness.send_ok(
+        &fixture.admin,
+        &[set_market_enabled_ix(&fixture.admin.pubkey(), &fixture.config, &market.market, false)],
+        &[],
+    );
+
+    let failed = harness.send_err(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 10 * ONE_TOKEN)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketDisabled);
+
+    // Re-enabling restores minting; burn would have worked even while
+    // disabled had she already minted (not exercised here since minting
+    // itself was blocked, so there is nothing yet to burn).
+    harness.send_ok(
+        &fixture.admin,
+        &[set_market_enabled_ix(&fixture.admin.pubkey(), &fixture.config, &market.market, true)],
+        &[],
+    );
+    harness.send_ok(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 10 * ONE_TOKEN)], &[]);
+}
+
+#[test]
+fn mint_then_burn_round_trip_returns_exactly_the_collateral() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let minter = setup_complete_set_minter(&mut harness, &market, &creator, 1_000 * ONE_TOKEN);
+    harness.send_ok(&minter.keypair, &[mint_complete_set_ix_for(&fixture, &market, &minter, 100 * ONE_TOKEN)], &[]);
+
+    // Burn in two steps to prove partial burns work identically to a single
+    // full burn.
+    harness.send_ok(
+        &minter.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            minter.keypair.pubkey(),
+            minter.up_token,
+            minter.down_token,
+            minter.destination,
+            40 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&vault), 60 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&up_mint), 60 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&down_mint), 60 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&minter.destination), 40 * ONE_TOKEN);
+
+    harness.send_ok(
+        &minter.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            minter.keypair.pubkey(),
+            minter.up_token,
+            minter.down_token,
+            minter.destination,
+            60 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&vault), 0);
+    assert_eq!(harness.mint_supply(&up_mint), 0);
+    assert_eq!(harness.mint_supply(&down_mint), 0);
+    assert_eq!(harness.token_balance(&minter.up_token), 0);
+    assert_eq!(harness.token_balance(&minter.down_token), 0);
+
+    // Exactly the original funding is back, split across the untouched
+    // source (900) and the destination that received both burns (100) --
+    // nothing created, nothing destroyed.
+    assert_eq!(
+        harness.token_balance(&minter.source) + harness.token_balance(&minter.destination),
+        1_000 * ONE_TOKEN
+    );
+}
+
+#[test]
+fn mint_then_settle_up_winner_redeems_1_to_1_and_loser_gets_nothing() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 200 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    // Bob never mints -- he only ever receives DOWN tokens via a raw
+    // transfer, exactly like a buyer on the AMM the design calls for. His
+    // token account is a plain (non-seeded) SPL account, proving
+    // `redeem_winning` works from any account the caller owns, not just the
+    // seeded one `mint_complete_set` creates for minters.
+    let bob = harness.funded_keypair();
+    let bob_down_token = harness.create_token_account(&bob, &down_mint, &bob.pubkey());
+    let bob_destination = harness.create_token_account(&bob, &settlement_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.down_token, &bob_down_token, 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.down_token), 0);
+    assert_eq!(harness.token_balance(&bob_down_token), 100 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry);
+    finalize_oracle(&mut harness, &market, market.strike + 1); // strictly above strike -> UP wins
+
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            100 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.up_token), 0);
+    assert_eq!(harness.token_balance(&vault), 0);
+    assert_eq!(harness.mint_supply(&up_mint), 0);
+    // The losing side's supply is frozen, not zeroed -- redemption never
+    // touches it.
+    assert_eq!(harness.mint_supply(&down_mint), 100 * ONE_TOKEN);
+
+    let failed = harness.send_err(
+        &bob,
+        &[redeem_winning_ix_for(&fixture, &market, bob.pubkey(), bob_down_token, bob_destination, 100 * ONE_TOKEN)],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::LosingSideNotRedeemable);
+    assert_eq!(harness.token_balance(&bob_down_token), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&bob_destination), 0);
+}
+
+#[test]
+fn mint_then_settle_down_mirrors_the_up_case() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 200 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    let bob = harness.funded_keypair();
+    let bob_up_token = harness.create_token_account(&bob, &up_mint, &bob.pubkey());
+    let bob_destination = harness.create_token_account(&bob, &settlement_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.up_token, &bob_up_token, 100 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry);
+    // Also covers the exact-tie case: a price equal to the strike resolves
+    // DOWN, not UP (see `math::up_wins`'s doc comment).
+    finalize_oracle(&mut harness, &market, market.strike);
+
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.down_token,
+            alice.destination,
+            100 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 100 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&down_mint), 0);
+    assert_eq!(harness.mint_supply(&up_mint), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&vault), 0);
+
+    let failed = harness.send_err(
+        &bob,
+        &[redeem_winning_ix_for(&fixture, &market, bob.pubkey(), bob_up_token, bob_destination, 100 * ONE_TOKEN)],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::LosingSideNotRedeemable);
+}
+
+#[test]
+fn redeem_winning_rejects_before_oracle_finalizes() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    harness.warp_to_timestamp(market.expiry);
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::OracleNotFinalized);
+}
+
+#[test]
+fn burn_complete_set_still_works_after_settlement() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    harness.warp_to_timestamp(market.expiry);
+    finalize_oracle(&mut harness, &market, market.strike + 1);
+
+    // She kept both sides -- burn_complete_set is still available even
+    // though the market has already settled.
+    harness.send_ok(
+        &alice.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.down_token,
+            alice.destination,
+            100 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 100 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&complete_set_vault_pda(&market.market)), 0);
+}
+
+/// Mirrors `set_pause_blocks_fills_but_never_settlement`'s guardian
+/// invariant for the conditional-token path: pausing blocks NEW exposure
+/// (`mint_complete_set`) but must never trap funds already at risk
+/// (`burn_complete_set`, `redeem_winning`).
+#[test]
+fn mint_complete_set_blocked_while_paused_but_burn_and_redeem_are_not() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 200 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    harness.send_ok(
+        &fixture.pause_authority,
+        &[set_pause_ix(&fixture.pause_authority.pubkey(), &fixture.config, true)],
+        &[],
+    );
+
+    let failed = harness.send_err(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 10 * ONE_TOKEN)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::ProtocolPaused);
+
+    harness.send_ok(
+        &alice.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.down_token,
+            alice.destination,
+            40 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 40 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry);
+    finalize_oracle(&mut harness, &market, market.strike + 1);
+    assert!(read_config(&harness, &fixture.config).paused);
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            60 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 100 * ONE_TOKEN);
+}
+
+#[test]
+fn create_market_rejects_zero_strike() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let now = harness.now();
+    let mut args = vsol::CreateMarketArgs {
+        market_id: [0u8; 32],
+        underlying_mint: Pubkey::new_unique(),
+        symbol: symbol_bytes("NVDA"),
+        price_scale: 1_000_000,
+        expiry: now + MARKET_LEAD_SECONDS + 3600,
+        observation_window_seconds: OBSERVATION_WINDOW,
+        settlement_grace_seconds: SETTLEMENT_GRACE,
+        max_confidence_bps: 100,
+        pyth_feed_id: [0x99u8; 32],
+        max_settlement_staleness_seconds: MAX_SETTLEMENT_STALENESS,
+        strike: 0,
+    };
+    args.market_id = expected_market_id(&args, settlement_mint);
+    let market = market_pda(&fixture.config, &args.market_id);
+    let oracle = oracle_pda(&market);
+    let failed = harness.send_err(
+        &creator,
+        &[create_market_ix(&creator.pubkey(), &fixture.config, &market, &oracle, &settlement_mint, args)],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::InvalidStrike);
+}
+
+/// Decision record for "the oracle never finalizes" (see this task's
+/// report): a holder of only ONE side is NOT permanently stuck. Before
+/// `redeem_unresolved` existed, `redeem_winning` required `oracle.finalized`
+/// unconditionally forever and `burn_complete_set` required holding BOTH
+/// sides, so a single-sided holder in a dead market had no recovery path at
+/// all short of reassembling a complete set from the open market. Now, once
+/// `final_settlement_deadline` has passed (so `publish_pyth_settlement` can
+/// never finalize the oracle out from under this redemption -- see
+/// `redeem_unresolved`'s doc comment), she can redeem her single side
+/// directly for a pro-rata share of the vault.
+#[test]
+fn single_side_holder_recovers_pro_rata_via_redeem_unresolved_when_oracle_never_finalizes() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let down_mint = down_mint_pda(&market.market);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 50 * ONE_TOKEN)], &[]);
+
+    // Alice gives away her entire DOWN side, leaving her holding UP only.
+    let bob = harness.funded_keypair();
+    let bob_down_token = harness.create_token_account(&bob, &down_mint, &bob.pubkey());
+    let bob_destination = harness.create_token_account(&bob, &settlement_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.down_token, &bob_down_token, 50 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.down_token), 0);
+
+    // Warp well past every settlement deadline -- the oracle is simply
+    // never published, simulating a genuinely dead feed.
+    let deadline = final_settlement_deadline(&market);
+    harness.warp_to_timestamp(deadline + 10_000);
+
+    // No automatic winner, so redeem_winning is (and stays) impossible.
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::OracleNotFinalized);
+
+    // Nor can she burn a complete set: she only holds UP now. This fails at
+    // the SPL token program (insufficient DOWN balance), not with a vsol
+    // error -- there is no vsol-level bailout to reject in the first place.
+    harness.send_err(
+        &alice.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.down_token,
+            alice.destination,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 0);
+
+    // But she CAN now redeem her single UP side directly via the escape
+    // hatch, for exactly half (vault == total_supply / 2 pre-redemption, so
+    // the pro-rata formula reduces to amount / 2).
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            50 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 25 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.up_token), 0);
+
+    // Bob, holding the other 50 DOWN, recovers the rest -- he is the "final
+    // redeemer" (up_mint's supply already fully drained by Alice's redeem),
+    // so his payout exactly drains the vault, no dust left behind.
+    harness.send_ok(
+        &bob,
+        &[redeem_unresolved_ix_for(&fixture, &market, bob.pubkey(), bob_down_token, bob_destination, 50 * ONE_TOKEN)],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&bob_destination), 25 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&complete_set_vault_pda(&market.market)), 0);
+}
+
+/// The conservation property the pool path's proptests check for
+/// (`math::tests::settlement_conserves_escrow`/`payout_never_exceeds_collateral`),
+/// mirrored here for the conditional-token path via a deterministic,
+/// multi-actor, multi-instruction scenario rather than a property test:
+/// this is a LiteSVM integration test (real token balances, real CPIs), not
+/// a pure function of `(direction, strike, width, price, max_payout)`, so
+/// there is no small closed-form input space to randomize over the way
+/// `math.rs` has for the payout formula -- see this task's report for why
+/// `up_wins` (the only new pure function this path introduces) gets its own
+/// proptests in math.rs instead.
+///
+/// Interleaves mint, burn (pre- AND post-settlement), peer-to-peer transfers
+/// that split complete sets across holders who never minted anything
+/// themselves, and redemption across three independent actors, checking
+/// after EVERY step that vault collateral exactly equals outstanding supply
+/// (both sides pre-settlement; the winning side only, post-settlement -- see
+/// `assert_invariant` below and this task's report for the derivation of
+/// why the losing side's supply is merely `>=` the vault post-settlement,
+/// not `==`). Finishes by proving total collateral ever recovered (via any
+/// mix of burns and redemptions) exactly equals total collateral ever
+/// minted -- nothing created, nothing destroyed, and no sequence drains more
+/// than was deposited.
+#[test]
+fn complete_set_conservation_holds_across_interleaved_mint_burn_redeem() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let up_mint = up_mint_pda(&market.market);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let assert_invariant = |harness: &Harness, settled_up: Option<bool>| {
+        let vault_balance = harness.token_balance(&vault);
+        let up_supply = harness.mint_supply(&up_mint);
+        let down_supply = harness.mint_supply(&down_mint);
+        match settled_up {
+            None => {
+                assert_eq!(vault_balance, up_supply, "pre-settlement: vault must equal UP supply");
+                assert_eq!(vault_balance, down_supply, "pre-settlement: vault must equal DOWN supply");
+            }
+            Some(up_won) => {
+                let (winning_supply, losing_supply) =
+                    if up_won { (up_supply, down_supply) } else { (down_supply, up_supply) };
+                assert_eq!(vault_balance, winning_supply, "post-settlement: vault must equal the winning supply");
+                assert!(losing_supply >= vault_balance, "the losing supply can only ever be >= the vault");
+            }
+        }
+    };
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 1_000 * ONE_TOKEN);
+    let bob = setup_complete_set_minter(&mut harness, &market, &creator, 1_000 * ONE_TOKEN);
+
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+    assert_invariant(&harness, None);
+    harness.send_ok(&bob.keypair, &[mint_complete_set_ix_for(&fixture, &market, &bob, 50 * ONE_TOKEN)], &[]);
+    assert_invariant(&harness, None);
+
+    harness.send_ok(
+        &alice.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.down_token,
+            alice.destination,
+            30 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_invariant(&harness, None);
+
+    // A third holder who never mints anything -- she only ever receives a
+    // partial UP and a partial DOWN balance via raw transfers.
+    let carol = harness.funded_keypair();
+    let carol_up_token = harness.create_token_account(&carol, &up_mint, &carol.pubkey());
+    let carol_down_token = harness.create_token_account(&carol, &down_mint, &carol.pubkey());
+    let carol_destination = harness.create_token_account(&carol, &settlement_mint, &carol.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.up_token, &carol_up_token, 40 * ONE_TOKEN);
+    harness.transfer_tokens(&bob.keypair, &bob.down_token, &carol_down_token, 20 * ONE_TOKEN);
+    assert_invariant(&harness, None); // peer-to-peer transfers never touch supply or the vault
+
+    // Carol burns the complete set she can assemble from her split holdings.
+    harness.send_ok(
+        &carol,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            carol.pubkey(),
+            carol_up_token,
+            carol_down_token,
+            carol_destination,
+            20 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_invariant(&harness, None);
+
+    // Balances now: Alice 30 up / 70 down, Bob 50 up / 30 down, Carol 20 up / 0 down.
+    assert_eq!(harness.token_balance(&alice.up_token), 30 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.down_token), 70 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&bob.up_token), 50 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&bob.down_token), 30 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&carol_up_token), 20 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&carol_down_token), 0);
+    assert_eq!(harness.mint_supply(&up_mint), 100 * ONE_TOKEN);
+    assert_eq!(harness.mint_supply(&down_mint), 100 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry);
+    finalize_oracle(&mut harness, &market, market.strike + 1); // UP wins
+    assert_invariant(&harness, Some(true));
+
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_winning_ix_for(&fixture, &market, alice.keypair.pubkey(), alice.up_token, alice.destination, 30 * ONE_TOKEN)],
+        &[],
+    );
+    assert_invariant(&harness, Some(true));
+    harness.send_ok(
+        &bob.keypair,
+        &[redeem_winning_ix_for(&fixture, &market, bob.keypair.pubkey(), bob.up_token, bob.destination, 50 * ONE_TOKEN)],
+        &[],
+    );
+    assert_invariant(&harness, Some(true));
+    harness.send_ok(
+        &carol,
+        &[redeem_winning_ix_for(&fixture, &market, carol.pubkey(), carol_up_token, carol_destination, 20 * ONE_TOKEN)],
+        &[],
+    );
+    assert_invariant(&harness, Some(true));
+
+    assert_eq!(harness.token_balance(&vault), 0);
+    assert_eq!(harness.mint_supply(&up_mint), 0);
+    // The losing (DOWN) side's supply is untouched by redemption -- frozen
+    // exactly where the last burn left it.
+    assert_eq!(harness.mint_supply(&down_mint), 100 * ONE_TOKEN);
+
+    // No further redemption is possible: Alice already redeemed every UP
+    // token she held. This fails at the SPL token program (insufficient
+    // balance), which is the actual backstop preventing any sequence from
+    // ever draining more than was deposited.
+    harness.send_err(
+        &alice.keypair,
+        &[redeem_winning_ix_for(&fixture, &market, alice.keypair.pubkey(), alice.up_token, alice.destination, 1)],
+        &[],
+    );
+
+    // Conservation: total ever minted (100 + 50 = 150) exactly equals total
+    // ever recovered via any mix of burns (30 + 20 = 50) and redemptions
+    // (30 + 50 + 20 = 100). Nothing was created, nothing was destroyed, and
+    // no sequence of mint/burn/redeem drained more than was deposited.
+    let total_minted = 150 * ONE_TOKEN;
+    let total_recovered =
+        harness.token_balance(&alice.destination) + harness.token_balance(&bob.destination) + harness.token_balance(&carol_destination);
+    assert_eq!(total_recovered, total_minted);
+}
+
+// =====================================================================
+// redeem_unresolved (FINDING 2: the escape hatch for an oracle that never
+// finalizes)
+// =====================================================================
+
+#[test]
+fn redeem_unresolved_rejects_before_the_final_settlement_deadline() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    // Well before expiry.
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::SettlementWindowOpen);
+
+    // Exactly AT the deadline is still refused -- the on-chain check is
+    // strict `now > final_settlement_deadline`, the exact complement of
+    // `publish_pyth_settlement`'s own `now <= final_deadline` boundary (see
+    // `final_settlement_deadline`'s doc comment in lib.rs for why the two
+    // MUST be exact complements, not merely close).
+    harness.warp_to_timestamp(final_settlement_deadline(&market));
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::SettlementWindowOpen);
+
+    // One second later, the hatch opens.
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+}
+
+/// The two payout paths must be strictly mutually exclusive: once the oracle
+/// finalizes (by any means, at any time), `redeem_unresolved` is refused
+/// even though the timing gate alone would otherwise be satisfied.
+/// `redeem_winning` continues to work normally.
+#[test]
+fn redeem_unresolved_rejects_once_the_oracle_is_finalized() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+    finalize_oracle(&mut harness, &market, market.strike + 1); // UP wins
+
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::OracleAlreadyFinalized);
+
+    // The real winner path still works exactly as normal.
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_winning_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            10 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 10 * ONE_TOKEN);
+}
+
+/// At the moment the hatch first opens (no prior redemptions), `vault ==
+/// total_supply / 2` always holds, so the pro-rata formula reduces to
+/// exactly `amount / 2` for both sides -- the standard "unresolvable market
+/// resolves 50/50" convention.
+#[test]
+fn redeem_unresolved_splits_exactly_in_half_for_both_sides_at_the_moment_the_hatch_opens() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    // Bob holds the entire DOWN side, Alice the entire UP side.
+    let bob = harness.funded_keypair();
+    let bob_down_token = harness.create_token_account(&bob, &down_mint, &bob.pubkey());
+    let bob_destination = harness.create_token_account(&bob, &settlement_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.down_token, &bob_down_token, 100 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            100 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 50 * ONE_TOKEN);
+
+    harness.send_ok(
+        &bob,
+        &[redeem_unresolved_ix_for(&fixture, &market, bob.pubkey(), bob_down_token, bob_destination, 100 * ONE_TOKEN)],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&bob_destination), 50 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&vault), 0);
+}
+
+/// Uses an ODD outstanding supply (S = 101) so `amount * vault / total`
+/// genuinely does not divide evenly -- Alice's redemption floors down and
+/// leaves one atom of dust in the vault. Bob, the FINAL redeemer (UP supply
+/// already fully drained by Alice), still drains the vault to EXACTLY zero:
+/// his `amount` equals the entire remaining `total_supply`, so his payout is
+/// `amount * vault / amount == vault` exactly, dust and all.
+#[test]
+fn redeem_unresolved_final_redeemer_drains_the_vault_to_exactly_zero_with_an_odd_supply() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let s: u64 = 101;
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, s);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, s)], &[]);
+
+    let bob = harness.funded_keypair();
+    let bob_down_token = harness.create_token_account(&bob, &down_mint, &bob.pubkey());
+    let bob_destination = harness.create_token_account(&bob, &settlement_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.down_token, &bob_down_token, s);
+
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+
+    // 101 * 101 / 202 = 50.5 -> floors to 50 (see
+    // math::calculate_pro_rata_redemption's own tests for the pinned
+    // closed-form check).
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(&fixture, &market, alice.keypair.pubkey(), alice.up_token, alice.destination, s)],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&alice.destination), 50);
+    assert_eq!(harness.token_balance(&vault), 51); // 101 - 50: one atom of dust left behind.
+
+    harness.send_ok(
+        &bob,
+        &[redeem_unresolved_ix_for(&fixture, &market, bob.pubkey(), bob_down_token, bob_destination, s)],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&bob_destination), 51);
+    assert_eq!(harness.token_balance(&vault), 0, "the final redeemer must drain the vault to exactly zero");
+
+    // Conservation: nothing created, nothing destroyed -- 50 + 51 == S.
+    assert_eq!(harness.token_balance(&alice.destination) + harness.token_balance(&bob_destination), s);
+}
+
+/// Burning (unlike redeeming) moves the vault and BOTH mint supplies by the
+/// identical amount, so it preserves `vault / total_supply == 1/2` exactly.
+/// This test mints, burns part of the position, THEN opens the hatch and
+/// redeems -- proving the intervening burn does not skew the pro-rata split
+/// away from the standard 50/50 the un-burned case gets.
+#[test]
+fn redeem_unresolved_pro_rata_is_unchanged_by_an_intervening_burn_complete_set() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let down_mint = down_mint_pda(&market.market);
+    let vault = complete_set_vault_pda(&market.market);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    // Burns 40 of her own complete set before giving away her DOWN side.
+    harness.send_ok(
+        &alice.keypair,
+        &[burn_complete_set_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.down_token,
+            alice.destination,
+            40 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_eq!(harness.token_balance(&vault), 60 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&alice.destination), 40 * ONE_TOKEN);
+
+    let bob = harness.funded_keypair();
+    let bob_down_token = harness.create_token_account(&bob, &down_mint, &bob.pubkey());
+    harness.transfer_tokens(&alice.keypair, &alice.down_token, &bob_down_token, 60 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+
+    // Still the FIRST redemption against this market -- vault (60) ==
+    // total_supply (120) / 2 still holds despite the earlier burn, so this
+    // is still exactly half of her 60 UP, not skewed by it.
+    harness.send_ok(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.up_token,
+            alice.destination,
+            60 * ONE_TOKEN,
+        )],
+        &[],
+    );
+    // 40 (from the earlier burn) + 30 (half of 60, from redeem_unresolved).
+    assert_eq!(harness.token_balance(&alice.destination), 70 * ONE_TOKEN);
+    assert_eq!(harness.token_balance(&vault), 30 * ONE_TOKEN);
+}
+
+/// `redeemer_token` may be EITHER conditional-token mint, but nothing else --
+/// the handler rejects a token account belonging to any other mint (here,
+/// the settlement mint itself) with a dedicated error rather than silently
+/// misbehaving or failing at the SPL token program with a confusing message.
+#[test]
+fn redeem_unresolved_rejects_a_token_account_belonging_to_neither_mint() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+
+    let alice = setup_complete_set_minter(&mut harness, &market, &creator, 100 * ONE_TOKEN);
+    harness.send_ok(&alice.keypair, &[mint_complete_set_ix_for(&fixture, &market, &alice, 100 * ONE_TOKEN)], &[]);
+
+    harness.warp_to_timestamp(final_settlement_deadline(&market) + 1);
+
+    let failed = harness.send_err(
+        &alice.keypair,
+        &[redeem_unresolved_ix_for(
+            &fixture,
+            &market,
+            alice.keypair.pubkey(),
+            alice.source, // a settlement-mint account -- neither UP nor DOWN
+            alice.destination,
+            ONE_TOKEN,
+        )],
+        &[],
+    );
+    assert_vsol_error(&failed, vsol::VsolError::InvalidConditionalTokenMint);
 }

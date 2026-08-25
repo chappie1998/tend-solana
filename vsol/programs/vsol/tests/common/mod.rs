@@ -25,9 +25,10 @@ use solana_sdk_ids::{system_program, sysvar::rent};
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
 use vsol::{
-    ELIGIBILITY_SEED, MARKET_SEED, NONCE_SEED, ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED,
-    POOL_POSITION_SEED, POOL_POSITION_VAULT_SEED, POOL_SEED, POOL_TOKEN_SEED, POSITION_SEED,
-    POSITION_VAULT_SEED, PROVIDER_SEED, WRITER_SEED, WRITER_TOKEN_SEED,
+    COMPLETE_SET_TOKEN_SEED, COMPLETE_SET_VAULT_SEED, DOWN_MINT_SEED, ELIGIBILITY_SEED,
+    MARKET_SEED, NONCE_SEED, ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED, POOL_POSITION_SEED,
+    POOL_POSITION_VAULT_SEED, POOL_SEED, POOL_TOKEN_SEED, POSITION_SEED, POSITION_VAULT_SEED,
+    PROVIDER_SEED, UP_MINT_SEED, WRITER_SEED, WRITER_TOKEN_SEED,
 };
 
 pub use anchor_lang::prelude::Pubkey;
@@ -173,6 +174,17 @@ impl Harness {
         spl_token::state::Account::unpack(&account.data)
             .expect("unpack token account")
             .amount
+    }
+
+    /// Reads an SPL mint's total supply directly, bypassing every
+    /// instruction handler -- used by the conditional-token ("complete set")
+    /// tests to check `up_mint`/`down_mint` supply against the collateral
+    /// vault balance.
+    pub fn mint_supply(&self, mint: &Pubkey) -> u64 {
+        let account = self.get_account(mint);
+        spl_token::state::Mint::unpack(&account.data)
+            .expect("unpack mint")
+            .supply
     }
 
     pub fn create_mint(&mut self, payer: &Keypair, authority: &Pubkey, decimals: u8) -> Pubkey {
@@ -356,6 +368,28 @@ pub fn pool_position_pda(nonce_record: &Pubkey) -> Pubkey {
 
 pub fn pool_position_vault_pda(position: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[POOL_POSITION_VAULT_SEED, position.as_ref()], &vsol::ID).0
+}
+
+// --- Conditional-token ("complete set") PDAs ---
+
+pub fn up_mint_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[UP_MINT_SEED, market.as_ref()], &vsol::ID).0
+}
+
+pub fn down_mint_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[DOWN_MINT_SEED, market.as_ref()], &vsol::ID).0
+}
+
+pub fn complete_set_vault_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[COMPLETE_SET_VAULT_SEED, market.as_ref()], &vsol::ID).0
+}
+
+/// The deterministic address `mint_complete_set` mints into (see
+/// `COMPLETE_SET_TOKEN_SEED`'s doc comment in src/lib.rs). `burn_complete_set`
+/// and `redeem_winning` accept this OR any other token account the caller
+/// holds a balance in -- it is not the only valid source for those two.
+pub fn complete_set_token_pda(mint: &Pubkey, owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[COMPLETE_SET_TOKEN_SEED, mint.as_ref(), owner.as_ref()], &vsol::ID).0
 }
 
 pub fn system_program_id() -> Pubkey {

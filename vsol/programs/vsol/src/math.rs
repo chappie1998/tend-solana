@@ -103,6 +103,55 @@ pub fn calculate_withdraw_amount(shares: u64, total_shares: u64, total_assets: u
     Ok(amount)
 }
 
+/// The conditional-token winner rule: a market settles UP if the finalized
+/// price is *strictly* above the market's strike, DOWN otherwise (an exact
+/// tie goes to DOWN). Centralized here so `redeem_winning` (lib.rs) and its
+/// tests share one definition instead of re-deriving the inequality inline.
+///
+/// Deliberately NOT built on `calculate_payout`: that function is a linear
+/// spread ramp over `[strike, strike + width]` for the older per-position
+/// payoff, not a binary threshold, and setting `width = 1` to approximate a
+/// binary would make an exact tie (`price == strike`) pay neither side --
+/// silently stranding collateral -- instead of resolving to DOWN as the
+/// design requires.
+pub fn up_wins(settlement_price: u64, strike: u64) -> bool {
+    settlement_price > strike
+}
+
+/// The `redeem_unresolved` payout: a pro-rata share of the collateral vault,
+/// `amount * vault_balance / total_supply`, computed in `u128` and checked
+/// back down to `u64`. `total_supply` is `up_mint.supply + down_mint.supply`
+/// -- the caller does that `checked_add` itself (in `u128`, since two `u64`
+/// supplies can together exceed `u64::MAX`) before calling this function.
+///
+/// Why pro-rata rather than a hardcoded `amount / 2` -- see
+/// `redeem_unresolved`'s doc comment in lib.rs for the full rationale, which
+/// this function's own tests below pin:
+/// - At the moment the hatch first opens (no redemptions yet), `vault_balance
+///   == total_supply / 2` always holds (`mint_complete_set`/`burn_complete_set`
+///   move all three by the identical amount every time), so this reduces to
+///   exactly `amount / 2` -- the standard "unresolvable market resolves
+///   50/50" convention.
+/// - It stays exact under ANY redemption order: floor division leaves dust
+///   in the vault after most redemptions, but whenever `amount ==
+///   total_supply` (the last redemption once the other side has fully
+///   drained), the payout is `amount * vault_balance / amount ==
+///   vault_balance` exactly -- no residual dust, regardless of how much
+///   floor-rounding dust accumulated in earlier redemptions.
+///
+/// `total_supply == 0` is rejected rather than silently dividing by zero --
+/// see `VsolError::NothingToRedeem`.
+pub fn calculate_pro_rata_redemption(amount: u64, vault_balance: u64, total_supply: u128) -> Result<u64> {
+    require!(amount > 0, VsolError::InvalidAmount);
+    require!(total_supply > 0, VsolError::NothingToRedeem);
+    let payout = (amount as u128)
+        .checked_mul(vault_balance as u128)
+        .ok_or(VsolError::MathOverflow)?
+        .checked_div(total_supply)
+        .ok_or(VsolError::MathOverflow)?;
+    u64::try_from(payout).map_err(|_| error!(VsolError::MathOverflow))
+}
+
 pub fn calculate_bps_limit(amount: u64, bps: u16) -> Result<u64> {
     let limit = (amount as u128)
         .checked_mul(bps as u128)
@@ -134,6 +183,15 @@ mod tests {
     }
 
     #[test]
+    fn up_wins_ties_go_to_down() {
+        assert!(!up_wins(100, 100)); // exact tie -> DOWN
+        assert!(up_wins(101, 100)); // strictly above -> UP
+        assert!(!up_wins(99, 100)); // strictly below -> DOWN
+        assert!(!up_wins(0, 0)); // tie at zero -> DOWN
+        assert!(up_wins(1, 0));
+    }
+
+    #[test]
     fn pool_share_math_rounds_against_value_extraction() {
         assert_eq!(calculate_deposit_shares(1_000, 0, 0).unwrap(), 1_000);
         assert_eq!(calculate_deposit_shares(333, 1_000, 3_000).unwrap(), 111);
@@ -149,6 +207,38 @@ mod tests {
         assert_eq!(calculate_bps_limit(10_000, 7_500).unwrap(), 7_500);
     }
 
+    #[test]
+    fn pro_rata_redemption_halves_exactly_at_the_moment_the_hatch_opens() {
+        // vault == total_supply / 2 (S = 100 on each side, vault = 100,
+        // total = 200) -- the invariant that always holds pre-redemption.
+        // Redeeming 40 of one side is owed exactly 20, not a rounded
+        // approximation.
+        assert_eq!(calculate_pro_rata_redemption(40, 100, 200).unwrap(), 20);
+        assert_eq!(calculate_pro_rata_redemption(100, 100, 200).unwrap(), 50);
+    }
+
+    #[test]
+    fn pro_rata_redemption_drains_the_vault_exactly_when_amount_equals_total_supply() {
+        // The "final redeemer" case: whatever is left of the vault is paid
+        // out in full, with no dust, because the numerator is trivially
+        // divisible by the denominator when they share the same value.
+        assert_eq!(calculate_pro_rata_redemption(51, 51, 51).unwrap(), 51);
+        assert_eq!(calculate_pro_rata_redemption(1, 999_999, 1).unwrap(), 999_999);
+    }
+
+    #[test]
+    fn pro_rata_redemption_floors_and_leaves_dust_for_a_non_exact_split() {
+        // 101 * 101 / 202 = 50.5 -> floors to 50, not 51 -- the dust that a
+        // later, exact-final redemption picks up (see the drain test above).
+        assert_eq!(calculate_pro_rata_redemption(101, 101, 202).unwrap(), 50);
+    }
+
+    #[test]
+    fn pro_rata_redemption_rejects_zero_amount_and_zero_total_supply() {
+        assert!(calculate_pro_rata_redemption(0, 100, 200).is_err());
+        assert!(calculate_pro_rata_redemption(50, 0, 0).is_err());
+    }
+
     proptest! {
         #[test]
         fn payout_never_exceeds_collateral(
@@ -160,6 +250,48 @@ mod tests {
         ) {
             let payout = calculate_payout(direction, strike, width, price, max_payout).unwrap();
             prop_assert!(payout <= max_payout);
+        }
+
+        #[test]
+        fn pro_rata_redemption_never_exceeds_the_vault(
+            amount in 1u64..=u64::MAX,
+            vault_balance in any::<u64>(),
+            total_supply in 1u128..=(2 * u64::MAX as u128),
+        ) {
+            // amount can legally exceed total_supply here (this function does
+            // not itself enforce amount <= total_supply -- the caller's own
+            // mint-supply `checked_sub` after the burn is what would catch
+            // that), so the payout can round up to more than vault_balance in
+            // that out-of-range case. Restrict to the in-range case this
+            // function is actually called under: amount <= total_supply.
+            prop_assume!(u128::from(amount) <= total_supply);
+            let payout = calculate_pro_rata_redemption(amount, vault_balance, total_supply).unwrap();
+            prop_assert!(payout <= vault_balance);
+        }
+
+        #[test]
+        fn up_wins_is_monotonic_in_price(
+            strike in any::<u64>(),
+            price in 0u64..u64::MAX,
+        ) {
+            // If `price` already wins for a given strike, every strictly
+            // larger price must also win -- the winner rule never flips back
+            // from UP to DOWN as the settlement price rises.
+            if up_wins(price, strike) {
+                prop_assert!(up_wins(price + 1, strike));
+            }
+        }
+
+        #[test]
+        fn up_wins_is_antitonic_in_strike(
+            price in any::<u64>(),
+            strike in 0u64..u64::MAX,
+        ) {
+            // Raising the strike can only ever make UP harder to win, never
+            // easier.
+            if !up_wins(price, strike) {
+                prop_assert!(!up_wins(price, strike + 1));
+            }
         }
 
         #[test]

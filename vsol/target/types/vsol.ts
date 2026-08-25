@@ -136,6 +136,164 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "burnCompleteSet",
+      "docs": [
+        "Burns `amount` of BOTH the UP and DOWN conditional tokens and returns",
+        "`amount` collateral from the vault. This is the arbitrage that keeps",
+        "UP + DOWN priced at ~1 unit of collateral, so it must work identically",
+        "before AND after settlement -- it is deliberately never gated on",
+        "`oracle.finalized` in either direction.",
+        "",
+        "Guardian: like `settle`/`close_pool_position`, this is a holder's exit",
+        "path, so -- unlike `mint_complete_set` -- it must keep working even",
+        "while the protocol is paused. Deliberately NOT gated on",
+        "`config.paused`."
+      ],
+      "discriminator": [
+        183,
+        36,
+        119,
+        130,
+        123,
+        198,
+        110,
+        211
+      ],
+      "accounts": [
+        {
+          "name": "burner",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "upMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  112,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "downMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  111,
+                  119,
+                  110,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateralVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "burnerUpToken",
+          "writable": true
+        },
+        {
+          "name": "burnerDownToken",
+          "writable": true
+        },
+        {
+          "name": "burnerDestination",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "cancelNonce",
       "discriminator": [
         75,
@@ -617,18 +775,34 @@ export type Vsol = {
         "`open_position_count` on `Market`, maintained by fill/settle/refund",
         "-- is the only way to actually enforce this, and remains the right",
         "fix before real money.",
-        "4. As a cheap, *additional* on-chain check (defense-in-depth, not the",
+        "4. UNLIKE point 3, the conditional-token (\"complete set\") collateral",
+        "vault IS cheaply, fully enumerable from the market alone: it is a",
+        "single deterministic PDA (`COMPLETE_SET_VAULT_SEED`, keyed only by",
+        "`market.key()`), not a per-nonce record like `Position`/",
+        "`PoolPosition`. `burn_complete_set` and `redeem_winning` both load",
+        "`market: Box<Account<'info, Market>>`, so once this account is",
+        "closed neither can ever execute again -- any balance still in the",
+        "vault at that point is unrecoverable forever. Because this check",
+        "IS cheap, it is a HARD on-chain requirement, not an off-chain",
+        "assumption like point 3: the handler requires the vault to be",
+        "either never created (nobody ever called `mint_complete_set`",
+        "against this market) or fully drained (`amount == 0`) before",
+        "allowing the close. See `CloseSettledMarket::collateral_vault`'s",
+        "own doc comment for why checking the vault balance alone --",
+        "without also inspecting `up_mint`/`down_mint` supply -- is",
+        "sufficient.",
+        "5. As a cheap, *additional* on-chain check (defense-in-depth, not the",
         "primary safety argument above, which already holds regardless): if",
         "the caller passes a `pool`/`pool_market` pair, it must be the",
         "authorization record for *this* market and pool, and it must have",
         "`enabled == false`. Passing `None` for both is accepted (an",
         "omitted pair is not proof no pool was ever authorized, but no",
         "cheaper on-chain check exists -- see point 3).",
-        "5. Permission: the caller must be `market.creator` or `config.admin`.",
+        "6. Permission: the caller must be `market.creator` or `config.admin`.",
         "Rent always returns to `market.creator` (`rent_recipient` is",
         "address-constrained to it), never to an arbitrary caller-supplied",
         "account.",
-        "6. Deliberately *not* gated on `config.paused`: this is maintenance",
+        "7. Deliberately *not* gated on `config.paused`: this is maintenance",
         "cleanup, not a trading action, so it must remain callable while",
         "the protocol is paused (mirrors `close_pool_position`'s guardian",
         "rationale for staying pause-independent)."
@@ -701,6 +875,57 @@ export type Vsol = {
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "collateralVault",
+          "docs": [
+            "vault PDA by `seeds =`/`bump`, so a caller can neither omit it nor",
+            "substitute a different (e.g. always-empty) account to dodge the",
+            "balance check in the handler. Deliberately an `UncheckedAccount`, not",
+            "`Box<Account<'info, TokenAccount>>` like `BurnCompleteSet`/",
+            "`RedeemWinning`'s own `collateral_vault`: THIS vault may legitimately",
+            "never have been created at all (a market nobody ever called",
+            "`mint_complete_set` against), and `Account<TokenAccount>`",
+            "deserialization fails closed on an empty/uninitialized account with",
+            "no `init_if_needed` escape hatch available on a `close`-adjacent",
+            "read-only check. The handler distinguishes \"never created\" (empty",
+            "account data) from \"created but still holds a balance\" (blocked)",
+            "itself, by inspecting the raw account.",
+            "",
+            "Checking ONLY this vault's balance -- not also `up_mint.supply`/",
+            "`down_mint.supply` -- is sufficient, and deliberately not \"hardened\"",
+            "with those two extra accounts: `vault.amount == 0` already implies",
+            "every winning conditional token has been redeemed (`redeem_winning`",
+            "is the only path that debits the vault post-settlement, and it always",
+            "debits the vault and the winning mint's supply by the identical",
+            "amount -- see its own `require!` check), so whatever supply remains",
+            "outstanding on either mint at that point is entirely losing-side",
+            "tokens, which are worthless by construction and carry no claim on",
+            "anything. Checking the vault is checking the one number that",
+            "actually matters; the mint supplies would be two more accounts for",
+            "no additional safety."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
         },
         {
           "name": "pool",
@@ -1902,6 +2127,232 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "mintCompleteSet",
+      "docs": [
+        "Mints a \"complete set\": pulls `amount` of the market's settlement",
+        "token into a per-market collateral vault PDA and mints `amount` of",
+        "BOTH the UP and DOWN conditional tokens to the caller. Fully",
+        "collateralized by construction -- `up_mint`/`down_mint`'s mint",
+        "authority is the market PDA, which never signs a `mint_to` CPI",
+        "anywhere except here, and this instruction always moves the vault and",
+        "both supplies by the identical `amount` in one transaction, verified",
+        "below by reloading all three and checking the exact expected delta",
+        "(the same defensive \"reload and compare\" pattern `fill_quote` and",
+        "`deposit_liquidity` already use elsewhere in this file).",
+        "",
+        "Gated on `!config.paused` AND `market.enabled`: like",
+        "`fill_quote`/`fill_pool_quote`, this creates new economic exposure,",
+        "so both the global pause guardian and the market's own admin kill",
+        "switch (`set_market_enabled`) block it. `burn_complete_set` and",
+        "`redeem_winning` are deliberately gated on NEITHER -- see their own",
+        "doc comments for why (same reason `settle`/`refund_unsettled`/etc.",
+        "never check `market.enabled` either: it only ever blocks new",
+        "exposure, never an exit)."
+      ],
+      "discriminator": [
+        70,
+        222,
+        130,
+        148,
+        234,
+        103,
+        137,
+        61
+      ],
+      "accounts": [
+        {
+          "name": "minter",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "upMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  112,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "downMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  111,
+                  119,
+                  110,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateralVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "minterSource",
+          "writable": true
+        },
+        {
+          "name": "minterUpToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "upMint"
+              },
+              {
+                "kind": "account",
+                "path": "minter"
+              }
+            ]
+          }
+        },
+        {
+          "name": "minterDownToken",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "downMint"
+              },
+              {
+                "kind": "account",
+                "path": "minter"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "nominateAdmin",
       "discriminator": [
         134,
@@ -2022,6 +2473,425 @@ export type Vsol = {
         }
       ],
       "args": []
+    },
+    {
+      "name": "redeemUnresolved",
+      "docs": [
+        "Escape hatch for a market whose oracle never finalizes: once",
+        "`publish_pyth_settlement` can no longer ever succeed again (see",
+        "`final_settlement_deadline`), burns `amount` of EITHER conditional",
+        "token for a pro-rata share of the collateral vault --",
+        "`amount * vault_balance / (up_mint.supply + down_mint.supply)`",
+        "(`math::calculate_pro_rata_redemption`) -- rather than requiring a",
+        "winner that will never be determined. This is the conditional-token",
+        "path's analogue of `refund_unsettled` for the older per-position",
+        "path: without it, a holder of only one side of a market whose oracle",
+        "is permanently dead has no way to ever recover anything, and",
+        "`burn_complete_set` does not help them (it requires holding BOTH",
+        "sides).",
+        "",
+        "Timing -- why the gate is `now > final_settlement_deadline(market)`,",
+        "exactly, and not the earlier `settlement_deadline`",
+        "`refund_unsettled`/`redeem_winning`'s sibling paths might suggest:",
+        "`redeem_winning` requires `oracle.finalized`, and",
+        "`publish_pyth_settlement` can still finalize the oracle for any",
+        "`now <= final_settlement_deadline(market)` (tier 1 the whole way;",
+        "tier 2 after its own additional `tier_two_open_at` gate). Opening",
+        "THIS hatch any earlier makes the two payout paths simultaneously",
+        "satisfiable, which is a real insolvency, not just a race: collateral",
+        "could be paid out pro-rata AND the market could later settle with a",
+        "real winner who is then owed more than the vault has left. Concretely,",
+        "with `S = 100` outstanding complete sets: if the hatch opened at the",
+        "bare `settlement_deadline`, Alice could pro-rata-redeem 50 UP for 25",
+        "(vault: 100 -> 75), the oracle could then finalize DOWN, and Bob --",
+        "holding 100 DOWN, owed 100 -- would find only 75 left; his",
+        "`checked_sub` fails and he can never redeem at all, a strictly worse",
+        "outcome (total lockup) than the bug this instruction exists to fix.",
+        "Gating on `final_settlement_deadline` instead makes `redeem_unresolved`",
+        "and `redeem_winning` strictly mutually exclusive: by the time this",
+        "hatch can open, `publish_pyth_settlement` is guaranteed to already be",
+        "permanently closed (see its own doc comment), so `oracle.finalized`",
+        "can never subsequently flip from false to true underneath a",
+        "redemption that already happened.",
+        "",
+        "Payout formula -- why pro-rata rather than a hardcoded `amount / 2`:",
+        "- At the instant the hatch first opens, `vault == up_mint.supply ==",
+        "down_mint.supply` always holds (`mint_complete_set`/",
+        "`burn_complete_set` move all three by the identical amount every",
+        "time -- see their own `require!` checks), so `total == 2 * vault`",
+        "and the formula reduces to exactly `amount / 2` -- the standard",
+        "\"unresolvable market resolves 50/50\" convention (the same rule",
+        "Polymarket applies to markets UMA cannot resolve).",
+        "- It stays exact under ANY redemption order, unlike a hardcoded half:",
+        "floor division leaves rounding dust in the vault after most",
+        "individual redemptions, but the FINAL redemption -- whichever side",
+        "still has supply once the other side has fully burned/redeemed to",
+        "zero -- always has `amount == total_supply`, so its payout is",
+        "`amount * vault / amount == vault` exactly, draining the vault to",
+        "zero with no dust left over (see `math::calculate_pro_rata_redemption`'s",
+        "own doc comment and tests). A flat `amount / 2` would leave dust in",
+        "the vault forever, and with `close_settled_market` now requiring an",
+        "empty vault (see `CloseSettledMarket::collateral_vault`), permanent",
+        "dust would mean the market -- and its rent -- could never be closed.",
+        "- It cannot be manipulated by minting/burning around a redemption:",
+        "`mint_complete_set` moves `vault += a` and `total_supply += 2a`;",
+        "`burn_complete_set` moves `vault -= a` and `total_supply -= 2a`.",
+        "Both preserve `vault / total_supply` exactly, so nobody can shift",
+        "the ratio in their favor before redeeming.",
+        "",
+        "Guardian: like `burn_complete_set`/`redeem_winning`, this is an exit",
+        "path -- deliberately NOT gated on `config.paused` or `market.enabled`."
+      ],
+      "discriminator": [
+        94,
+        144,
+        129,
+        29,
+        214,
+        131,
+        149,
+        78
+      ],
+      "accounts": [
+        {
+          "name": "redeemer",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle"
+          ]
+        },
+        {
+          "name": "oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "upMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  112,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "downMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  111,
+                  119,
+                  110,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateralVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "redeemerToken",
+          "writable": true
+        },
+        {
+          "name": "redeemerDestination",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "redeemWinning",
+      "docs": [
+        "Redeems `amount` of the market's WINNING conditional token for",
+        "`amount` collateral, once the oracle has finalized. The winner rule:",
+        "UP wins if the finalized price is *strictly* above `market.strike`,",
+        "DOWN otherwise (an exact tie goes to DOWN) -- see `math::up_wins`.",
+        "The losing side can never redeem: `redeemer_token.mint` is checked",
+        "against whichever side actually won.",
+        "",
+        "Guardian: like `burn_complete_set`, deliberately NOT gated on",
+        "`config.paused` -- a winner must always be able to claim their",
+        "payout, exactly the same rationale `settle`/`close_pool_position`",
+        "document for staying pause-independent."
+      ],
+      "discriminator": [
+        191,
+        44,
+        57,
+        7,
+        31,
+        46,
+        190,
+        162
+      ],
+      "accounts": [
+        {
+          "name": "redeemer",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle"
+          ]
+        },
+        {
+          "name": "oracle",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "settlementMint",
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "upMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  112,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "downMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  111,
+                  119,
+                  110,
+                  45,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateralVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  115,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "redeemerToken",
+          "writable": true
+        },
+        {
+          "name": "redeemerDestination",
+          "writable": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "refundPoolPosition",
@@ -3723,6 +4593,32 @@ export type Vsol = {
       ]
     },
     {
+      "name": "completeSetBurned",
+      "discriminator": [
+        202,
+        191,
+        88,
+        162,
+        119,
+        157,
+        167,
+        98
+      ]
+    },
+    {
+      "name": "completeSetMinted",
+      "discriminator": [
+        138,
+        100,
+        135,
+        145,
+        242,
+        178,
+        224,
+        155
+      ]
+    },
+    {
       "name": "configInitialized",
       "discriminator": [
         181,
@@ -4019,6 +4915,32 @@ export type Vsol = {
         237,
         134,
         134
+      ]
+    },
+    {
+      "name": "unresolvedRedeemed",
+      "discriminator": [
+        45,
+        128,
+        62,
+        73,
+        20,
+        116,
+        3,
+        220
+      ]
+    },
+    {
+      "name": "winningRedeemed",
+      "discriminator": [
+        46,
+        214,
+        83,
+        245,
+        144,
+        28,
+        187,
+        212
       ]
     },
     {
@@ -4371,6 +5293,31 @@ export type Vsol = {
       "code": 6061,
       "name": "poolUpdateTimelocked",
       "msg": "The pending liquidity pool update's timelock has not yet elapsed."
+    },
+    {
+      "code": 6062,
+      "name": "invalidStrike",
+      "msg": "The market strike must be positive."
+    },
+    {
+      "code": 6063,
+      "name": "losingSideNotRedeemable",
+      "msg": "The supplied token account does not match the market's winning side."
+    },
+    {
+      "code": 6064,
+      "name": "marketHasOutstandingCollateral",
+      "msg": "The market's collateral vault still holds outstanding complete-set collateral: redeem or burn every outstanding complete set before closing this market."
+    },
+    {
+      "code": 6065,
+      "name": "invalidConditionalTokenMint",
+      "msg": "The supplied token account does not belong to either the UP or DOWN mint."
+    },
+    {
+      "code": 6066,
+      "name": "nothingToRedeem",
+      "msg": "There is no outstanding conditional-token supply left to redeem."
     }
   ],
   "types": [
@@ -4394,6 +5341,46 @@ export type Vsol = {
           {
             "name": "pendingAdmin",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "completeSetBurned",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "burner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "completeSetMinted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "minter",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
           }
         ]
       }
@@ -4554,6 +5541,10 @@ export type Vsol = {
           {
             "name": "maxSettlementStalenessSeconds",
             "type": "u32"
+          },
+          {
+            "name": "strike",
+            "type": "u64"
           }
         ]
       }
@@ -5083,6 +6074,10 @@ export type Vsol = {
           {
             "name": "maxSettlementStalenessSeconds",
             "type": "u32"
+          },
+          {
+            "name": "strike",
+            "type": "u64"
           }
         ]
       }
@@ -5821,6 +6816,34 @@ export type Vsol = {
       }
     },
     {
+      "name": "unresolvedRedeemed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "redeemer",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "payout",
+            "type": "u64"
+          },
+          {
+            "name": "redeemedUp",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
       "name": "updateConfigArgs",
       "type": {
         "kind": "struct",
@@ -5868,6 +6891,30 @@ export type Vsol = {
           {
             "name": "maxPositionBps",
             "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "winningRedeemed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "redeemer",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "upWon",
+            "type": "bool"
           }
         ]
       }
