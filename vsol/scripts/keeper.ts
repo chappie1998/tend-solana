@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { AnchorError, AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import BN from "bn.js";
+import { HermesClient } from "@pythnetwork/hermes-client";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
   AddressLookupTableProgram,
@@ -24,12 +25,19 @@ import {
   type RetiringLookupTableEntry,
 } from "./lib/lookup-table.ts";
 import {
+  fetchAllMarkets,
+  fetchLatestPythUpdate,
+  pythPriceToScaledAtoms,
+  type DecodedMarketForCleanup,
+} from "./lib/settlement.ts";
+import {
   deriveConfig,
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveMarket,
   deriveMarketId,
   deriveOracle,
+  ladderStrike,
   liquidityPoolId,
   MARKET_MAX_CONFIDENCE_BPS as MAX_CONFIDENCE_BPS,
   MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
@@ -80,7 +88,22 @@ const MARKET_SYMBOL = "NVDA";
 // keeper at the abandoned 214-byte pool and it died decoding it
 // ("offset out of range: 238 > 204") before minting a single rung, so the app
 // had no tradable series at all.
-const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v4`;
+//
+// Bumped v4 -> v5 on 2026-08-24 when the conditional-token core added
+// `strike: u64` to `Market` (see the struct in vsol/programs/vsol/src/lib.rs),
+// taking that account from 281 to 289 bytes. Unlike the v3->v4 bump, the
+// `LiquidityPool` account itself did NOT change shape -- this bump is not
+// forced by a PDA/size collision on the pool. It is forced by what happened
+// to the MARKETS the old pool authorized: every pre-upgrade Market account
+// is now permanently undecodable by the upgraded program (Anchor
+// deserializes against the current, larger struct, so a 281-byte account
+// simply fails to load -- see bootstrap.ts's identical "stale pre-upgrade
+// account layout is inert" handling for the legacy UI market). A pool whose
+// `authorizedMarkets` manifest still points at those now-inert markets is a
+// stale epoch even though its own account is fine, so bootstrap mints a
+// fresh v5 pool alongside the fresh v5 markets rather than re-authorizing a
+// v4 pool against addresses that no longer mean anything post-upgrade.
+const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v5`;
 
 /**
  * Mirrors `MIN_MARKET_LEAD_SECONDS` in vsol/programs/vsol/src/lib.rs exactly
@@ -170,6 +193,97 @@ function redact(text: string): string {
 
 function describeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
+}
+
+// Constructed lazily -- see getHermesClient below -- so a pass where every
+// scheduled rung already exists on-chain makes zero Hermes calls.
+let hermesClient: HermesClient | undefined;
+
+/**
+ * Lazily constructs (and reuses) the single Hermes client this run needs.
+ * The constructor itself performs no I/O, but keeping this behind a getter
+ * -- rather than a module-scope `new HermesClient(...)` -- keeps the intent
+ * explicit: ensureMarketRung must only call this on a genuine cache miss
+ * (a rung with no existing on-chain match), never on every pass.
+ */
+function getHermesClient(): HermesClient {
+  if (!hermesClient) {
+    hermesClient = new HermesClient(process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network", {
+      accessToken: process.env.PYTH_API_KEY?.trim() || undefined,
+      timeout: 20_000,
+      httpRetries: 3,
+    });
+  }
+  return hermesClient;
+}
+
+/**
+ * The non-strike fingerprint a discovered on-chain market must match to be
+ * treated as "this rung's" market: same feed, symbol, and every policy
+ * constant the factory hashes into `expected_market_id` other than expiry
+ * (matched separately, by the caller, via the map key) and strike (which is
+ * exactly the field this lookup exists to read back rather than assume).
+ */
+type RungPolicy = {
+  pythFeedId: string;
+  symbol: string;
+  observationWindowSeconds: number;
+  settlementGraceSeconds: number;
+  maxConfidenceBps: number;
+  priceScale: bigint;
+  maxSettlementStalenessSeconds: number;
+};
+
+function matchesRungPolicy(market: DecodedMarketForCleanup, policy: RungPolicy): boolean {
+  return (
+    market.enabled
+    && market.pythFeedId.toLowerCase() === policy.pythFeedId.toLowerCase()
+    && market.symbol === policy.symbol
+    && market.observationWindowSeconds === policy.observationWindowSeconds
+    && market.settlementGraceSeconds === policy.settlementGraceSeconds
+    && market.maxConfidenceBps === policy.maxConfidenceBps
+    && market.priceScale === policy.priceScale
+    && market.maxSettlementStalenessSeconds === policy.maxSettlementStalenessSeconds
+  );
+}
+
+/**
+ * Builds the discover-first lookup table `ensureMarketRung` consults before
+ * ever touching Hermes: every currently-live, enabled market matching this
+ * keeper's (feed, symbol, policy) fingerprint, keyed by its expiry (the
+ * rolling grid's own rung identity -- see rollingMarketSchedule). Exported
+ * (and kept pure, no RPC) so vsol/tests/keeper.test.ts can exercise the
+ * matching/collision logic in isolation.
+ *
+ * Two markets can legitimately share an expiry here: the documented
+ * strike-ladder race where two keeper instances first-see the same new
+ * expiry with different spot and each lists an adjacent ladder rung (see
+ * `ladderStrike`'s doc comment in ../sdk/index.ts). Both are valid ladder
+ * points, neither is a duplicate contract -- `concurrency: group:
+ * vsol-keeper` in .github/workflows/vsol-keeper.yml already serializes CI
+ * runs, so this is a rare manual-run-vs-CI race at worst. This function
+ * deterministically keeps the first market encountered for a given expiry
+ * (stable with respect to `markets`' own order) and logs the collision
+ * rather than picking arbitrarily every call.
+ */
+export function indexMarketsByExpiry(
+  markets: readonly DecodedMarketForCleanup[],
+  policy: RungPolicy,
+): Map<number, DecodedMarketForCleanup> {
+  const index = new Map<number, DecodedMarketForCleanup>();
+  for (const market of markets) {
+    if (!matchesRungPolicy(market, policy)) continue;
+    const existing = index.get(market.expiry);
+    if (existing) {
+      console.log(
+        `warn: multiple live markets match expiry ${market.expiry} for this feed/symbol/policy (ladder-rung race) -- ` +
+          `keeping ${existing.address} (strike ${existing.strike.toString()}), ignoring ${market.address} (strike ${market.strike.toString()})`,
+      );
+      continue;
+    }
+    index.set(market.expiry, market);
+  }
+  return index;
 }
 
 /**
@@ -352,10 +466,24 @@ type CreatedMarketRung = {
  * transaction (this create) plus one best-effort ALT extend, instead of the
  * full batch of up to ten transactions the previous two-pass design incurred.
  *
+ * DISCOVER-FIRST: `strike` is a listed ladder parameter, not something this
+ * (stateless, GitHub-Actions-run) keeper may re-derive from live spot every
+ * pass -- see `STRIKE_LADDER_STEP`/`ladderStrike`'s doc comment in
+ * ../sdk/index.ts for why that would drift and mint a fresh market on every
+ * boundary. So `params.existingByExpiry` -- built once per pass by `main`
+ * from a single `fetchAllMarkets` scan -- is consulted FIRST: if this rung's
+ * expiry already has a live, enabled, policy-matching market, its address
+ * (and strike) are read back as-is, with no Hermes call and no re-derivation
+ * of the market id at all. Hermes is only ever touched, and `deriveMarketId`
+ * only ever called, on a genuine miss -- a boundary nobody has minted yet.
+ *
  * Returns undefined when there is (and will be) no market to authorize:
  * either the rung is already too close to its own trade cutoff to be worth
  * minting at all (see isRungAuthorizable/CREATE_AUTHORIZE_MARGIN_SECONDS), in
- * which case it is about to roll onto the next boundary anyway.
+ * which case it is about to roll onto the next boundary anyway; or Hermes
+ * was unavailable for a genuinely new expiry this pass (logged as a warning,
+ * not thrown -- a Hermes outage must never stop the keeper from maintaining
+ * rungs that already exist, and it recovers on its own next pass).
  */
 async function ensureMarketRung(params: {
   creatorProgram: Program<Vsol>;
@@ -364,36 +492,31 @@ async function ensureMarketRung(params: {
   settlementMint: PublicKey;
   underlyingMint: PublicKey;
   series: ScheduledSeries;
+  existingByExpiry: ReadonlyMap<number, DecodedMarketForCleanup>;
   counters: Counters;
   addressLookupTable?: PublicKey;
   now: number;
 }): Promise<CreatedMarketRung | undefined> {
   const { series } = params;
   const symbol = symbolBytes(MARKET_SYMBOL);
-  const id = await deriveMarketId({
-    pythFeedId: PYTH_FEED_BYTES,
-    settlementMint: params.settlementMint,
-    expiry: BigInt(series.expiry),
-    observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-    settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-    priceScale: PRICE_SCALE,
-    maxConfidenceBps: MAX_CONFIDENCE_BPS,
-    symbol,
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
-  });
-  const market = deriveMarket(params.config, id);
-  const oracle = deriveOracle(market);
 
-  if (await accountExists(market)) {
-    console.log(`skip: ${series.code} market already exists at ${market.toBase58()}`);
+  const existing = params.existingByExpiry.get(series.expiry);
+  if (existing) {
+    const market = new PublicKey(existing.address);
+    const oracle = deriveOracle(market);
+    console.log(
+      `skip: ${series.code} market already exists at ${market.toBase58()} (strike ${existing.strike.toString()}); ` +
+        "discovered on-chain, no Hermes call needed",
+    );
     params.counters.skipped += 1;
     return { market, oracle };
   }
 
-  // Don't mint a rung that can never be authorized: if its trade cutoff is
-  // already inside (or within CREATE_AUTHORIZE_MARGIN_SECONDS of) the
-  // program's minimum lead window, creating it now would only produce a
-  // market this same pass's authorization attempt is guaranteed to reject.
+  // Don't mint (or even fetch a Hermes price for) a rung that can never be
+  // authorized: if its trade cutoff is already inside (or within
+  // CREATE_AUTHORIZE_MARGIN_SECONDS of) the program's minimum lead window,
+  // creating it now would only produce a market this same pass's
+  // authorization attempt is guaranteed to reject.
   if (
     !isRungAuthorizable({
       now: params.now,
@@ -409,6 +532,56 @@ async function ensureMarketRung(params: {
     return undefined;
   }
 
+  // A genuinely new expiry: this is the ONLY path that ever touches Hermes
+  // or lists a strike. See ladderStrike's doc comment (../sdk/index.ts) for
+  // why this must happen at most once per expiry, never re-derived on a
+  // later pass -- discovery above is what guarantees that.
+  let strike: bigint;
+  try {
+    const hermes = getHermesClient();
+    const { update } = await fetchLatestPythUpdate(hermes, PYTH_FEED_ID);
+    const parsed = update.parsed?.[0];
+    if (!parsed) throw new Error(`Hermes returned no parsed price data for feed ${PYTH_FEED_ID}`);
+    const spot = pythPriceToScaledAtoms(BigInt(parsed.price.price), parsed.price.expo, PRICE_SCALE);
+    strike = ladderStrike(spot);
+  } catch (error) {
+    // A Hermes outage must never stop the keeper from maintaining rungs that
+    // already exist (handled entirely above, with no Hermes dependency) --
+    // it only means this one genuinely-new expiry is not minted THIS pass.
+    // It recovers on the very next pass once Hermes is reachable again.
+    console.log(
+      `warn: ${series.code} market not created this pass -- Hermes spot price unavailable for feed ${PYTH_FEED_ID} ` +
+        `(${describeError(error)}); existing rungs are unaffected, will retry next pass`,
+    );
+    params.counters.skipped += 1;
+    return undefined;
+  }
+
+  const id = await deriveMarketId({
+    pythFeedId: PYTH_FEED_BYTES,
+    settlementMint: params.settlementMint,
+    expiry: BigInt(series.expiry),
+    observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+    settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+    priceScale: PRICE_SCALE,
+    maxConfidenceBps: MAX_CONFIDENCE_BPS,
+    symbol,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+    strike,
+  });
+  const market = deriveMarket(params.config, id);
+  const oracle = deriveOracle(market);
+
+  // Defensive re-check: a concurrent keeper instance (a manual run racing
+  // CI, say -- see indexMarketsByExpiry's doc comment) may have created this
+  // exact (feed, symbol, expiry, policy, strike) market between this pass's
+  // discovery scan and now.
+  if (await accountExists(market)) {
+    console.log(`skip: ${series.code} market already exists at ${market.toBase58()} (strike ${strike.toString()}); lost a create race since this pass's scan`);
+    params.counters.skipped += 1;
+    return { market, oracle };
+  }
+
   try {
     await params.creatorProgram.methods
       .createMarket({
@@ -422,6 +595,7 @@ async function ensureMarketRung(params: {
         maxConfidenceBps: MAX_CONFIDENCE_BPS,
         pythFeedId: PYTH_FEED_BYTES,
         maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+        strike: new BN(strike.toString()),
       })
       .accountsStrict({
         creator: params.creator.publicKey,
@@ -434,7 +608,7 @@ async function ensureMarketRung(params: {
       })
       .rpc();
     console.log(
-      `created: ${series.code} market ${market.toBase58()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
+      `created: ${series.code} market ${market.toBase58()} strike ${strike.toString()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
     );
     params.counters.created += 1;
 
@@ -666,6 +840,7 @@ async function processRungs(params: {
   settlementMint: PublicKey;
   underlyingMint: PublicKey;
   schedule: ScheduledSeries[];
+  existingByExpiry: ReadonlyMap<number, DecodedMarketForCleanup>;
   counters: Counters;
   addressLookupTable?: PublicKey;
   now: number;
@@ -684,6 +859,7 @@ async function processRungs(params: {
       settlementMint: params.settlementMint,
       underlyingMint: params.underlyingMint,
       series,
+      existingByExpiry: params.existingByExpiry,
       counters: params.counters,
       addressLookupTable: params.addressLookupTable,
       now: params.now,
@@ -748,6 +924,21 @@ async function main(): Promise<void> {
   // the manifest existing at all, let alone publishing an ALT yet.
   const addressLookupTable = await readAddressLookupTable();
 
+  // Discover-first: one getProgramAccounts scan for the whole pass, indexed
+  // by expiry, so ensureMarketRung never re-derives a rung's strike (or even
+  // calls Hermes) for an expiry that already has a live market -- see
+  // ensureMarketRung's and indexMarketsByExpiry's doc comments above.
+  const allMarkets = await fetchAllMarkets(connection, VSOL_PROGRAM_ID);
+  const existingByExpiry = indexMarketsByExpiry(allMarkets, {
+    pythFeedId: PYTH_FEED_ID,
+    symbol: MARKET_SYMBOL,
+    observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+    settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+    maxConfidenceBps: MAX_CONFIDENCE_BPS,
+    priceScale: PRICE_SCALE,
+    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+  });
+
   // Interleaved per-rung pass (create, then immediately authorize) -- see
   // processRungs's docstring for why this replaced the old
   // create-all-then-authorize-all two-pass structure.
@@ -761,6 +952,7 @@ async function main(): Promise<void> {
     settlementMint,
     underlyingMint,
     schedule,
+    existingByExpiry,
     counters,
     addressLookupTable,
     now,

@@ -6,17 +6,14 @@ import {
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
-  deriveMarket,
-  deriveMarketId,
-  deriveOracle,
   MARKET_MAX_CONFIDENCE_BPS,
   MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
   MARKET_OBSERVATION_WINDOW_SECONDS,
   MARKET_SETTLEMENT_GRACE_SECONDS,
   PRICE_SCALE,
-  symbolBytes,
 } from "../sdk/index.ts";
 import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
+import { fetchAllMarkets, type DecodedMarketForCleanup } from "./lib/settlement.ts";
 import { type RetiringLookupTableEntry, stableFillAddresses } from "./lib/lookup-table.ts";
 
 const cluster = process.env.VSOL_CLUSTER ?? "devnet";
@@ -29,6 +26,21 @@ const programId = new PublicKey(String(deployment.programId));
 
 if (deployment.pythUpgradeDeployed !== true) {
   throw new Error("The manifest is fail-closed: the Pyth upgrade has not passed bootstrap verification");
+}
+
+// bootstrap.ts now writes the manifest in two phases: once right after the
+// real deployment artifacts exist (smokeStatus: "not-run", or "skipped"
+// under VSOL_SKIP_SMOKE=1), and again once the adversarial smoke lifecycle
+// finishes (smokeStatus: "passed"). Only a "passed" manifest carries real
+// smoke evidence for the checks below to verify -- fail with a clear,
+// specific error here rather than letting an absent/empty `smoke` object
+// crash deep inside those checks (e.g. `new PublicKey(String(undefined))`).
+// Older manifests predate this field entirely and are treated as before.
+if (deployment.smokeStatus !== undefined && deployment.smokeStatus !== "passed") {
+  throw new Error(
+    `The manifest's smoke lifecycle status is "${String(deployment.smokeStatus)}", not "passed" -- `
+    + "verify-deployment requires a fully-verified deployment. Run bootstrap without VSOL_SKIP_SMOKE to produce one.",
+  );
 }
 
 const requiredExecutable = ["programId", "pythReceiverProgram"];
@@ -74,24 +86,35 @@ async function fetchTransactionWithRetry(connection: Connection, signature: stri
 // (it can list an address the cranker has since legitimately closed, and it
 // never lists a rung the keeper minted after the last manifest write). It
 // remains a structural/manifest-shape input below, but "must be alive
-// onchain" is instead re-derived straight from chain, the same way the app
-// resolves the tradeable grid (see app/lib/series-resolver.ts /
-// resolveVsolSeries and app/lib/expiries.ts): recompute the current grid
-// from the cluster clock via the shared rollingMarketSchedule that
-// bootstrap.ts and keeper.ts both import, then rebuild each rung's
-// deterministic market id/address with the same series-policy constants
-// they use. rollingMarketSchedule always returns rungs strictly ahead of
-// `now` (see expiry-grid.ts's nextFixedBoundary/advanceUntilAfter), so every
-// rung it returns is, by construction, currently tradeable -- there is no
-// separate "is this expired" filter to apply here.
+// onchain" is instead verified straight from chain.
+//
+// This USED TO be a pure address derivation (rebuild each rung's
+// deterministic market id from the shared series-policy constants, exactly
+// like the app's app/lib/series-resolver.ts / resolveVsolSeries does). That
+// is no longer possible: `strike` is now part of `expected_market_id`'s hash
+// (see vsol/sdk/index.ts's MarketIdParams and lib.rs's expected_market_id),
+// and `strike` is a listed ladder rung chosen by whichever keeper pass first
+// mints a given expiry (see STRIKE_LADDER_STEP/ladderStrike's doc comment) --
+// this script has no way to know it in advance.
+//
+// So verification switches from "derive the expected address and check it"
+// to discovery: scan every live Market account the program owns
+// (fetchAllMarkets, the same discover-first primitive scripts/keeper.ts
+// uses) and require that each of rollingMarketSchedule(now)'s five expiries
+// has at least one live, enabled market matching this deployment's feed,
+// symbol, and every non-strike policy constant. This is a STRICTLY STRONGER
+// check than address derivation was: the old check could only ever prove
+// that ONE specific candidate address, if it happened to exist, was
+// well-formed. This one proves the currently-listed rung for each
+// expiry -- whatever address or strike it actually has -- really does
+// satisfy every other policy parameter, live and enabled, with no address
+// the script never looked at left unchecked. The strike itself is not
+// verified against anything (there is nothing to verify it against -- any
+// positive strike a keeper listed is by definition a valid ladder rung); it
+// is only reported below, for visibility.
 const MARKET_SYMBOL = "NVDA"; // Not an SDK export -- mirrors the same local constant in scripts/keeper.ts and scripts/bootstrap.ts.
-// Anchor account discriminator for the `Market` struct (see
-// target/idl/vsol.json's accounts[].discriminator), so a same-owner account
-// of a different type can never be mistaken for a rolling-grid market.
-const MARKET_ACCOUNT_DISCRIMINATOR = Buffer.from([219, 190, 213, 55, 0, 227, 198, 154]);
 const configAddress = new PublicKey(String(deployment.config));
 const settlementMintAddress = new PublicKey(String(deployment.settlementMint));
-const pythFeedBytes = [...Buffer.from(expectedFeedId, "hex")];
 
 async function clusterUnixTime(): Promise<number> {
   const slot = await connection.getSlot("confirmed");
@@ -100,25 +123,46 @@ async function clusterUnixTime(): Promise<number> {
   return blockTime;
 }
 
-type CurrentGridRung = { series: ScheduledSeries; id: Buffer; market: PublicKey; oracle: PublicKey };
+type CurrentGridRung = { series: ScheduledSeries; market: PublicKey; oracle: PublicKey; strike: bigint; creator: string };
 
 const now = await clusterUnixTime();
+const expectedSchedule = rollingMarketSchedule(now);
+
+const allMarkets = await fetchAllMarkets(connection, programId);
+const liveRungByExpiry = new Map<number, DecodedMarketForCleanup>();
+for (const market of allMarkets) {
+  const matchesPolicy = market.enabled
+    && market.pythFeedId.toLowerCase() === expectedFeedId.toLowerCase()
+    && market.symbol === MARKET_SYMBOL
+    && market.observationWindowSeconds === MARKET_OBSERVATION_WINDOW_SECONDS
+    && market.settlementGraceSeconds === MARKET_SETTLEMENT_GRACE_SECONDS
+    && market.maxConfidenceBps === MARKET_MAX_CONFIDENCE_BPS
+    && market.priceScale === PRICE_SCALE
+    && market.maxSettlementStalenessSeconds === MARKET_MAX_SETTLEMENT_STALENESS_SECONDS;
+  if (!matchesPolicy) continue;
+  // Same ladder-rung race noted on ladderStrike/indexMarketsByExpiry: two
+  // markets can legitimately share an expiry (adjacent strikes), neither a
+  // duplicate contract. Keeping the first found is enough to prove SOME
+  // live, correctly-configured rung exists for this expiry -- everything
+  // this check promises.
+  if (!liveRungByExpiry.has(market.expiry)) liveRungByExpiry.set(market.expiry, market);
+}
+
 const currentGrid: CurrentGridRung[] = [];
-for (const series of rollingMarketSchedule(now)) {
-  const id = await deriveMarketId({
-    pythFeedId: pythFeedBytes,
-    settlementMint: settlementMintAddress,
-    expiry: BigInt(series.expiry),
-    observationWindowSeconds: MARKET_OBSERVATION_WINDOW_SECONDS,
-    settlementGraceSeconds: MARKET_SETTLEMENT_GRACE_SECONDS,
-    priceScale: PRICE_SCALE,
-    maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
-    symbol: symbolBytes(MARKET_SYMBOL),
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+const missingRungs: ScheduledSeries[] = [];
+for (const series of expectedSchedule) {
+  const found = liveRungByExpiry.get(series.expiry);
+  if (!found) {
+    missingRungs.push(series);
+    continue;
+  }
+  currentGrid.push({
+    series,
+    market: new PublicKey(found.address),
+    oracle: new PublicKey(found.oracle),
+    strike: found.strike,
+    creator: found.creator,
   });
-  const market = deriveMarket(configAddress, id);
-  const oracle = deriveOracle(market);
-  currentGrid.push({ series, id, market, oracle });
 }
 
 // Read the entire public deployment state in one RPC batch. Public devnet endpoints
@@ -187,57 +231,48 @@ if (String(deployment.uiMarket) !== String(markets.find((series) => series.code 
   throw new Error("The legacy UI pointer does not reference the catalog's 30D market");
 }
 
-// Chain-derived current grid: every rung rollingMarketSchedule(now) returns
-// is currently tradeable by construction, so a market that DOES exist must
-// be correctly formed (hard failure below). A rung that does NOT yet exist
-// is treated as keeper lag -- a soft warning, not a failure -- since the
-// keeper mints on its own interval and verify-deployment must not become
-// flaky against that timing. This never touches an already-expired rung: a
-// closed, formerly-listed address from an older schedule (or from the stale
-// deployment.markets snapshot above) is simply not part of currentGrid at all.
+// A rung whose expiry has no live, policy-matching market at all (built into
+// liveRungByExpiry above) is treated as keeper lag -- a soft warning, not a
+// failure -- since the keeper mints on its own interval and verify-deployment
+// must not become flaky against that timing. This never touches an
+// already-expired rung: a closed, formerly-listed address from an older
+// schedule (or from the stale deployment.markets snapshot above) is simply
+// not part of the current schedule at all.
+for (const series of missingRungs) {
+  console.warn(
+    `warn: currently-live rolling market ${series.code} (expiry ${new Date(series.expiry * 1000).toISOString()}) `
+    + "has no live, enabled market matching the expected feed/symbol/policy parameters onchain -- treating as keeper lag, not a failure",
+  );
+}
+
+// currentGrid holds only expiries that DID have a policy-matching match in
+// the fetchAllMarkets scan above -- fetchAllMarkets itself already
+// guarantees program ownership, the Market discriminator, and the exact
+// (upgraded) account size for every entry it returns (see
+// decodeMarketAccountForCleanup in scripts/lib/settlement.ts), and the
+// policy-matching filter above already guarantees feed/symbol/observation
+// window/settlement grace/confidence/price scale/staleness/enabled. What is
+// verified here is everything that filter could NOT check from the decoded
+// summary alone: a non-default creator, and the settlement mint (read
+// directly off the raw account bytes -- decodeMarketAccountForCleanup does
+// not surface it, since the keeper's discover-first lookup does not need
+// it), plus that this rung's oracle still exists and is program-owned. A
+// market that vanished between this pass's discovery scan and this batched
+// fetch (e.g. closed by a concurrent cranker run) is treated the same as
+// "never found" above, not as a hard failure -- a benign race, not a bug.
 for (const rung of currentGrid) {
   const account = accountInfo(rung.market);
   if (!account) {
     console.warn(
       `warn: currently-live rolling market ${rung.series.code} (expiry ${new Date(rung.series.expiry * 1000).toISOString()}) `
-      + `is not yet minted onchain at ${rung.market.toBase58()} -- treating as keeper lag, not a failure`,
+      + `discovered at ${rung.market.toBase58()} but disappeared before verification -- treating as keeper/cranker lag, not a failure`,
     );
     continue;
   }
-  if (!account.owner.equals(programId)) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) is not owned by the VSOL program`);
-  }
-  const data = Buffer.from(account.data);
-  if (data.length < 281 || !data.subarray(0, 8).equals(MARKET_ACCOUNT_DISCRIMINATOR)) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) does not decode as a Market account`);
-  }
-  if (!rung.id.equals(data.subarray(41, 73))) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) market id does not match its derived parameters`);
-  }
-  const creator = new PublicKey(data.subarray(245, 277));
-  if (creator.equals(PublicKey.default)) {
+  if (rung.creator === PublicKey.default.toBase58()) {
     throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) has no recorded creator`);
   }
-  const feedId = data.subarray(211, 243).toString("hex");
-  if (feedId !== expectedFeedId) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) is not bound to Pyth feed ${expectedFeedId}`);
-  }
-  const onchainExpiry = Number(data.readBigInt64LE(193));
-  if (onchainExpiry !== rung.series.expiry) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) expiry does not match the derived grid`);
-  }
-  const observationWindow = data.readUInt32LE(201);
-  const settlementGrace = data.readUInt32LE(205);
-  const maxConfidenceBps = data.readUInt16LE(209);
-  const maxSettlementStalenessSeconds = data.readUInt32LE(277);
-  if (
-    observationWindow !== MARKET_OBSERVATION_WINDOW_SECONDS
-    || settlementGrace !== MARKET_SETTLEMENT_GRACE_SECONDS
-    || maxConfidenceBps !== MARKET_MAX_CONFIDENCE_BPS
-    || maxSettlementStalenessSeconds !== MARKET_MAX_SETTLEMENT_STALENESS_SECONDS
-  ) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) does not use the expected series policy constants`);
-  }
+  const data = Buffer.from(account.data);
   const onchainSettlementMint = new PublicKey(data.subarray(105, 137));
   if (!onchainSettlementMint.equals(settlementMintAddress)) {
     throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) settlement mint does not match the manifest`);
@@ -246,6 +281,7 @@ for (const rung of currentGrid) {
   if (!oracleAccount || !oracleAccount.owner.equals(programId)) {
     throw new Error(`Current rolling market ${rung.series.code}'s oracle ${rung.oracle.toBase58()} is missing or not owned by the VSOL program`);
   }
+  console.log(`  ${rung.series.code} rung: market ${rung.market.toBase58()} strike ${rung.strike.toString()} (expiry ${new Date(rung.series.expiry * 1000).toISOString()})`);
 }
 const legacyUnsafe = accountInfo(LEGACY_UNSAFE_UI_MARKET);
 if (legacyUnsafe && legacyUnsafe.data.at(-1) !== 0) {
@@ -518,5 +554,14 @@ console.log(JSON.stringify({
   smokePythFeedId: deployment.smokePythFeedId,
   addressLookupTable: deployment.addressLookupTable ?? null,
   retiringLookupTables: retiringLookupTables.map((entry) => entry.address),
+  // Discovered, not derived -- see the discovery block above for why. Each
+  // entry's strike is whatever ladder rung the keeper actually listed.
+  currentGrid: currentGrid.map((rung) => ({
+    code: rung.series.code,
+    market: rung.market.toBase58(),
+    expiry: rung.series.expiry,
+    strike: rung.strike.toString(),
+  })),
+  missingRungs: missingRungs.map((series) => series.code),
   verifiedAt: new Date().toISOString(),
 }, null, 2));

@@ -49,6 +49,7 @@ import {
   calculateDepositShares,
   calculatePayout,
   deriveMarketId,
+  ladderStrike,
   liquidityPoolId,
   MARKET_MAX_CONFIDENCE_BPS,
   MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
@@ -66,6 +67,7 @@ import {
   type PoolBuyback,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
+import { pythPriceToScaledAtoms } from "./lib/settlement.ts";
 
 // The official packages publish dual ESM/CJS builds, but solana-utils 0.6.0's
 // ESM entry imports an extensionless jito-ts path that Node 24 rejects. Loading
@@ -74,10 +76,29 @@ const require = createRequire(import.meta.url);
 const { PythSolanaReceiver } = require("@pythnetwork/pyth-solana-receiver") as typeof import("@pythnetwork/pyth-solana-receiver");
 const { sendTransactions } = require("@pythnetwork/solana-utils") as typeof import("@pythnetwork/solana-utils");
 
+// VSOL_SKIP_SMOKE=1 skips the entire adversarial smoke lifecycle (smoke
+// markets, fills, real-time settlement waits, refunds, the early-close
+// buyback) and writes the deployment manifest immediately after the real
+// deployment artifacts (config, mints, rolling market catalog, main
+// liquidity pool) are on chain, with smokeStatus: "skipped". Honest
+// tradeoff: the resulting manifest is a usable record of what got deployed,
+// but carries none of the adversarial verification that smokeStatus:
+// "passed" certifies -- no proof that fills, settlement, refunds, replay
+// rejection, or the early-close buyback actually work end-to-end against
+// this cluster. Reach for it when the deployment artifacts are what you
+// need, or when a flaky public RPC makes the multi-minute lifecycle
+// unreachable -- it is never a substitute for a full run before anything
+// that depends on the smoke lifecycle having actually passed.
+const skipSmoke = process.env.VSOL_SKIP_SMOKE === "1";
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+// A longer initial confirmation timeout (web3.js defaults to 60s/30s
+// depending on confirmation strategy) gives public RPC endpoints room to
+// recover from the 429 rate-limiting and dropped connections that make the
+// smoke lifecycle's confirmations flaky. commitment is threaded through
+// from the single `commitment` const above rather than re-hardcoded here.
+const connection = new Connection(rpcUrl, { commitment, confirmTransactionInitialTimeout: 120_000 });
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
@@ -86,6 +107,12 @@ const pythFeedId = "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860
 const smokePythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const pythFeedBytes = [...Buffer.from(pythFeedId, "hex")];
 const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
+// The three VSOL-TEST smoke markets are deterministic test fixtures on a
+// mock feed (their settlement price is whatever the smoke Pyth publisher
+// happens to post, unrelated to any real underlying) -- they must NOT
+// depend on live spot the way the rolling NVDA catalog does. A fixed
+// constant keeps their strike reproducible across runs.
+const SMOKE_MARKET_STRIKE = 100n * PRICE_SCALE;
 const pythReceiverProgram = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 
 type MarketManifest = {
@@ -98,6 +125,10 @@ type MarketManifest = {
   maxSettlementStalenessSeconds: number;
   lastTradeAt: number;
   creator: string;
+  // The conditional-token winner threshold this rung was listed at -- a
+  // fixed ladder rung, not a value re-derivable from the manifest alone. See
+  // STRIKE_LADDER_STEP/ladderStrike in ../sdk/index.ts.
+  strike: string;
 };
 
 type LiquidityPoolManifest = {
@@ -139,9 +170,31 @@ type Deployment = {
   uiExpiry: number;
   markets: MarketManifest[];
   liquidityPools: LiquidityPoolManifest[];
+  // Whether the adversarial smoke lifecycle (smoke markets, fills,
+  // settlement, refunds, early-close buyback) ran and passed for this
+  // manifest -- "passed" is the only status `smoke` below carries real
+  // evidence for. "not-run" means the deployment artifacts above are real
+  // and on chain, but the manifest was written before the lifecycle
+  // completed (e.g. the process died partway through it, or is still
+  // running). "skipped" means VSOL_SKIP_SMOKE=1 deliberately bypassed the
+  // lifecycle. scripts/verify-deployment.ts is fail-closed on this field.
+  smokeStatus: "skipped" | "passed" | "not-run";
   smoke: Record<string, string | number | boolean>;
   generatedAt: string;
 };
+
+// The fields every manifest write shares, regardless of whether the smoke
+// lifecycle has run yet. Built once in main() as soon as the real deployment
+// artifacts (config, mints, rolling market catalog, main liquidity pool) are
+// known, and reused by both the phase-1 (pre-smoke) and phase-2 (post-smoke)
+// writes below so the ~20-field object literal never has to be duplicated.
+type DeploymentArtifacts = Omit<Deployment, "smokeStatus" | "smoke" | "generatedAt">;
+
+async function writeDeploymentManifest(deployment: Deployment, phase: string): Promise<void> {
+  await mkdir(dirname(deploymentPath), { recursive: true });
+  await writeFile(deploymentPath, `${JSON.stringify(deployment, null, 2)}\n`);
+  console.log(`Deployment manifest written (${phase}, smokeStatus: ${deployment.smokeStatus}) -> ${deploymentPath}`);
+}
 
 // USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS, and
 // MARKET_MAX_SETTLEMENT_STALENESS_SECONDS now live in ../sdk/index.ts (see the
@@ -149,9 +202,10 @@ type Deployment = {
 // vsol/scripts/keeper.ts, so this script and the app can never derive
 // different market ids from the same rolling-grid parameters.
 // 8-byte discriminator + Market::INIT_SPACE under the upgraded factory layout
-// (277 bytes through creator, +4 for the appended max_settlement_staleness_seconds
-// u32); accounts of any other size predate the upgrade and no longer deserialize.
-const MARKET_ACCOUNT_SIZE = 281;
+// (277 bytes through max_settlement_staleness_seconds, +8 for the appended
+// conditional-token strike u64); accounts of any other size predate the
+// upgrade and no longer deserialize.
+const MARKET_ACCOUNT_SIZE = 289;
 
 // Tend is a 24/7 protocol: there is no market calendar here. Rolling market
 // expiries are pure UTC clock boundaries, mirroring app/lib/expiries.ts. The
@@ -260,6 +314,12 @@ async function createMarket(params: {
   settlementGraceSeconds: number;
   maxSettlementStalenessSeconds: number;
   pythFeedId: number[];
+  // The conditional-token winner threshold -- a listed ladder rung (see
+  // STRIKE_LADDER_STEP/ladderStrike in ../sdk/index.ts), never derived here.
+  // Callers own picking it: the rolling catalog ladders live spot once
+  // before its loop, and the smoke markets use a fixed constant (see main()
+  // below for both).
+  strike: bigint;
 }) {
   const symbol = symbolBytes(params.symbol);
   // The program enforces the deterministic factory id, so the id must be the
@@ -274,6 +334,7 @@ async function createMarket(params: {
     maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
     symbol,
     maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+    strike: params.strike,
   });
   const market = deriveMarket(params.config, id);
   const oracle = deriveOracle(market);
@@ -290,6 +351,7 @@ async function createMarket(params: {
         maxConfidenceBps: MARKET_MAX_CONFIDENCE_BPS,
         pythFeedId: params.pythFeedId,
         maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+        strike: new BN(params.strike.toString()),
       })
       .accountsStrict({
         creator: params.creator.publicKey,
@@ -302,7 +364,7 @@ async function createMarket(params: {
       })
       .rpc();
   }
-  return { id, market, oracle };
+  return { id, market, oracle, strike: params.strike };
 }
 
 async function ensureLiquidityPool(params: {
@@ -628,6 +690,74 @@ async function publishPythSettlement(params: {
   };
 }
 
+// Matches only the transient, network-level failure shapes actually observed
+// against the public devnet RPC: a stale blockhash by send time, 429 rate
+// limiting, and dropped connections (surfaced either directly or as a fetch
+// failure's cause). Deliberately narrow -- an AnchorError or other custom
+// program error (a real protocol failure) never matches any of these and so
+// is never retried; it must surface on the first attempt, unchanged.
+const TRANSIENT_RPC_ERROR_PATTERNS = [
+  /blockhash not found/i,
+  /\b429\b/,
+  /too many requests/i,
+  /ECONNRESET/i,
+  /fetch failed/i,
+];
+
+// Error `cause` chains (e.g. `TypeError: fetch failed` wrapping the
+// underlying `Error: read ECONNRESET`) are where the network-level detail
+// actually lives, so match against the whole chain rather than just the
+// outermost message.
+function describeErrorChain(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  while (current instanceof Error) {
+    parts.push(current.message);
+    current = (current as { cause?: unknown }).cause;
+  }
+  if (parts.length === 0) parts.push(String(error));
+  return parts.join(" | ");
+}
+
+function isTransientRpcError(error: unknown): boolean {
+  const description = describeErrorChain(error);
+  return TRANSIENT_RPC_ERROR_PATTERNS.some((pattern) => pattern.test(description));
+}
+
+// Bounded-retry wrapper around sendAndConfirmTransaction for the smoke
+// lifecycle, which runs several minutes of real-time transactions against a
+// cluster that has, in practice, 429'd and dropped connections mid-run.
+// connection.sendTransaction (called internally by sendAndConfirmTransaction)
+// already fetches a fresh blockhash and re-signs on every invocation, so
+// simply calling it again is sufficient to recover from an expired
+// blockhash -- no manual blockhash/signature surgery is needed here. Retries
+// ONLY on isTransientRpcError; any other failure (in particular a program
+// error) is rethrown immediately and unchanged on the first attempt. This is
+// not a blanket try/catch -- it exists to survive network flake, not to hide
+// protocol bugs.
+async function sendAndConfirmWithRetry(
+  transaction: Transaction,
+  signers: Keypair[],
+  label: string,
+  maxAttempts = 4,
+): Promise<string> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await sendAndConfirmTransaction(connection, transaction, signers, { commitment });
+    } catch (error) {
+      if (attempt >= maxAttempts || !isTransientRpcError(error)) throw error;
+      const backoffMs = Math.min(500 * 2 ** (attempt - 1), 8_000);
+      console.warn(
+        `  ${label}: transient RPC error on attempt ${attempt}/${maxAttempts} (${describeErrorChain(error)}), retrying in ${backoffMs}ms`,
+      );
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, backoffMs));
+    }
+  }
+  // Unreachable: the final iteration (attempt === maxAttempts) always
+  // returns or throws inside the loop body above.
+  throw new Error(`${label}: exhausted retries without a terminal result`);
+}
+
 async function main(): Promise<void> {
   console.log(`VSOL bootstrap on ${cluster} through the configured RPC`);
   const previousDeployment = existsSync(deploymentPath)
@@ -732,6 +862,26 @@ async function main(): Promise<void> {
 
   const now = await clusterUnixTime();
   const schedule = rollingMarketSchedule(now);
+
+  // The conditional-token strike is a listed ladder rung, not something
+  // re-derived per rung on every pass -- see STRIKE_LADDER_STEP/ladderStrike's
+  // doc comment in ../sdk/index.ts. Fetch spot ONCE for this whole bootstrap
+  // pass and reuse the one resulting strike for all five rolling rungs, so a
+  // single catalog snapshot never straddles two different ladder rungs for
+  // what is meant to be one coherent listing moment. Reuses the existing
+  // pythUpdateAtOrAfter plumbing (below) with expiry=0, which is trivially
+  // satisfied by the very first Hermes response -- i.e. "whatever Hermes has
+  // right now", the same semantics fetchLatestPythUpdate gives the cranker
+  // and keeper.
+  const { parsed: rollingSpotUpdate } = await pythUpdateAtOrAfter(pythFeedId, 0);
+  const rollingSpot = pythPriceToScaledAtoms(
+    BigInt(rollingSpotUpdate.price.price),
+    rollingSpotUpdate.price.expo,
+    PRICE_SCALE,
+  );
+  const rollingStrike = ladderStrike(rollingSpot);
+  console.log(`Rolling NVDA catalog strike: ${rollingStrike.toString()} (spot ${rollingSpot.toString()} at PRICE_SCALE)`);
+
   const catalog: Array<MarketManifest & { marketKey: PublicKey; oracleKey: PublicKey }> = [];
   for (const series of schedule) {
     const created = await createMarket({
@@ -746,6 +896,7 @@ async function main(): Promise<void> {
       settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
       maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
       pythFeedId: pythFeedBytes,
+      strike: rollingStrike,
     });
     catalog.push({
       code: series.code,
@@ -757,6 +908,7 @@ async function main(): Promise<void> {
       maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
       lastTradeAt: series.lastTradeAt,
       creator: creator.publicKey.toBase58(),
+      strike: rollingStrike.toString(),
       marketKey: created.market,
       oracleKey: created.oracle,
     });
@@ -790,7 +942,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:tUSDC:main-v4`,
+    label: `${cluster}:tUSDC:main-v5`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 2_500,
   });
@@ -835,6 +987,81 @@ async function main(): Promise<void> {
     });
   }
 
+  // --- Phase 1: the real deployment is done. Write the manifest now. ---
+  // Everything above this point (config, mints, the rolling market catalog,
+  // the main liquidity pool) is idempotent and is already live on chain by
+  // the time this runs. Everything below is an adversarial smoke-test
+  // lifecycle -- a test suite, not a deployment step. A transient RPC
+  // failure anywhere in that test suite must never cost us the record of
+  // what was just deployed, so the manifest is written here, before the
+  // suite starts, and rewritten (not appended) once it finishes.
+  const deploymentArtifacts: DeploymentArtifacts = {
+    cluster,
+    rpcUrl: cluster === "devnet" ? "https://api.devnet.solana.com" : rpcUrl,
+    programId: VSOL_PROGRAM_ID.toBase58(),
+    pythUpgradeDeployed: true,
+    closePoolPositionDeployed: true,
+    programUpgradeSignature: previousDeployment.programUpgradeSignature,
+    pythReceiverProgram,
+    pythFeedId,
+    smokePythFeedId,
+    config: config.toBase58(),
+    admin: admin.publicKey.toBase58(),
+    maker: maker.publicKey.toBase58(),
+    buyer: buyer.publicKey.toBase58(),
+    creator: creator.publicKey.toBase58(),
+    settlementMint: settlementMint.toBase58(),
+    underlyingMint: underlyingMint.toBase58(),
+    writerVault: writerVault.toBase58(),
+    writerToken: writerToken.toBase58(),
+    treasuryToken: treasuryToken.toBase58(),
+    domainSeparator: [...domainSeparator],
+    domainVersion,
+    uiMarket: ui.market.toBase58(),
+    uiOracle: ui.oracle.toBase58(),
+    uiExpiry,
+    markets: catalog.map((series) => ({
+      code: series.code,
+      address: series.address,
+      oracle: series.oracle,
+      expiry: series.expiry,
+      observationWindowSeconds: series.observationWindowSeconds,
+      settlementGraceSeconds: series.settlementGraceSeconds,
+      maxSettlementStalenessSeconds: series.maxSettlementStalenessSeconds,
+      lastTradeAt: series.lastTradeAt,
+      creator: creator.publicKey.toBase58(),
+      strike: series.strike,
+    })),
+    liquidityPools: [{
+      id: Buffer.from(mainPool.id).toString("hex"),
+      address: mainPool.pool.toBase58(),
+      token: mainPool.poolToken.toBase58(),
+      quoteAuthority: maker.publicKey.toBase58(),
+      settlementMint: settlementMint.toBase58(),
+      maxUtilizationBps: 8_000,
+      maxPositionBps: 2_500,
+      authorizedMarkets: catalog.map((series) => series.address),
+      manager: creator.publicKey.toBase58(),
+    }],
+  };
+  await writeDeploymentManifest(
+    {
+      ...deploymentArtifacts,
+      smokeStatus: skipSmoke ? "skipped" : "not-run",
+      smoke: {},
+      generatedAt: new Date().toISOString(),
+    },
+    "phase 1: deployment artifacts, before the smoke lifecycle",
+  );
+
+  if (skipSmoke) {
+    console.log(
+      "VSOL_SKIP_SMOKE=1: skipping the adversarial smoke lifecycle. "
+      + "The manifest above is a real, usable deployment record but carries no smoke verification (smokeStatus: \"skipped\").",
+    );
+    return;
+  }
+
   const smokeExpiry = (await clusterUnixTime()) + (cluster === "localnet" ? 30 : 75);
   const runId = `${Date.now()}`;
   // Staleness must respect the program's MAX_SETTLEMENT_STALENESS_TO_WINDOW_RATIO
@@ -857,6 +1084,7 @@ async function main(): Promise<void> {
     // (120 + 600) * 10 — well inside the ratio bound. See the note above.
     maxSettlementStalenessSeconds: 7_200,
     pythFeedId: smokePythFeedBytes,
+    strike: SMOKE_MARKET_STRIKE,
   });
   const refundMarket = await createMarket({
     creatorProgram,
@@ -871,6 +1099,7 @@ async function main(): Promise<void> {
     // (5 + 15) * 10 — well inside the ratio bound. See the note above.
     maxSettlementStalenessSeconds: 200,
     pythFeedId: smokePythFeedBytes,
+    strike: SMOKE_MARKET_STRIKE,
   });
 
   const smokePool = await ensureLiquidityPool({
@@ -879,7 +1108,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:smoke-v4:${runId}`,
+    label: `${cluster}:smoke-v5:${runId}`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 5_000,
   });
@@ -956,7 +1185,7 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const successFillSignature = await sendAndConfirmTransaction(connection, successFill.transaction, [buyer], { commitment });
+  const successFillSignature = await sendAndConfirmWithRetry(successFill.transaction, [buyer], "success fill");
   const refundFill = await buildFill({
     buyerProgram,
     buyer,
@@ -971,7 +1200,7 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const refundFillSignature = await sendAndConfirmTransaction(connection, refundFill.transaction, [buyer], { commitment });
+  const refundFillSignature = await sendAndConfirmWithRetry(refundFill.transaction, [buyer], "refund fill");
 
   const poolSuccessFill = await buildPoolFill({
     buyerProgram,
@@ -988,12 +1217,7 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const poolSuccessFillSignature = await sendAndConfirmTransaction(
-    connection,
-    poolSuccessFill.transaction,
-    [buyer],
-    { commitment },
-  );
+  const poolSuccessFillSignature = await sendAndConfirmWithRetry(poolSuccessFill.transaction, [buyer], "pool success fill");
   const poolRefundFill = await buildPoolFill({
     buyerProgram,
     buyer,
@@ -1009,13 +1233,12 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const poolRefundFillSignature = await sendAndConfirmTransaction(
-    connection,
-    poolRefundFill.transaction,
-    [buyer],
-    { commitment },
-  );
+  const poolRefundFillSignature = await sendAndConfirmWithRetry(poolRefundFill.transaction, [buyer], "pool refund fill");
 
+  // These two replay checks are deliberately NOT sendAndConfirmWithRetry:
+  // the whole point is that the program itself rejects the resend (a
+  // consumed nonce), so retrying on failure would retry the very outcome
+  // the assertion below requires.
   let replayRejected = false;
   try {
     await sendAndConfirmTransaction(connection, successFill.transaction, [buyer], { commitment });
@@ -1164,6 +1387,7 @@ async function main(): Promise<void> {
     // (120 + 600) * 10 — well inside the ratio bound. See the note above.
     maxSettlementStalenessSeconds: 7_200,
     pythFeedId: smokePythFeedBytes,
+    strike: SMOKE_MARKET_STRIKE,
   });
   const closePoolMarket = await authorizePoolMarket({
     managerProgram: creatorProgram,
@@ -1234,7 +1458,7 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const closeFillSignature = await sendAndConfirmTransaction(connection, closeFill.transaction, [buyer], { commitment });
+  const closeFillSignature = await sendAndConfirmWithRetry(closeFill.transaction, [buyer], "early-close fill");
 
   // Pre-close balances: the baseline the buyback's token movements are
   // measured against.
@@ -1267,7 +1491,7 @@ async function main(): Promise<void> {
     domainSeparator,
     domainVersion,
   });
-  const closeEarlySignature = await sendAndConfirmTransaction(connection, closeTransaction, [buyer], { commitment });
+  const closeEarlySignature = await sendAndConfirmWithRetry(closeTransaction, [buyer], "early-close buyback");
 
   if (await accountExists(closeFill.position)) throw new Error("Early-closed pool position account did not close");
   if (await accountExists(closeFill.positionVault)) throw new Error("Early-closed pool position vault did not close");
@@ -1346,53 +1570,13 @@ async function main(): Promise<void> {
   }
   console.log(`  pool residue after full withdrawal: ${poolDust} base units (virtual-offset dust, bound ${MAX_POOL_DUST})`);
 
+  // --- Phase 2: the smoke lifecycle passed. Rewrite the manifest with the
+  // evidence filled in. deploymentArtifacts (built in phase 1, above) is
+  // reused as-is -- it has not changed, since nothing below phase 1 touches
+  // the deployment artifacts themselves.
   const deployment: Deployment = {
-    cluster,
-    rpcUrl: cluster === "devnet" ? "https://api.devnet.solana.com" : rpcUrl,
-    programId: VSOL_PROGRAM_ID.toBase58(),
-    pythUpgradeDeployed: true,
-    closePoolPositionDeployed: true,
-    programUpgradeSignature: previousDeployment.programUpgradeSignature,
-    pythReceiverProgram,
-    pythFeedId,
-    smokePythFeedId,
-    config: config.toBase58(),
-    admin: admin.publicKey.toBase58(),
-    maker: maker.publicKey.toBase58(),
-    buyer: buyer.publicKey.toBase58(),
-    creator: creator.publicKey.toBase58(),
-    settlementMint: settlementMint.toBase58(),
-    underlyingMint: underlyingMint.toBase58(),
-    writerVault: writerVault.toBase58(),
-    writerToken: writerToken.toBase58(),
-    treasuryToken: treasuryToken.toBase58(),
-    domainSeparator: [...domainSeparator],
-    domainVersion,
-    uiMarket: ui.market.toBase58(),
-    uiOracle: ui.oracle.toBase58(),
-    uiExpiry,
-    markets: catalog.map((series) => ({
-      code: series.code,
-      address: series.address,
-      oracle: series.oracle,
-      expiry: series.expiry,
-      observationWindowSeconds: series.observationWindowSeconds,
-      settlementGraceSeconds: series.settlementGraceSeconds,
-      maxSettlementStalenessSeconds: series.maxSettlementStalenessSeconds,
-      lastTradeAt: series.lastTradeAt,
-      creator: creator.publicKey.toBase58(),
-    })),
-    liquidityPools: [{
-      id: Buffer.from(mainPool.id).toString("hex"),
-      address: mainPool.pool.toBase58(),
-      token: mainPool.poolToken.toBase58(),
-      quoteAuthority: maker.publicKey.toBase58(),
-      settlementMint: settlementMint.toBase58(),
-      maxUtilizationBps: 8_000,
-      maxPositionBps: 2_500,
-      authorizedMarkets: catalog.map((series) => series.address),
-      manager: creator.publicKey.toBase58(),
-    }],
+    ...deploymentArtifacts,
+    smokeStatus: "passed",
     smoke: {
       ...(previousDeployment.smoke ?? {}),
       successFillSignature,
@@ -1440,8 +1624,7 @@ async function main(): Promise<void> {
     },
     generatedAt: new Date().toISOString(),
   };
-  await mkdir(dirname(deploymentPath), { recursive: true });
-  await writeFile(deploymentPath, `${JSON.stringify(deployment, null, 2)}\n`);
+  await writeDeploymentManifest(deployment, "phase 2: smoke lifecycle complete");
   console.log(JSON.stringify(deployment, null, 2));
 }
 

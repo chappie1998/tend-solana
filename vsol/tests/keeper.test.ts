@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isRungAuthorizable } from "../scripts/keeper.ts";
+import { indexMarketsByExpiry, isRungAuthorizable } from "../scripts/keeper.ts";
+import type { DecodedMarketForCleanup } from "../scripts/lib/settlement.ts";
 
 // isRungAuthorizable is the pure mirror of the on-chain
 // set_liquidity_pool_market check (last_trade_at >= now + MIN_MARKET_LEAD_SECONDS
@@ -106,4 +107,96 @@ test("isRungAuthorizable: a create-time margin can reject a rung that is still n
 
   assert.equal(isRungAuthorizable({ now, lastTradeAt, expiry, minLeadSeconds: MIN_LEAD }), true);
   assert.equal(isRungAuthorizable({ now, lastTradeAt, expiry, minLeadSeconds: MIN_LEAD + 60 }), false);
+});
+
+// indexMarketsByExpiry is the pure core of the keeper's discover-first rung
+// lookup (see ensureMarketRung's doc comment): the fingerprint match it
+// performs is exactly what lets a pass with every rung already minted skip
+// Hermes entirely. No RPC, no Connection -- feeding it plain
+// DecodedMarketForCleanup fixtures exercises the matching/collision logic in
+// isolation, per this function's own doc comment in keeper.ts.
+
+const POLICY = {
+  pythFeedId: "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593",
+  symbol: "NVDA",
+  observationWindowSeconds: 30,
+  settlementGraceSeconds: 900,
+  maxConfidenceBps: 500,
+  priceScale: 1_000_000n,
+  maxSettlementStalenessSeconds: 86_400,
+};
+
+function marketFixture(overrides: Partial<DecodedMarketForCleanup> = {}): DecodedMarketForCleanup {
+  return {
+    address: overrides.address ?? "market-address",
+    oracle: overrides.oracle ?? "oracle-address",
+    creator: overrides.creator ?? "creator-address",
+    expiry: overrides.expiry ?? 1_000_000,
+    observationWindowSeconds: overrides.observationWindowSeconds ?? POLICY.observationWindowSeconds,
+    settlementGraceSeconds: overrides.settlementGraceSeconds ?? POLICY.settlementGraceSeconds,
+    marketId: overrides.marketId ?? "market-id",
+    symbol: overrides.symbol ?? POLICY.symbol,
+    pythFeedId: overrides.pythFeedId ?? POLICY.pythFeedId,
+    maxConfidenceBps: overrides.maxConfidenceBps ?? POLICY.maxConfidenceBps,
+    priceScale: overrides.priceScale ?? POLICY.priceScale,
+    maxSettlementStalenessSeconds: overrides.maxSettlementStalenessSeconds ?? POLICY.maxSettlementStalenessSeconds,
+    enabled: overrides.enabled ?? true,
+    strike: overrides.strike ?? 100_000_000n,
+  };
+}
+
+test("indexMarketsByExpiry keys a policy-matching market by its expiry", () => {
+  const market = marketFixture({ address: "m1", expiry: 1_000_000 });
+  const index = indexMarketsByExpiry([market], POLICY);
+  assert.equal(index.size, 1);
+  assert.equal(index.get(1_000_000)?.address, "m1");
+});
+
+test("indexMarketsByExpiry excludes a market on a different feed", () => {
+  const market = marketFixture({ pythFeedId: "ff".repeat(32) });
+  const index = indexMarketsByExpiry([market], POLICY);
+  assert.equal(index.size, 0);
+});
+
+test("indexMarketsByExpiry excludes a market with a different symbol", () => {
+  const market = marketFixture({ symbol: "AAPL" });
+  const index = indexMarketsByExpiry([market], POLICY);
+  assert.equal(index.size, 0);
+});
+
+test("indexMarketsByExpiry excludes a market whose policy constants have drifted (observation window, grace, confidence, price scale, staleness)", () => {
+  assert.equal(indexMarketsByExpiry([marketFixture({ observationWindowSeconds: 60 })], POLICY).size, 0);
+  assert.equal(indexMarketsByExpiry([marketFixture({ settlementGraceSeconds: 60 })], POLICY).size, 0);
+  assert.equal(indexMarketsByExpiry([marketFixture({ maxConfidenceBps: 100 })], POLICY).size, 0);
+  assert.equal(indexMarketsByExpiry([marketFixture({ priceScale: 1_000n })], POLICY).size, 0);
+  assert.equal(indexMarketsByExpiry([marketFixture({ maxSettlementStalenessSeconds: 1 })], POLICY).size, 0);
+});
+
+test("indexMarketsByExpiry excludes a disabled market -- a guardian-disabled rung is never reused", () => {
+  const market = marketFixture({ enabled: false });
+  const index = indexMarketsByExpiry([market], POLICY);
+  assert.equal(index.size, 0);
+});
+
+test("indexMarketsByExpiry matches pythFeedId case-insensitively", () => {
+  const market = marketFixture({ pythFeedId: POLICY.pythFeedId.toUpperCase() });
+  const index = indexMarketsByExpiry([market], POLICY);
+  assert.equal(index.size, 1);
+});
+
+test("indexMarketsByExpiry keeps the first market of a ladder-rung race at the same expiry and drops the second", () => {
+  const first = marketFixture({ address: "m-first", expiry: 2_000_000, strike: 100_000_000n });
+  const second = marketFixture({ address: "m-second", expiry: 2_000_000, strike: 105_000_000n });
+  const index = indexMarketsByExpiry([first, second], POLICY);
+  assert.equal(index.size, 1);
+  assert.equal(index.get(2_000_000)?.address, "m-first");
+});
+
+test("indexMarketsByExpiry indexes multiple distinct expiries independently", () => {
+  const fifteenMinute = marketFixture({ address: "m-15m", expiry: 1_000_900 });
+  const oneHour = marketFixture({ address: "m-1h", expiry: 1_003_600 });
+  const index = indexMarketsByExpiry([fifteenMinute, oneHour], POLICY);
+  assert.equal(index.size, 2);
+  assert.equal(index.get(1_000_900)?.address, "m-15m");
+  assert.equal(index.get(1_003_600)?.address, "m-1h");
 });
