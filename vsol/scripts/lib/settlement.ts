@@ -6,6 +6,7 @@ import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-tok
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import type { Vsol } from "../../target/types/vsol.ts";
 import {
+  deriveCompleteSetVault,
   deriveLiquidityPoolToken,
   derivePoolNonce,
   derivePoolPositionVault,
@@ -86,16 +87,29 @@ export async function fetchOpenDirectPositions(
   return positions;
 }
 
-// --- Market account decoding (for the market-cleanup pass) ------------------
+// --- Market account decoding (for the market-cleanup pass AND the keeper's
+// discover-first rung lookup) -------------------------------------------------
 // Layout mirrors `Market` in vsol/target/types/vsol.ts and the byte offsets
 // documented in app/lib/vsol-server.ts's decodeMarketAccount; reproduced
 // independently here (rather than imported) so this script package has no
-// dependency on app/. Only the fields the cleanup pass actually needs are
-// decoded: oracle@137 (to call close_settled_market without re-deriving it),
-// expiry@193 / observationWindowSeconds@201 / settlementGraceSeconds@205 (to
-// compute the close deadline), and creator@245 (the required rent_recipient
-// and, on devnet, the same key as the cranker's own signer).
-export const MARKET_ACCOUNT_SIZE = 281;
+// dependency on app/. Decodes:
+//   oracle@137                            (to call close_settled_market without re-deriving it)
+//   symbol@169 (16 bytes, NUL-trimmed)    (the keeper's rung fingerprint)
+//   priceScale@185 (u64)                  (the keeper's rung fingerprint)
+//   expiry@193 (i64)                      (to compute the close deadline / the rung's grid slot)
+//   observationWindowSeconds@201 (u32)    (to compute the close deadline / the keeper's rung fingerprint)
+//   settlementGraceSeconds@205 (u32)      (to compute the close deadline / the keeper's rung fingerprint)
+//   maxConfidenceBps@209 (u16)            (the keeper's rung fingerprint)
+//   pythFeedId@211 (32 bytes)             (the keeper's rung fingerprint)
+//   enabled@244 (bool)                    (the keeper only reuses a currently-enabled rung)
+//   creator@245                           (the required rent_recipient, and on devnet the same
+//                                          key as the cranker's own signer)
+//   maxSettlementStalenessSeconds@277 (u32) (the keeper's rung fingerprint)
+//   strike@281 (u64)                      (read back, never re-derived -- see ladderStrike in
+//                                          vsol/sdk/index.ts and keeper.ts's ensureMarketRung)
+//   marketId@41 (32 bytes)                (surfaced as a convenience for logging/debugging;
+//                                          not used to re-derive the account's own address)
+export const MARKET_ACCOUNT_SIZE = 289;
 // sha256("account:Market")[0..8].
 export const MARKET_ACCOUNT_DISCRIMINATOR = Object.freeze([219, 190, 213, 55, 0, 227, 198, 154]);
 
@@ -214,6 +228,19 @@ export type DecodedMarketForCleanup = {
   expiry: number;
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
+  // --- Added for the keeper's discover-first rung lookup (see
+  // ensureMarketRung in scripts/keeper.ts): enough to match an existing
+  // on-chain market against a rung's (feed, symbol, policy) fingerprint
+  // without re-deriving its address, and to read back the strike it was
+  // actually listed at rather than re-computing it from live spot.
+  marketId: string;
+  symbol: string;
+  pythFeedId: string;
+  maxConfidenceBps: number;
+  priceScale: bigint;
+  maxSettlementStalenessSeconds: number;
+  enabled: boolean;
+  strike: bigint;
 };
 
 /** Pure decoder: no RPC, so it is directly unit-testable against fixture buffers. */
@@ -231,6 +258,14 @@ export function decodeMarketAccountForCleanup(address: PublicKey, data: Buffer):
     observationWindowSeconds: data.readUInt32LE(201),
     settlementGraceSeconds: data.readUInt32LE(205),
     creator: publicKeyAt(data, 245),
+    marketId: data.subarray(41, 73).toString("hex"),
+    symbol: data.subarray(169, 185).toString("ascii").replace(/\0+$/, ""),
+    pythFeedId: data.subarray(211, 243).toString("hex"),
+    maxConfidenceBps: data.readUInt16LE(209),
+    priceScale: data.readBigUInt64LE(185),
+    maxSettlementStalenessSeconds: data.readUInt32LE(277),
+    enabled: data[244] === 1,
+    strike: data.readBigUInt64LE(281),
   };
 }
 
@@ -272,6 +307,18 @@ export type MarketWindow = {
 };
 
 /**
+ * `observation_end` in `publish_pyth_settlement`: `expiry + observation_window_seconds`.
+ * Split out from `computeSettlementDeadline` (which additionally adds
+ * `settlement_grace_seconds`) because it is also, on its own, the exact
+ * upper bound of tier 1's acceptance window (`publish_time <= observation_end`)
+ * -- both `selectViableSettlementTier` and `fetchPythUpdateForSettlement`
+ * need that instant by itself, not bundled with the grace period.
+ */
+export function computeObservationEnd(market: MarketWindow): number {
+  return market.expiry + market.observationWindowSeconds;
+}
+
+/**
  * The FULL settlement deadline: expiry + observation window + settlement
  * grace. This is exactly the instant `refund_unsettled`/`refund_pool_position`
  * first become callable on-chain, and the base `computeMarketCloseDeadline`
@@ -287,7 +334,7 @@ export type MarketWindow = {
  * instruction could still accept it, not just up to this earlier instant.
  */
 export function computeSettlementDeadline(market: MarketWindow): number {
-  return market.expiry + market.observationWindowSeconds + market.settlementGraceSeconds;
+  return computeObservationEnd(market) + market.settlementGraceSeconds;
 }
 
 /**
@@ -396,6 +443,90 @@ export function marketsWithOpenPositions(params: {
   ]);
 }
 
+// --- Conditional-token ("complete set") collateral vault --------------------
+// FINDING 1 fix: `close_settled_market` now requires the market's collateral
+// vault (see `COMPLETE_SET_VAULT_SEED` / `deriveCompleteSetVault`) to be
+// either never-created or fully drained before it will close -- see
+// `CloseSettledMarket::collateral_vault`'s doc comment in
+// vsol/programs/vsol/src/lib.rs. This section gives the off-chain cleanup
+// pass the SAME exclusion, so it stops burning fees retrying
+// `close_settled_market` forever against a market it can no longer close
+// (rather than relying on every caller to discover that the hard way from a
+// `MarketHasOutstandingCollateral` revert).
+
+// Standard SPL Token `Account` layout: mint(32) + owner(32) + amount(8) +
+// ... -- `amount` is the only field this cleanup pass needs.
+const TOKEN_ACCOUNT_AMOUNT_OFFSET = 64;
+const TOKEN_ACCOUNT_MIN_SIZE = TOKEN_ACCOUNT_AMOUNT_OFFSET + 8;
+
+/**
+ * Pure decoder: no RPC, so it is directly unit-testable against fixture
+ * buffers. Only decodes `amount` -- the one field this cleanup pass needs
+ * from the collateral vault.
+ */
+export function decodeTokenAccountAmount(data: Buffer): bigint {
+  if (data.length < TOKEN_ACCOUNT_MIN_SIZE) {
+    throw new Error("The token account size is invalid");
+  }
+  return data.readBigUInt64LE(TOKEN_ACCOUNT_AMOUNT_OFFSET);
+}
+
+/**
+ * Fetches each market's complete-set collateral vault balance in one batched
+ * `getMultipleAccountsInfo` call. A market whose vault PDA does not exist at
+ * all (nobody ever called `mint_complete_set` against it) maps to `0n` --
+ * exactly the same "nothing to check" state the on-chain handler treats an
+ * empty/uninitialized vault as (see `CloseSettledMarket::collateral_vault`'s
+ * doc comment). A vault account that exists but fails to decode (wrong size,
+ * unexpected shape) is treated as non-zero/unsafe-to-close rather than
+ * silently skipped -- unlike the position/market decoders above, silently
+ * excluding a malformed vault here would be excluding it from a SAFETY
+ * check, not from a candidate list, so the conservative failure direction is
+ * reversed.
+ */
+export async function fetchCollateralVaultBalances(
+  connection: Connection,
+  markets: readonly PublicKey[],
+  programId: PublicKey = VSOL_PROGRAM_ID,
+): Promise<Map<string, bigint>> {
+  const result = new Map<string, bigint>();
+  if (markets.length === 0) return result;
+  const vaults = markets.map((market) => deriveCompleteSetVault(market, programId));
+  const accounts = await connection.getMultipleAccountsInfo(vaults, { commitment: "confirmed" });
+  markets.forEach((market, index) => {
+    const account = accounts[index];
+    if (!account) {
+      result.set(market.toBase58(), 0n);
+      return;
+    }
+    try {
+      result.set(market.toBase58(), decodeTokenAccountAmount(Buffer.from(account.data)));
+    } catch {
+      // Exists but doesn't decode as a token account: treat as non-zero so
+      // it excludes the market from closing rather than risking stranding it.
+      result.set(market.toBase58(), 1n);
+    }
+  });
+  return result;
+}
+
+/**
+ * Builds the "markets with outstanding collateral" set
+ * `selectMarketCloseCandidates` uses for its FINDING 1 exclusion, given a
+ * balance map from `fetchCollateralVaultBalances`. Pulled into its own pure,
+ * exported, unit-tested function for the same reason `marketsWithOpenPositions`
+ * is: it isolates "which markets are unsafe to close" from "how their
+ * balances were fetched", so the filtering logic is testable with plain
+ * fixture data instead of a live RPC connection.
+ */
+export function marketsWithOutstandingCollateral(balances: ReadonlyMap<string, bigint>): Set<string> {
+  const result = new Set<string>();
+  for (const [market, balance] of balances) {
+    if (balance > 0n) result.add(market);
+  }
+  return result;
+}
+
 /**
  * The market-cleanup safety predicate. `close_settled_market` cannot verify
  * on-chain that no open position still references the market (positions are
@@ -418,6 +549,16 @@ export function marketsWithOpenPositions(params: {
  *      set and calls this function), so that a position just settled or
  *      refunded this same pass has already dropped out of it before this
  *      predicate runs.
+ *   3. Its address is NOT in `marketsWithOutstandingCollateral` -- the
+ *      FINDING 1 exclusion, mirroring the on-chain handler's own
+ *      `MarketHasOutstandingCollateral` check (see
+ *      `CloseSettledMarket::collateral_vault`'s doc comment in lib.rs). This
+ *      is a cheap, exact mirror (unlike point 2's position scan, this vault
+ *      balance really is fully enumerable from the market alone) -- it
+ *      exists here purely so this cleanup pass does not keep re-attempting
+ *      (and paying transaction fees for) a `close_settled_market` call the
+ *      chain will simply revert, not because the on-chain check is
+ *      insufficient on its own.
  *
  * "Already closed" requires no explicit branch here: a closed market's
  * account no longer exists on-chain, so it is simply absent from the
@@ -431,11 +572,13 @@ export function selectMarketCloseCandidates(params: {
   markets: readonly DecodedMarketForCleanup[];
   now: number;
   marketsWithOpenPositions: ReadonlySet<string>;
+  marketsWithOutstandingCollateral: ReadonlySet<string>;
   maxPerRun: number;
 }): DecodedMarketForCleanup[] {
   const candidates = params.markets.filter((market) => {
     if (params.now <= computeMarketCloseDeadline(market)) return false;
     if (params.marketsWithOpenPositions.has(market.address)) return false;
+    if (params.marketsWithOutstandingCollateral.has(market.address)) return false;
     return true;
   });
   return candidates.slice(0, Math.max(0, params.maxPerRun));
@@ -471,6 +614,124 @@ export function decideMarketPublishAction(
     return { kind: "skip", reason: "settlement window has closed; refund_pool_position applies instead" };
   }
   return { kind: "publish" };
+}
+
+export type ViableSettlementTier = "tier-one" | "tier-two";
+
+/**
+ * Which settlement tier -- if either -- `publish_pyth_settlement` could
+ * currently accept a print for, given only wall-clock timing (no Pyth price
+ * fetched yet). This is the fix for a confirmed live bug: the cranker used
+ * to always fetch "the latest Hermes print" for every publish attempt, which
+ * only ever satisfies tier 1 (and only on the rare cranker pass that happens
+ * to land inside the 30-second observation window), and can NEVER satisfy
+ * tier 2 -- tier 2 requires a print AT OR BEFORE `expiry`, and "the latest
+ * print" is by construction never before `expiry` once the market has
+ * expired. Measured on the live deployment: 13 of 14 expired markets had
+ * unfinalized oracles as a direct result. This function tells
+ * `fetchPythUpdateForSettlement` which Hermes query strategy is even worth
+ * trying, so it stops blindly fetching "latest" and instead fetches the
+ * print the currently-open tier actually needs.
+ *
+ * Built entirely from the SAME pure helpers `decideMarketPublishAction`
+ * already uses (`computeObservationEnd`, `computeTierTwoOpenAt`,
+ * `computeFinalSettlementDeadline`) -- this does not re-derive or restate
+ * any timing rule, and does not change what `decideMarketPublishAction`
+ * itself decides (that function still owns "is a publish attempt even worth
+ * making at all", e.g. the `oracleFinalized` check this function does not
+ * repeat).
+ *
+ * Returns:
+ *  - `"tier-one"`: `now` is within `[expiry, observation_end]`. A print
+ *    fetched right now ("whatever Hermes has right now") is expected to
+ *    land inside the tier-1 window, since Hermes' latest print trails `now`
+ *    by at most a few seconds while the feed is actively publishing.
+ *  - `"tier-two"`: tier 2's own gate (`computeTierTwoOpenAt`) has opened,
+ *    and the final settlement deadline has not yet passed.
+ *  - `null`: neither -- either before `expiry`, in the gap between
+ *    `observation_end` and `computeTierTwoOpenAt` (exactly
+ *    `SETTLEMENT_REFUND_PRIORITY_SECONDS` wide) where nothing
+ *    chain-acceptable can be freshly fetched, or past
+ *    `computeFinalSettlementDeadline` altogether.
+ */
+export function selectViableSettlementTier(
+  params: PublishWindow & { now: number },
+): ViableSettlementTier | null {
+  const { now } = params;
+  if (now < params.expiry) return null;
+  if (now <= computeObservationEnd(params)) return "tier-one";
+  if (now > computeTierTwoOpenAt(params) && now <= computeFinalSettlementDeadline(params)) {
+    return "tier-two";
+  }
+  return null;
+}
+
+/**
+ * Builds the "publish-attempt set": the markets `runSettlementPhase` should
+ * even bother calling `decideMarketPublishAction` for this pass.
+ *
+ * FIX for a confirmed live bug: `runSettlementPhase` used to build its ENTIRE
+ * work list from `fetchOpenPoolPositions` -- `[...new Set(positions.map(p =>
+ * p.market))]` -- so a market reachable from no `PoolPosition` and no direct
+ * `Position` was never enumerated at all. A v2 conditional-token market is
+ * exactly that: its only on-chain state is two SPL mints (UP/DOWN) and a
+ * complete-set collateral vault, no position account of either kind. Such a
+ * market's oracle was therefore NEVER finalized by this cranker, so
+ * `redeem_winning` reverted with `OracleNotFinalized` forever, and holders'
+ * only recourse was `redeem_unresolved` once `final_deadline` passed -- which
+ * pays pro-rata 50/50 regardless of who actually won. That silently turned
+ * the product into a coin flip for every conditional-token market. This
+ * function is the enumeration fix: it adds "has a non-zero complete-set
+ * vault" as an independent reason a market belongs in the publish-attempt
+ * set, alongside "has an open position" (pool-backed OR direct-maker -- see
+ * `marketsWithOpenPositions`).
+ *
+ * A market belongs in the set when ALL of:
+ *   1. It has passed expiry: `now >= market.expiry` (inclusive, matching
+ *      `filterExpiredOpenPositions` and `decideMarketPublishAction`'s own
+ *      `now < expiry` skip check).
+ *   2. Its oracle is not already finalized -- a finalized oracle needs no
+ *      further publish attempt (`decideMarketPublishAction` would just skip
+ *      it), so excluding it here avoids the wasted Hermes fetch + tx attempt
+ *      for every already-settled market on the whole deployment.
+ *   3. It has something at stake: its address is in `marketsWithOpenPositions`
+ *      OR in `marketsWithOutstandingCollateral`.
+ *
+ * This is deliberately a COARSE pre-filter, not a replacement for
+ * `decideMarketPublishAction`: it decides ONLY which markets are worth
+ * calling that function for, never how the tier-1/tier-2/final-deadline
+ * timing itself is decided -- that logic is unchanged and unweakened.
+ *
+ * IMPORTANT -- what this function is deliberately NOT used for: gating
+ * whether a market's already-open positions get their settle/refund
+ * decision made. A market whose oracle was already finalized (by a prior
+ * pass, a concurrent cranker, or the buyer's own settlement call) is
+ * EXCLUDED from this set by rule 2 above, yet may still have an open
+ * position waiting on `settle_pool_position`/`refund_pool_position`. The
+ * caller must keep driving that loop from its own expired-position scan
+ * (unioned with this set), never from this set alone, or settlement would
+ * regress for exactly that already-finalized case.
+ *
+ * Every market address appears at most once in the input `markets` array
+ * (one account per market), so the result is deduplicated by construction:
+ * a market present in BOTH `marketsWithOpenPositions` and
+ * `marketsWithOutstandingCollateral` is selected exactly once, never twice.
+ */
+export function selectMarketsNeedingSettlementAttempt(params: {
+  markets: readonly DecodedMarketForCleanup[];
+  now: number;
+  marketsWithFinalizedOracle: ReadonlySet<string>;
+  marketsWithOpenPositions: ReadonlySet<string>;
+  marketsWithOutstandingCollateral: ReadonlySet<string>;
+}): DecodedMarketForCleanup[] {
+  return params.markets.filter((market) => {
+    if (params.now < market.expiry) return false;
+    if (params.marketsWithFinalizedOracle.has(market.address)) return false;
+    return (
+      params.marketsWithOpenPositions.has(market.address) ||
+      params.marketsWithOutstandingCollateral.has(market.address)
+    );
+  });
 }
 
 export type PoolPositionDecision = { kind: "settle" } | { kind: "refund" } | { kind: "skip"; reason: string };
@@ -589,6 +850,530 @@ export async function fetchLatestPythUpdate(
     throw new Error("Hermes returned no base64 Pyth update");
   }
   return { update, publishTime: parsed.price.publish_time };
+}
+
+// --- Tier-appropriate Pyth fetch (the actual bug fix) ------------------------
+// `fetchLatestPythUpdate` above always returns the NEWEST print, which
+// `publish_pyth_settlement` only accepts under tier 1, and only on the rare
+// cranker pass that happens to land inside the 30-second observation window
+// -- it can never satisfy tier 2 (see `selectViableSettlementTier`'s doc
+// comment for the confirmed live impact). The functions below fetch the
+// print the CURRENTLY VIABLE tier actually needs instead of always asking
+// Hermes for "latest".
+
+// The print search walks the feed's ACTUAL print sequence rather than a
+// timestamp grid. Two earlier strategies failed against the live feed and are
+// recorded here so neither is reintroduced:
+//
+//   * A binary search for "the latest timestamp with any data" is INVALID.
+//     Binary search needs "data at T implies data at every earlier T in
+//     range", but the NVDA feed only publishes during US equity hours, so
+//     availability across [expiry - staleness, expiry] is dark -> live ->
+//     dark. There is no cutoff to converge on; it lands correctly only by
+//     luck.
+//   * Walking back on a FIXED stride (60s) hops over prints. The measured
+//     acceptable print sat 916s from the anchor -- not a multiple of 60 -- so
+//     a 60s grid stepped straight past it and reported a false negative after
+//     46 probes.
+//
+// Instead: anchor at the feed's newest print (one getLatestPriceUpdates call,
+// no search at all), then after each rejection resume at
+// `returnedPublishTime - 1`, which lands on a real print every time. A dark
+// gap is escaped by widening the step geometrically. Measured: 3 probes,
+// where the old strategy burned 46 and still failed.
+
+export type PythSettlementFetchResult =
+  | {
+      ok: true;
+      tier: ViableSettlementTier;
+      update: PythUpdate;
+      publishTime: number;
+      ageSeconds: number;
+      probeCount: number;
+    }
+  | { ok: false; reason: string };
+
+// --- Confidence-aware print selection (the SECOND confirmed live bug) ------
+// "The latest print that exists" is not the same thing as "the latest print
+// the chain will ACCEPT". A live tier-2 settlement was rejected on-chain with
+// error 6039 (`OracleConfidenceTooWide`) because the print tier 2 selected --
+// Hermes' latest print at/before expiry -- was the feed's FINAL print at
+// market close, where Pyth blows its own confidence band open. Measured live
+// against feed b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593:
+// the 20:00:19Z closing print carries conf_bps 887 against a 500 bps market
+// bound, while the 19:45:00Z print ~15 minutes earlier carries conf_bps 5. For
+// any market expiring while the feed is dark (equities trade roughly 19% of
+// the week), "latest print at or before expiry" IS that closing print, so
+// tier-2 (and, at an expiry landing exactly at the close, tier-1) selection
+// was predictably picking a print the program is guaranteed to reject.
+//
+// Confidence is NOT monotonic in time, so a plain binary search cannot locate
+// "the latest print satisfying the acceptance predicate" the way
+// the anchor is the feed's newest print, located without any search.
+// The fix keeps that binary search exactly as-is (to find a starting anchor)
+// and adds a small bounded walk BACKWARDS from that anchor
+// (`walkPrintSequenceForAcceptablePrint`), re-testing the full acceptance
+// predicate (`isSettlementPrintAcceptable`: time bounds AND confidence) at
+// each step, stopping at the first passing print.
+
+/** MUST match `BPS_DENOMINATOR` in vsol/programs/vsol/src/lib.rs. */
+export const BPS_DENOMINATOR = 10_000n;
+
+/**
+ * A single Pyth print, parsed to the fields `isSettlementPrintAcceptable`
+ * needs: Hermes' own `price`/`conf` (NOT the on-chain normalized scale).
+ * `normalize_pyth_price` in lib.rs scales both proportionally by the same
+ * factor, so the confidence-to-price RATIO the `OracleConfidenceTooWide`
+ * check depends on is identical whichever scale it is evaluated at -- see the
+ * `confidence_bps`/`max_confidence` check immediately after that function in
+ * `publish_pyth_settlement`.
+ */
+export type SettlementPrintCandidate = {
+  publishTime: number;
+  price: bigint;
+  conf: bigint;
+};
+
+/**
+ * `conf * BPS_DENOMINATOR / price`, floored -- the same ratio
+ * `publish_pyth_settlement` computes (as `confidence_bps`, compared against
+ * `max_confidence_bps * price`) but expressed as a single bps number for
+ * logging/diagnostics. A non-positive price can never satisfy the on-chain
+ * check (see `isSettlementPrintAcceptable`), so it is reported as
+ * `Number.POSITIVE_INFINITY` here rather than dividing by zero or a negative
+ * number.
+ */
+export function confidenceBpsOf(candidate: SettlementPrintCandidate): number {
+  if (candidate.price <= 0n) return Number.POSITIVE_INFINITY;
+  return Number((candidate.conf * BPS_DENOMINATOR) / candidate.price);
+}
+
+export type PrintAcceptabilityReason =
+  | "publish_time_before_lower_bound"
+  | "publish_time_after_upper_bound"
+  | "staleness_exceeds_bound"
+  | "confidence_too_wide";
+
+export type PrintAcceptabilityResult = { ok: true } | { ok: false; reason: PrintAcceptabilityReason; detail: string };
+
+/**
+ * THE fix for the confirmed live `OracleConfidenceTooWide` rejection: mirrors
+ * every on-chain acceptance condition `publish_pyth_settlement` checks for a
+ * given tier, so a caller can test a candidate print BEFORE spending a
+ * transaction on it -- exactly as the pre-existing tier bound checks used to
+ * do for timing alone. Pure and network-free by design (per this module's
+ * pure-core/thin-RPC-shell split), so it is directly unit-testable against
+ * the real measured numbers from the live failure.
+ *
+ * tier === "tier-one": `publish_time` must fall within
+ * `[expiry, observation_end]` (mirrors `tier_one_ok`'s two `publish_time`
+ * bounds -- NOT its separate `publish_time <= now` freshness bound, which
+ * depends on wall-clock `now` rather than the print alone and is enforced by
+ * the RPC shell after a candidate is picked, not by this pure predicate).
+ *
+ * tier === "tier-two": `publish_time` must be at or before `expiry`, AND
+ * `expiry - publish_time` must not exceed `window.maxSettlementStalenessSeconds`
+ * (mirrors `tier_two_ok`'s two bounds exactly).
+ *
+ * Both tiers, in addition: `conf * BPS_DENOMINATOR <= price * maxConfidenceBps`
+ * -- the exact `OracleConfidenceTooWide` check, evaluated directly on Hermes'
+ * parsed price/conf (see `SettlementPrintCandidate`'s doc comment for why
+ * that is equivalent to the on-chain normalized-scale check).
+ */
+export function isSettlementPrintAcceptable(params: {
+  tier: ViableSettlementTier;
+  candidate: SettlementPrintCandidate;
+  window: PublishWindow;
+  maxConfidenceBps: number;
+}): PrintAcceptabilityResult {
+  const { tier, candidate, window, maxConfidenceBps } = params;
+  const { publishTime, price, conf } = candidate;
+
+  if (tier === "tier-one") {
+    const observationEnd = computeObservationEnd(window);
+    if (publishTime < window.expiry) {
+      return {
+        ok: false,
+        reason: "publish_time_before_lower_bound",
+        detail: `publish_time ${publishTime} is before expiry ${window.expiry}`,
+      };
+    }
+    if (publishTime > observationEnd) {
+      return {
+        ok: false,
+        reason: "publish_time_after_upper_bound",
+        detail: `publish_time ${publishTime} is after observation_end ${observationEnd}`,
+      };
+    }
+  } else {
+    if (publishTime > window.expiry) {
+      return {
+        ok: false,
+        reason: "publish_time_after_upper_bound",
+        detail: `publish_time ${publishTime} is after expiry ${window.expiry}`,
+      };
+    }
+    const staleness = window.expiry - publishTime;
+    if (staleness > window.maxSettlementStalenessSeconds) {
+      return {
+        ok: false,
+        reason: "staleness_exceeds_bound",
+        detail: `staleness ${staleness}s (expiry ${window.expiry} - publish_time ${publishTime}) exceeds the ${window.maxSettlementStalenessSeconds}s bound`,
+      };
+    }
+  }
+
+  // Mirrors `confidence_bps <= max_confidence` in publish_pyth_settlement
+  // exactly (see BPS_DENOMINATOR's doc comment for why the raw Hermes scale
+  // is equivalent to the on-chain normalized scale here).
+  if (conf * BPS_DENOMINATOR > price * BigInt(maxConfidenceBps)) {
+    return {
+      ok: false,
+      reason: "confidence_too_wide",
+      detail: `confidence ${confidenceBpsOf(candidate)} bps (price ${price}, conf ${conf}) exceeds the ${maxConfidenceBps} bps bound`,
+    };
+  }
+  return { ok: true };
+}
+
+/** Injected fetch for `walkPrintSequenceForAcceptablePrint`: resolves the parsed candidate AND an arbitrary caller-supplied payload (the raw `PythUpdate`, for the RPC shell) together, or `null` if Hermes has nothing at `timestamp`. Mirrors `TimestampProbe<T>`'s injection pattern above. */
+/**
+ * The three-valued result of probing Hermes at one timestamp.
+ *
+ * Three-valued deliberately. An earlier version used `T | null` with a
+ * blanket `catch { return null }`, which made a transient `fetch failed` or
+ * 429 indistinguishable from Hermes' genuine 404 "Update data not found" --
+ * a live run ended with `fetch failed` and reported "no print available"
+ * for a range that demonstrably contained acceptable prints. A 404 is DATA
+ * ("the feed published nothing here"); anything else is an error and must
+ * surface as one, never as absence.
+ */
+export type SettlementPrintProbeResult<T> =
+  | { kind: "print"; candidate: SettlementPrintCandidate; value: T }
+  | { kind: "absent" };
+
+export type SettlementPrintProbe<T> = (timestamp: number) => Promise<SettlementPrintProbeResult<T>>;
+
+export type SettlementPrintWalkResult<T> =
+  | { ok: true; candidate: SettlementPrintCandidate; value: T; probeCount: number }
+  | { ok: false; reason: "no_print_available"; detail: string; probeCount: number }
+  | {
+      ok: false;
+      reason: "confidence_too_wide";
+      detail: string;
+      probeCount: number;
+      bestConfBps: number;
+      maxConfidenceBps: number;
+    };
+
+/** First step used to escape a dark gap (a stretch where the feed published nothing). */
+export const SETTLEMENT_PRINT_GAP_STEP_SECONDS = 60;
+/** Each successive 404 multiplies the gap step by this, so a multi-hour overnight gap costs a handful of probes rather than hundreds. */
+export const SETTLEMENT_PRINT_GAP_GROWTH = 4;
+/** Ceiling on the gap step, so the walk cannot leap over an entire trading session. */
+export const SETTLEMENT_PRINT_GAP_MAX_SECONDS = 3_600;
+/** Hard cap on probes for one settlement attempt. The measured live case needs 2 here; the cap only bounds pathological feeds. */
+export const SETTLEMENT_PRINT_MAX_PROBES = 40;
+
+/**
+ * Walks backwards from `startTimestamp` looking for the newest print that
+ * satisfies the FULL on-chain acceptance predicate (time bounds AND
+ * confidence), never probing below `lowerBound`.
+ *
+ * The walk steps onto real prints rather than a timestamp grid: after a
+ * print is rejected, the next probe is at `publishTime - 1`, which is by
+ * construction the newest instant that could hold a different print. Only a
+ * 404 (a genuine gap in publication) advances by a synthetic step, and that
+ * step widens geometrically so an overnight gap is crossed cheaply.
+ *
+ * Why not a binary search: confidence is not monotonic in time, and neither
+ * is availability for an equities feed -- see the note above this section.
+ *
+ * Errors from `probe` are NOT caught here. A network failure must propagate
+ * rather than masquerade as "the feed published nothing".
+ *
+ * Distinguishes its two failure modes so an operator can act on them: no
+ * print existed anywhere in range (`no_print_available`) versus prints
+ * existed but every one was too wide (`confidence_too_wide`, carrying the
+ * best observed bps and the bound it was measured against).
+ */
+export async function walkPrintSequenceForAcceptablePrint<T>(params: {
+  probe: SettlementPrintProbe<T>;
+  tier: ViableSettlementTier;
+  window: PublishWindow;
+  maxConfidenceBps: number;
+  startTimestamp: number;
+  lowerBound: number;
+  maxProbes?: number;
+}): Promise<SettlementPrintWalkResult<T>> {
+  const maxProbes = params.maxProbes ?? SETTLEMENT_PRINT_MAX_PROBES;
+
+  let timestamp = params.startTimestamp;
+  let gapStep = SETTLEMENT_PRINT_GAP_STEP_SECONDS;
+  let probeCount = 0;
+  let anyPrintFound = false;
+  let bestConfBps: number | null = null;
+
+  while (timestamp >= params.lowerBound && probeCount < maxProbes) {
+    probeCount += 1;
+    // eslint-disable-next-line no-await-in-loop -- inherently sequential: each probe's target depends on the previous print's publish time.
+    const probed = await params.probe(timestamp);
+
+    if (probed.kind === "absent") {
+      // A gap in publication. Jump back by a widening step to cross it.
+      timestamp -= gapStep;
+      gapStep = Math.min(gapStep * SETTLEMENT_PRINT_GAP_GROWTH, SETTLEMENT_PRINT_GAP_MAX_SECONDS);
+      continue;
+    }
+
+    // Landed on a real print: reset the gap stride.
+    gapStep = SETTLEMENT_PRINT_GAP_STEP_SECONDS;
+    anyPrintFound = true;
+
+    const acceptability = isSettlementPrintAcceptable({
+      tier: params.tier,
+      candidate: probed.candidate,
+      window: params.window,
+      maxConfidenceBps: params.maxConfidenceBps,
+    });
+    if (acceptability.ok) {
+      return { ok: true, candidate: probed.candidate, value: probed.value, probeCount };
+    }
+
+    const confBps = confidenceBpsOf(probed.candidate);
+    if (bestConfBps === null || confBps < bestConfBps) bestConfBps = confBps;
+
+    // Resume at the instant just before this print, which lands on a real
+    // print rather than an arbitrary grid position.
+    const next = probed.candidate.publishTime - 1;
+    timestamp = next < timestamp ? next : timestamp - 1;
+  }
+
+  if (!anyPrintFound) {
+    return {
+      ok: false,
+      reason: "no_print_available",
+      detail: `no print was available at any of the ${probeCount} timestamp(s) probed walking back from ${params.startTimestamp} (floor ${params.lowerBound})`,
+      probeCount,
+    };
+  }
+  return {
+    ok: false,
+    reason: "confidence_too_wide",
+    detail: `${probeCount} print(s) probed walking back from ${params.startTimestamp}; the best candidate carried ${bestConfBps} bps confidence, exceeding the ${params.maxConfidenceBps} bps bound`,
+    probeCount,
+    bestConfBps: bestConfBps ?? Number.POSITIVE_INFINITY,
+    maxConfidenceBps: params.maxConfidenceBps,
+  };
+}
+
+/** Parses a Hermes update into the fields both the tier bound checks and the confidence check need. Returns `null` for a missing/mismatched/empty update -- the same "not usable" contract the walk's probe relies on. */
+function parseSettlementPrintCandidate(update: PythUpdate, feedId: string): SettlementPrintCandidate | null {
+  const parsed = update.parsed?.[0];
+  if (!parsed || parsed.id.toLowerCase() !== feedId.toLowerCase()) return null;
+  if (update.binary.encoding !== "base64" || !update.binary.data.length) return null;
+  return {
+    publishTime: parsed.price.publish_time,
+    price: BigInt(parsed.price.price),
+    conf: BigInt(parsed.price.conf),
+  };
+}
+
+/**
+ * True only for Hermes' "this feed published nothing at that timestamp"
+ * response (HTTP 404 / "Update data not found"), which is DATA, not a
+ * failure. Everything else -- timeouts, 429s, connection resets -- is a real
+ * error and must propagate.
+ *
+ * This distinction is the fix for a confirmed false negative: a blanket
+ * `catch { return null }` let a `fetch failed` masquerade as "the feed has no
+ * print here", and a live cranker run consequently reported "no tier-two
+ * print available" for a range that contained perfectly good prints.
+ */
+function isHermesNoDataError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b404\b/.test(message) || /update data not found/i.test(message);
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Fetches the print `tier` needs for `window`.
+ *
+ * Anchors on the feed's newest print via a single `getLatestPriceUpdates`
+ * (clamped to the tier's upper bound) rather than searching for one, then
+ * walks the real print sequence backwards testing the FULL acceptance
+ * predicate -- time bounds AND confidence -- at each step. See the note
+ * above `walkPrintSequenceForAcceptablePrint` for why the two earlier
+ * search strategies (binary search, fixed-stride walk) were both wrong.
+ *
+ * Every result this returns has already been validated against the exact
+ * on-chain acceptance bounds (`tier_one_ok`/`tier_two_ok` AND
+ * `OracleConfidenceTooWide`) in `publish_pyth_settlement`, so a caller that
+ * posts what this returns can never hit either kind of on-chain rejection
+ * from a bad print choice; only a genuine race (a concurrent run finalizing
+ * the oracle first, `OracleAlreadyFinalized`) remains possible.
+ *
+ * The picked candidate is additionally checked against `publish_time <= now`
+ * for tier one -- `tier_one_ok`'s third bound, which depends on wall-clock
+ * `now` rather than the print alone, so it cannot live inside
+ * `isSettlementPrintAcceptable` (a pure function of the candidate and the
+ * market window only).
+ */
+async function fetchViablePrint(
+  hermes: HermesClient,
+  feedId: string,
+  tier: ViableSettlementTier,
+  window: PublishWindow,
+  maxConfidenceBps: number,
+  now: number,
+): Promise<PythSettlementFetchResult> {
+  const observationEnd = computeObservationEnd(window);
+  const lowerBound = tier === "tier-one" ? window.expiry : window.expiry - window.maxSettlementStalenessSeconds;
+  const upperBound = tier === "tier-one" ? observationEnd : window.expiry;
+
+  // The anchor: the newest print the feed has, clamped to this tier's upper
+  // bound. One call, no search -- and for the overnight/tier-2 case this
+  // lands directly on the last print before the feed went dark, which is
+  // exactly where the walk wants to start.
+  let anchor: number;
+  try {
+    const latest = await hermes.getLatestPriceUpdates([feedId], { encoding: "base64", parsed: true });
+    const parsed = parseSettlementPrintCandidate(latest, feedId);
+    anchor = parsed ? Math.min(upperBound, parsed.publishTime) : upperBound;
+  } catch {
+    // Hermes could not serve "latest" at all. Fall back to probing from the
+    // tier's own upper bound; the walk below handles a 404 there by stepping
+    // back, so this degrades rather than failing outright.
+    anchor = upperBound;
+  }
+
+  let probeErrors = 0;
+  const probe: SettlementPrintProbe<PythUpdate> = async (timestamp) => {
+    let update: PythUpdate;
+    try {
+      update = await hermes.getPriceUpdatesAtTimestamp(timestamp, [feedId], { encoding: "base64", parsed: true });
+    } catch (error) {
+      // ONLY a 404 means "the feed published nothing at this timestamp".
+      // Anything else (timeout, 429, connection reset) is an error and must
+      // not be reported as absence -- see SettlementPrintProbeResult.
+      if (isHermesNoDataError(error)) return { kind: "absent" };
+      probeErrors += 1;
+      throw error;
+    }
+    const candidate = parseSettlementPrintCandidate(update, feedId);
+    return candidate ? { kind: "print", candidate, value: update } : { kind: "absent" };
+  };
+
+  let walkResult;
+  try {
+    walkResult = await walkPrintSequenceForAcceptablePrint({
+      probe,
+      tier,
+      window,
+      maxConfidenceBps,
+      startTimestamp: anchor,
+      lowerBound,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `Hermes failed while searching for a ${tier} print in [${lowerBound}, ${anchor}] (${probeErrors} probe error(s)): ${describeError(error)}`,
+    };
+  }
+
+  if (!walkResult.ok) {
+    if (walkResult.reason === "no_print_available") {
+      return {
+        ok: false,
+        reason: `no ${tier} print available in Hermes for [${lowerBound}, ${anchor}] after ${walkResult.probeCount} probe(s)`,
+      };
+    }
+    return {
+      ok: false,
+      reason:
+        `${tier} print(s) found in [${lowerBound}, ${anchor}] but every candidate fails the confidence bound -- ` +
+        `best candidate ${walkResult.bestConfBps} bps exceeds the ${walkResult.maxConfidenceBps} bps bound ` +
+        `(${walkResult.probeCount} probe(s))`,
+    };
+  }
+
+  const { publishTime } = walkResult.candidate;
+  if (tier === "tier-one" && publishTime > now) {
+    return { ok: false, reason: `tier-one candidate publish_time ${publishTime} is after now ${now}` };
+  }
+
+  return {
+    ok: true,
+    tier,
+    update: walkResult.value,
+    publishTime,
+    ageSeconds: Math.max(0, now - publishTime),
+    probeCount: walkResult.probeCount,
+  };
+}
+
+/**
+ * Replaces `fetchLatestPythUpdate` for the settlement publish path: fetches
+ * the Pyth update appropriate to whichever tier `selectViableSettlementTier`
+ * says is currently viable for `window` at `now`, rather than blindly
+ * fetching "the latest print" (which only ever satisfies tier 1, and never
+ * tier 2 -- see that function's doc comment for the confirmed live impact),
+ * and -- as of the `OracleConfidenceTooWide` fix above -- never a print whose
+ * confidence band the market's own `maxConfidenceBps` would reject either.
+ *
+ * `maxConfidenceBps` is threaded through from the caller's decoded market
+ * state (`DecodedMarketForCleanup.maxConfidenceBps` / `market.max_confidence_bps`
+ * on-chain) as its own parameter, rather than folded into `window`, since
+ * none of `PublishWindow`'s other consumers (`decideMarketPublishAction`,
+ * `selectViableSettlementTier`, the deadline helpers) need it.
+ *
+ * Every result this returns has ALREADY been validated against the exact
+ * on-chain acceptance bounds (`tier_one_ok`/`tier_two_ok` AND
+ * `OracleConfidenceTooWide` in `publish_pyth_settlement`) -- so a caller that
+ * posts what this returns can never hit a tier- or confidence-related
+ * on-chain rejection; only a genuine race (a concurrent run finalizing the
+ * oracle first, `OracleAlreadyFinalized`) remains possible.
+ * `fetchLatestPythUpdate` is left in place for `keeper.ts`, which uses it for
+ * an unrelated purpose (reading the current spot price to derive a strike,
+ * not settlement) and is not wrong there -- just wrong for this call site.
+ */
+export async function fetchPythUpdateForSettlement(
+  hermes: HermesClient,
+  feedId: string,
+  window: PublishWindow,
+  maxConfidenceBps: number,
+  now: number,
+): Promise<PythSettlementFetchResult> {
+  const tier = selectViableSettlementTier({ ...window, now });
+  if (tier === null) {
+    return { ok: false, reason: "neither settlement tier is currently viable for this market" };
+  }
+  return fetchViablePrint(hermes, feedId, tier, window, maxConfidenceBps, now);
+}
+
+/**
+ * Converts a Pyth parsed price (an integer mantissa plus a base-10 exponent,
+ * e.g. `{ price: "123456789012", expo: -8 }`) into VSOL's `PRICE_SCALE`
+ * (1e6) fixed-point atoms: `price * 10^expo * priceScale`, computed entirely
+ * in `bigint` arithmetic so it never picks up floating-point drift. Pyth
+ * equity/crypto feeds virtually always publish a negative `expo` (the
+ * mantissa is an integer many places larger than the human-readable price),
+ * but a non-negative `expo` is handled too for completeness.
+ *
+ * This is the same normalization bootstrap.ts's smoke-settlement flow does
+ * inline (see its `normalizedPythPrice` computation); pulled out here as a
+ * pure, exported, unit-tested function because scripts/keeper.ts's
+ * discover-first rung creation needs the identical conversion to turn a
+ * fresh Hermes spot price into a `ladderStrike` input (see
+ * `STRIKE_LADDER_STEP`/`ladderStrike` in ../../sdk/index.ts).
+ */
+export function pythPriceToScaledAtoms(price: bigint, expo: number, priceScale: bigint): bigint {
+  return expo >= 0
+    ? price * priceScale * (10n ** BigInt(expo))
+    : price * priceScale / (10n ** BigInt(-expo));
 }
 
 /**
@@ -749,6 +1534,15 @@ export async function refundPoolPositionOnChain(params: {
  * market.creator by address constraint, so passing a signer that is not the
  * market's creator (and not config.admin) simply fails with Unauthorized,
  * which the caller treats as a skip.
+ *
+ * `collateralVault` is derived from `market`, not caller-supplied: it is
+ * always the market's own `deriveCompleteSetVault(market)` PDA (see
+ * `CloseSettledMarket::collateral_vault`'s doc comment in lib.rs -- the
+ * on-chain handler itself is what checks its balance, this is just the
+ * account address). The caller (`selectMarketCloseCandidates`) should
+ * already have proven this market is safe to close via
+ * `marketsWithOutstandingCollateral` before calling this function, but the
+ * on-chain check is the actual backstop regardless.
  */
 export async function closeSettledMarketOnChain(params: {
   program: Program<Vsol>;
@@ -765,6 +1559,7 @@ export async function closeSettledMarketOnChain(params: {
       config: params.config,
       market: params.market,
       oracle: params.oracle,
+      collateralVault: deriveCompleteSetVault(params.market),
       pool: null,
       poolMarket: null,
       rentRecipient: params.rentRecipient,
