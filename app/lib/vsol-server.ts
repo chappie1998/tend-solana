@@ -41,13 +41,22 @@ import {
 import { runtimeEnv } from "./runtime-env.ts";
 import { markets } from "./markets.ts";
 import {
-  PLACEHOLDER_STRIKE_DO_NOT_TRUST,
+  findVsolSeriesCandidateForMarket,
   resolveAvailableVsolSeries,
   resolveVsolSeries,
   resolveVsolSeriesCatalog,
   type ResolvedVsolSeries,
 } from "./series-resolver.ts";
 import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
+import { decodeMarketAccount } from "./vsol-market-accounts.ts";
+
+// Re-exported: chain-catalog.ts, chain-positions.ts, and vsol-launch.ts all
+// import this from vsol-server.ts. The decoder itself now lives in
+// vsol-market-accounts.ts (a leaf module with no dependency on
+// series-resolver.ts) so series-resolver.ts can reuse it too without an
+// import cycle (vsol-server.ts already depends on series-resolver.ts) --
+// see that module's header comment.
+export { decodeMarketAccount };
 
 export function getVsolConnection() {
   // Resolve this after the request route has installed Cloudflare bindings.
@@ -179,7 +188,6 @@ const FILL_POOL_QUOTE = idlInstruction("fill_pool_quote");
 const DEPOSIT_LIQUIDITY = idlInstruction("deposit_liquidity");
 const WITHDRAW_LIQUIDITY = idlInstruction("withdraw_liquidity");
 const CONFIG_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("Config");
-const MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("Market");
 const ORACLE_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("SettlementOracle");
 const POOL_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPool");
 const PROVIDER_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityProvider");
@@ -342,35 +350,6 @@ export function decodeConfigAccount(data: Buffer) {
     eligibilityRequired: data[204] === 1,
     domainSeparator: data.subarray(205, 237),
     domainVersion: data.readUInt16LE(237),
-  };
-}
-
-// 289 bytes: 281 (pre-strike-ladder layout) + 8 for the appended
-// conditional-token `strike: u64` (see the Market struct in
-// vsol/programs/vsol/src/lib.rs). Not yet decoded below -- nothing in the
-// app reads it today -- but the exact-size check must track the real
-// on-chain layout or every market account fails to decode outright.
-export function decodeMarketAccount(data: Buffer) {
-  expectAccount(data, 289, MARKET_ACCOUNT_DISCRIMINATOR, "VSOL market");
-  return {
-    config: publicKeyAt(data, 9),
-    marketId: data.subarray(41, 73),
-    underlyingMint: publicKeyAt(data, 73),
-    settlementMint: publicKeyAt(data, 105),
-    oracle: publicKeyAt(data, 137),
-    symbol: data.subarray(169, 185).toString("ascii").replace(/\0+$/, ""),
-    priceScale: data.readBigUInt64LE(185),
-    expiry: Number(data.readBigInt64LE(193)),
-    observationWindowSeconds: data.readUInt32LE(201),
-    settlementGraceSeconds: data.readUInt32LE(205),
-    maxConfidenceBps: data.readUInt16LE(209),
-    pythFeedId: data.subarray(211, 243).toString("hex"),
-    settlementDecimals: data[243],
-    enabled: data[244] === 1,
-    creator: publicKeyAt(data, 245),
-    // Appended after launch: bounds how old a tier-2 last-known price may be
-    // relative to `expiry` (see the two-tier settlement note on the oracle).
-    maxSettlementStalenessSeconds: data.readUInt32LE(277),
   };
 }
 
@@ -783,20 +762,14 @@ type CreateMarketSeriesParams = {
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
   maxSettlementStalenessSeconds: number;
-  // TODO(v2-strike-ladder): optional and defaulted -- NOT because omitting
-  // it is fine (create_market requires strike > 0 onchain) -- but because
-  // every caller of buildCreateMarketInstruction (buildCreateMarketTransaction
-  // in vsol-launch.ts, the mint-on-demand path below, and the
-  // signed-transaction inspector below) sits downstream of the same
-  // known-broken subsystem as app/lib/series-resolver.ts's `resolveVsolSeries`
-  // (see its module-level TODO): there is no chain-agnostic formula for a
-  // listed ladder strike, and none of today's callers have a real one to
-  // supply. The default (PLACEHOLDER_STRIKE_DO_NOT_TRUST) makes this compile
-  // and keeps the Borsh-encoded instruction data the correct LENGTH/SHAPE,
-  // but the VALUE is not trustworthy -- this whole path needs the same
-  // chain-discovery follow-up series-resolver.ts does before Launch-a-series
-  // is safe to use again.
-  strike?: bigint;
+  // REQUIRED, deliberately not defaulted. `strike` is hashed into
+  // `expected_market_id`, so it selects the market PDA -- listing a series
+  // means CHOOSING a strike, exactly as choosing an expiry does. An earlier
+  // version defaulted this to a placeholder so the module would compile,
+  // which meant every address this encoder produced was silently wrong.
+  // Callers must supply a real ladder rung; `ladderStrike(spot)` from
+  // vsol/sdk is the way to land on one.
+  strike: bigint;
 };
 
 /**
@@ -821,9 +794,13 @@ export async function buildCreateMarketInstruction(params: {
   expected?: { market: PublicKey; oracle: PublicKey };
 }) {
   const symbol = symbolBytes(params.series.symbol);
-  // See CreateMarketSeriesParams.strike's TODO above -- a placeholder when
-  // absent, not a real listed ladder rung.
-  const strike = params.series.strike ?? PLACEHOLDER_STRIKE_DO_NOT_TRUST;
+  const { strike } = params.series;
+  // create_market rejects a non-positive strike (VsolError::InvalidStrike),
+  // and a wrong-but-positive one silently derives a different market. Fail
+  // here rather than at the cluster.
+  if (strike <= 0n) {
+    throw new Error("A series must be listed at a positive strike (see STRIKE_LADDER_STEP in vsol/sdk).");
+  }
   const marketId = await deriveMarketId({
     pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,

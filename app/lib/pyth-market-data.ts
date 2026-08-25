@@ -1,6 +1,6 @@
-import type { Market } from "./markets";
-import { getPythMarketBars } from "./pyth-market-bars";
-import { runtimeEnv } from "./runtime-env";
+import type { Market } from "./markets.ts";
+import { getPythMarketBars } from "./pyth-market-bars.ts";
+import { runtimeEnv } from "./runtime-env.ts";
 
 type HermesPrice = {
   price: string;

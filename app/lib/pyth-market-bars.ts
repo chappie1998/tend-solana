@@ -4,9 +4,9 @@ import {
   parsePythUdfBars,
   type ChartResolution,
   type MarketBar,
-} from "./market-bars";
-import type { Market } from "./markets";
-import { runtimeEnv } from "./runtime-env";
+} from "./market-bars.ts";
+import type { Market } from "./markets.ts";
+import { runtimeEnv } from "./runtime-env.ts";
 
 export type PythMarketBars = {
   symbol: string;

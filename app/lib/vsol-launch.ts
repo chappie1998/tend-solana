@@ -6,9 +6,11 @@
 import { Connection, PublicKey, SYSVAR_RENT_PUBKEY, SystemProgram, Transaction } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
+  PRICE_SCALE,
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
+  ladderStrike,
 } from "../../vsol/sdk";
 import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_SETTLEMENT_MINT } from "./vsol";
 import {
@@ -29,6 +31,8 @@ import {
   type LaunchSeriesParams,
 } from "./launch-params";
 import type { ExpiryCode } from "./expiries";
+import { markets } from "./markets";
+import { getPythSnapshot } from "./pyth-market-data";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
 
@@ -47,6 +51,22 @@ async function withBlockhash(connection: Connection, feePayer: PublicKey, transa
   return transaction;
 }
 
+/**
+ * Live spot for `symbol`, in PRICE_SCALE atoms, for choosing a ladder rung.
+ * Deliberately fails loudly rather than falling back to a guess: a launched
+ * series is permanent and its strike selects its address, so listing one at
+ * a fabricated strike is worse than not listing it at all.
+ */
+async function fetchLadderSpot(symbol: string): Promise<bigint> {
+  const market = markets.find((entry) => entry.symbol === symbol);
+  if (!market) throw new Error(`Unknown market symbol ${symbol}`);
+  const snapshot = await getPythSnapshot(market);
+  if (!Number.isFinite(snapshot.price) || snapshot.price <= 0) {
+    throw new Error("Pyth has no usable spot price right now, so a strike cannot be chosen. Try again shortly.");
+  }
+  return BigInt(Math.round(snapshot.price * Number(PRICE_SCALE)));
+}
+
 export async function buildCreateMarketTransaction(params: {
   creator: PublicKey;
   code: ExpiryCode;
@@ -58,11 +78,20 @@ export async function buildCreateMarketTransaction(params: {
   if (series.expiry < now + LAUNCH_MIN_LEAD_SECONDS) {
     throw new Error("The selected grid expiry is already inside the onchain lead window. Pick a later expiry.");
   }
+  // Listing a series means CHOOSING a strike, so it is supplied explicitly
+  // here rather than defaulted: `strike` is hashed into the market id, and a
+  // wrong-but-positive value silently derives a different market. Launch has
+  // no strike picker yet, so it lists the at-the-money ladder rung -- the
+  // same rung the keeper would pick for a new expiry, which keeps a
+  // hand-launched series on the same ladder as the automatic ones instead of
+  // fragmenting the chain onto an off-grid strike.
+  const spot = await fetchLadderSpot("NVDA");
+  const strike = ladderStrike(spot);
   // Shared with the mint-on-demand quote path (app/lib/vsol-server.ts) and its
   // send-path inspector, so there is exactly one create_market encoder.
   const { instruction, market, oracle, marketId } = await buildCreateMarketInstruction({
     creator: params.creator,
-    series,
+    series: { ...series, strike },
   });
   const existing = await connection.getAccountInfo(market, "confirmed");
   if (existing) {
