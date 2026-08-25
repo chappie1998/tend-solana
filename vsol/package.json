@@ -12,12 +12,14 @@
     "test:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "test:sdk": "node --import tsx --test tests/*.test.ts",
     "check": "npm run test:rust && npm run test:lint && npm run test:sdk",
-    "devnet:bootstrap": "node --import tsx scripts/bootstrap.ts",
-    "devnet:verify": "node --import tsx scripts/verify-deployment.ts",
-    "keeper": "node --import tsx scripts/keeper.ts",
-    "cranker": "node --import tsx scripts/cranker.ts",
-    "lookup-table": "node --import tsx scripts/create-lookup-table.ts",
-    "test:rust:only": "cargo test --workspace --all-targets"
+    "devnet:bootstrap": "node --env-file-if-exists=.env --import tsx scripts/bootstrap.ts",
+    "devnet:verify": "node --env-file-if-exists=.env --import tsx scripts/verify-deployment.ts",
+    "keeper": "node --env-file-if-exists=.env --import tsx scripts/keeper.ts",
+    "cranker": "node --env-file-if-exists=.env --import tsx scripts/cranker.ts",
+    "lookup-table": "node --env-file-if-exists=.env --import tsx scripts/create-lookup-table.ts",
+    "test:rust:only": "cargo test --workspace --all-targets",
+    "prove:complete-set": "node --env-file-if-exists=.env --import tsx scripts/prove-complete-set.ts",
+    "prove:redeem": "node --env-file-if-exists=.env --import tsx scripts/prove-redeem-winning.ts"
   },
   "dependencies": {
     "@anchor-lang/core": "1.0.2",
