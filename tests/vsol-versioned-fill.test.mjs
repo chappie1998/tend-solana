@@ -16,7 +16,7 @@ import nacl from "tweetnacl";
 
 // Moving VSOL fill transactions to v0 (with an address lookup table) is what
 // lets both the plain 2-instruction fill (~1154 bytes) and the 4-instruction
-// mint-on-demand shape (~1469 bytes, previously rejected outright by
+// mint-on-demand shape (~1477 bytes, previously rejected outright by
 // buildVsolQuoteTransaction's size guard -- see tests/mint-on-demand.test.mjs)
 // fit under Solana's 1232-byte packet limit. These tests exercise the real
 // composer/inspector from app/lib/vsol-server.ts with a stub
@@ -201,7 +201,7 @@ test("MEASURED FINDING: composeVsolFillTransaction with a stub lookup table brin
   assert.ok(versionedSize <= 1232, `MEASURED: v0 plain fill is ${versionedSize} bytes -- must stay under 1232`);
 });
 
-test("MEASURED FINDING: composeVsolFillTransaction with a stub lookup table brings the 4-instruction mint-on-demand fill under Solana's 1232-byte packet limit (previously 1469 bytes, over budget -- see tests/mint-on-demand.test.mjs)", async () => {
+test("MEASURED FINDING: composeVsolFillTransaction with a stub lookup table brings the 4-instruction mint-on-demand fill under Solana's 1232-byte packet limit (previously 1477 bytes, over budget -- see tests/mint-on-demand.test.mjs)", async () => {
   const { server, resolver, vsol, sdk } = await loadModules();
   const series = await resolveLiveNvda30D(resolver);
   const buyer = Keypair.generate();
@@ -222,8 +222,10 @@ test("MEASURED FINDING: composeVsolFillTransaction with a stub lookup table brin
   const legacySize = 1 + compiledLegacy.header.numRequiredSignatures * 64 + compiledLegacy.serialize().length;
   // Matches the previously-measured, structurally-fixed size from
   // tests/mint-on-demand.test.mjs -- confirms this test builds the exact
-  // same 4-instruction shape before checking what the ALT does to it.
-  assert.equal(legacySize, 1469, `expected the unmodified legacy mint-and-fill size to match the known 1469-byte measurement, got ${legacySize}`);
+  // same 4-instruction shape before checking what the ALT does to it. (1477,
+  // not the older 1469: create_market's data grew by 8 bytes for the
+  // conditional-token `strike: u64` appended to CreateMarketArgs.)
+  assert.equal(legacySize, 1477, `expected the unmodified legacy mint-and-fill size to match the known 1477-byte measurement, got ${legacySize}`);
 
   const versionedTransaction = server.composeVsolFillTransaction({
     feePayer: buyer.publicKey,

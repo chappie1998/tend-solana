@@ -16,9 +16,35 @@
 // The explicit .ts extensions on internal imports keep this module directly
 // importable by the node:test suite (type stripping) as well as the bundler,
 // matching the convention already used by app/lib/launch-params.ts.
+//
+// TODO(v2-strike-ladder): `strike` is now part of `expected_market_id`'s hash
+// (see vsol/sdk/index.ts's MarketIdParams and lib.rs's expected_market_id),
+// and it is a listed ladder rung a keeper chooses from live spot at mint
+// time (see STRIKE_LADDER_STEP/ladderStrike's doc comment) -- there is no
+// formula that recovers it from (symbol, code, now) alone. That breaks this
+// module's whole premise: pure, chain-agnostic address derivation from grid
+// parameters can no longer produce the market's real address, only ONE
+// candidate among however many strikes happen to be listed at that expiry.
+// The `strike` passed to `deriveMarketId` below is a placeholder that makes
+// this compile, NOT a correct value -- do not trust `resolveVsolSeries`'s
+// output for anything strike-sensitive. This resolver needs to move to
+// chain discovery (fetchAllMarkets + filter by expiry, the same
+// discover-first approach vsol/scripts/keeper.ts and
+// vsol/scripts/verify-deployment.ts now use) as a follow-up; that is out of
+// scope for the change that introduced strike and is intentionally left
+// broken here rather than papered over.
+// Exported (not just module-local) because app/lib/vsol-server.ts's
+// buildCreateMarketInstruction -- and everything downstream of it
+// (app/lib/vsol-launch.ts's Launch-a-series flow, the mint-on-demand path,
+// and the signed-transaction inspector) -- sits on the exact same broken
+// premise: none of those callers have a real listed strike to supply either,
+// for the exact same reason described above. One shared placeholder keeps
+// that "do not trust this" fact from silently forking into two different
+// magic numbers.
+export const PLACEHOLDER_STRIKE_DO_NOT_TRUST = 100n * PRICE_SCALE; // see the TODO above.
 
 import { PublicKey } from "@solana/web3.js";
-import { deriveMarket, deriveMarketId, deriveOracle, symbolBytes } from "../../vsol/sdk/index.ts";
+import { deriveMarket, deriveMarketId, deriveOracle, PRICE_SCALE, symbolBytes } from "../../vsol/sdk/index.ts";
 import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_PYTH_FEED_ID, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
 import { deriveLaunchSeriesParams } from "./launch-params.ts";
 import { expiryCodes, type ExpiryCode } from "./expiries.ts";
@@ -67,6 +93,10 @@ export async function resolveVsolSeries(symbol: string, code: ExpiryCode, nowMs:
       maxConfidenceBps: params.maxConfidenceBps,
       symbol: symbolBytes(params.symbol),
       maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+      // TODO(v2-strike-ladder): placeholder, not a real strike -- see the
+      // module-level TODO above. The resulting marketKey/oracleKey below are
+      // only ever correct by coincidence.
+      strike: PLACEHOLDER_STRIKE_DO_NOT_TRUST,
     });
     const marketKey = deriveMarket(VSOL_CONFIG, marketId, VSOL_PROGRAM_ID);
     const oracleKey = deriveOracle(marketKey, VSOL_PROGRAM_ID);

@@ -41,6 +41,7 @@ import {
 import { runtimeEnv } from "./runtime-env.ts";
 import { markets } from "./markets.ts";
 import {
+  PLACEHOLDER_STRIKE_DO_NOT_TRUST,
   resolveAvailableVsolSeries,
   resolveVsolSeries,
   resolveVsolSeriesCatalog,
@@ -344,8 +345,13 @@ export function decodeConfigAccount(data: Buffer) {
   };
 }
 
+// 289 bytes: 281 (pre-strike-ladder layout) + 8 for the appended
+// conditional-token `strike: u64` (see the Market struct in
+// vsol/programs/vsol/src/lib.rs). Not yet decoded below -- nothing in the
+// app reads it today -- but the exact-size check must track the real
+// on-chain layout or every market account fails to decode outright.
 export function decodeMarketAccount(data: Buffer) {
-  expectAccount(data, 281, MARKET_ACCOUNT_DISCRIMINATOR, "VSOL market");
+  expectAccount(data, 289, MARKET_ACCOUNT_DISCRIMINATOR, "VSOL market");
   return {
     config: publicKeyAt(data, 9),
     marketId: data.subarray(41, 73),
@@ -777,6 +783,20 @@ type CreateMarketSeriesParams = {
   observationWindowSeconds: number;
   settlementGraceSeconds: number;
   maxSettlementStalenessSeconds: number;
+  // TODO(v2-strike-ladder): optional and defaulted -- NOT because omitting
+  // it is fine (create_market requires strike > 0 onchain) -- but because
+  // every caller of buildCreateMarketInstruction (buildCreateMarketTransaction
+  // in vsol-launch.ts, the mint-on-demand path below, and the
+  // signed-transaction inspector below) sits downstream of the same
+  // known-broken subsystem as app/lib/series-resolver.ts's `resolveVsolSeries`
+  // (see its module-level TODO): there is no chain-agnostic formula for a
+  // listed ladder strike, and none of today's callers have a real one to
+  // supply. The default (PLACEHOLDER_STRIKE_DO_NOT_TRUST) makes this compile
+  // and keeps the Borsh-encoded instruction data the correct LENGTH/SHAPE,
+  // but the VALUE is not trustworthy -- this whole path needs the same
+  // chain-discovery follow-up series-resolver.ts does before Launch-a-series
+  // is safe to use again.
+  strike?: bigint;
 };
 
 /**
@@ -801,6 +821,9 @@ export async function buildCreateMarketInstruction(params: {
   expected?: { market: PublicKey; oracle: PublicKey };
 }) {
   const symbol = symbolBytes(params.series.symbol);
+  // See CreateMarketSeriesParams.strike's TODO above -- a placeholder when
+  // absent, not a real listed ladder rung.
+  const strike = params.series.strike ?? PLACEHOLDER_STRIKE_DO_NOT_TRUST;
   const marketId = await deriveMarketId({
     pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,
@@ -811,6 +834,7 @@ export async function buildCreateMarketInstruction(params: {
     maxConfidenceBps: LAUNCH_MAX_CONFIDENCE_BPS,
     symbol,
     maxSettlementStalenessSeconds: params.series.maxSettlementStalenessSeconds,
+    strike,
   });
   const market = PublicKey.findProgramAddressSync([MARKET_SEED, VSOL_CONFIG.toBuffer(), marketId], VSOL_PROGRAM_ID)[0];
   const oracle = PublicKey.findProgramAddressSync([ORACLE_SEED, market.toBuffer()], VSOL_PROGRAM_ID)[0];
@@ -827,10 +851,13 @@ export async function buildCreateMarketInstruction(params: {
     encodeU32(params.series.settlementGraceSeconds),
     encodeU16(LAUNCH_MAX_CONFIDENCE_BPS),
     Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
-    // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
-    // vsol/programs/vsol/src/lib.rs, where this field was appended after
-    // `pyth_feed_id` to keep the on-chain layout backward compatible.
     encodeU32(params.series.maxSettlementStalenessSeconds),
+    // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
+    // vsol/programs/vsol/src/lib.rs, where `strike` was appended after
+    // `max_settlement_staleness_seconds`. See CreateMarketSeriesParams.strike's
+    // TODO above -- the VALUE encoded here is not trustworthy, only the
+    // length/shape is correct.
+    encodeU64(strike),
   ]);
   const instruction = instructionFromIdl(idlInstruction("create_market"), {
     creator: params.creator,

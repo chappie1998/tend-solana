@@ -194,6 +194,12 @@ test("launch series parameters stay on the 24/7 UTC grid and bind the determinis
     maxConfidenceBps: params.maxConfidenceBps,
     symbol: sdk.symbolBytes(params.symbol),
     maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+    // The conditional-token winner threshold -- a listed ladder rung (see
+    // STRIKE_LADDER_STEP/ladderStrike in vsol/sdk/index.ts), part of
+    // expected_market_id's hash. An arbitrary fixed value is fine here: this
+    // block only tests that deriveMarketId is deterministic and binds every
+    // parameter, not any particular strike-selection policy.
+    strike: 100n * sdk.PRICE_SCALE,
   };
   assert.equal(params.maxSettlementStalenessSeconds, launch.LAUNCH_MAX_SETTLEMENT_STALENESS_SECONDS);
   const id = await sdk.deriveMarketId(base);
@@ -206,6 +212,8 @@ test("launch series parameters stay on the 24/7 UTC grid and bind the determinis
     maxSettlementStalenessSeconds: base.maxSettlementStalenessSeconds + 60,
   });
   assert.notDeepEqual(differentStaleness, id);
+  const differentStrike = await sdk.deriveMarketId({ ...base, strike: base.strike + sdk.PRICE_SCALE });
+  assert.notDeepEqual(differentStrike, id);
 
   // Tend is 24/7: a weekend/overnight timestamp still derives a valid intraday
   // series — no session, holiday, or weekend gating.

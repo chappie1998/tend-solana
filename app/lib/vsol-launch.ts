@@ -32,7 +32,10 @@ import type { ExpiryCode } from "./expiries";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
 
-const CREATE_MARKET_DATA_LENGTH = 8 + 32 + 32 + 16 + 8 + 8 + 4 + 4 + 2 + 32 + 4;
+// +8 for the appended conditional-token `strike: u64` (see CreateMarketArgs
+// in vsol/programs/vsol/src/lib.rs and buildCreateMarketInstruction's
+// encoder in vsol-server.ts, which now always encodes it as the last field).
+const CREATE_MARKET_DATA_LENGTH = 8 + 32 + 32 + 16 + 8 + 8 + 4 + 4 + 2 + 32 + 4 + 8;
 const CREATE_POOL_DATA_LENGTH = 8 + 32 + 32 + 2 + 2;
 const AUTHORIZE_MARKET_DATA_LENGTH = 8 + 8 + 1;
 

@@ -196,19 +196,21 @@ test("MEASURED FINDING: the composed mint-on-demand transaction (create_market +
   // Every field in every one of these four instructions is fixed-width (no
   // variable-length strings or vectors), so this size is deterministic --
   // identical for every symbol, expiry code, and order size. This is a real,
-  // structural ~237-byte overage, not a rounding/edge-case artifact: the
-  // 283-byte real pool-quote message (see app/lib/vsol-server.ts's private
-  // poolQuoteMessage, mirrored in vsol/sdk's poolQuoteMessage) costs 395
-  // bytes once wrapped in the Ed25519 native-program instruction format, and
-  // the extra create_market (150 data + 7 accounts) + set_liquidity_pool_market
-  // (17 data + 6 accounts) instructions add roughly 315 more bytes on top of
-  // an already-large plain fill (~1154 bytes with the real message).
+  // structural overage, not a rounding/edge-case artifact: the 283-byte real
+  // pool-quote message (see app/lib/vsol-server.ts's private poolQuoteMessage,
+  // mirrored in vsol/sdk's poolQuoteMessage) costs 395 bytes once wrapped in
+  // the Ed25519 native-program instruction format, and the extra
+  // create_market (158 data + 7 accounts -- 150 plus the conditional-token
+  // `strike: u64` appended to CreateMarketArgs, see
+  // vsol/programs/vsol/src/lib.rs) + set_liquidity_pool_market (17 data + 6
+  // accounts) instructions add the rest on top of an already-large plain
+  // fill (~1154 bytes with the real message).
   assert.equal(signatureInstruction.data.length, 395, "the real Ed25519 instruction wrapping the 283-byte pool-quote message is a fixed 395 bytes");
   assert.ok(
     size > 1232,
     `composed mint-on-demand transaction is only ${size} bytes -- expected it to exceed 1232 given fixed-width encoding; if this ever shrinks below the limit, buildVsolQuoteTransaction's size guard (and this comment) should be revisited`,
   );
-  assert.equal(size, 1469, `composed mint-on-demand transaction size drifted to ${size} bytes (previously measured 1469) -- re-verify whether it now fits and update the fail-closed guard/report accordingly`);
+  assert.equal(size, 1477, `composed mint-on-demand transaction size drifted to ${size} bytes (previously measured 1477, after the conditional-token strike field added 8 bytes to create_market's data) -- re-verify whether it now fits and update the fail-closed guard/report accordingly`);
 
   // buildVsolQuoteTransaction's own guard (MAX_TRANSACTION_BYTES = 1232, see
   // app/lib/vsol-server.ts) must reject exactly this size rather than sign

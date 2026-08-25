@@ -103,6 +103,14 @@ test("resolveVsolSeries parity: the derived market matches an independent derive
       maxConfidenceBps: params.maxConfidenceBps,
       symbol: sdk.symbolBytes(params.symbol),
       maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+      // TODO(v2-strike-ladder): resolveVsolSeries has no real listed strike
+      // to give either -- see series-resolver.ts's module-level TODO. This
+      // must use the exact same known-not-trustworthy placeholder the
+      // resolver itself defaults to (PLACEHOLDER_STRIKE_DO_NOT_TRUST) so
+      // this parity check still means what it says: "the resolver's
+      // internal derivation matches an independent one," not "the
+      // placeholder happens to cancel out."
+      strike: resolver.PLACEHOLDER_STRIKE_DO_NOT_TRUST,
     });
     const expectedMarket = sdk.deriveMarket(vsol.VSOL_CONFIG, expectedMarketId, vsol.VSOL_PROGRAM_ID);
     const expectedOracle = sdk.deriveOracle(expectedMarket, vsol.VSOL_PROGRAM_ID);

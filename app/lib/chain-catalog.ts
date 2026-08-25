@@ -13,8 +13,22 @@ import {
 import { markets } from "./markets";
 import { resolveAvailableVsolSeries } from "./series-resolver";
 
-const MARKET_ACCOUNT_SIZE = 281;
-const POOL_ACCOUNT_SIZE = 214;
+// 289 bytes: 281 (pre-strike-ladder layout) + 8 for the appended
+// conditional-token `strike: u64` (see the Market struct in
+// vsol/programs/vsol/src/lib.rs). Accounts of any other size predate the
+// upgrade and no longer deserialize.
+const MARKET_ACCOUNT_SIZE = 289;
+// 266 bytes, NOT the 214 this constant held until 2026-08-25. `LiquidityPool`
+// grew when `manager`, the four `pending_*` timelock fields, and `total_assets`
+// were appended (see the struct in vsol/programs/vsol/src/lib.rs), and
+// decodePoolAccount in ./vsol-server.ts has always enforced 266. The stale 214
+// here filtered getProgramAccounts down to ONLY the abandoned pre-timelock
+// pools, every one of which then threw inside decodePoolAccount's exact-size
+// check and was swallowed by the catch below -- so this catalog reported zero
+// pools no matter how many were live. Keep this in lockstep with
+// decodePoolAccount: a filter size and a decoder size that disagree fail
+// silently, which is exactly how this went unnoticed.
+const POOL_ACCOUNT_SIZE = 266;
 const POOL_MARKET_ACCOUNT_SIZE = 82;
 
 export type DiscoveredMarket = {
