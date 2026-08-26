@@ -34,8 +34,14 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(chartData, /AbortController/);
   assert.doesNotMatch(chartRoute, /PYTH_API_KEY|Authorization|Bearer/);
   assert.match(markets, /deployment\.underlyingMint/);
-  assert.match(markets, /b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593/);
-  assert.match(markets, /Equity\.US\.NVDA\/USD/);
+  // Crypto.NVDAX/USD, the 24/7 tokenized-NVDA feed -- NOT Equity.US.NVDA/USD,
+  // whose Pyth schedule is 0930-1600 weekdays with holiday closures and which
+  // left ~80% of a 24/7 expiry grid settling on an already-known price.
+  assert.match(markets, /4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f/);
+  assert.match(markets, /Crypto\.NVDAX\/USD/);
+  // Settlement and display must stay on the SAME feed: showing one price and
+  // settling on another is the failure this pins against.
+  assert.doesNotMatch(markets, /Equity\.US\.NVDA\/USD/);
   assert.match(layout, /Solana devnet/);
 });
 

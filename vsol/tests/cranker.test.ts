@@ -273,7 +273,7 @@ test("selectViableSettlementTier: past the final settlement deadline -> neither 
 // exists" is not the same thing as "the latest print the chain will accept"
 // -- Pyth blows its confidence band open on the FINAL print before a feed
 // goes quiet. Measured live against feed
-// b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593 (NVDA,
+// b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593 (the RETIRED equity feed) (NVDA,
 // max_confidence_bps 500 on this deployment):
 //   20:00:19Z (closing print, market close): price 20844000, conf 1849000 -> conf_bps 887 (REJECTED)
 //   19:45:00Z (mid-session, ~15 min earlier): price 20862500, conf 10929   -> conf_bps 5   (passes)

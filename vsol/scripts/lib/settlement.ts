@@ -899,7 +899,7 @@ export type PythSettlementFetchResult =
 // error 6039 (`OracleConfidenceTooWide`) because the print tier 2 selected --
 // Hermes' latest print at/before expiry -- was the feed's FINAL print at
 // market close, where Pyth blows its own confidence band open. Measured live
-// against feed b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593:
+// against feed b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593 (the RETIRED equity feed):
 // the 20:00:19Z closing print carries conf_bps 887 against a 500 bps market
 // bound, while the 19:45:00Z print ~15 minutes earlier carries conf_bps 5. For
 // any market expiring while the feed is dark (equities trade roughly 19% of

@@ -103,7 +103,10 @@ const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
 const walletPath = process.env.SOLANA_WALLET?.replace(/^~/, homedir()) ?? resolve(homedir(), ".config/solana/id.json");
-const pythFeedId = "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593";
+// Crypto.NVDAX/USD (tokenized NVDA), not the equity feed -- see the long
+// note on PYTH_FEED_ID in scripts/keeper.ts for why the equity feed cannot
+// settle a 24/7 grid.
+const pythFeedId = "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f";
 const smokePythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const pythFeedBytes = [...Buffer.from(pythFeedId, "hex")];
 const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
@@ -942,7 +945,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:tUSDC:main-v5`,
+    label: `${cluster}:tUSDC:main-v6`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 2_500,
   });
@@ -1108,7 +1111,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:smoke-v5:${runId}`,
+    label: `${cluster}:smoke-v6:${runId}`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 5_000,
   });

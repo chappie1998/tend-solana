@@ -70,7 +70,17 @@ const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
 // on the deterministic factory inputs, which is why both scripts import the
 // shared policy constants from ../sdk/index.ts rather than each hardcoding
 // their own copies.
-const PYTH_FEED_ID = "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593";
+// Crypto.NVDAX/USD -- tokenized NVDA (xStocks), NOT Equity.US.NVDA/USD.
+// Pyth's own feed metadata declares the equity feed "0930-1600" Mon-Fri, C
+// on weekends, plus seven holiday closures: 32.5h of a 168h week, 19.3%.
+// Tend mints expiries on a 24/7 UTC grid, so ~80% of markets expired while
+// that feed was dark and settled on a price already fixed and public before
+// expiry. A real market proved this is not merely theoretical: expiry 04:45Z
+// settled on a stale pre-close print at $209.46 (DOWN won) while this feed
+// had a live print AT expiry of $210.32 -- above the $210 strike, so UP
+// should have won. This feed's schedule is "O,O,O,O,O,O,O": open all seven
+// days, no holiday closures.
+const PYTH_FEED_ID = "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f";
 const PYTH_FEED_BYTES = [...Buffer.from(PYTH_FEED_ID, "hex")];
 const MARKET_SYMBOL = "NVDA";
 // USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS,
@@ -103,7 +113,14 @@ const MARKET_SYMBOL = "NVDA";
 // stale epoch even though its own account is fine, so bootstrap mints a
 // fresh v5 pool alongside the fresh v5 markets rather than re-authorizing a
 // v4 pool against addresses that no longer mean anything post-upgrade.
-const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v5`;
+//
+// Bumped v5 -> v6 on 2026-08-26 when the NVDA market moved from
+// Equity.US.NVDA/USD to the 24/7 Crypto.NVDAX/USD feed. The feed id is
+// hashed into every market id, so every rung lands at a new address and a
+// v5 pool's `authorizedMarkets` list points entirely at a retired epoch --
+// the same reasoning as the v4 -> v5 bump above, which was forced by the
+// Market layout change rather than a feed change.
+const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v6`;
 
 /**
  * Mirrors `MIN_MARKET_LEAD_SECONDS` in vsol/programs/vsol/src/lib.rs exactly
