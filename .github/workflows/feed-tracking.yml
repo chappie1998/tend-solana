@@ -1,0 +1,130 @@
+name: NVDA feed tracking
+
+# Samples every NVDA-related Pyth feed on a schedule so the decision to move
+# Tend's NVDA market off `Equity.US.NVDA/USD` (which goes dark outside US
+# equity hours) onto the tokenized `Crypto.NVDAX/USD` rests on days of
+# evidence rather than one spot check. See vsol/scripts/feed-tracking-sample.ts
+# for what is measured and why, and `npm --prefix vsol run feed:report` for
+# the analysis.
+#
+# Hermes retains only ~31 hours of history, so this CANNOT be backfilled --
+# the data has to be collected forward, and it needs to span a weekend to
+# answer the open question about weekend coverage.
+#
+# DATA LIVES ON ITS OWN BRANCH. Every run appends one line and commits, which
+# would be hundreds of commits on a working branch. Writing to the orphan
+# branch `feed-tracking-data` keeps `sol` clean while leaving the data
+# durable and reviewable. This is the only workflow in the repo with
+# `contents: write`, and it only ever touches that one branch.
+#
+# To collect locally instead (no CI, no write permission), run
+# `npm --prefix vsol run feed:sample` on a timer -- but note that a sleeping
+# laptop silently stops sampling, which is exactly the gap this workflow
+# closes.
+
+on:
+  schedule:
+    # Every 30 minutes: ~48 runs/day. GitHub bills each run rounded UP to a
+    # full minute, and this repo is private, so cadence is a real cost --
+    # */15 would be ~2,900 min/month on top of the keeper and cranker, which
+    # already run every 10 minutes. 30-minute resolution fully answers the
+    # question at hand ("is the feed dark for HOURS at a time"); it is not
+    # trying to catch a sub-minute outage.
+    #
+    # Cheaper alternative, if Actions minutes are tight: delete this schedule
+    # and run `npm --prefix vsol run feed:sample` locally on a timer. A gap
+    # from a sleeping laptop does NOT corrupt the result -- staleness is
+    # measured at sample time, so a missed sample is simply absent from the
+    # report rather than being counted as a dark feed.
+    - cron: "0,30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: feed-tracking
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # The sampler uses nothing but global fetch and node:fs -- no Solana or
+      # Anchor dependency -- so installing the full vsol tree for one HTTP
+      # call would be pure waste. tsx alone is enough to run the .ts file.
+      - name: Install tsx
+        run: npm install --no-save --no-audit --no-fund tsx@4.20.6
+
+      # Run from the repo root so the bare `tsx` specifier resolves against
+      # the root node_modules installed above. The sampler writes relative to
+      # its own module path, so its output location does not depend on cwd.
+      - name: Sample the feeds
+        run: node --import tsx vsol/scripts/feed-tracking-sample.ts
+
+      - name: Append to the data branch
+        env:
+          DATA_BRANCH: feed-tracking-data
+        run: |
+          set -euo pipefail
+
+          SAMPLE_FILE=vsol/.feed-tracking/samples.jsonl
+          if [ ! -s "$SAMPLE_FILE" ]; then
+            echo "The sampler produced no output." >&2
+            exit 1
+          fi
+          # Stash the new line outside the working tree before switching
+          # branches, so a checkout cannot clobber it.
+          cp "$SAMPLE_FILE" "$RUNNER_TEMP/new-sample.jsonl"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Land on the data branch whether or not it already exists. An
+          # orphan branch keeps the data history completely separate from the
+          # code history rather than forking off whatever commit ran first.
+          if git ls-remote --exit-code --heads origin "$DATA_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$DATA_BRANCH" --depth=1
+            git checkout -B "$DATA_BRANCH" "origin/$DATA_BRANCH"
+          else
+            echo "Creating $DATA_BRANCH (first run)."
+            git checkout --orphan "$DATA_BRANCH"
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            rm -rf data
+          fi
+
+          mkdir -p data
+          cat "$RUNNER_TEMP/new-sample.jsonl" >> data/samples.jsonl
+
+          # The orphan branch carries the data and a pointer back to what
+          # produced it, nothing else.
+          cat > README.md <<'DOC'
+          # NVDA feed tracking data
+
+          Append-only samples from `.github/workflows/feed-tracking.yml`, one
+          JSON object per line in `data/samples.jsonl`.
+
+          This branch deliberately holds no code. It exists so hundreds of
+          scheduled sample commits do not land on a working branch.
+
+          To analyse: copy `data/samples.jsonl` to
+          `vsol/.feed-tracking/samples.jsonl` and run
+          `npm --prefix vsol run feed:report`.
+          DOC
+
+          git add data/samples.jsonl README.md
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+            exit 0
+          fi
+          git commit -m "chore(feed-tracking): sample $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin "HEAD:$DATA_BRANCH"

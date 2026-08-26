@@ -8,3 +8,6 @@
 !/target/types/vsol.ts
 !/target/deploy/.gitkeep
 *.log
+
+# Forward-sampled Pyth feed observations (feed-tracking-sample.ts).
+/.feed-tracking/

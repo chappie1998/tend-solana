@@ -19,7 +19,9 @@
     "lookup-table": "node --env-file-if-exists=.env --import tsx scripts/create-lookup-table.ts",
     "test:rust:only": "cargo test --workspace --all-targets",
     "prove:complete-set": "node --env-file-if-exists=.env --import tsx scripts/prove-complete-set.ts",
-    "prove:redeem": "node --env-file-if-exists=.env --import tsx scripts/prove-redeem-winning.ts"
+    "prove:redeem": "node --env-file-if-exists=.env --import tsx scripts/prove-redeem-winning.ts",
+    "feed:sample": "node --env-file-if-exists=.env --import tsx scripts/feed-tracking-sample.ts",
+    "feed:report": "node --env-file-if-exists=.env --import tsx scripts/feed-tracking-report.ts"
   },
   "dependencies": {
     "@anchor-lang/core": "1.0.2",
