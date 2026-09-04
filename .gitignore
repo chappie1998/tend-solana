@@ -50,3 +50,4 @@ next-env.d.ts
 # Local worker secrets (wrangler). Never commit.
 .dev.vars
 .dev.vars.*
+.neon

@@ -1,7 +1,16 @@
 import { sql } from "drizzle-orm";
-import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  boolean,
+  doublePrecision,
+  index,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
 
-export const positions = sqliteTable(
+export const positions = pgTable(
   "positions",
   {
     id: text("id").primaryKey(),
@@ -13,13 +22,13 @@ export const positions = sqliteTable(
     maker: text("maker").notNull(),
     symbol: text("symbol").notNull(),
     direction: text("direction", { enum: ["up", "down"] }).notNull(),
-    amount: real("amount").notNull(),
-    premium: real("premium").notNull(),
-    strike: real("strike").notNull(),
-    capPrice: real("cap_price").notNull(),
+    amount: doublePrecision("amount").notNull(),
+    premium: doublePrecision("premium").notNull(),
+    strike: doublePrecision("strike").notNull(),
+    capPrice: doublePrecision("cap_price").notNull(),
     expiryDays: integer("expiry_days").notNull(),
     expiryCode: text("expiry_code").notNull().default("7D"),
-    optionExpiryAt: integer("option_expiry_at", { mode: "timestamp_ms" }).notNull().default(sql`0`),
+    optionExpiryAt: timestamp("option_expiry_at", { mode: "date", withTimezone: true }).notNull().default(sql`to_timestamp(0)`),
     observationWindowSeconds: integer("observation_window_seconds").notNull().default(900),
     tradeLockSeconds: integer("trade_lock_seconds").notNull().default(300),
     status: text("status", { enum: ["preview_confirmed", "settled"] }).notNull(),
@@ -29,7 +38,7 @@ export const positions = sqliteTable(
     simulationSlot: integer("simulation_slot"),
     simulationUnitsConsumed: integer("simulation_units_consumed"),
     simulationLogsHash: text("simulation_logs_hash"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
   },
   (table) => [
     index("positions_user_created_idx").on(table.userEmail, table.createdAt),
@@ -38,7 +47,7 @@ export const positions = sqliteTable(
   ],
 );
 
-export const transactionSimulations = sqliteTable(
+export const transactionSimulations = pgTable(
   "transaction_simulations",
   {
     id: text("id").primaryKey(),
@@ -56,8 +65,8 @@ export const transactionSimulations = sqliteTable(
     transactionSignature: text("transaction_signature"),
     submissionStatus: text("submission_status", { enum: ["not_sent", "confirmed", "failed"] }).notNull(),
     submissionError: text("submission_error"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
+    confirmedAt: timestamp("confirmed_at", { mode: "date", withTimezone: true }),
   },
   (table) => [
     index("transaction_simulations_user_created_idx").on(table.userEmail, table.createdAt),
@@ -66,7 +75,7 @@ export const transactionSimulations = sqliteTable(
   ],
 );
 
-export const rfqQuotes = sqliteTable(
+export const rfqQuotes = pgTable(
   "rfq_quotes",
   {
     id: text("id").primaryKey(),
@@ -76,42 +85,42 @@ export const rfqQuotes = sqliteTable(
     maker: text("maker").notNull(),
     symbol: text("symbol").notNull(),
     direction: text("direction", { enum: ["up", "down"] }).notNull(),
-    amount: real("amount").notNull(),
-    premium: real("premium").notNull(),
-    maxPayout: real("max_payout").notNull(),
-    strike: real("strike").notNull(),
-    capPrice: real("cap_price").notNull(),
-    breakeven: real("breakeven").notNull(),
-    pricingVolatility: real("implied_volatility").notNull(),
+    amount: doublePrecision("amount").notNull(),
+    premium: doublePrecision("premium").notNull(),
+    maxPayout: doublePrecision("max_payout").notNull(),
+    strike: doublePrecision("strike").notNull(),
+    capPrice: doublePrecision("cap_price").notNull(),
+    breakeven: doublePrecision("breakeven").notNull(),
+    pricingVolatility: doublePrecision("implied_volatility").notNull(),
     volatilitySource: text("volatility_source").notNull().default("legacy"),
-    effectiveLeverage: real("effective_leverage").notNull(),
+    effectiveLeverage: doublePrecision("effective_leverage").notNull(),
     latencyMs: integer("latency_ms").notNull(),
     badge: text("badge").notNull(),
     expiryDays: integer("expiry_days").notNull(),
     expiryCode: text("expiry_code").notNull().default("7D"),
-    optionExpiryAt: integer("option_expiry_at", { mode: "timestamp_ms" }).notNull().default(sql`0`),
+    optionExpiryAt: timestamp("option_expiry_at", { mode: "date", withTimezone: true }).notNull().default(sql`to_timestamp(0)`),
     observationWindowSeconds: integer("observation_window_seconds").notNull().default(900),
     tradeLockSeconds: integer("trade_lock_seconds").notNull().default(300),
     payoff: integer("payoff").notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    consumedAt: integer("consumed_at", { mode: "timestamp_ms" }),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    expiresAt: timestamp("expires_at", { mode: "date", withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { mode: "date", withTimezone: true }),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
   },
   (table) => [index("rfq_quotes_expiry_idx").on(table.expiresAt)],
 );
 
-export const authNonces = sqliteTable(
+export const authNonces = pgTable(
   "auth_nonces",
   {
     nonce: text("nonce").primaryKey(),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    usedAt: integer("used_at", { mode: "timestamp_ms" }),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { mode: "date", withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { mode: "date", withTimezone: true }),
   },
   (table) => [index("auth_nonces_expires_idx").on(table.expiresAt)],
 );
 
-export const launchActions = sqliteTable(
+export const launchActions = pgTable(
   "launch_actions",
   {
     id: text("id").primaryKey(),
@@ -132,9 +141,9 @@ export const launchActions = sqliteTable(
     transactionSignature: text("transaction_signature"),
     submissionStatus: text("submission_status", { enum: ["prepared", "confirmed", "failed"] }).notNull(),
     submissionError: text("submission_error"),
-    postStateVerified: integer("post_state_verified", { mode: "boolean" }),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+    postStateVerified: boolean("post_state_verified"),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
+    confirmedAt: timestamp("confirmed_at", { mode: "date", withTimezone: true }),
   },
   (table) => [
     index("launch_actions_user_created_idx").on(table.userKey, table.createdAt),
@@ -145,7 +154,7 @@ export const launchActions = sqliteTable(
   ],
 );
 
-export const closeActions = sqliteTable(
+export const closeActions = pgTable(
   "close_actions",
   {
     id: text("id").primaryKey(),
@@ -158,7 +167,7 @@ export const closeActions = sqliteTable(
     buybackAmountAtoms: text("buyback_amount_atoms").notNull(),
     minProceedsAtoms: text("min_proceeds_atoms").notNull(),
     fairValueAtoms: text("fair_value_atoms").notNull(),
-    spreadBps: real("spread_bps").notNull(),
+    spreadBps: doublePrecision("spread_bps").notNull(),
     quoteExpiry: integer("quote_expiry").notNull(),
     transactionMessageHash: text("transaction_message_hash").notNull(),
     transactionHash: text("transaction_hash"),
@@ -173,9 +182,9 @@ export const closeActions = sqliteTable(
     submissionError: text("submission_error"),
     preBuyerAtoms: text("pre_buyer_atoms").notNull(),
     postBuyerAtoms: text("post_buyer_atoms"),
-    postStateVerified: integer("post_state_verified", { mode: "boolean" }),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+    postStateVerified: boolean("post_state_verified"),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
+    confirmedAt: timestamp("confirmed_at", { mode: "date", withTimezone: true }),
   },
   (table) => [
     index("close_actions_wallet_created_idx").on(table.walletAddress, table.createdAt),
@@ -186,7 +195,7 @@ export const closeActions = sqliteTable(
   ],
 );
 
-export const liquidityActions = sqliteTable(
+export const liquidityActions = pgTable(
   "liquidity_actions",
   {
     id: text("id").primaryKey(),
@@ -216,8 +225,8 @@ export const liquidityActions = sqliteTable(
     postWalletAtoms: text("post_wallet_atoms"),
     postPoolAtoms: text("post_pool_atoms"),
     postSharesAtoms: text("post_shares_atoms"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),
+    confirmedAt: timestamp("confirmed_at", { mode: "date", withTimezone: true }),
   },
   (table) => [
     index("liquidity_actions_user_created_idx").on(table.userEmail, table.createdAt),

@@ -6,9 +6,9 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
-    "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
-    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
     "test": "node --env-file-if-exists=vsol/.env --test --test-concurrency=1 tests/*.test.mjs",
     "test:vsol": "npm --prefix vsol run check",
     "test:web-smoke": "node --import tsx vsol/scripts/web-execution-smoke.ts",
@@ -16,9 +16,13 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:vsol",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "node --env-file-if-exists=.env.local node_modules/drizzle-kit/bin.cjs generate",
+    "db:migrate": "node --env-file-if-exists=.env.local node_modules/drizzle-kit/bin.cjs migrate"
   },
   "dependencies": {
+    "@neon/config": "^1.3.0",
+    "@neon/env": "^1.2.1",
+    "@neondatabase/serverless": "^1.1.0",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.98.4",
     "buffer": "6.0.3",
@@ -31,23 +35,15 @@
     "tweetnacl": "1.0.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
-    "@cloudflare/workers-types": "^4.20260702.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",
-    "typescript": "5.9.3",
-    "vinext": "0.0.50",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "typescript": "5.9.3"
   },
   "overrides": {
     "bn.js": "5.2.5",
