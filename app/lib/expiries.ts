@@ -2,6 +2,16 @@
 // no market calendar, no session, and no holiday — the only real constraint is
 // whether a fresh Pyth print exists for a symbol (see `intradayEligible`),
 // which is a feed-availability fact, not an hours-of-operation rule.
+//
+// Both feed-availability facts come from the market config in ./markets.ts,
+// never from a symbol comparison in here. A hardcoded `symbol === "NVDA"`
+// used to stand in for `intradayEligible`, which silently made every
+// intraday code unavailable for any other symbol the moment a second market
+// was listed — the catalog would look broken with nothing to point at.
+
+// The explicit .ts extension keeps this module importable by the node:test
+// suite (type stripping) as well as the bundler, matching ./launch-params.ts.
+import { marketBySymbol } from "./markets.ts";
 
 export type ExpiryCode = "15M" | "1H" | "EOD" | "7D" | "30D";
 
@@ -112,7 +122,16 @@ function computeExpiryGrid(now: number): ExpiryGrid {
 }
 
 export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()): ExpiryDefinition {
-  const intradayEligible = symbol === "NVDA";
+  // Driven entirely by the market config: an unknown symbol is neither
+  // tradable nor intraday-eligible, and a configured-but-not-live market
+  // (see `MarketStatus` in ./markets.ts) is unavailable at EVERY code, which
+  // is the single chokepoint that keeps a coming-soon symbol out of the
+  // launch, series-resolution and quote paths -- deriveLaunchSeriesParams
+  // throws on an unavailable definition, and everything downstream of it
+  // funnels through that.
+  const market = marketBySymbol(symbol);
+  const tradable = market?.status === "live";
+  const intradayEligible = tradable && market.intradayEligible;
   const grid = computeExpiryGrid(now);
   const expiryAt = grid[code];
   let expiryDays = 0;
@@ -136,9 +155,15 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
   }
 
   const durationMinutes = Math.max(1, Math.ceil((expiryAt - now) / MINUTE));
-  const available = (!INTRADAY_CODES.has(code) || intradayEligible) && expiryAt - now > tradeLockSeconds * 1_000;
+  const available = tradable
+    && (!INTRADAY_CODES.has(code) || intradayEligible)
+    && expiryAt - now > tradeLockSeconds * 1_000;
   let availabilityReason = "A matching deployed onchain series is required.";
-  if (INTRADAY_CODES.has(code) && !intradayEligible) {
+  if (!tradable) {
+    // The market's own configured explanation, so the sentence a user reads
+    // on a disabled chip is the same one the server enforces.
+    availabilityReason = market?.statusNote || "This symbol is not a configured Tend market.";
+  } else if (INTRADAY_CODES.has(code) && !intradayEligible) {
     availabilityReason = "This symbol has no verified intraday Pyth feed.";
   } else if (!available) {
     availabilityReason = "This series is too close to its trade cutoff. A new series must roll first.";

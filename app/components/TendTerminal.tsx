@@ -79,13 +79,20 @@ type CatalogPoolState = {
   authorizedMarkets: string[];
 };
 
+// Every configured market is SHOWN; only the live ones can be selected.
+// `tradable` is read off the market config's `status` field (see
+// `MarketStatus` in app/lib/markets.ts) -- never a symbol comparison here --
+// so a market moving between live and coming-soon is a one-line config edit.
 const assets = markets.map((market) => ({
   ticker: market.symbol,
   name: market.name,
   token: market.tokenAddress,
   oracleStatus: market.oracleStatus,
   intradayEligible: market.intradayEligible,
+  tradable: market.status === "live",
+  statusNote: market.statusNote,
 }));
+const tradableAssets = assets.filter((asset) => asset.tradable);
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
   { id: "market", label: "Trade", icon: Activity },
@@ -267,7 +274,7 @@ function TradeView({
   onConnect: () => void | Promise<void>;
   onPositionSaved: (position: SavedPosition) => void;
 }) {
-  const [assetTicker, setAssetTicker] = useState("NVDA");
+  const [assetTicker, setAssetTicker] = useState(() => tradableAssets[0]?.ticker ?? "");
   const [direction, setDirection] = useState<Direction>("up");
   const [expiry, setExpiry] = useState<ExpiryCode>("30D");
   const [payoff, setPayoff] = useState(5);
@@ -288,7 +295,9 @@ function TradeView({
   const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const asset = assets.find((item) => item.ticker === assetTicker) ?? assets[0];
+  // Only ever a tradable asset: the coming-soon chips are disabled, so
+  // `assetTicker` can never hold one, and the fallback stays on the live set.
+  const asset = tradableAssets.find((item) => item.ticker === assetTicker) ?? tradableAssets[0] ?? assets[0];
   const notional = Number(amount) || 0;
   const expiryOptions = expiryCodes.map((code) => {
     const definition = resolveExpiry(code, asset.ticker, now);
@@ -517,8 +526,8 @@ function TradeView({
 
         <div className="asset-strip" role="group" aria-label="Available markets">
           {assets.map((item) => (
-            <button key={item.ticker} type="button" onClick={() => { setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-              <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : "Pyth pending"}</small></span><em className={item.ticker === asset.ticker && marketSnapshot?.mode === "live" ? "positive" : ""}>{item.ticker === asset.ticker ? marketSnapshot?.mode ?? "—" : "—"}</em>
+            <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
+              <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : "Pyth pending"}</small></span><em className={item.ticker === asset.ticker && item.tradable && marketSnapshot?.mode === "live" ? "positive" : ""}>{!item.tradable ? "—" : item.ticker === asset.ticker ? marketSnapshot?.mode ?? "—" : "—"}</em>
             </button>
           ))}
         </div>

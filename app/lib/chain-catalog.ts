@@ -10,7 +10,7 @@ import {
   decodePoolMarketAccount,
   getVsolConnection,
 } from "./vsol-server";
-import { markets } from "./markets";
+import { liveMarkets } from "./markets";
 import { resolveAvailableVsolSeries } from "./series-resolver";
 
 // 289 bytes: 281 (pre-strike-ladder layout) + 8 for the appended
@@ -113,7 +113,9 @@ export async function getVsolChainCatalog(connection: Connection = getVsolConnec
   // rather than read from a checked-in manifest. These are the series that
   // ship separately (via getVsolSeriesStates) with full onchain verification,
   // so they are excluded below rather than double-listed as "discovered".
-  const currentSeries = await resolveAvailableVsolSeries(markets.map((market) => market.symbol));
+  // liveMarkets only: a coming-soon market has no minted series to discover
+  // (nothing mints it) and no feed to price it with.
+  const currentSeries = await resolveAvailableVsolSeries(liveMarkets.map((market) => market.symbol));
   const rollingGridMarkets = new Set(currentSeries.map((series) => series.marketKey.toBase58()));
   const tendAuthorized = new Set(manifestPool ? authorizations.get(manifestPool) ?? [] : []);
   const discovered: DiscoveredMarket[] = [];

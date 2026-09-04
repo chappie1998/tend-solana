@@ -5,7 +5,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { VSOL_PROGRAM_ID } from "./vsol";
 import { decodeMarketAccount, getVsolConnection } from "./vsol-server";
-import { markets } from "./markets";
+import { liveMarkets } from "./markets";
 import { resolveAvailableVsolSeries } from "./series-resolver";
 import {
   POOL_POSITION_ACCOUNT_SIZE,
@@ -90,7 +90,9 @@ export async function getChainPositions(buyer: PublicKey, connection: Connection
   // won't match here — that's fine, since `market` (decoded above straight
   // from the position's own on-chain market account) already carries the
   // authoritative symbol/expiry; this is purely a nicer "15M"/"30D"-style label.
-  const currentSeries = await resolveAvailableVsolSeries(markets.map((market) => market.symbol));
+  // liveMarkets only: nothing mints a coming-soon market, so there is no
+  // position on one to match against.
+  const currentSeries = await resolveAvailableVsolSeries(liveMarkets.map((market) => market.symbol));
 
   return decoded
     .map(({ address, position }): ChainPosition => {

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Keypair, Transaction } from "@solana/web3.js";
+import { liveMarkets } from "../../app/lib/markets.ts";
 
 const appUrl = process.env.VSOL_APP_URL ?? "http://localhost:3001";
 const buyer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(await readFile(resolve(import.meta.dirname, "../.devnet/web-smoke-buyer.json"), "utf8")) as number[]));
@@ -25,13 +26,19 @@ async function get(path: string) {
   return result;
 }
 
+// Read from the market config so this smoke follows the live market rather
+// than a hardcoded ticker (a coming-soon market has no entitled feed and
+// would 422 here by design). Mirrors app/lib/vsol-launch.ts's launchSymbol().
+const SMOKE_SYMBOL = liveMarkets[0]?.symbol
+  ?? (() => { throw new Error("No live market is configured in app/lib/markets.ts"); })();
+
 const status = await get("/api/vsol/status") as { ok?: boolean };
 if (!status.ok) throw new Error("VSOL status endpoint did not verify devnet");
-const marketData = await get("/api/market-data?symbol=NVDA") as { snapshot?: { mode?: string } };
+const marketData = await get(`/api/market-data?symbol=${SMOKE_SYMBOL}`) as { snapshot?: { mode?: string } };
 const markets = await get("/api/markets");
 await post("/api/vsol/faucet", { walletAddress: buyer.publicKey.toBase58() });
 const quoteRequest = {
-  symbol: "NVDA",
+  symbol: SMOKE_SYMBOL,
   direction: "up",
   amount: 200,
   expiryCode: "30D",

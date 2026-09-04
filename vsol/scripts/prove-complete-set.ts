@@ -46,6 +46,7 @@ import {
   deriveUpMint,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
+import { liveMarkets } from "../../app/lib/markets.ts";
 
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
@@ -136,7 +137,10 @@ async function main(): Promise<void> {
   const settlementMint = new PublicKey(deployment.settlementMint!);
   const minter = await loadKeypair(resolve(workspace, ".devnet", `${cluster}-buyer.json`));
 
-  const market = await pickMarket("NVDA");
+  // The live market's symbol from the config, not a hardcoded ticker.
+  const symbol = liveMarkets[0]?.symbol;
+  if (!symbol) throw new Error("No live market is configured in app/lib/markets.ts");
+  const market = await pickMarket(symbol);
   const config = deriveConfig();
   const upMint = deriveUpMint(market.address);
   const downMint = deriveDownMint(market.address);

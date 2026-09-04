@@ -47,7 +47,7 @@ const requiredExecutable = ["programId", "pythReceiverProgram"];
 const requiredAccounts = ["config", "settlementMint", "underlyingMint", "writerVault", "writerToken", "uiMarket", "uiOracle"];
 const expectedFeedId = String(deployment.pythFeedId);
 const markets = deployment.markets as Array<Record<string, unknown>> | undefined;
-if (!Array.isArray(markets) || markets.length !== 5) throw new Error("The rolling NVDA market catalog is incomplete");
+if (!Array.isArray(markets) || markets.length !== 5) throw new Error("The rolling market catalog is incomplete");
 const liquidityPools = deployment.liquidityPools as Array<Record<string, unknown>> | undefined;
 if (!Array.isArray(liquidityPools) || liquidityPools.length < 1) throw new Error("No passive liquidity pool is deployed");
 const smoke = deployment.smoke as Record<string, unknown> | undefined;
@@ -112,7 +112,7 @@ async function fetchTransactionWithRetry(connection: Connection, signature: stri
 // verified against anything (there is nothing to verify it against -- any
 // positive strike a keeper listed is by definition a valid ladder rung); it
 // is only reported below, for visibility.
-const MARKET_SYMBOL = "NVDA"; // Not an SDK export -- mirrors the same local constant in scripts/keeper.ts and scripts/bootstrap.ts.
+const MARKET_SYMBOL = "SOL"; // Not an SDK export -- mirrors the same local constant in scripts/keeper.ts and scripts/bootstrap.ts.
 const configAddress = new PublicKey(String(deployment.config));
 const settlementMintAddress = new PublicKey(String(deployment.settlementMint));
 
@@ -285,7 +285,7 @@ for (const rung of currentGrid) {
 }
 const legacyUnsafe = accountInfo(LEGACY_UNSAFE_UI_MARKET);
 if (legacyUnsafe && legacyUnsafe.data.at(-1) !== 0) {
-  throw new Error("The midnight-expiry legacy NVDA market remains enabled");
+  throw new Error("The midnight-expiry legacy UI market remains enabled");
 }
 
 for (const poolManifest of liquidityPools) {

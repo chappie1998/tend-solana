@@ -1,5 +1,5 @@
 import "../../lib/runtime-env-worker";
-import { marketBySymbol } from "../../lib/markets";
+import { tradableMarketBySymbol } from "../../lib/markets";
 import { quoteFor, type Direction } from "../../lib/options";
 import { ensureDb, getDb } from "../../../db";
 import { rfqQuotes } from "../../../db/schema";
@@ -38,7 +38,11 @@ export async function POST(request: Request) {
     : legacyDays === 14 ? "7D" : legacyDays === 30 ? "30D" : "7D") as ExpiryCode;
   const payoff = Number(input.payoff);
   const buyer = parsePublicKey(input.walletAddress);
-  const market = marketBySymbol(symbol);
+  // tradableMarketBySymbol, NOT marketBySymbol: a coming-soon market (see
+  // `MarketStatus` in app/lib/markets.ts) is listed for display but has no
+  // usable price feed, so it must never reach the quote path. Quoting
+  // something that cannot settle is worse than showing nothing.
+  const market = tradableMarketBySymbol(symbol);
 
   if (!market || !direction) return json({ error: "Choose a supported market and direction." }, 422);
   if (!buyer) return json({ error: "Connect a valid Solana wallet before requesting an executable quote." }, 422);

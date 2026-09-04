@@ -128,7 +128,15 @@ jobs:
           });
           JS
 
+      # PYTH_API_KEY is REQUIRED, not optional: Pyth made Hermes
+      # authentication mandatory on 2026-08-26. Without it every
+      # getLatestPriceUpdates call returns 401 unauthorized, so the keeper
+      # cannot pick a ladder strike and mints nothing -- silently, since the
+      # job itself still "runs". This mirrors the identical block in
+      # vsol-cranker.yml; the secret already exists on the repo.
       - name: Run keeper
         run: npm --prefix vsol run keeper
         env:
           VSOL_RPC_URL: ${{ secrets.VSOL_RPC_URL }}
+          PYTH_API_KEY: ${{ secrets.PYTH_API_KEY }}
+          PYTH_HERMES_URL: ${{ secrets.PYTH_HERMES_URL }}

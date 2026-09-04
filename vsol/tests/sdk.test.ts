@@ -264,14 +264,17 @@ test("marketCloseableAfter is strictly after expiry whenever either window is po
 // comment in sdk/index.ts for why strike is a listed ladder parameter, not
 // something re-derived from live spot on every keeper pass.
 test("ladderStrike rounds to the nearest ladder step", () => {
-  const step = STRIKE_LADDER_STEP; // $5.00 at PRICE_SCALE
+  const step = STRIKE_LADDER_STEP; // $2.50 at PRICE_SCALE
+  assert.equal(step, 2_500_000n);
   assert.equal(ladderStrike(100n * PRICE_SCALE), 100n * PRICE_SCALE);
-  // $101.99 rounds down to the $100 rung (closer than the $105 rung).
-  assert.equal(ladderStrike(101n * PRICE_SCALE + 990_000n), 100n * PRICE_SCALE);
-  // $102.51 rounds up to the $105 rung.
-  assert.equal(ladderStrike(102n * PRICE_SCALE + 510_000n), 105n * PRICE_SCALE);
+  // $101.24 rounds down to the $100.00 rung (closer than the $102.50 rung).
+  assert.equal(ladderStrike(101n * PRICE_SCALE + 240_000n), 100n * PRICE_SCALE);
+  // $101.43 -- live SOL spot when the step was resized -- rounds up to $102.50.
+  assert.equal(ladderStrike(101n * PRICE_SCALE + 430_000n), 102n * PRICE_SCALE + 500_000n);
+  // $101.26 rounds up to the $102.50 rung.
+  assert.equal(ladderStrike(101n * PRICE_SCALE + 260_000n), 102n * PRICE_SCALE + 500_000n);
   // Exactly on a half-step boundary rounds up (round-half-up, deterministic).
-  assert.equal(ladderStrike(100n * PRICE_SCALE + step / 2n), 105n * PRICE_SCALE);
+  assert.equal(ladderStrike(100n * PRICE_SCALE + step / 2n), 102n * PRICE_SCALE + 500_000n);
 });
 
 test("ladderStrike clamps to a minimum of one step (create_market requires strike > 0)", () => {

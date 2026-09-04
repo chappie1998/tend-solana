@@ -168,21 +168,21 @@ test("launch series parameters stay on the 24/7 UTC grid and bind the determinis
 
   const now = Date.parse("2026-07-17T14:00:00Z");
   for (const code of ["7D", "30D"]) {
-    const params = launch.deriveLaunchSeriesParams(code, "NVDA", now);
-    const definition = expiries.resolveExpiry(code, "NVDA", now);
+    const params = launch.deriveLaunchSeriesParams(code, "SOL", now);
+    const definition = expiries.resolveExpiry(code, "SOL", now);
     assert.equal(params.expiry, Math.floor(definition.expiryAt / 1_000), `${code} expiry sits on the grid`);
     assert.equal(params.lastTradeAt, params.expiry - definition.tradeLockSeconds);
     assert.equal(params.observationWindowSeconds, 30);
     assert.equal(params.settlementGraceSeconds, 900);
     assert.equal(params.maxConfidenceBps, 500);
     assert.equal(params.priceScale, 1_000_000n);
-    assert.equal(params.symbol, "NVDA");
+    assert.equal(params.symbol, "SOL");
   }
 
   // Grid params must hash to the same deterministic market id every time,
   // and any parameter change must move the id (Rust↔TS parity is covered in
   // the frozen SDK suite; this binds the launch flow to that derivation).
-  const params = launch.deriveLaunchSeriesParams("30D", "NVDA", now);
+  const params = launch.deriveLaunchSeriesParams("30D", "SOL", now);
   const settlementMint = new (await import("@solana/web3.js")).PublicKey("EaU6Yus9b7SWz3gzRNMuerpn1U9mYpfm996CQd2Lzhh4");
   const base = {
     pythFeedId: Buffer.from("b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593", "hex"),
@@ -218,7 +218,7 @@ test("launch series parameters stay on the 24/7 UTC grid and bind the determinis
   // Tend is 24/7: a weekend/overnight timestamp still derives a valid intraday
   // series — no session, holiday, or weekend gating.
   const weekendOvernight = Date.parse("2026-07-18T22:15:00Z");
-  const weekendSeries = launch.deriveLaunchSeriesParams("15M", "NVDA", weekendOvernight);
+  const weekendSeries = launch.deriveLaunchSeriesParams("15M", "SOL", weekendOvernight);
   assert.equal(new Date(weekendSeries.expiry * 1_000).toISOString(), "2026-07-18T22:30:00.000Z");
 
   // Pool risk limits mirror the program bounds.

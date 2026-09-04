@@ -10,7 +10,7 @@ import {
 } from "@solana/spl-token";
 import { Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { quoteFor } from "../../app/lib/options.ts";
-import { marketBySymbol } from "../../app/lib/markets.ts";
+import { liveMarkets } from "../../app/lib/markets.ts";
 import { getPythRealizedVolatility, getPythSnapshot } from "../../app/lib/pyth-market-data.ts";
 import deployment from "../deployments/devnet.json" with { type: "json" };
 import {
@@ -59,10 +59,12 @@ async function main() {
     await mintTo(connection, faucet, VSOL_SETTLEMENT_MINT, buyerToken, faucet, 1_000n * 1_000_000n, [], {}, TOKEN_PROGRAM_ID);
   }
 
-  const market = marketBySymbol("NVDA");
-  if (!market) throw new Error("NVDA market metadata is missing");
+  // The live market from the config, not a hardcoded ticker: a coming-soon
+  // market has no entitled Pyth feed to snapshot.
+  const market = liveMarkets[0];
+  if (!market) throw new Error("No live market is configured in app/lib/markets.ts");
   const [snapshot, volatility] = await Promise.all([getPythSnapshot(market), getPythRealizedVolatility(market)]);
-  if (snapshot.mode !== "live") throw new Error(`Pyth NVDA feed is not fresh: ${snapshot.mode}`);
+  if (snapshot.mode !== "live") throw new Error(`Pyth ${market.symbol} feed is not fresh: ${snapshot.mode}`);
   const durationMinutes = Math.max(1, Math.floor((deployment.uiExpiry * 1_000 - Date.now()) / 60_000));
   const economics = quoteFor({ spot: snapshot.price, amount: 250, durationMinutes, direction: "up", payoff: 5, volatility: volatility.value });
   const quote = await buildVsolQuoteTransaction({

@@ -48,7 +48,7 @@ export function normalCdf(x: number): number {
 // Ported unchanged from the Monad engine's reasoning, re-justified for
 // Tend's wider duration range (15 minutes to 30 days here, vs. Monad's
 // sub-24h series): at 30 days, a ~4-5% annualized risk-free rate contributes
-// roughly 0.3-0.4% of drift -- still a fraction of NVDA's realized vol
+// roughly 0.3-0.4% of drift -- still a fraction of the underlying's vol
 // (typically 20-100%+, and this engine prices up to 400% pre-gap-risk) but
 // no longer microscopic the way it was at Monad's few-hour horizon. r=0
 // remains deliberate rather than an oversight: it's the conservative,
@@ -211,7 +211,7 @@ export function probabilityItm(direction: Direction, spot: number, strike: numbe
 // The new floor is sized against THAT risk specifically, not against the
 // quote's own duration: 0.6% of spot is ~2.2x the expected (1-sigma) price
 // move over the SHORTEST observation window this product has (60 seconds)
-// at 200% annualized vol -- already far above NVDA's realistic realized vol
+// at 200% annualized vol -- already far above any realistic realized vol
 // (usually 20-80%) and with headroom under the accepted [1%, 400%] input
 // range before the gap-risk multiplier. That leaves a defensible margin
 // against benign in-window dispersion capturing the ramp, while being ~5x
@@ -352,8 +352,9 @@ export function solveStrikeForTargetPremium(p: StrikeSolveParams): StrikeSolveRe
   };
 }
 
-// Off-hours, Pyth's Equity.US.NVDA/USD feed stops printing fresh updates, so
-// the reference price can go stale. Tend never closes for that — instead the
+// A Pyth feed can stop printing fresh updates (a session-bound equity feed
+// off-hours, or any feed during an outage), so the reference price can go
+// stale. Tend never closes for that — instead the
 // gap-risk (the price could jump before the feed resumes) gets priced into
 // the premium via a bounded, monotonic vol bump. Every extra hour of
 // unobserved time scales the effective volatility up by sqrt(elapsed time),

@@ -1,5 +1,5 @@
 import "../../lib/runtime-env-worker";
-import { marketBySymbol } from "../../lib/markets";
+import { tradableMarketBySymbol } from "../../lib/markets";
 import { getPythSnapshot } from "../../lib/pyth-market-data";
 
 function json(body: unknown, status = 200, cacheControl = "no-store") {
@@ -8,7 +8,9 @@ function json(body: unknown, status = 200, cacheControl = "no-store") {
 
 export async function GET(request: Request) {
   const symbol = (new URL(request.url).searchParams.get("symbol") ?? "").toUpperCase();
-  const market = marketBySymbol(symbol);
+  // tradableMarketBySymbol: a coming-soon market's feed is not entitled on
+  // this deployment, so there is no snapshot to serve for it.
+  const market = tradableMarketBySymbol(symbol);
   if (!market) return json({ error: "Choose a market with a verified Pyth feed." }, 422);
   try {
     return json(

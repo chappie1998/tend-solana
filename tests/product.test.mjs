@@ -34,14 +34,20 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(chartData, /AbortController/);
   assert.doesNotMatch(chartRoute, /PYTH_API_KEY|Authorization|Bearer/);
   assert.match(markets, /deployment\.underlyingMint/);
-  // Crypto.NVDAX/USD, the 24/7 tokenized-NVDA feed -- NOT Equity.US.NVDA/USD,
-  // whose Pyth schedule is 0930-1600 weekdays with holiday closures and which
-  // left ~80% of a 24/7 expiry grid settling on an already-known price.
-  assert.match(markets, /4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f/);
-  assert.match(markets, /Crypto\.NVDAX\/USD/);
+  // Crypto.SOL/USD -- the live devnet settlement feed. Pyth's schedule for it
+  // is "O,O,O,O,O,O,O" (all seven days, no holiday closures), which is what a
+  // 24/7 expiry grid requires. NOT Equity.US.NVDA/USD, whose 0930-1600
+  // weekday schedule left ~80% of the grid settling on an already-known price.
+  assert.match(markets, /ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d/);
+  assert.match(markets, /Crypto\.SOL\/USD/);
   // Settlement and display must stay on the SAME feed: showing one price and
-  // settling on another is the failure this pins against.
-  assert.doesNotMatch(markets, /Equity\.US\.NVDA\/USD/);
+  // settling on another is the failure this pins against. Checked against the
+  // pythSymbol FIELDS specifically, not the whole file -- the prose in
+  // markets.ts legitimately names the equity feed when explaining why it is
+  // not entitled here.
+  const displaySymbols = [...markets.matchAll(/pythSymbol:\s*"([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(displaySymbols, ["Crypto.SOL/USD", "Crypto.NVDAX/USD"]);
+  assert.ok(displaySymbols.every((symbol) => !symbol.startsWith("Equity.")), "no market may display a session-bound equity feed");
   assert.match(layout, /Solana devnet/);
 });
 
@@ -162,7 +168,7 @@ test("short-duration products stay oracle gated but never session gated", async 
   assert.doesNotMatch(quotesRoute, /snapshot\.mode\s*!==\s*["']live["']/);
 
   const now = Date.parse("2026-07-17T14:00:00Z");
-  const intraday = expiries.resolveExpiry("15M", "NVDA", now);
+  const intraday = expiries.resolveExpiry("15M", "SOL", now);
   assert.equal(intraday.available, true);
   assert.equal(intraday.durationMinutes, 15);
   assert.equal(intraday.observationWindowSeconds, 60);
@@ -173,21 +179,21 @@ test("short-duration products stay oracle gated but never session gated", async 
   // of sessions, holidays, weekends, or market hours anywhere in the surface.
   const weekendOvernight = Date.parse("2026-07-18T22:15:00Z");
   for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
-    const definition = expiries.resolveExpiry(code, "NVDA", weekendOvernight);
+    const definition = expiries.resolveExpiry(code, "SOL", weekendOvernight);
     assert.equal(definition.available, true, `${code} must be available on a weekend/overnight timestamp`);
     assert.doesNotMatch(definition.availabilityReason, /session|holiday|weekend|market (open|close)/i);
   }
-  assert.equal(new Date(expiries.resolveExpiry("15M", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-18T22:30:00.000Z");
-  assert.equal(new Date(expiries.resolveExpiry("1H", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-19T00:00:00.000Z");
-  const eod = expiries.resolveExpiry("EOD", "NVDA", weekendOvernight);
+  assert.equal(new Date(expiries.resolveExpiry("15M", "SOL", weekendOvernight).expiryAt).toISOString(), "2026-07-18T22:30:00.000Z");
+  assert.equal(new Date(expiries.resolveExpiry("1H", "SOL", weekendOvernight).expiryAt).toISOString(), "2026-07-19T00:00:00.000Z");
+  const eod = expiries.resolveExpiry("EOD", "SOL", weekendOvernight);
   // EOD's natural boundary (next UTC midnight) is also 2026-07-19T00:00:00Z here —
   // identical to 1H's boundary. The grid must not collapse the two onto one
   // market, so EOD advances by one full day (its own cadence) past the collision.
   assert.equal(new Date(eod.expiryAt).toISOString(), "2026-07-20T00:00:00.000Z");
   assert.equal(eod.label, "Next daily settlement");
   assert.equal(eod.shortLabel, "Daily");
-  assert.equal(new Date(expiries.resolveExpiry("7D", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-07-26T00:00:00.000Z");
-  assert.equal(new Date(expiries.resolveExpiry("30D", "NVDA", weekendOvernight).expiryAt).toISOString(), "2026-08-18T00:00:00.000Z");
+  assert.equal(new Date(expiries.resolveExpiry("7D", "SOL", weekendOvernight).expiryAt).toISOString(), "2026-07-26T00:00:00.000Z");
+  assert.equal(new Date(expiries.resolveExpiry("30D", "SOL", weekendOvernight).expiryAt).toISOString(), "2026-08-18T00:00:00.000Z");
 
   // Only a missing intraday feed can make a code unavailable, never the clock.
   const unsupportedSymbol = expiries.resolveExpiry("15M", "TSLA", now);
@@ -195,12 +201,75 @@ test("short-duration products stay oracle gated but never session gated", async 
   assert.doesNotMatch(unsupportedSymbol.availabilityReason, /session|holiday|weekend/i);
 });
 
+test("the catalog lists SOL live and NVDA as coming soon, and coming soon cannot be traded", async () => {
+  const [markets, expiries, quotesRoute, terminal] = await Promise.all([
+    import(new URL("app/lib/markets.ts", root)),
+    import(new URL("app/lib/expiries.ts", root)),
+    readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
+    readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+  ]);
+
+  const sol = markets.marketBySymbol("SOL");
+  const nvda = markets.marketBySymbol("NVDA");
+
+  // SOL is the live devnet market: entitled 24/7 crypto feed, tradable.
+  assert.ok(sol, "SOL must be a configured market");
+  assert.equal(sol.status, "live");
+  assert.equal(sol.pythSymbol, "Crypto.SOL/USD");
+  assert.equal(sol.pythFeedId, "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d");
+  assert.equal(markets.isTradableSymbol("SOL"), true);
+  assert.ok(markets.liveMarkets.some((market) => market.symbol === "SOL"));
+
+  // NVDA stays ON SCREEN -- the RWA positioning is the product direction and
+  // is not being dropped -- but it must be impossible to trade. Its Pyth
+  // equity/tokenized-equity feeds need a paid entitlement tier this
+  // deployment does not have (verified: 403 "Not entitled" on both
+  // Equity.US.NVDA/USD and Crypto.NVDAX/USD), so it cannot settle here yet.
+  assert.ok(nvda, "NVDA must stay listed, as a coming-soon market");
+  assert.equal(nvda.status, "coming-soon");
+  assert.match(nvda.statusNote, /coming soon/i);
+  assert.equal(markets.isTradableSymbol("NVDA"), false);
+  assert.equal(markets.tradableMarketBySymbol("NVDA"), undefined);
+  assert.ok(!markets.liveMarkets.some((market) => market.symbol === "NVDA"), "a coming-soon market must never reach the live set");
+
+  // The gate that actually enforces it: EVERY expiry code -- intraday and
+  // standard -- resolves unavailable for a coming-soon symbol, which is what
+  // makes deriveLaunchSeriesParams throw and keeps the symbol out of the
+  // series resolver, the launch flow and the quote path.
+  const now = Date.parse("2026-07-17T14:00:00Z");
+  for (const code of expiries.expiryCodes) {
+    const live = expiries.resolveExpiry(code, "SOL", now);
+    assert.equal(live.available, true, `${code} must be available for the live market`);
+    const soon = expiries.resolveExpiry(code, "NVDA", now);
+    assert.equal(soon.available, false, `${code} must be unavailable for a coming-soon market`);
+    assert.equal(soon.availabilityReason, nvda.statusNote);
+    // Still never a calendar excuse -- Tend is 24/7.
+    assert.doesNotMatch(soon.availabilityReason, /session|holiday|weekend|market (open|close)/i);
+  }
+
+  // The quote path must resolve through the tradable lookup, not the display
+  // one: a coming-soon symbol must never produce a quote.
+  assert.match(quotesRoute, /tradableMarketBySymbol/);
+  assert.doesNotMatch(quotesRoute, /\bmarketBySymbol\(/);
+
+  // The intraday gate reads the market config, never a hardcoded ticker.
+  const expiriesSource = await readFile(new URL("app/lib/expiries.ts", root), "utf8");
+  // The assignment specifically -- the prose above it legitimately quotes the
+  // old hardcoded test while explaining why it was wrong.
+  assert.doesNotMatch(expiriesSource, /const intradayEligible = symbol ===/);
+  assert.match(expiriesSource, /market\.intradayEligible/);
+
+  // The selector shows the coming-soon market, disabled and labelled.
+  assert.match(terminal, /Coming soon/);
+  assert.match(terminal, /disabled=\{!item\.tradable\}/);
+});
+
 test("expiry grid stays strictly increasing and collision-free across every UTC clock position", async () => {
   const expiries = await import(new URL("app/lib/expiries.ts", root));
   const codes = ["15M", "1H", "EOD", "7D", "30D"];
 
   function assertGridOrdering(atMs, label) {
-    const boundaries = codes.map((code) => expiries.resolveExpiry(code, "NVDA", atMs).expiryAt);
+    const boundaries = codes.map((code) => expiries.resolveExpiry(code, "SOL", atMs).expiryAt);
     for (let i = 1; i < boundaries.length; i += 1) {
       assert.ok(
         boundaries[i] > boundaries[i - 1],
@@ -238,9 +307,9 @@ test("expiry chip details disambiguate by calendar day, never just time-of-day",
   // Before the fix, 1H and EOD both formatted as time-only ("12:00 AM UTC")
   // and were indistinguishable on the chips despite expiring a day apart.
   const now = Date.parse("2026-07-21T22:57:00Z");
-  const fifteen = expiries.resolveExpiry("15M", "NVDA", now);
-  const oneHour = expiries.resolveExpiry("1H", "NVDA", now);
-  const eod = expiries.resolveExpiry("EOD", "NVDA", now);
+  const fifteen = expiries.resolveExpiry("15M", "SOL", now);
+  const oneHour = expiries.resolveExpiry("1H", "SOL", now);
+  const eod = expiries.resolveExpiry("EOD", "SOL", now);
 
   assert.equal(new Date(fifteen.expiryAt).toISOString(), "2026-07-21T23:15:00.000Z");
   assert.equal(new Date(oneHour.expiryAt).toISOString(), "2026-07-22T00:00:00.000Z");

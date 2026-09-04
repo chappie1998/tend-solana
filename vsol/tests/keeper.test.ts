@@ -117,8 +117,8 @@ test("isRungAuthorizable: a create-time margin can reject a rung that is still n
 // isolation, per this function's own doc comment in keeper.ts.
 
 const POLICY = {
-  pythFeedId: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f",
-  symbol: "NVDA",
+  pythFeedId: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+  symbol: "SOL",
   observationWindowSeconds: 30,
   settlementGraceSeconds: 900,
   maxConfidenceBps: 500,

@@ -166,7 +166,9 @@ export async function getPythSnapshot(market: Market): Promise<PythMarketSnapsho
       source: "Pyth Core Hermes",
       warning: mode === "live"
         ? "Fresh Pyth reference; settlement still uses an onchain verified update."
-        : `Reference is ${ageMinutes} min old; Equity.US.NVDA/USD is not printing fresh updates right now. Gap risk is priced into the quote, not hidden.`,
+        // Names the market's OWN feed rather than a hardcoded symbol -- the
+        // string a user reads must match the feed they will settle on.
+        : `Reference is ${ageMinutes} min old; ${market.pythSymbol} is not printing fresh updates right now. Gap risk is priced into the quote, not hidden.`,
     };
     snapshotCache.set(market.pythFeedId, { expiresAt: Date.now() + 5_000, value });
     snapshotFailures.delete(market.pythFeedId);
@@ -200,18 +202,18 @@ export async function getPythRealizedVolatility(market: Market): Promise<Realize
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
   const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
   // The annualization factor MUST match the cadence of the bars above, not
-  // the calendar. These are daily bars, and every market in app/lib/markets.ts
-  // 365, not 252. The market settles on Crypto.NVDAX/USD -- tokenized NVDA,
-  // whose Pyth schedule is "O,O,O,O,O,O,O" (open all seven days, no holiday
-  // closures), so bars exist on all 365 calendar days rather than the ~252
-  // trading days a US equity feed produces.
+  // the calendar. These are daily bars, and every LIVE market in
+  // app/lib/markets.ts settles on a feed whose Pyth schedule is
+  // "O,O,O,O,O,O,O" (open all seven days, no holiday closures) -- currently
+  // Crypto.SOL/USD -- so bars exist on all 365 calendar days rather than the
+  // ~252 trading days a US equity feed produces. Hence 365, not 252.
   //
   // This is the exact trap the previous comment here warned about: while the
   // only market was the equity feed, 252 was correct and NOT a market-hours
-  // assumption. Moving to a 24/7 feed makes it wrong -- sampling 365
-  // returns/year and annualizing by sqrt(252) understates realized vol by
-  // sqrt(365/252) = 1.20x, i.e. ~20% too low, which would systematically
-  // underprice every option quoted off it.
+  // assumption. A 24/7 feed makes it wrong -- sampling 365 returns/year and
+  // annualizing by sqrt(252) understates realized vol by sqrt(365/252) =
+  // 1.20x, i.e. ~20% too low, which would systematically underprice every
+  // option quoted off it.
   //
   // >>> If a market is ever added back on a SESSION-BOUND feed (any
   // >>> Equity.US.* id), this must become per-market: 252 for those, 365 for

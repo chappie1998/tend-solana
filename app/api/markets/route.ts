@@ -1,12 +1,16 @@
 import "../../lib/runtime-env-worker";
-import { markets } from "../../lib/markets";
+import { liveMarkets, markets } from "../../lib/markets";
 import { getPythSnapshot } from "../../lib/pyth-market-data";
 import { getVsolChainCatalog } from "../../lib/chain-catalog";
 import { describeRpcFailure, getVsolSeriesStates } from "../../lib/vsol-server";
 
 export async function GET() {
   const [snapshots, seriesResult, catalogResult] = await Promise.all([
-    Promise.all(markets.map(async (market) => {
+    // Snapshots come from LIVE markets only. A coming-soon market has no
+    // entitled Pyth feed, so polling Hermes for it every 15s would produce a
+    // guaranteed 403 per poll and nothing else. The full `markets` list is
+    // still returned below so the UI can render it as a disabled chip.
+    Promise.all(liveMarkets.map(async (market) => {
     try {
       return { symbol: market.symbol, snapshot: await getPythSnapshot(market) };
     } catch (error) {

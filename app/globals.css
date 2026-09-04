@@ -191,6 +191,12 @@ code, .tabular {
 .asset-chip small { color: var(--ink-muted); font: var(--text-2xs) ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .asset-chip em { font-size: var(--text-2xs); font-weight: 650; font-style: normal; color: var(--ink-muted); }
 .asset-chip.active em { color: var(--ink); }
+/* A listed-but-not-yet-tradable market (see `MarketStatus` in
+   app/lib/markets.ts). Visibly present and named, visibly not selectable --
+   the honest state for a market whose Pyth feed needs a paid entitlement. */
+.asset-chip:disabled, .asset-chip.coming-soon { cursor: not-allowed; opacity: 0.55; background: var(--surface); }
+.asset-chip.coming-soon:hover { border-color: var(--border); }
+.asset-chip.coming-soon small { color: var(--ink-muted); font-style: italic; }
 .positive { color: var(--positive) !important; }
 .negative { color: var(--negative) !important; }
 

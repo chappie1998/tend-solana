@@ -31,7 +31,7 @@ import {
   type LaunchSeriesParams,
 } from "./launch-params";
 import type { ExpiryCode } from "./expiries";
-import { markets } from "./markets";
+import { liveMarkets, tradableMarketBySymbol } from "./markets";
 import { getPythSnapshot } from "./pyth-market-data";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
@@ -52,14 +52,28 @@ async function withBlockhash(connection: Connection, feePayer: PublicKey, transa
 }
 
 /**
+ * The symbol Launch lists series for. Read from the market config (the first
+ * LIVE market) rather than hardcoded: Launch has no symbol picker yet, and a
+ * hardcoded ticker here would keep minting series for a market that is no
+ * longer the tradable one.
+ */
+export function launchSymbol(): string {
+  const symbol = liveMarkets[0]?.symbol;
+  if (!symbol) throw new Error("No live market is configured, so no series can be launched.");
+  return symbol;
+}
+
+/**
  * Live spot for `symbol`, in PRICE_SCALE atoms, for choosing a ladder rung.
  * Deliberately fails loudly rather than falling back to a guess: a launched
  * series is permanent and its strike selects its address, so listing one at
  * a fabricated strike is worse than not listing it at all.
  */
 async function fetchLadderSpot(symbol: string): Promise<bigint> {
-  const market = markets.find((entry) => entry.symbol === symbol);
-  if (!market) throw new Error(`Unknown market symbol ${symbol}`);
+  // tradableMarketBySymbol, not a raw lookup: a coming-soon market has no
+  // entitled Pyth feed, so there is no spot to round into a ladder rung.
+  const market = tradableMarketBySymbol(symbol);
+  if (!market) throw new Error(`${symbol} is not a tradable Tend market`);
   const snapshot = await getPythSnapshot(market);
   if (!Number.isFinite(snapshot.price) || snapshot.price <= 0) {
     throw new Error("Pyth has no usable spot price right now, so a strike cannot be chosen. Try again shortly.");
@@ -73,7 +87,7 @@ export async function buildCreateMarketTransaction(params: {
   connection?: Connection;
 }) {
   const connection = params.connection ?? getVsolConnection();
-  const series: LaunchSeriesParams = deriveLaunchSeriesParams(params.code, "NVDA", Date.now());
+  const series: LaunchSeriesParams = deriveLaunchSeriesParams(params.code, launchSymbol(), Date.now());
   const now = await getVsolClusterTime(connection);
   if (series.expiry < now + LAUNCH_MIN_LEAD_SECONDS) {
     throw new Error("The selected grid expiry is already inside the onchain lead window. Pick a later expiry.");
@@ -85,7 +99,7 @@ export async function buildCreateMarketTransaction(params: {
   // same rung the keeper would pick for a new expiry, which keeps a
   // hand-launched series on the same ladder as the automatic ones instead of
   // fragmenting the chain onto an off-grid strike.
-  const spot = await fetchLadderSpot("NVDA");
+  const spot = await fetchLadderSpot(launchSymbol());
   const strike = ladderStrike(spot);
   // Shared with the mint-on-demand quote path (app/lib/vsol-server.ts) and its
   // send-path inspector, so there is exactly one create_market encoder.

@@ -867,10 +867,11 @@ export async function fetchLatestPythUpdate(
 //
 //   * A binary search for "the latest timestamp with any data" is INVALID.
 //     Binary search needs "data at T implies data at every earlier T in
-//     range", but the NVDA feed only publishes during US equity hours, so
-//     availability across [expiry - staleness, expiry] is dark -> live ->
+//     range", but that does not hold for a feed with gaps -- the equity feed
+//     this was measured against only published during US equity hours, so
+//     availability across [expiry - staleness, expiry] was dark -> live ->
 //     dark. There is no cutoff to converge on; it lands correctly only by
-//     luck.
+//     luck. A 24/7 feed makes it look fine right up until it isn't.
 //   * Walking back on a FIXED stride (60s) hops over prints. The measured
 //     acceptable print sat 916s from the anchor -- not a multiple of 60 -- so
 //     a 60s grid stepped straight past it and reported a false negative after

@@ -81,7 +81,18 @@ export const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
 // applied statelessly: an already-listed rung's strike is read back from
 // chain, never re-derived from spot, and `ladderStrike` is only ever called
 // once, at the moment a genuinely new expiry is first minted.
-export const STRIKE_LADDER_STEP = 5n * PRICE_SCALE; // $5.00
+//
+// STEP SIZING. A rung should be a small but meaningful move -- roughly 2-3%
+// of spot. Too coarse and every expiry lists a single strike far from the
+// money; too fine and adjacent rungs fragment what little liquidity a devnet
+// pool has across near-identical contracts. $5.00 was sized for a ~$210
+// underlying (~2.4%). The devnet market now settles on Crypto.SOL/USD at
+// ~$101, where $5.00 would be ~4.9% -- so the step is $2.50, ~2.5% of spot.
+// Worked example at SOL spot $101.43: ladderStrike rounds to the nearest
+// $2.50 rung, giving a $102.50 strike (the $100.00 rung is $1.43 away, the
+// $102.50 rung $1.07). Re-derive this if the underlying's price level
+// changes by more than about 2x.
+export const STRIKE_LADDER_STEP = (5n * PRICE_SCALE) / 2n; // $2.50
 
 /**
  * Rounds `referencePrice` to the nearest `STRIKE_LADDER_STEP`, clamped to a

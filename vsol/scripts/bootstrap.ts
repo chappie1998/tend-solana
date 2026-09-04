@@ -103,19 +103,38 @@ const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
 const walletPath = process.env.SOLANA_WALLET?.replace(/^~/, homedir()) ?? resolve(homedir(), ".config/solana/id.json");
-// Crypto.NVDAX/USD (tokenized NVDA), not the equity feed -- see the long
-// note on PYTH_FEED_ID in scripts/keeper.ts for why the equity feed cannot
-// settle a 24/7 grid.
-const pythFeedId = "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f";
+// Crypto.SOL/USD -- see the long note on PYTH_FEED_ID in scripts/keeper.ts
+// for why the grid needs a feed that publishes all seven days, and why this
+// deployment can no longer read the equity or tokenized-equity feeds at all
+// (Pyth's mandatory Hermes auth; this key is entitled to crypto spot only).
+// This is a devnet settlement choice, not a change of product direction.
+const pythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+// The smoke fixtures deliberately share the same feed id as the real market
+// here. They are told apart by SYMBOL (VSOL-TEST) and by a fixed strike, both
+// of which are hashed into the market id, so they still land at their own
+// addresses and can never collide with a rolling-catalog rung.
 const smokePythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const pythFeedBytes = [...Buffer.from(pythFeedId, "hex")];
 const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
-// The three VSOL-TEST smoke markets are deterministic test fixtures on a
-// mock feed (their settlement price is whatever the smoke Pyth publisher
-// happens to post, unrelated to any real underlying) -- they must NOT
-// depend on live spot the way the rolling NVDA catalog does. A fixed
+// The three VSOL-TEST smoke markets are deterministic test fixtures -- they
+// must NOT depend on live spot the way the rolling catalog does. A fixed
 // constant keeps their strike reproducible across runs.
 const SMOKE_MARKET_STRIKE = 100n * PRICE_SCALE;
+// The rolling catalog's symbol. Hashed into every market id alongside the
+// feed id, so changing it relocates every rung -- see MAIN_POOL_LABEL below.
+// MUST match MARKET_SYMBOL in scripts/keeper.ts and scripts/verify-deployment.ts.
+const MARKET_SYMBOL = "SOL";
+// MUST match MAIN_POOL_LABEL in scripts/keeper.ts, which carries the full
+// v3 -> v4 -> v5 -> v6 -> v7 history of why this label is versioned at all.
+// The short version: a new label mints a new pool PDA, and a fresh pool is
+// required whenever the markets an old pool authorized stop being the
+// markets that exist. v7 is the 2026-09-04 move off Crypto.NVDAX/USD onto
+// Crypto.SOL/USD (Pyth's mandatory Hermes auth left this deployment's key
+// un-entitled for every equity and tokenized-equity feed), which changed
+// both the feed id AND the symbol -- each of which is hashed into every
+// market id -- so every v6 rung is at a retired address and a v6 pool's
+// `authorizedMarkets` list points entirely at a dead epoch.
+const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v7`;
 const pythReceiverProgram = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 
 type MarketManifest = {
@@ -883,7 +902,7 @@ async function main(): Promise<void> {
     PRICE_SCALE,
   );
   const rollingStrike = ladderStrike(rollingSpot);
-  console.log(`Rolling NVDA catalog strike: ${rollingStrike.toString()} (spot ${rollingSpot.toString()} at PRICE_SCALE)`);
+  console.log(`Rolling ${MARKET_SYMBOL} catalog strike: ${rollingStrike.toString()} (spot ${rollingSpot.toString()} at PRICE_SCALE)`);
 
   const catalog: Array<MarketManifest & { marketKey: PublicKey; oracleKey: PublicKey }> = [];
   for (const series of schedule) {
@@ -893,7 +912,7 @@ async function main(): Promise<void> {
       config,
       settlementMint,
       underlyingMint,
-      symbol: "NVDA",
+      symbol: MARKET_SYMBOL,
       expiry: series.expiry,
       observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
       settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
@@ -945,7 +964,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:tUSDC:main-v6`,
+    label: MAIN_POOL_LABEL,
     maxUtilizationBps: 8_000,
     maxPositionBps: 2_500,
   });
@@ -1111,7 +1130,7 @@ async function main(): Promise<void> {
     config,
     settlementMint,
     quoteAuthority: maker.publicKey,
-    label: `${cluster}:smoke-v6:${runId}`,
+    label: `${cluster}:smoke-v7:${runId}`,
     maxUtilizationBps: 8_000,
     maxPositionBps: 5_000,
   });

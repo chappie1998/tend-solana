@@ -70,19 +70,34 @@ const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
 // on the deterministic factory inputs, which is why both scripts import the
 // shared policy constants from ../sdk/index.ts rather than each hardcoding
 // their own copies.
-// Crypto.NVDAX/USD -- tokenized NVDA (xStocks), NOT Equity.US.NVDA/USD.
-// Pyth's own feed metadata declares the equity feed "0930-1600" Mon-Fri, C
-// on weekends, plus seven holiday closures: 32.5h of a 168h week, 19.3%.
-// Tend mints expiries on a 24/7 UTC grid, so ~80% of markets expired while
-// that feed was dark and settled on a price already fixed and public before
-// expiry. A real market proved this is not merely theoretical: expiry 04:45Z
-// settled on a stale pre-close print at $209.46 (DOWN won) while this feed
-// had a live print AT expiry of $210.32 -- above the $210 strike, so UP
-// should have won. This feed's schedule is "O,O,O,O,O,O,O": open all seven
-// days, no holiday closures.
-const PYTH_FEED_ID = "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f";
+// Crypto.SOL/USD. Pyth's own feed metadata declares its schedule
+// "America/New_York;O,O,O,O,O,O,O;" -- open all seven days, no holiday
+// closures -- which is the property Tend's 24/7 UTC expiry grid requires and
+// the property the previous NVDAX move was chasing. The original equity feed
+// (Equity.US.NVDA/USD) declared "0930-1600" Mon-Fri, closed weekends, plus
+// seven holiday closures: 32.5h of a 168h week, 19.3%. ~80% of markets
+// expired while it was dark and settled on a price already fixed and public
+// before expiry. A real market proved that was not merely theoretical:
+// expiry 04:45Z settled on a stale pre-close print at $209.46 (DOWN won)
+// while the live print AT expiry was $210.32 -- above the $210 strike, so UP
+// should have won.
+//
+// WHY THIS IS NOT NVDAX ANY MORE: Pyth made Hermes authentication mandatory
+// on 2026-08-26. This deployment's API key is entitled to crypto SPOT feeds
+// only; both Equity.US.NVDA/USD and the tokenized Crypto.NVDAX/USD return
+// 403 "Not entitled: ... no grant accepts this feed". Equity and
+// tokenized-equity feeds sit behind a paid Pyth tier this devnet deployment
+// does not buy, so the keeper could not fetch a price and minted nothing for
+// over a week.
+//
+// This is a DEVNET settlement choice, made to keep the protocol exercised on
+// a feed that is actually readable here. It is NOT a change of product
+// direction -- the RWA/equity positioning is a mainnet decision and is
+// untouched. NVDA stays listed in app/lib/markets.ts as a coming-soon
+// market, and nothing in this keeper mints, authorizes or settles it.
+const PYTH_FEED_ID = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const PYTH_FEED_BYTES = [...Buffer.from(PYTH_FEED_ID, "hex")];
-const MARKET_SYMBOL = "NVDA";
+const MARKET_SYMBOL = "SOL";
 // USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS,
 // MAX_CONFIDENCE_BPS, and MARKET_MAX_SETTLEMENT_STALENESS_SECONDS now live in
 // ../sdk/index.ts (see the import above) — the single shared home with
@@ -120,7 +135,15 @@ const MARKET_SYMBOL = "NVDA";
 // v5 pool's `authorizedMarkets` list points entirely at a retired epoch --
 // the same reasoning as the v4 -> v5 bump above, which was forced by the
 // Market layout change rather than a feed change.
-const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v6`;
+//
+// Bumped v6 -> v7 on 2026-09-04 when the devnet market moved off
+// Crypto.NVDAX/USD onto Crypto.SOL/USD, because Pyth's now-mandatory Hermes
+// auth leaves this deployment's key un-entitled for every equity and
+// tokenized-equity feed (see PYTH_FEED_ID above). Same mechanism as the
+// v5 -> v6 bump: a feed change relocates every market id, so a v6 pool's
+// `authorizedMarkets` list is a retired epoch. The SYMBOL changed too
+// (NVDA -> SOL), which is hashed in as well, so this is doubly a relocation.
+const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v7`;
 
 /**
  * Mirrors `MIN_MARKET_LEAD_SECONDS` in vsol/programs/vsol/src/lib.rs exactly

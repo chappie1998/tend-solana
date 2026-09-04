@@ -4,7 +4,7 @@
 //
 // This module is NOT pure and DOES make RPC calls -- unlike its previous
 // incarnation, which only ever computed one deterministic candidate address
-// per (symbol, code). Since strike moved onto a listed $5 ladder
+// per (symbol, code). Since strike moved onto a fixed listed ladder
 // (STRIKE_LADDER_STEP / ladderStrike, see vsol/sdk/index.ts) rather than
 // being derivable from (symbol, code, now) alone, there can be several
 // strikes live at the same expiry -- the market id hashes `strike` in (see

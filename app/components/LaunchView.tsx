@@ -10,8 +10,15 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
+import { liveMarkets } from "../lib/markets";
 import { signSerializedSolanaTransaction } from "../lib/solana-wallet";
 import { solanaExplorerUrl } from "../lib/vsol";
+
+// Mirrors app/lib/vsol-launch.ts's launchSymbol(): Launch has no symbol
+// picker yet, so it lists series for the first LIVE market. Falls back to a
+// harmless placeholder purely so the component still renders if no live
+// market is configured -- the server refuses the launch in that case anyway.
+const launchTicker = liveMarkets[0]?.symbol ?? "";
 
 type LaunchReceipt = {
   kind: string;
@@ -105,7 +112,11 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
     setPoolAddress("");
   }
 
-  const gridOptions = expiryCodes.map((code) => resolveExpiry(code, "NVDA", now));
+  // Read from the market config, never a hardcoded ticker: the server's
+  // launch builder (app/lib/vsol-launch.ts's launchSymbol) picks the first
+  // LIVE market, and this preview must resolve the same symbol or the grid
+  // shown here would describe a different market than the one minted.
+  const gridOptions = expiryCodes.map((code) => resolveExpiry(code, launchTicker, now));
   const selectedGrid = gridOptions.find((option) => option.code === expiry) ?? gridOptions[gridOptions.length - 1];
 
   async function submitPanel(panel: "series" | "pool" | "authorize", event: FormEvent) {
@@ -116,7 +127,7 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
     try {
       if (panel === "series") {
         const { sent } = await runLaunchFlow({ walletAddress, kind: "create_market", expiryCode: expiry });
-        setReceipts((current) => [{ kind: "Series created", signature: sent.signature!, targetAddress: sent.targetAddress!, label: `NVDA ${expiry}` }, ...current]);
+        setReceipts((current) => [{ kind: "Series created", signature: sent.signature!, targetAddress: sent.targetAddress!, label: `${launchTicker} ${expiry}` }, ...current]);
       } else if (panel === "pool") {
         const { sent } = await runLaunchFlow({
           walletAddress,

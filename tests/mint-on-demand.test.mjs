@@ -35,9 +35,9 @@ async function loadModules() {
 }
 
 async function resolveLiveNvda30D(resolver) {
-  const available = await resolver.resolveAvailableVsolSeries(["NVDA"]);
+  const available = await resolver.resolveAvailableVsolSeries(["SOL"]);
   const series = available.find((entry) => entry.code === "30D");
-  assert.ok(series, "NVDA/30D must resolve to a candidate series");
+  assert.ok(series, "SOL/30D must resolve to a candidate series");
   return series;
 }
 

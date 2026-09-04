@@ -39,7 +39,7 @@ import {
   VSOL_SETTLEMENT_MINT,
 } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
-import { markets } from "./markets.ts";
+import { liveMarkets } from "./markets.ts";
 import {
   findVsolSeriesCandidateForMarket,
   resolveAvailableVsolSeries,
@@ -198,8 +198,12 @@ const POOL_POSITION_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("PoolPositio
 // its consumers) still refer to a resolved series candidate as `VsolSeries`.
 export type VsolSeries = ResolvedVsolSeries;
 
+// Every symbol the chain side is allowed to touch. Deliberately the LIVE
+// set only (see `MarketStatus` in ./markets.ts): a coming-soon market has no
+// entitled Pyth feed, so nothing mints it, nothing quotes it, and there is
+// no series to resolve for it.
 function allMarketSymbols(): string[] {
-  return markets.map((market) => market.symbol);
+  return liveMarkets.map((market) => market.symbol);
 }
 
 // Fallback for callers (currently just vsol/scripts/web-execution-smoke.ts)
@@ -207,7 +211,8 @@ function allMarketSymbols(): string[] {
 // whichever manifest entry happened to be the "30D" series; now resolves the
 // live chain-derived 30D rung for the first configured market symbol.
 async function defaultQuoteSeries(): Promise<ResolvedVsolSeries | null> {
-  const defaultSymbol = markets[0]?.symbol ?? "NVDA";
+  const defaultSymbol = liveMarkets[0]?.symbol;
+  if (!defaultSymbol) return null;
   const resolution = await resolveVsolSeries(defaultSymbol, "30D");
   return resolution.available ? resolution.series : null;
 }

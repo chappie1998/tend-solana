@@ -33,8 +33,8 @@ const STRIKE = 210_000_000n;
 test("deriveVsolSeriesCandidate is deterministic: same symbol+code+clock+strike gives the same market and oracle PDA", async () => {
   const { resolver } = await loadModules();
   const now = Date.parse("2026-07-21T14:00:00Z");
-  const first = await resolver.deriveVsolSeriesCandidate("NVDA", "30D", now, STRIKE);
-  const second = await resolver.deriveVsolSeriesCandidate("NVDA", "30D", now, STRIKE);
+  const first = await resolver.deriveVsolSeriesCandidate("SOL", "30D", now, STRIKE);
+  const second = await resolver.deriveVsolSeriesCandidate("SOL", "30D", now, STRIKE);
   assert.equal(first.marketKey.toBase58(), second.marketKey.toBase58());
   assert.equal(first.oracleKey.toBase58(), second.oracleKey.toBase58());
 });
@@ -42,20 +42,20 @@ test("deriveVsolSeriesCandidate is deterministic: same symbol+code+clock+strike 
 test("deriveVsolSeriesCandidate binds every series parameter, strike included: changing code, the clock, or the strike moves the market id", async () => {
   const { resolver } = await loadModules();
   const now = Date.parse("2026-07-21T14:00:00Z");
-  const baseline = await resolver.deriveVsolSeriesCandidate("NVDA", "30D", now, STRIKE);
+  const baseline = await resolver.deriveVsolSeriesCandidate("SOL", "30D", now, STRIKE);
 
   // A different expiry code targets a different grid boundary -> different expiry -> different id.
-  const differentCode = await resolver.deriveVsolSeriesCandidate("NVDA", "7D", now, STRIKE);
+  const differentCode = await resolver.deriveVsolSeriesCandidate("SOL", "7D", now, STRIKE);
   assert.notEqual(differentCode.marketKey.toBase58(), baseline.marketKey.toBase58());
 
   // Crossing a grid boundary for the SAME code must also move the market.
-  const later = await resolver.deriveVsolSeriesCandidate("NVDA", "30D", now + 40 * 24 * 60 * 60 * 1000, STRIKE);
+  const later = await resolver.deriveVsolSeriesCandidate("SOL", "30D", now + 40 * 24 * 60 * 60 * 1000, STRIKE);
   assert.notEqual(later.marketKey.toBase58(), baseline.marketKey.toBase58());
   assert.ok(later.expiry > baseline.expiry);
 
   // And the strike itself is part of the id -- one ladder rung apart is a
   // DIFFERENT contract, not the same market at a different price.
-  const otherStrike = await resolver.deriveVsolSeriesCandidate("NVDA", "30D", now, STRIKE + 5_000_000n);
+  const otherStrike = await resolver.deriveVsolSeriesCandidate("SOL", "30D", now, STRIKE + 5_000_000n);
   assert.notEqual(otherStrike.marketKey.toBase58(), baseline.marketKey.toBase58());
 });
 
@@ -87,14 +87,14 @@ test("deriveVsolSeriesCandidate parity: the derived market matches an independen
   const now = Date.parse("2026-07-21T14:00:00Z");
 
   for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
-    const candidate = await resolver.deriveVsolSeriesCandidate("NVDA", code, now, STRIKE);
+    const candidate = await resolver.deriveVsolSeriesCandidate("SOL", code, now, STRIKE);
 
     // Independently recompute the params and market id using the exact same
     // shared constants module (app/lib/launch-params.ts) the resolver itself
     // is supposed to consume. If a future edit makes series-resolver.ts drift
     // from these constants (e.g. hardcoding a different confidence bps or
     // price scale), this assertion fails loudly.
-    const params = launchParams.deriveLaunchSeriesParams(code, "NVDA", now);
+    const params = launchParams.deriveLaunchSeriesParams(code, "SOL", now);
     assert.equal(params.observationWindowSeconds, launchParams.LAUNCH_OBSERVATION_WINDOW_SECONDS);
     assert.equal(params.settlementGraceSeconds, launchParams.LAUNCH_SETTLEMENT_GRACE_SECONDS);
     assert.equal(params.maxConfidenceBps, launchParams.LAUNCH_MAX_CONFIDENCE_BPS);
@@ -133,12 +133,12 @@ test("a code with no viable on-chain market resolves to unavailable with a clear
   const { resolver } = await loadModules();
   const now = Date.parse("2026-07-21T14:00:00Z");
 
-  // TSLA has no verified intraday Pyth feed (see app/lib/expiries.ts), so an
-  // intraday code must resolve to unavailable rather than deriving a market
-  // (or throwing) for a symbol the grid does not support intraday.
+  // TSLA is not a configured market at all (see app/lib/markets.ts), so every
+  // code must resolve to unavailable with a reason rather than deriving a
+  // market -- or throwing -- for a symbol the catalog does not carry.
   const resolution = await resolver.resolveVsolSeries("TSLA", "15M", now);
   assert.equal(resolution.available, false);
-  assert.match(resolution.reason, /intraday/i);
+  assert.match(resolution.reason, /not a configured Tend market/i);
   assert.equal(resolution.symbol, "TSLA");
   assert.equal(resolution.code, "15M");
 
@@ -146,17 +146,28 @@ test("a code with no viable on-chain market resolves to unavailable with a clear
   const lowercase = await resolver.resolveVsolSeries("tsla", "1H", now);
   assert.equal(lowercase.available, false);
   assert.equal(lowercase.symbol, "TSLA");
+
+  // A CONFIGURED but coming-soon market (NVDA: its Pyth equity/tokenized-
+  // equity feeds need a paid entitlement this deployment does not have) is
+  // the case that matters most -- it is listed and visible, so the resolver
+  // is the last line stopping it from producing a tradable series. Every
+  // code, intraday and standard, must refuse it.
+  for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
+    const comingSoon = await resolver.resolveVsolSeries("NVDA", code, now);
+    assert.equal(comingSoon.available, false, `NVDA/${code} must never resolve to a tradable series`);
+    assert.match(comingSoon.reason, /coming soon/i);
+  }
 });
 
 test("resolveVsolSeriesCatalog and resolveAvailableVsolSeries never throw, and separate listed rungs from unlisted ones", async () => {
   const { resolver, launchParams, vsol, accounts } = await loadModules();
   const now = Date.parse("2026-07-21T14:00:00Z");
 
-  // Stub a chain that has listed exactly the NVDA rungs and nothing for TSLA.
+  // Stub a chain that has listed exactly the SOL rungs and nothing for TSLA.
   const entries = [];
   for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
-    const params = launchParams.deriveLaunchSeriesParams(code, "NVDA", now);
-    const candidate = await resolver.deriveVsolSeriesCandidate("NVDA", code, now, STRIKE);
+    const params = launchParams.deriveLaunchSeriesParams(code, "SOL", now);
+    const candidate = await resolver.deriveVsolSeriesCandidate("SOL", code, now, STRIKE);
     entries.push({
       address: candidate.marketKey,
       data: buildMarketAccountBuffer({
@@ -164,7 +175,7 @@ test("resolveVsolSeriesCatalog and resolveAvailableVsolSeries never throw, and s
         config: vsol.VSOL_CONFIG,
         settlementMint: vsol.VSOL_SETTLEMENT_MINT,
         oracle: candidate.oracleKey,
-        symbol: "NVDA",
+        symbol: "SOL",
         priceScale: params.priceScale,
         expiry: params.expiry,
         observationWindowSeconds: params.observationWindowSeconds,
@@ -178,19 +189,19 @@ test("resolveVsolSeriesCatalog and resolveAvailableVsolSeries never throw, and s
   }
   const deps = { connection: stubConnection(entries), fetchSpot: async () => 210 };
 
-  const catalog = await resolver.resolveVsolSeriesCatalog(["NVDA", "TSLA"], now, deps);
+  const catalog = await resolver.resolveVsolSeriesCatalog(["SOL", "TSLA"], now, deps);
   assert.equal(catalog.length, 10); // 5 codes x 2 symbols
-  const nvdaEntries = catalog.filter((entry) => entry.symbol === "NVDA");
+  const solEntries = catalog.filter((entry) => entry.symbol === "SOL");
   const tslaEntries = catalog.filter((entry) => entry.symbol === "TSLA");
-  assert.equal(nvdaEntries.length, 5);
+  assert.equal(solEntries.length, 5);
   assert.equal(tslaEntries.length, 5);
-  assert.ok(nvdaEntries.every((entry) => entry.available), "every listed NVDA rung must resolve");
+  assert.ok(solEntries.every((entry) => entry.available), "every listed SOL rung must resolve");
   // Nothing was listed for TSLA, so every TSLA rung is unavailable -- with a
   // reason, never a throw.
   assert.ok(tslaEntries.every((entry) => !entry.available));
   assert.ok(tslaEntries.every((entry) => typeof entry.reason === "string" && entry.reason.length > 0));
 
-  const available = await resolver.resolveAvailableVsolSeries(["NVDA", "TSLA"], now, deps);
+  const available = await resolver.resolveAvailableVsolSeries(["SOL", "TSLA"], now, deps);
   assert.equal(available.length, 5);
   assert.ok(available.every((series) => series.marketKey && series.oracleKey));
   assert.ok(available.every((series) => series.strike === STRIKE), "the resolved series must carry the strike read back from chain");
