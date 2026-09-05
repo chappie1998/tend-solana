@@ -23,7 +23,12 @@ export type PythMarketBars = {
   lastBarTime: number;
 };
 
-const UPSTREAM_TIMEOUT_MS = 8_000;
+// Measured: Pyth's history API returns a 1,440-bar window in ~2.1-2.8s. 8s left
+// barely 3x headroom, and a single slow response aborted the request outright
+// -- the user saw "Couldn't load real market bars" for what was really one slow
+// upstream call. 15s keeps a comfortable margin while staying far inside the
+// serverless execution ceiling.
+const UPSTREAM_TIMEOUT_MS = 15_000;
 const MAX_UPSTREAM_BYTES = 2_000_000;
 const PYTH_AUTH_REQUIRED_AT = Date.UTC(2026, 6, 31);
 const cache = new Map<string, { expiresAt: number; value: PythMarketBars }>();

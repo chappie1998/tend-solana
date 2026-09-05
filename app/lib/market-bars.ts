@@ -20,12 +20,23 @@ const resolutionSeconds: Record<ChartResolution, number> = {
   D: 24 * 60 * 60,
 };
 
+// Each window is sized so that (lookback / resolution) lands comfortably under
+// MAX_BARS. That invariant used to be violated by every intraday resolution --
+// 5m asked for 10 days (2,880 bars) and 60m for 120 days (2,880), both over the
+// 2,000 cap -- so the fetch either failed the bar-count check outright or spent
+// its whole timeout pulling a payload it was always going to reject. The chart
+// rendered "Couldn't load real market bars" for that reason alone, independent
+// of which upstream served it.
+//
+// 1,440 bars per resolution is the target: dense enough to read, roughly half
+// the cap, and it keeps every window's payload small enough to return well
+// inside UPSTREAM_TIMEOUT_MS.
 const lookbackSeconds: Record<ChartResolution, number> = {
-  "1": 3 * 24 * 60 * 60,
-  "5": 10 * 24 * 60 * 60,
-  "15": 30 * 24 * 60 * 60,
-  "60": 120 * 24 * 60 * 60,
-  D: 365 * 24 * 60 * 60,
+  "1": 24 * 60 * 60, //        1,440 one-minute bars
+  "5": 5 * 24 * 60 * 60, //    1,440 five-minute bars
+  "15": 15 * 24 * 60 * 60, //  1,440 fifteen-minute bars
+  "60": 60 * 24 * 60 * 60, //  1,440 hourly bars
+  D: 365 * 24 * 60 * 60, //      365 daily bars
 };
 
 export function isChartResolution(value: string): value is ChartResolution {
