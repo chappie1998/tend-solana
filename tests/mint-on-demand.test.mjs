@@ -411,3 +411,42 @@ test("inspectVsolFillTransaction's mint-and-fill branch falls back to the grid c
   // market has to verify against the real chain state first.
   assert.match(branch, /resolveAvailableVsolSeries\(allMarketSymbols\(\)\)/);
 });
+
+test("the catalog never advertises a not-yet-listed rung as tradable while its fill cannot be composed", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
+
+  // MEASURED, not assumed: the mint-and-fill shape composes to 1265 bytes
+  // against the real published ALT -- 33 over the 1232-byte packet limit --
+  // so buildVsolQuoteTransaction fails closed and /api/quotes returns 503.
+  // The size test above passes only because its stub lookup table covers
+  // accounts the real table cannot (the per-series market/oracle/pool-market,
+  // the per-trade position, the per-user token account).
+  //
+  // So the catalog must gate on the same fact. A ticket that offers "Mints on
+  // fill" and then refuses every quote is worse than one that says the rung
+  // is unavailable, which is exactly what these rungs said before the
+  // resolver was wired up.
+  assert.match(source, /const MINT_ON_FILL_IS_EXECUTABLE = (true|false);/);
+  const executable = /const MINT_ON_FILL_IS_EXECUTABLE = true;/.test(source);
+
+  // Whatever the flag says, availability and the reason must move together --
+  // never `available: true` with the oversized reason, or vice versa.
+  assert.match(source, /available: MINT_ON_FILL_IS_EXECUTABLE,/);
+  assert.match(
+    source,
+    /availabilityReason: MINT_ON_FILL_IS_EXECUTABLE \? SERIES_NOT_YET_MINTED_REASON : MINT_ON_FILL_OVERSIZED_REASON,/,
+  );
+
+  // The wiring that makes mint-on-fill reachable must stay in place either
+  // way: the flag gates what is ADVERTISED, and must never be "fixed" by
+  // unwiring the resolver or the verification fallback.
+  assert.match(source, /resolveOrPlanVsolSeriesCatalog/);
+  assert.match(source, /findVsolSeriesCandidateForMarket\(allMarketSymbols\(\), market\)/);
+
+  if (!executable) {
+    // While it is off, the fail-closed guard in buildVsolQuoteTransaction is
+    // the backstop and must remain.
+    assert.match(source, /VsolTransactionTooLarge/);
+    assert.match(source, /const MAX_TRANSACTION_BYTES = 1232;/);
+  }
+});

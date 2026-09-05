@@ -69,6 +69,40 @@ const PRICE_SCALE = 1_000_000n;
 // consumer in TendTerminal.tsx) can recognize "just needs minting" without
 // re-deriving or duplicating the literal.
 export const SERIES_NOT_YET_MINTED_REASON = "This series has not been minted yet.";
+
+/**
+ * Whether a rung that is not listed yet may be ADVERTISED as tradable.
+ *
+ * False, and measured rather than assumed. The mint-and-fill shape composes to
+ * 1265 bytes against the published address lookup table -- 33 bytes over
+ * MAX_TRANSACTION_BYTES -- so buildVsolQuoteTransaction fails closed and the
+ * quote returns 503 VSOL_TRANSACTION_TOO_LARGE. Measured against production on
+ * 2026-09-06 with the real ALT (7n98WJ7k…, 11 addresses), not a test stub; the
+ * size test in tests/vsol-versioned-fill.test.mjs passes because its stub table
+ * covers accounts the real one cannot.
+ *
+ * It cannot: of the 8 uncovered static keys in that transaction, 7 are the
+ * per-series market/oracle/pool-market, the per-trade position, and the
+ * per-user token account -- none of which a shared table can hold, and the
+ * 15M/1H rungs roll every 15 minutes and every hour. Only the maker is stable
+ * and missing, and collapsing it saves 31 of the 33 bytes needed.
+ *
+ * So the resolver and verification wiring below are correct and stay wired --
+ * they are what makes mint-on-fill reachable at all -- but the CATALOG must not
+ * promise a trade the quote path will refuse. Advertising these rungs as
+ * "Mints on fill" while every quote 503s is worse than the honest
+ * "Unavailable" they showed before.
+ *
+ * Flip to true once the composed transaction fits: dropping the pool manager
+ * from the mint-and-fill signer set (-64 bytes) or shrinking the signed quote
+ * payload would each clear it on their own.
+ */
+const MINT_ON_FILL_IS_EXECUTABLE = false;
+
+/** Honest reason for a rung that could be planned, but whose fill cannot be composed yet. */
+const MINT_ON_FILL_OVERSIZED_REASON =
+  "This series is not listed yet, and minting it as part of a fill currently exceeds Solana's transaction size limit.";
+
 // Solana's max transaction packet size (IPv6 MTU minus headers). The
 // mint-on-demand path adds two instructions to an already-large fill
 // transaction; if the composed size ever exceeds this, ship no path at all
@@ -934,10 +968,14 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
   return Promise.all(resolutions.map(async (resolution): Promise<VsolSeriesState> => {
     if (resolution.available && resolution.planned) {
       // A rung nobody has listed yet. Its market account does not exist, so
-      // reading it would always miss -- report the planned series directly,
-      // with the reason the ticket renders as "Mints on fill". The buyer's own
-      // fill creates and authorizes it (buildVsolQuoteTransaction below), so
-      // this is genuinely selectable, not a dressed-up failure.
+      // reading it would always miss -- report the planned series directly
+      // rather than attempting a read that is guaranteed to fail.
+      //
+      // Whether it is OFFERED depends on MINT_ON_FILL_IS_EXECUTABLE: the
+      // buyer's own fill would create and authorize it, but only if that
+      // transaction can actually be composed under the packet limit. While it
+      // cannot, the rung is reported unavailable with the real reason instead
+      // of being advertised as "Mints on fill" and then 503-ing on quote.
       const { series } = resolution;
       return {
         symbol: series.symbol,
@@ -947,11 +985,11 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
         expiry: series.expiry,
         observationWindowSeconds: series.observationWindowSeconds,
         lastTradeAt: series.lastTradeAt,
-        enabled: true,
+        enabled: MINT_ON_FILL_IS_EXECUTABLE,
         finalized: false,
-        poolAuthorized: true,
-        available: true,
-        availabilityReason: SERIES_NOT_YET_MINTED_REASON,
+        poolAuthorized: MINT_ON_FILL_IS_EXECUTABLE,
+        available: MINT_ON_FILL_IS_EXECUTABLE,
+        availabilityReason: MINT_ON_FILL_IS_EXECUTABLE ? SERIES_NOT_YET_MINTED_REASON : MINT_ON_FILL_OVERSIZED_REASON,
       };
     }
     if (!resolution.available) {
