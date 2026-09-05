@@ -31,7 +31,6 @@ import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
   VSOL_LIQUIDITY,
-  VSOL_PYTH_FEED_ID,
   VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RETIRING_LOOKUP_TABLES,
@@ -39,7 +38,7 @@ import {
   VSOL_SETTLEMENT_MINT,
 } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
-import { liveMarkets } from "./markets.ts";
+import { liveMarkets, pythFeedIdFor } from "./markets.ts";
 import {
   findVsolSeriesCandidateForMarket,
   resolveAvailableVsolSeries,
@@ -675,6 +674,7 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
   }
   const market = decodeMarketAccount(Buffer.from(marketAccount.data));
   const oracle = decodeOracleAccount(Buffer.from(oracleAccount.data));
+  const expectedFeedId = pythFeedIdFor(series.symbol);
   const expectedMarket = PublicKey.findProgramAddressSync([MARKET_SEED, VSOL_CONFIG.toBuffer(), market.marketId], VSOL_PROGRAM_ID)[0];
   const expectedOracle = PublicKey.findProgramAddressSync([ORACLE_SEED, series.marketKey.toBuffer()], VSOL_PROGRAM_ID)[0];
   const exactBinding = expectedMarket.equals(series.marketKey)
@@ -683,8 +683,11 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     && market.settlementMint.equals(VSOL_SETTLEMENT_MINT)
     && market.oracle.equals(series.oracleKey)
     && oracle.market.equals(series.marketKey)
-    && market.pythFeedId === VSOL_PYTH_FEED_ID
-    && oracle.pythFeedId === VSOL_PYTH_FEED_ID
+    // This series' OWN symbol's feed, not the manifest's single legacy
+    // `pythFeedId`: with SOL, BTC and ETH all live, one shared expected feed
+    // would reject two of the three as "not matching verified onchain state".
+    && market.pythFeedId === expectedFeedId
+    && oracle.pythFeedId === expectedFeedId
     && market.expiry === series.expiry
     && market.observationWindowSeconds === series.observationWindowSeconds
     && market.settlementGraceSeconds === series.settlementGraceSeconds
@@ -799,6 +802,10 @@ export async function buildCreateMarketInstruction(params: {
   expected?: { market: PublicKey; oracle: PublicKey };
 }) {
   const symbol = symbolBytes(params.series.symbol);
+  // Per-symbol (see pythFeedIdFor in ./markets.ts). The feed is hashed into
+  // `expected_market_id`, so encoding SOL's feed into a BTC create_market
+  // would derive -- and then mint -- a market at the wrong address entirely.
+  const feedId = pythFeedIdFor(params.series.symbol);
   const { strike } = params.series;
   // create_market rejects a non-positive strike (VsolError::InvalidStrike),
   // and a wrong-but-positive one silently derives a different market. Fail
@@ -807,7 +814,7 @@ export async function buildCreateMarketInstruction(params: {
     throw new Error("A series must be listed at a positive strike (see STRIKE_LADDER_STEP in vsol/sdk).");
   }
   const marketId = await deriveMarketId({
-    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    pythFeedId: Buffer.from(feedId, "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,
     expiry: BigInt(params.series.expiry),
     observationWindowSeconds: params.series.observationWindowSeconds,
@@ -832,7 +839,7 @@ export async function buildCreateMarketInstruction(params: {
     encodeU32(params.series.observationWindowSeconds),
     encodeU32(params.series.settlementGraceSeconds),
     encodeU16(LAUNCH_MAX_CONFIDENCE_BPS),
-    Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    Buffer.from(feedId, "hex"),
     encodeU32(params.series.maxSettlementStalenessSeconds),
     // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
     // vsol/programs/vsol/src/lib.rs, where `strike` was appended after

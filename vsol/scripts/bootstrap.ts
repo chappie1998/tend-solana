@@ -68,6 +68,10 @@ import {
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
 import { pythPriceToScaledAtoms } from "./lib/settlement.ts";
+// The shared market config -- the same list app/lib/markets.ts serves to the
+// UI and vsol/scripts/keeper.ts mints against. Imported rather than mirrored
+// so "which markets are live" is decided in exactly one file.
+import { liveMarkets, type Market } from "../../app/lib/markets.ts";
 
 // The official packages publish dual ESM/CJS builds, but solana-utils 0.6.0's
 // ESM entry imports an extensionless jito-ts path that Node 24 rejects. Loading
@@ -103,27 +107,55 @@ const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
 const walletPath = process.env.SOLANA_WALLET?.replace(/^~/, homedir()) ?? resolve(homedir(), ".config/solana/id.json");
-// Crypto.SOL/USD -- see the long note on PYTH_FEED_ID in scripts/keeper.ts
-// for why the grid needs a feed that publishes all seven days, and why this
-// deployment can no longer read the equity or tokenized-equity feeds at all
-// (Pyth's mandatory Hermes auth; this key is entitled to crypto spot only).
-// This is a devnet settlement choice, not a change of product direction.
-const pythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-// The smoke fixtures deliberately share the same feed id as the real market
-// here. They are told apart by SYMBOL (VSOL-TEST) and by a fixed strike, both
-// of which are hashed into the market id, so they still land at their own
-// addresses and can never collide with a rolling-catalog rung.
+// WHICH MARKETS THIS BOOTSTRAPS: every market app/lib/markets.ts marks
+// `status: "live"` -- SOL, BTC and ETH today -- each getting the full
+// 15M/1H/EOD/7D/30D grid, all authorized on the one main pool below. There is
+// no feed or symbol constant here any more: those were a single-market
+// assumption that let the chain and the app disagree about what exists.
+//
+// Every live feed must publish all seven days, because Tend's expiry grid is
+// 24/7 UTC with no market calendar; every live entry is a Pyth crypto spot
+// feed ("O,O,O,O,O,O,O", no holiday closures), which is also the only tier
+// this deployment's Pyth key is entitled to. See the long note in
+// scripts/keeper.ts for the equity/tokenized-equity 403s that keep NVDA and
+// Google coming-soon, and app/lib/markets.ts for why SpaceX is a different
+// kind of blocked entirely.
+//
+// The smoke fixtures deliberately share the SOL feed id. They are told apart
+// by SYMBOL (VSOL-TEST) and by a fixed strike, both of which are hashed into
+// the market id, so they still land at their own addresses and can never
+// collide with a rolling-catalog rung.
 const smokePythFeedId = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-const pythFeedBytes = [...Buffer.from(pythFeedId, "hex")];
 const smokePythFeedBytes = [...Buffer.from(smokePythFeedId, "hex")];
 // The three VSOL-TEST smoke markets are deterministic test fixtures -- they
 // must NOT depend on live spot the way the rolling catalog does. A fixed
 // constant keeps their strike reproducible across runs.
 const SMOKE_MARKET_STRIKE = 100n * PRICE_SCALE;
-// The rolling catalog's symbol. Hashed into every market id alongside the
-// feed id, so changing it relocates every rung -- see MAIN_POOL_LABEL below.
-// MUST match MARKET_SYMBOL in scripts/keeper.ts and scripts/verify-deployment.ts.
-const MARKET_SYMBOL = "SOL";
+
+/**
+ * One live market's factory inputs, resolved from the shared config. Built
+ * per market instead of read from module constants so the feed, the symbol
+ * and the ladder step travel together and cannot be mixed between markets.
+ */
+type BootstrapMarket = {
+  symbol: string;
+  pythFeedId: string;
+  pythFeedBytes: number[];
+  /** This market's rung size -- see `strikeLadderStep` in app/lib/markets.ts. */
+  strikeLadderStep: bigint;
+};
+
+function toBootstrapMarket(market: Market): BootstrapMarket {
+  if (!market.pythFeedId) {
+    throw new Error(`${market.symbol} is marked live but has no Pyth feed id configured`);
+  }
+  return {
+    symbol: market.symbol,
+    pythFeedId: market.pythFeedId,
+    pythFeedBytes: [...Buffer.from(market.pythFeedId, "hex")],
+    strikeLadderStep: market.strikeLadderStep,
+  };
+}
 // MUST match MAIN_POOL_LABEL in scripts/keeper.ts, which carries the full
 // v3 -> v4 -> v5 -> v6 -> v7 history of why this label is versioned at all.
 // The short version: a new label mints a new pool PDA, and a fresh pool is
@@ -134,11 +166,26 @@ const MARKET_SYMBOL = "SOL";
 // both the feed id AND the symbol -- each of which is hashed into every
 // market id -- so every v6 rung is at a retired address and a v6 pool's
 // `authorizedMarkets` list points entirely at a dead epoch.
+//
+// NOT bumped to v8 by the 2026-09-05 move to three live markets (SOL, BTC,
+// ETH). The rule this label follows is "a new pool whenever the markets an
+// old pool authorized stop being the markets that exist" -- and nothing here
+// relocates an existing market id. SOL keeps its feed, symbol, policy
+// constants and $2.50 ladder step, so every v7 SOL rung is still at its own
+// address and still correctly authorized. BTC and ETH are ADDED to the same
+// pool via set_liquidity_pool_market, which is exactly what per-market
+// authorization is for. Bumping here would abandon a funded pool and its
+// vault for no reason, and cost the rent of minting both again.
 const MAIN_POOL_LABEL = `${cluster}:tUSDC:main-v7`;
 const pythReceiverProgram = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 
 type MarketManifest = {
   code: SeriesCode;
+  // Which market this rung belongs to. Added when the catalog went from one
+  // market to three: `code` alone is no longer unique in this array (there
+  // are three "30D" rungs now), so anything reading the manifest must key on
+  // (symbol, code) rather than on code by itself.
+  symbol: string;
   address: string;
   oracle: string;
   expiry: number;
@@ -885,58 +932,91 @@ async function main(): Promise<void> {
   const now = await clusterUnixTime();
   const schedule = rollingMarketSchedule(now);
 
-  // The conditional-token strike is a listed ladder rung, not something
-  // re-derived per rung on every pass -- see STRIKE_LADDER_STEP/ladderStrike's
-  // doc comment in ../sdk/index.ts. Fetch spot ONCE for this whole bootstrap
-  // pass and reuse the one resulting strike for all five rolling rungs, so a
-  // single catalog snapshot never straddles two different ladder rungs for
-  // what is meant to be one coherent listing moment. Reuses the existing
-  // pythUpdateAtOrAfter plumbing (below) with expiry=0, which is trivially
-  // satisfied by the very first Hermes response -- i.e. "whatever Hermes has
-  // right now", the same semantics fetchLatestPythUpdate gives the cranker
-  // and keeper.
-  const { parsed: rollingSpotUpdate } = await pythUpdateAtOrAfter(pythFeedId, 0);
-  const rollingSpot = pythPriceToScaledAtoms(
-    BigInt(rollingSpotUpdate.price.price),
-    rollingSpotUpdate.price.expo,
-    PRICE_SCALE,
-  );
-  const rollingStrike = ladderStrike(rollingSpot);
-  console.log(`Rolling ${MARKET_SYMBOL} catalog strike: ${rollingStrike.toString()} (spot ${rollingSpot.toString()} at PRICE_SCALE)`);
+  // Every market app/lib/markets.ts marks live, in config order. The first
+  // one is the anchor market: the legacy single-market `uiMarket` pointer
+  // below still has to name exactly one rung, and it names that market's 30D.
+  const listings = liveMarkets.map(toBootstrapMarket);
+  if (listings.length === 0) throw new Error("No market is configured live in app/lib/markets.ts; there is nothing to bootstrap");
+  const anchorSymbol = listings[0].symbol;
+  console.log(`Bootstrapping ${listings.length} live market(s): ${listings.map((market) => market.symbol).join(", ")}`);
 
   const catalog: Array<MarketManifest & { marketKey: PublicKey; oracleKey: PublicKey }> = [];
-  for (const series of schedule) {
-    const created = await createMarket({
-      creatorProgram,
-      creator,
-      config,
-      settlementMint,
-      underlyingMint,
-      symbol: MARKET_SYMBOL,
-      expiry: series.expiry,
-      observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-      settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-      maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
-      pythFeedId: pythFeedBytes,
-      strike: rollingStrike,
-    });
-    catalog.push({
-      code: series.code,
-      address: created.market.toBase58(),
-      oracle: created.oracle.toBase58(),
-      expiry: series.expiry,
-      observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-      settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-      maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
-      lastTradeAt: series.lastTradeAt,
-      creator: creator.publicKey.toBase58(),
-      strike: rollingStrike.toString(),
-      marketKey: created.market,
-      oracleKey: created.oracle,
-    });
+  const skippedMarkets: string[] = [];
+  for (const listing of listings) {
+    // PER-MARKET ISOLATION, matching scripts/keeper.ts: one market's feed
+    // going dark, or one mint failing outright, must not cost the other two
+    // their catalogs. The market is skipped with a named log line and the
+    // pass continues; whatever it did mint before failing stays valid on
+    // chain and a later keeper pass fills the rest of its grid in.
+    try {
+      // The conditional-token strike is a listed ladder rung, not something
+      // re-derived per rung -- see STRIKE_LADDER_STEP/ladderStrike's doc
+      // comment in ../sdk/index.ts. Fetch spot ONCE PER MARKET and reuse the
+      // one resulting strike for all five of its rolling rungs, so a single
+      // catalog snapshot never straddles two different ladder rungs for what
+      // is meant to be one coherent listing moment. Reuses the existing
+      // pythUpdateAtOrAfter plumbing (below) with expiry=0, which is
+      // trivially satisfied by the very first Hermes response -- i.e.
+      // "whatever Hermes has right now", the same semantics
+      // fetchLatestPythUpdate gives the cranker and keeper.
+      const { parsed: rollingSpotUpdate } = await pythUpdateAtOrAfter(listing.pythFeedId, 0);
+      const rollingSpot = pythPriceToScaledAtoms(
+        BigInt(rollingSpotUpdate.price.price),
+        rollingSpotUpdate.price.expo,
+        PRICE_SCALE,
+      );
+      // This market's OWN ladder step: $2.50 is 2.4% of SOL and 0.003% of
+      // BTC. See `strikeLadderStep` in app/lib/markets.ts.
+      const rollingStrike = ladderStrike(rollingSpot, listing.strikeLadderStep);
+      console.log(
+        `Rolling ${listing.symbol} catalog strike: ${rollingStrike.toString()} ` +
+          `(spot ${rollingSpot.toString()}, step ${listing.strikeLadderStep.toString()}, at PRICE_SCALE)`,
+      );
+
+      for (const series of schedule) {
+        const created = await createMarket({
+          creatorProgram,
+          creator,
+          config,
+          settlementMint,
+          underlyingMint,
+          symbol: listing.symbol,
+          expiry: series.expiry,
+          observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+          settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+          maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+          pythFeedId: listing.pythFeedBytes,
+          strike: rollingStrike,
+        });
+        catalog.push({
+          code: series.code,
+          symbol: listing.symbol,
+          address: created.market.toBase58(),
+          oracle: created.oracle.toBase58(),
+          expiry: series.expiry,
+          observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+          settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+          maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+          lastTradeAt: series.lastTradeAt,
+          creator: creator.publicKey.toBase58(),
+          strike: rollingStrike.toString(),
+          marketKey: created.market,
+          oracleKey: created.oracle,
+        });
+      }
+    } catch (error) {
+      skippedMarkets.push(listing.symbol);
+      console.log(
+        `warn: SKIPPING market ${listing.symbol} -- ${describeErrorChain(error)}. ` +
+          "The remaining markets continue; a later keeper pass mints this one's grid.",
+      );
+    }
   }
-  const uiSeries = catalog.find((series) => series.code === "30D");
-  if (!uiSeries) throw new Error("The rolling catalog did not create a 30D market");
+  // The anchor market's own 30D rung. Found by (symbol, code): with three
+  // markets in the catalog, `code === "30D"` alone matches three rungs, and
+  // whichever one came first would be an accident of loop order.
+  const uiSeries = catalog.find((series) => series.symbol === anchorSymbol && series.code === "30D");
+  if (!uiSeries) throw new Error(`The rolling catalog did not create a 30D market for the anchor market ${anchorSymbol}`);
   const uiExpiry = uiSeries.expiry;
   const ui = { market: uiSeries.marketKey, oracle: uiSeries.oracleKey };
 
@@ -1025,7 +1105,13 @@ async function main(): Promise<void> {
     closePoolPositionDeployed: true,
     programUpgradeSignature: previousDeployment.programUpgradeSignature,
     pythReceiverProgram,
-    pythFeedId,
+    // LEGACY, single-market field. It now carries the ANCHOR market's feed
+    // (the first live entry in app/lib/markets.ts) purely so older readers of
+    // this manifest keep working. Nothing in the app derives a market id from
+    // it any more: with three live markets, one shared "expected feed" would
+    // reject two of them -- app/lib/markets.ts's pythFeedIdFor is the source
+    // of truth per symbol. See app/lib/series-resolver.ts's matchesSlot.
+    pythFeedId: listings[0].pythFeedId,
     smokePythFeedId,
     config: config.toBase58(),
     admin: admin.publicKey.toBase58(),
@@ -1044,6 +1130,7 @@ async function main(): Promise<void> {
     uiExpiry,
     markets: catalog.map((series) => ({
       code: series.code,
+      symbol: series.symbol,
       address: series.address,
       oracle: series.oracle,
       expiry: series.expiry,
@@ -1066,6 +1153,9 @@ async function main(): Promise<void> {
       manager: creator.publicKey.toBase58(),
     }],
   };
+  if (skippedMarkets.length > 0) {
+    console.log(`Bootstrap catalog SKIPPED MARKETS: ${skippedMarkets.join(", ")} (see the warnings above)`);
+  }
   await writeDeploymentManifest(
     {
       ...deploymentArtifacts,

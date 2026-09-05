@@ -58,11 +58,11 @@
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { deriveMarket, deriveMarketId, deriveOracle, ladderStrike, PRICE_SCALE, symbolBytes } from "../../vsol/sdk/index.ts";
-import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_PYTH_FEED_ID, VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
+import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
 import { deriveLaunchSeriesParams, type LaunchSeriesParams } from "./launch-params.ts";
 import { expiryCodes, type ExpiryCode } from "./expiries.ts";
-import { marketBySymbol } from "./markets.ts";
+import { marketBySymbol, pythFeedIdFor, strikeLadderStepFor } from "./markets.ts";
 import { getPythSnapshot } from "./pyth-market-data.ts";
 import { fetchAllVsolMarkets, type DiscoveredVsolMarket } from "./vsol-market-accounts.ts";
 
@@ -128,9 +128,14 @@ function absDiff(a: bigint, b: bigint): bigint {
 
 function matchesSlot(entry: DiscoveredVsolMarket, params: LaunchSeriesParams): boolean {
   const market = entry.market;
+  // The feed comes from THIS symbol's market config, not from the
+  // deployment manifest's single `pythFeedId`. That manifest field described
+  // the one market this deployment used to have; matching every symbol
+  // against it would make a BTC or ETH rung -- correctly minted, live on
+  // chain -- fail to match its own grid slot and vanish from the app.
   return market.config.equals(VSOL_CONFIG)
     && market.settlementMint.equals(VSOL_SETTLEMENT_MINT)
-    && market.pythFeedId.toLowerCase() === VSOL_PYTH_FEED_ID.toLowerCase()
+    && market.pythFeedId.toLowerCase() === pythFeedIdFor(params.symbol).toLowerCase()
     && market.symbol.toUpperCase() === params.symbol
     && market.priceScale === params.priceScale
     && market.maxConfidenceBps === params.maxConfidenceBps
@@ -356,7 +361,9 @@ export async function deriveVsolSeriesCandidate(symbol: string, code: ExpiryCode
   const normalizedSymbol = symbol.toUpperCase();
   const params = deriveLaunchSeriesParams(code, normalizedSymbol, nowMs);
   const marketId = await deriveMarketId({
-    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    // Per-symbol, for the same reason matchesSlot is: predicting a BTC
+    // listing's PDA from SOL's feed yields an address nothing will ever mint.
+    pythFeedId: Buffer.from(pythFeedIdFor(normalizedSymbol), "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,
     expiry: BigInt(params.expiry),
     observationWindowSeconds: params.observationWindowSeconds,
@@ -405,7 +412,10 @@ export async function resolveOrPlanVsolSeries(symbol: string, code: ExpiryCode, 
     const spot = await fetchSpot(symbol);
     if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
     const spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
-    const strike = ladderStrike(spotAtoms);
+    // This symbol's own ladder step -- see `strikeLadderStep` in
+    // app/lib/markets.ts. Rounding BTC onto SOL's $2.50 step would plan a
+    // listing on a rung the keeper will never mint.
+    const strike = ladderStrike(spotAtoms, strikeLadderStepFor(symbol));
     const series = await deriveVsolSeriesCandidate(symbol, code, nowMs, strike);
     return {
       symbol: series.symbol,
@@ -449,7 +459,7 @@ export async function findVsolSeriesCandidateForMarket(
     } catch {
       continue;
     }
-    const strike = ladderStrike(spotAtoms);
+    const strike = ladderStrike(spotAtoms, strikeLadderStepFor(symbol));
     for (const code of expiryCodes) {
       try {
         const candidate = await deriveVsolSeriesCandidate(symbol, code, nowMs, strike);

@@ -31,7 +31,7 @@ import {
   type LaunchSeriesParams,
 } from "./launch-params";
 import type { ExpiryCode } from "./expiries";
-import { liveMarkets, tradableMarketBySymbol } from "./markets";
+import { liveMarkets, strikeLadderStepFor, tradableMarketBySymbol } from "./markets";
 import { getPythSnapshot } from "./pyth-market-data";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
@@ -100,7 +100,10 @@ export async function buildCreateMarketTransaction(params: {
   // hand-launched series on the same ladder as the automatic ones instead of
   // fragmenting the chain onto an off-grid strike.
   const spot = await fetchLadderSpot(launchSymbol());
-  const strike = ladderStrike(spot);
+  // The launched symbol's OWN ladder step (see `strikeLadderStep` in
+  // ./markets.ts): SOL's $2.50 rung applied to BTC would list a strike no
+  // keeper pass will ever land on, orphaning the series.
+  const strike = ladderStrike(spot, strikeLadderStepFor(launchSymbol()));
   // Shared with the mint-on-demand quote path (app/lib/vsol-server.ts) and its
   // send-path inspector, so there is exactly one create_market encoder.
   const { instruction, market, oracle, marketId } = await buildCreateMarketInstruction({

@@ -210,8 +210,16 @@ code, .tabular, .num {
    would be five competing accents. */
 .asset-logo { width: 28px; height: 28px; display: grid; place-items: center; border-radius: var(--r-panel); border: 1px solid var(--border-strong); flex: 0 0 auto; font-family: var(--mono); font-weight: 600; font-size: var(--t-sm); color: var(--ink-2); background: var(--surface-2); }
 
-/* Market selector — a tab strip, not a grid of cards. */
-.asset-strip { display: flex; gap: 0; border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+/* Market selector — one panel, two ruled regions (Crypto, Stocks), each a
+   tab strip. Not a grid of cards and not nested panels: a category is drawn
+   by shading its head and ruling the group, edge to edge (rule 3). */
+.asset-strip { display: block; border: 1px solid var(--border); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
+.asset-group + .asset-group { border-top: 1px solid var(--border); }
+/* Panel-head density (8/12), and a column head's weight — this labels a
+   region, it is not a heading anyone reads as prose. */
+.asset-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 26px; padding: 4px 12px; background: var(--surface-2); border-bottom: 1px solid var(--border); font-size: var(--t-micro); font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-2); }
+.asset-group-head span { font-family: var(--mono); font-weight: 500; letter-spacing: 0.04em; color: var(--ink-3); }
+.asset-group-row { display: flex; gap: 0; flex-wrap: wrap; }
 .asset-chip { flex: 0 1 auto; min-width: 148px; min-height: 40px; padding: 5px 12px; border: 0; border-right: 1px solid var(--border); background: transparent; display: flex; align-items: center; gap: 8px; text-align: left; cursor: pointer; transition: background-color 120ms ease, color 120ms ease; position: relative; }
 .asset-chip:last-child { border-right: 0; }
 .asset-chip:hover:not(:disabled) { background: var(--surface-2); }
@@ -227,6 +235,12 @@ code, .tabular, .num {
    named and visible, unmistakably not selectable. */
 .asset-chip:disabled, .asset-chip.coming-soon { cursor: not-allowed; background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--ink-3) 6%, transparent) 6px 7px); }
 .asset-chip.coming-soon strong, .asset-chip.coming-soon small, .asset-chip.coming-soon em { color: var(--ink-3); }
+/* A coming-soon market states its own reason, so it takes the full row: the
+   two reasons differ in kind (an un-entitled feed vs no feed at all) and
+   "Coming soon" alone would flatten that difference. Sans, not mono — this
+   is prose, not a value you compare down a column. */
+.asset-chip.coming-soon { flex: 1 1 100%; align-items: flex-start; }
+.asset-chip .asset-chip-note { display: block; min-width: 0; flex: 1 1 auto; padding-top: 1px; font-size: var(--t-xs); font-weight: 400; line-height: 1.45; color: var(--ink-3); text-wrap: pretty; }
 
 .positive { color: var(--positive) !important; }
 .negative { color: var(--negative) !important; }
@@ -593,8 +607,11 @@ footer a:hover { color: var(--ink); }
   .trade-layout, .dashboard-view { padding: 8px 8px 24px; }
   .ticket-column { max-width: none; }
   .instrument-id { flex-wrap: wrap; }
-  .asset-strip { flex-wrap: wrap; }
+  .asset-group-row { flex-wrap: wrap; }
   .asset-chip { flex: 1 1 50%; min-width: 0; min-height: 46px; }
+  /* Narrow: the note stacks under the ticker rather than sharing its row. */
+  .asset-chip.coming-soon { flex: 1 1 100%; flex-wrap: wrap; }
+  .asset-chip .asset-chip-note { flex-basis: 100%; padding-top: 3px; }
   .price-row { align-items: flex-start; flex-direction: column; gap: 10px; }
   .spot-price > strong { font-size: 1.5rem; }
   .market-stats { width: 100%; display: grid; grid-template-columns: 1fr 1fr 1fr; }
