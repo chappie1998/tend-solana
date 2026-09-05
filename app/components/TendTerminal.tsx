@@ -91,6 +91,10 @@ const assets = markets.map((market) => ({
   intradayEligible: market.intradayEligible,
   tradable: market.status === "live",
   statusNote: market.statusNote,
+  // Both read straight from config so no view can invent an asset class.
+  assetClass: market.assetClass,
+  blurb: market.blurb,
+  pythSymbol: market.pythSymbol,
 }));
 const tradableAssets = assets.filter((asset) => asset.tradable);
 
@@ -520,7 +524,7 @@ function TradeView({
         <div className="product-intro"><span className="eyebrow">VSOL · Solana-native defined risk</span><h1>Options, without the trapdoors.</h1><p>Choose up or down. Your loss is capped at the premium, and Solana escrows the writer’s full payout before the trade opens.</p></div>
         <VsolStatus />
         <div className="market-header">
-          <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2><span>Stock Token</span></div><p>{asset.name} economic exposure</p></div></div>
+          <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2>{/* Both strings come from app/lib/markets.ts. SOL was hardcoded as "Stock Token" here, which is simply untrue — the config carries what each instrument actually is so no view can invent it. */}<span>{asset.assetClass}</span></div><p>{asset.blurb}</p></div></div>
           <span className="asset-picker">Devnet sandbox</span>
         </div>
 

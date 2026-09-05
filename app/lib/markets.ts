@@ -25,6 +25,19 @@ export type Market = {
   intradayEligible: boolean;
   status: MarketStatus;
   /**
+   * What the instrument actually IS, rendered verbatim as the badge beside
+   * the ticker. It lives in config precisely so no view can invent one --
+   * SOL was previously badged "Stock Token" by a hardcoded string in
+   * TendTerminal.tsx, which is false and the kind of copy that costs more
+   * credibility than any styling problem.
+   */
+  assetClass: string;
+  /**
+   * One true sentence naming the underlying and the feed it settles on.
+   * Shown under the ticker; must stay accurate to `pythSymbol` above.
+   */
+  blurb: string;
+  /**
    * Short, user-facing sentence explaining why a non-live market cannot
    * trade. Empty string for live markets. Shown on the disabled selector
    * chip and returned verbatim by the expiry/quote gates, so the reason a
@@ -55,6 +68,8 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.SOL/USD",
     intradayEligible: true,
     status: "live",
+    assetClass: "Native asset",
+    blurb: "Solana's native asset, settled against the Pyth Crypto.SOL/USD feed.",
     statusNote: "",
   },
   {
@@ -85,7 +100,9 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.NVDAX/USD",
     intradayEligible: true,
     status: "coming-soon",
-    statusNote: "Coming soon — equity feeds need a paid Pyth tier.",
+    assetClass: "Tokenized equity",
+    blurb: "Tokenized NVIDIA (xStocks), priced by the Pyth Crypto.NVDAX/USD feed.",
+    statusNote: "Coming soon — not tradable: this deployment's Pyth key covers crypto feeds only, and Crypto.NVDAX/USD needs a paid entitlement tier.",
   },
 ];
 
