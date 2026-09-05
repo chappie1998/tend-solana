@@ -648,27 +648,72 @@ async function getPoolCore(connection: Connection): Promise<PoolCore> {
 // treated as authoritative from chain rather than compared against a
 // locally-derived policy value; the caller applies it via the existing
 // before-cutoff / before-expiry availability logic.
-async function getPoolMarketState(series: VsolSeries, connection: Connection) {
-  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
-  const address = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
-  const account = await connection.getAccountInfo(address, "confirmed");
-  if (!account || !account.owner.equals(VSOL_PROGRAM_ID)) throw new Error("The VSOL pool-market authorization is unavailable");
-  // decodePoolMarketAccount enforces the account discriminator and exact size.
-  const state = decodePoolMarketAccount(Buffer.from(account.data));
-  if (!state.pool.equals(VSOL_LIQUIDITY.poolKey) || !state.market.equals(series.marketKey)) {
-    throw new Error("The published pool-market authorization does not match onchain state");
-  }
-  return { ...state, address };
-}
 
 export async function getVsolSeriesState(series: VsolSeries, connection = getVsolConnection()): Promise<VsolSeriesState> {
-  const [marketAccount, oracleAccount, poolMarket, now] = await Promise.all([
+  const [marketAccount, oracleAccount, poolMarketAccount, now] = await Promise.all([
     connection.getAccountInfo(series.marketKey, "confirmed"),
     connection.getAccountInfo(series.oracleKey, "confirmed"),
-    getPoolMarketState(series, connection),
+    connection.getAccountInfo(derivePoolMarketAddress(series), "confirmed"),
     clusterTime(connection),
   ]);
+  return verifyVsolSeriesState(series, { marketAccount, oracleAccount, poolMarketAccount }, now);
+}
+
+function derivePoolMarketAddress(series: VsolSeries): PublicKey {
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  return derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
+}
+
+// getMultipleAccounts' documented per-request ceiling. Chunking keeps this
+// correct as the market list grows rather than silently truncating.
+const MAX_ACCOUNTS_PER_BATCH = 100;
+
+/**
+ * Reads `keys` in as few round trips as the RPC allows, returning them by
+ * base58 address. Duplicates are de-duplicated first (a pool-market address is
+ * derived from its market, so a catalog naturally repeats keys); a missing
+ * account is simply absent from the map, exactly as a null getAccountInfo.
+ */
+async function fetchAccountsByKey(connection: Connection, keys: PublicKey[]) {
+  const unique = [...new Map(keys.map((key) => [key.toBase58(), key])).values()];
+  const byKey = new Map<string, { data: Uint8Array; owner: PublicKey }>();
+  for (let index = 0; index < unique.length; index += MAX_ACCOUNTS_PER_BATCH) {
+    const chunk = unique.slice(index, index + MAX_ACCOUNTS_PER_BATCH);
+    const accounts = await connection.getMultipleAccountsInfo(chunk, "confirmed");
+    accounts.forEach((account, position) => {
+      if (account) byKey.set(chunk[position].toBase58(), account);
+    });
+  }
+  return byKey;
+}
+
+/** The three accounts a series' state is verified against, already fetched. */
+type FetchedSeriesAccounts = {
+  marketAccount: { data: Uint8Array; owner: PublicKey } | null;
+  oracleAccount: { data: Uint8Array; owner: PublicKey } | null;
+  poolMarketAccount: { data: Uint8Array; owner: PublicKey } | null;
+};
+
+/**
+ * Every check that decides whether a series is tradable, with the RPC reads
+ * hoisted out. Pure on purpose: getVsolSeriesState fetches one series' accounts
+ * and getVsolSeriesStates fetches a whole catalog's in one batched call, and
+ * BOTH verify through here -- so batching can never end up enforcing less than
+ * the single-series path.
+ */
+function verifyVsolSeriesState(series: VsolSeries, accounts: FetchedSeriesAccounts, now: number): VsolSeriesState {
+  const { marketAccount, oracleAccount, poolMarketAccount } = accounts;
   if (!marketAccount || !oracleAccount) throw new Error(SERIES_NOT_YET_MINTED_REASON);
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  if (!poolMarketAccount || !poolMarketAccount.owner.equals(VSOL_PROGRAM_ID)) {
+    throw new Error("The VSOL pool-market authorization is unavailable");
+  }
+  // decodePoolMarketAccount enforces the account discriminator and exact size.
+  const decodedPoolMarket = decodePoolMarketAccount(Buffer.from(poolMarketAccount.data));
+  if (!decodedPoolMarket.pool.equals(VSOL_LIQUIDITY.poolKey) || !decodedPoolMarket.market.equals(series.marketKey)) {
+    throw new Error("The published pool-market authorization does not match onchain state");
+  }
+  const poolMarket = { ...decodedPoolMarket, address: derivePoolMarketAddress(series) };
   if (!marketAccount.owner.equals(VSOL_PROGRAM_ID) || !oracleAccount.owner.equals(VSOL_PROGRAM_ID)) {
     throw new Error("The deployed VSOL series is not owned by the verified program");
   }
@@ -870,6 +915,22 @@ export async function buildCreateMarketInstruction(params: {
  */
 export async function getVsolSeriesStates(connection = getVsolConnection()): Promise<VsolSeriesState[]> {
   const resolutions = await resolveOrPlanVsolSeriesCatalog(allMarketSymbols());
+  // Every account this catalog needs, fetched in ONE batched call rather than
+  // three per listed rung. The per-rung shape cost ~5 RPC round trips (market,
+  // oracle, pool-market, getSlot, getBlockTime) x every listed rung -- ~46
+  // calls for a 15-slot catalog -- which rate-limited the RPC often enough
+  // that expiries intermittently rendered "Unavailable" in the ticket for no
+  // real reason. This is 4 calls total, and the clock is read once for the
+  // whole batch instead of once per rung.
+  const listed = resolutions.flatMap((resolution) => (resolution.available && !resolution.planned ? [resolution.series] : []));
+  const [accountsByKey, batchNow] = await Promise.all([
+    fetchAccountsByKey(
+      connection,
+      listed.flatMap((series) => [series.marketKey, series.oracleKey, derivePoolMarketAddress(series)]),
+    ),
+    clusterTime(connection).then((value) => value, () => null),
+  ]);
+
   return Promise.all(resolutions.map(async (resolution): Promise<VsolSeriesState> => {
     if (resolution.available && resolution.planned) {
       // A rung nobody has listed yet. Its market account does not exist, so
@@ -910,7 +971,13 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
       };
     }
     try {
-      return await getVsolSeriesState(resolution.series, connection);
+      if (batchNow === null) throw new Error("Devnet clock is unavailable");
+      const { series } = resolution;
+      return verifyVsolSeriesState(series, {
+        marketAccount: accountsByKey.get(series.marketKey.toBase58()) ?? null,
+        oracleAccount: accountsByKey.get(series.oracleKey.toBase58()) ?? null,
+        poolMarketAccount: accountsByKey.get(derivePoolMarketAddress(series).toBase58()) ?? null,
+      }, batchNow);
     } catch (error) {
       const { series } = resolution;
       return {

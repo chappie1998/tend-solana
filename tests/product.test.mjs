@@ -116,8 +116,8 @@ test("server creates buyer-bound V2 pool RFQs and verifies fills before persiste
   // authorized after the last bootstrap snapshot).
   assert.doesNotMatch(server, /authorizedMarketKeys/);
   assert.match(server, /derivePoolMarket\(VSOL_LIQUIDITY\.poolKey, series\.marketKey\)/);
-  assert.match(server, /state\.pool\.equals\(VSOL_LIQUIDITY\.poolKey\)/);
-  assert.match(server, /state\.market\.equals\(series\.marketKey\)/);
+  assert.match(server, /decodedPoolMarket\.pool\.equals\(VSOL_LIQUIDITY\.poolKey\)/);
+  assert.match(server, /decodedPoolMarket\.market\.equals\(series\.marketKey\)/);
   assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(positionsRoute, /persisted, passing simulation/);

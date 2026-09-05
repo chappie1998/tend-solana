@@ -242,7 +242,19 @@ test("callers resolve series from chain, not the retired manifest lookup, and is
   assert.match(server, /This series has not been minted yet\./);
   // getVsolSeriesStates must catch per-rung failures rather than letting a
   // single bad/unminted rung reject the whole Promise.all batch.
-  assert.match(server, /try\s*{\s*return await getVsolSeriesState/);
+  // The catalog must read its accounts in ONE batched call and the cluster
+  // clock ONCE for the whole batch. The per-rung shape it replaced cost ~5 RPC
+  // round trips per listed rung (~46 for a 15-slot catalog), which the RPC
+  // rate-limited often enough that expiries intermittently rendered
+  // "Unavailable" in the ticket with no real cause.
+  assert.match(server, /getMultipleAccountsInfo/);
+  // One clock read for the whole batch, not one per rung.
+  assert.match(server, /clusterTime\(connection\)\.then/);
+
+  // Per-rung isolation: the catalog verifies each rung inside its own
+  // try/catch, so one bad or unreadable rung cannot reject the whole
+  // Promise.all batch and blank the entire expiry ladder.
+  assert.match(server, /try\s*{[\s\S]{0,400}?verifyVsolSeriesState\(series,[\s\S]{0,400}?}\s*catch \(error\)/);
 
   // The manifest keeps its other roles (program id, config, pool, mints):
   // these exports must still be present and still manifest-sourced.
