@@ -648,7 +648,7 @@ async function waitUntil(timestamp: number, label: string): Promise<void> {
 }
 
 async function pythUpdateAtOrAfter(feedId: string, expiry: number) {
-  const client = new HermesClient(process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network", {
+  const client = new HermesClient(process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network", {
     accessToken: process.env.PYTH_API_KEY?.trim() || undefined,
     timeout: 20_000,
     httpRetries: 3,

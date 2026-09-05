@@ -77,7 +77,7 @@ const commitment = "confirmed" as const;
 const connection = new Connection(rpcUrl, commitment);
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
-const hermes = new HermesClient(process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network", {
+const hermes = new HermesClient(process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network", {
   accessToken: process.env.PYTH_API_KEY?.trim() || undefined,
   timeout: 20_000,
   httpRetries: 3,

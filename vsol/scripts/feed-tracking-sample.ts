@@ -43,7 +43,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const HERMES = process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network";
+const HERMES = process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network";
 const workspace = resolve(import.meta.dirname, "..");
 const outputDir = resolve(workspace, ".feed-tracking");
 const outputPath = resolve(outputDir, "samples.jsonl");

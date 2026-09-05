@@ -248,7 +248,14 @@ let hermesClient: HermesClient | undefined;
  */
 function getHermesClient(): HermesClient {
   if (!hermesClient) {
-    hermesClient = new HermesClient(process.env.PYTH_HERMES_URL ?? "https://hermes.pyth.network", {
+    // `|| default`, NOT `?? default`. GitHub Actions substitutes an UNSET
+    // secret as an EMPTY STRING rather than leaving the variable unset, and
+    // `??` only falls back on null/undefined — so `""` would win and become
+    // the Hermes base URL. That is exactly what happened: the workflow
+    // referenced a `PYTH_HERMES_URL` secret that was never created, and every
+    // keeper pass failed with a bare "Invalid URL" while looking, misleadingly,
+    // like a Pyth outage.
+    hermesClient = new HermesClient(process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network", {
       accessToken: process.env.PYTH_API_KEY?.trim() || undefined,
       timeout: 20_000,
       httpRetries: 3,
