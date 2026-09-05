@@ -89,6 +89,19 @@ export type Market = {
    * settlement path for it even in principle, at any price tier.
    */
   statusNote: string;
+  /**
+   * Two or three words carrying the SAME distinction `statusNote` makes, for
+   * the selector chip. `statusNote` stays the authoritative sentence and is
+   * still what the gates return and what the chip shows on hover -- but
+   * rendering three full sentences inline made the untradable markets taller
+   * than the tradable ones and inverted the panel's hierarchy. Empty string
+   * for live markets.
+   *
+   * Must preserve the kind-of-blocker distinction: a billing state that a
+   * purchase clears reads differently from an instrument that has no
+   * settlement source in principle.
+   */
+  statusTag: string;
 };
 
 // Ladder steps in dollars, converted once here so each market's entry reads
@@ -120,6 +133,7 @@ export const markets: Market[] = [
     assetClass: "Native asset",
     blurb: "Solana's native asset, settled against the Pyth Crypto.SOL/USD feed.",
     statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "BTC",
@@ -143,6 +157,7 @@ export const markets: Market[] = [
     assetClass: "Native asset",
     blurb: "Bitcoin, settled against the Pyth Crypto.BTC/USD feed.",
     statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "ETH",
@@ -166,6 +181,7 @@ export const markets: Market[] = [
     assetClass: "Native asset",
     blurb: "Ether, settled against the Pyth Crypto.ETH/USD feed.",
     statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "NVDA",
@@ -205,6 +221,7 @@ export const markets: Market[] = [
     assetClass: "Tokenized equity",
     blurb: "Tokenized NVIDIA (xStocks), priced by the Pyth Crypto.NVDAX/USD feed.",
     statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.NVDAX/USD needs a paid tier.",
+    statusTag: "Feed not entitled",
   },
   {
     symbol: "GOOGL",
@@ -229,6 +246,7 @@ export const markets: Market[] = [
     assetClass: "Tokenized equity",
     blurb: "Tokenized Alphabet (xStocks), priced by the Pyth Crypto.GOOGLX/USD feed.",
     statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.GOOGLX/USD needs a paid tier.",
+    statusTag: "Feed not entitled",
   },
   {
     symbol: "SPACEX",
@@ -260,6 +278,7 @@ export const markets: Market[] = [
     assetClass: "Private company",
     blurb: "SpaceX equity. No public market and no oracle — listed here as a target, not a tradable series.",
     statusNote: "Coming soon — SpaceX is a private company: no public price and no Pyth feed exists for it at all, so there is no settlement source to trade against yet.",
+    statusTag: "No feed exists",
   },
 ];
 

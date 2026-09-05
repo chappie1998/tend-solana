@@ -363,9 +363,20 @@ test("the catalog is two categories: three tradable crypto markets and three com
   assert.deepEqual(markets.marketsByCategory.map((group) => group.markets.length), [3, 3]);
   assert.match(terminal, /marketsByCategory/);
   assert.match(terminal, /asset-group-head/);
-  // The reason is rendered, not just tooltipped.
+  // WHICH kind of blocker a coming-soon market has is rendered, not just
+  // tooltipped -- as the two-word `statusTag`, so these untradable rows never
+  // outweigh the tradable ones. The authoritative sentence stays reachable as
+  // the chip's title, and stays the same string the gates return.
   assert.match(terminal, /asset-chip-note/);
-  assert.match(terminal, /\{item\.statusNote\}/);
+  assert.match(terminal, /\{item\.statusTag\}/);
+  assert.match(terminal, /title=\{item\.tradable \? undefined : item\.statusNote\}/);
+  // Every coming-soon market must carry both, and the tag must preserve the
+  // distinction the sentence makes rather than collapsing to one label.
+  const soonMarkets = markets.markets.filter((market) => market.status !== "live");
+  assert.equal(soonMarkets.length, 3);
+  assert.ok(soonMarkets.every((market) => market.statusTag.length > 0 && market.statusTag.length <= 20));
+  assert.equal(new Set(soonMarkets.map((market) => market.statusTag)).size, 2);
+  assert.ok(markets.markets.filter((market) => market.status === "live").every((market) => market.statusTag === ""));
 });
 
 test("expiry grid stays strictly increasing and collision-free across every UTC clock position", async () => {

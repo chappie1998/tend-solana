@@ -101,6 +101,7 @@ function toAsset(market: (typeof markets)[number]) {
     intradayEligible: market.intradayEligible,
     tradable: market.status === "live",
     statusNote: market.statusNote,
+    statusTag: market.statusTag,
     // Both read straight from config so no view can invent an asset class.
     assetClass: market.assetClass,
     blurb: market.blurb,
@@ -585,14 +586,25 @@ function TradeView({
                 {group.assets.map((item) => (
                   <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
                     <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : "Pyth pending"}</small></span>
-                    {/* The reason is rendered, not only tooltipped: the two coming-soon
-                        cases are different in kind (an un-entitled feed vs no feed at
-                        all) and a user cannot tell which is which from "Coming soon".
-                        Same string the server returns from resolveExpiry, so the reason
-                        shown is the reason enforced. */}
+                    {/* The two coming-soon cases are different in kind (an un-entitled
+                        feed vs no feed at all) and a user cannot tell which is which
+                        from "Coming soon", so the distinction is rendered, not only
+                        tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
+                        full sentence. Three sentences inline made the UNTRADABLE
+                        markets taller than the tradable ones. The authoritative
+                        sentence is still one hover away (the button's `title`), and it
+                        is still the same string the server returns from resolveExpiry,
+                        so the reason shown is the reason enforced.
+
+                        A market that is tradable but not selected shows nothing here:
+                        it has a live price in the line above, and an em-dash beside a
+                        real price reads as missing data rather than as "not the
+                        market you are looking at". */}
                     {item.tradable
-                      ? <em className={item.ticker === asset.ticker && marketSnapshot?.mode === "live" ? "positive" : ""}>{item.ticker === asset.ticker ? marketSnapshot?.mode ?? "—" : "—"}</em>
-                      : <span className="asset-chip-note">{item.statusNote}</span>}
+                      ? item.ticker === asset.ticker
+                        ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
+                        : null
+                      : <span className="asset-chip-note">{item.statusTag}</span>}
                   </button>
                 ))}
               </div>

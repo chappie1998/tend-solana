@@ -235,12 +235,14 @@ code, .tabular, .num {
    named and visible, unmistakably not selectable. */
 .asset-chip:disabled, .asset-chip.coming-soon { cursor: not-allowed; background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--ink-3) 6%, transparent) 6px 7px); }
 .asset-chip.coming-soon strong, .asset-chip.coming-soon small, .asset-chip.coming-soon em { color: var(--ink-3); }
-/* A coming-soon market states its own reason, so it takes the full row: the
-   two reasons differ in kind (an un-entitled feed vs no feed at all) and
-   "Coming soon" alone would flatten that difference. Sans, not mono — this
-   is prose, not a value you compare down a column. */
-.asset-chip.coming-soon { flex: 1 1 100%; align-items: flex-start; }
-.asset-chip .asset-chip-note { display: block; min-width: 0; flex: 1 1 auto; padding-top: 1px; font-size: var(--t-xs); font-weight: 400; line-height: 1.45; color: var(--ink-3); text-wrap: pretty; }
+/* A coming-soon market names WHICH kind of blocker it has (an un-entitled
+   feed vs no feed at all) — "Coming soon" alone would flatten that
+   difference. Two words, sitting in the same slot the live markets use for
+   their status: these rows must not outweigh the tradable ones, which is
+   what a full sentence per row did. The authoritative sentence is the
+   button's title, one hover away. */
+.asset-chip.coming-soon { flex: 1 1 auto; }
+.asset-chip .asset-chip-note { min-width: 0; flex: 0 0 auto; margin-left: auto; padding-left: 10px; font-size: var(--t-xs); font-weight: 400; letter-spacing: 0.01em; line-height: 1.3; color: var(--ink-3); white-space: nowrap; }
 
 .positive { color: var(--positive) !important; }
 .negative { color: var(--negative) !important; }
@@ -609,9 +611,9 @@ footer a:hover { color: var(--ink); }
   .instrument-id { flex-wrap: wrap; }
   .asset-group-row { flex-wrap: wrap; }
   .asset-chip { flex: 1 1 50%; min-width: 0; min-height: 46px; }
-  /* Narrow: the note stacks under the ticker rather than sharing its row. */
-  .asset-chip.coming-soon { flex: 1 1 100%; flex-wrap: wrap; }
-  .asset-chip .asset-chip-note { flex-basis: 100%; padding-top: 3px; }
+  /* Narrow: the tag keeps sharing the ticker's row — it is two words now,
+     so it no longer needs one of its own. */
+  .asset-chip.coming-soon { flex: 1 1 50%; }
   .price-row { align-items: flex-start; flex-direction: column; gap: 10px; }
   .spot-price > strong { font-size: 1.5rem; }
   .market-stats { width: 100%; display: grid; grid-template-columns: 1fr 1fr 1fr; }
