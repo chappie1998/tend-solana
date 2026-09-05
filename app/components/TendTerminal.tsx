@@ -280,13 +280,17 @@ const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
 
 // Exact string app/lib/vsol-server.ts's getVsolSeriesState throws (and the
 // onchain catalog reports via /api/markets) when a rung's market account does
-// not exist yet. A buyer can still trade it -- their fill mints and
-// authorizes the series in the same transaction (see buildVsolQuoteTransaction) --
-// so this is treated as selectable, not blocked, while keeping the honest
-// underlying reason intact for anything that still needs the real one.
+// not exist yet. A buyer can still trade it -- requesting a quote lists the
+// series on chain server-side first (listVsolSeriesOnChain), then quotes the
+// ordinary fill -- so this is treated as selectable, not blocked, while
+// keeping the honest underlying reason intact for anything that needs it.
+//
+// The buyer pays no extra rent and signs nothing extra: the listing is its own
+// server-signed transaction, which is also why the buyer's fill stays at two
+// instructions and inside the packet limit.
 const MINT_ON_DEMAND_REASON = "This series has not been minted yet.";
-const MINT_ON_DEMAND_CHIP_NOTE = "Mints on fill";
-const MINT_ON_DEMAND_FULL_NOTE = "First trade mints this series onchain — you pay ~0.003 SOL rent.";
+const MINT_ON_DEMAND_CHIP_NOTE = "Lists on quote";
+const MINT_ON_DEMAND_FULL_NOTE = "No one has listed this expiry yet — requesting a quote lists it onchain first, then quotes it. Costs you nothing extra.";
 
 // Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
 function expiryChipNote(item: Pick<ExpiryDefinition, "available" | "detail" | "availabilityReason">): string {

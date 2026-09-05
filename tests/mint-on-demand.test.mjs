@@ -350,13 +350,14 @@ test("vsolPoolManager fails closed with a clear message when VSOL_POOL_MANAGER_S
 test("buildVsolQuoteTransaction wraps a missing/mismatched pool manager key into an honest, distinctly-named fail-closed error for the mint-on-demand path", async () => {
   const server = await import(new URL("app/lib/vsol-server.ts", root));
   const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
-  // vsolPoolManager() is only ever reached inside the `seriesState.mintOnDemand`
-  // branch, so ordinary fills on already-minted series never call it -- and
+  // vsolPoolManager() is only ever reached from listVsolSeriesOnChain, which
+  // buildVsolQuoteTransaction calls only inside the `seriesState.mintOnDemand`
+  // branch -- so ordinary fills on already-listed series never call it, and
   // any failure there is re-thrown as a clearly-named, honest error rather
   // than silently proceeding without pool-manager authorization.
-  assert.match(source, /if \(seriesState\.mintOnDemand\)/);
+  assert.match(source, /if \(seriesState\.mintOnDemand\) await listVsolSeriesOnChain\(series, connection\);/);
   assert.match(source, /poolManager = vsolPoolManager\(\)/);
-  assert.match(source, /Mint-on-demand is unavailable: \$\{message\}/);
+  assert.match(source, /Listing this series is unavailable: \$\{message\}/);
   assert.match(source, /wrapped\.name = "VsolPoolManagerUnavailable"/);
   assert.ok(typeof server.buildVsolQuoteTransaction === "function");
 });
@@ -412,41 +413,42 @@ test("inspectVsolFillTransaction's mint-and-fill branch falls back to the grid c
   assert.match(branch, /resolveAvailableVsolSeries\(allMarketSymbols\(\)\)/);
 });
 
-test("the catalog never advertises a not-yet-listed rung as tradable while its fill cannot be composed", async () => {
+test("an unlisted rung is listed in its OWN server-signed transaction, keeping the buyer's fill at two instructions", async () => {
   const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
 
-  // MEASURED, not assumed: the mint-and-fill shape composes to 1265 bytes
-  // against the real published ALT -- 33 over the 1232-byte packet limit --
-  // so buildVsolQuoteTransaction fails closed and /api/quotes returns 503.
-  // The size test above passes only because its stub lookup table covers
-  // accounts the real table cannot (the per-series market/oracle/pool-market,
-  // the per-trade position, the per-user token account).
+  // The bug this pins: folding create_market + set_liquidity_pool_market into
+  // the BUYER's fill made a 4-instruction transaction that measured 1265 bytes
+  // against the real published lookup table -- 33 over the 1232-byte packet
+  // limit -- so every 15M/1H/EOD quote failed closed and those rungs could
+  // never trade. Extending the table cannot fix it: 7 of the 8 uncovered
+  // static keys are per-series, per-trade or per-user.
   //
-  // So the catalog must gate on the same fact. A ticket that offers "Mints on
-  // fill" and then refuses every quote is worse than one that says the rung
-  // is unavailable, which is exactly what these rungs said before the
-  // resolver was wired up.
+  // So the listing is hoisted into its own server-signed transaction and the
+  // buyer keeps the plain 2-instruction fill that has always fit.
+  assert.match(source, /instructions: \[signatureInstruction, fillInstruction\],/);
+  assert.doesNotMatch(source, /instructions: \[\.\.\.mintInstructions/);
+  assert.match(source, /async function listVsolSeriesOnChain\(/);
+
+  // The listing must stay atomic — a market created without its pool-market
+  // authorization is a rung that exists but can never be quoted.
+  const listing = source.slice(source.indexOf("async function listVsolSeriesOnChain("));
+  assert.match(listing, /\.add\(created\.instruction, authorizeInstruction\)/);
+
+  // Idempotency must be decided by READING the chain, never by matching the
+  // error text: two concurrent quotes on the same unlisted rung race, and the
+  // loser's "already in use" is success — but a genuine failure must not be.
+  assert.match(listing, /getAccountInfo\(series\.marketKey, "confirmed"\)/);
+  assert.match(listing, /if \(!account \|\| !account\.owner\.equals\(VSOL_PROGRAM_ID\)\) throw error;/);
+
+  // Availability and the reason must move together, so the catalog can never
+  // advertise a rung the quote path would refuse.
   assert.match(source, /const MINT_ON_FILL_IS_EXECUTABLE = (true|false);/);
-  const executable = /const MINT_ON_FILL_IS_EXECUTABLE = true;/.test(source);
-
-  // Whatever the flag says, availability and the reason must move together --
-  // never `available: true` with the oversized reason, or vice versa.
   assert.match(source, /available: MINT_ON_FILL_IS_EXECUTABLE,/);
-  assert.match(
-    source,
-    /availabilityReason: MINT_ON_FILL_IS_EXECUTABLE \? SERIES_NOT_YET_MINTED_REASON : MINT_ON_FILL_OVERSIZED_REASON,/,
-  );
 
-  // The wiring that makes mint-on-fill reachable must stay in place either
-  // way: the flag gates what is ADVERTISED, and must never be "fixed" by
-  // unwiring the resolver or the verification fallback.
+  // The wiring that makes these rungs reachable at all must stay in place.
   assert.match(source, /resolveOrPlanVsolSeriesCatalog/);
   assert.match(source, /findVsolSeriesCandidateForMarket\(allMarketSymbols\(\), market\)/);
-
-  if (!executable) {
-    // While it is off, the fail-closed guard in buildVsolQuoteTransaction is
-    // the backstop and must remain.
-    assert.match(source, /VsolTransactionTooLarge/);
-    assert.match(source, /const MAX_TRANSACTION_BYTES = 1232;/);
-  }
+  // And the fail-closed size guard remains the backstop.
+  assert.match(source, /VsolTransactionTooLarge/);
+  assert.match(source, /const MAX_TRANSACTION_BYTES = 1232;/);
 });

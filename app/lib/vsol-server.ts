@@ -73,35 +73,18 @@ export const SERIES_NOT_YET_MINTED_REASON = "This series has not been minted yet
 /**
  * Whether a rung that is not listed yet may be ADVERTISED as tradable.
  *
- * False, and measured rather than assumed. The mint-and-fill shape composes to
- * 1265 bytes against the published address lookup table -- 33 bytes over
- * MAX_TRANSACTION_BYTES -- so buildVsolQuoteTransaction fails closed and the
- * quote returns 503 VSOL_TRANSACTION_TOO_LARGE. Measured against production on
- * 2026-09-06 with the real ALT (7n98WJ7k…, 11 addresses), not a test stub; the
- * size test in tests/vsol-versioned-fill.test.mjs passes because its stub table
- * covers accounts the real one cannot.
+ * True, because listVsolSeriesOnChain lists it server-side when the quote is
+ * requested, leaving the buyer the plain two-instruction fill. It was false
+ * while the buyer had to mint the rung inside their own fill: that shape
+ * measured 1265 bytes against the real lookup table, 33 over the packet limit,
+ * so every such quote failed closed and the catalog would have been promising
+ * a trade the quote path always refused.
  *
- * It cannot: of the 8 uncovered static keys in that transaction, 7 are the
- * per-series market/oracle/pool-market, the per-trade position, and the
- * per-user token account -- none of which a shared table can hold, and the
- * 15M/1H rungs roll every 15 minutes and every hour. Only the maker is stable
- * and missing, and collapsing it saves 31 of the 33 bytes needed.
- *
- * So the resolver and verification wiring below are correct and stay wired --
- * they are what makes mint-on-fill reachable at all -- but the CATALOG must not
- * promise a trade the quote path will refuse. Advertising these rungs as
- * "Mints on fill" while every quote 503s is worse than the honest
- * "Unavailable" they showed before.
- *
- * Flip to true once the composed transaction fits: dropping the pool manager
- * from the mint-and-fill signer set (-64 bytes) or shrinking the signed quote
- * payload would each clear it on their own.
+ * Kept as a named constant rather than deleted: it is the single switch that
+ * decides whether the intraday rungs -- 15M, 1H and EOD, the ones no keeper
+ * pre-mints because they roll too fast -- are offered at all.
  */
-const MINT_ON_FILL_IS_EXECUTABLE = false;
-
-/** Honest reason for a rung that could be planned, but whose fill cannot be composed yet. */
-const MINT_ON_FILL_OVERSIZED_REASON =
-  "This series is not listed yet, and minting it as part of a fill currently exceeds Solana's transaction size limit.";
+const MINT_ON_FILL_IS_EXECUTABLE = true;
 
 // Solana's max transaction packet size (IPv6 MTU minus headers). The
 // mint-on-demand path adds two instructions to an already-large fill
@@ -971,11 +954,11 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
       // reading it would always miss -- report the planned series directly
       // rather than attempting a read that is guaranteed to fail.
       //
-      // Whether it is OFFERED depends on MINT_ON_FILL_IS_EXECUTABLE: the
-      // buyer's own fill would create and authorize it, but only if that
-      // transaction can actually be composed under the packet limit. While it
-      // cannot, the rung is reported unavailable with the real reason instead
-      // of being advertised as "Mints on fill" and then 503-ing on quote.
+      // Whether it is OFFERED depends on MINT_ON_FILL_IS_EXECUTABLE. It is
+      // genuinely selectable: requesting a quote lists the rung on chain
+      // server-side (listVsolSeriesOnChain) and then returns the ordinary
+      // two-instruction fill, so nothing here promises a trade the quote path
+      // would refuse.
       const { series } = resolution;
       return {
         symbol: series.symbol,
@@ -989,7 +972,7 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
         finalized: false,
         poolAuthorized: MINT_ON_FILL_IS_EXECUTABLE,
         available: MINT_ON_FILL_IS_EXECUTABLE,
-        availabilityReason: MINT_ON_FILL_IS_EXECUTABLE ? SERIES_NOT_YET_MINTED_REASON : MINT_ON_FILL_OVERSIZED_REASON,
+        availabilityReason: SERIES_NOT_YET_MINTED_REASON,
       };
     }
     if (!resolution.available) {
@@ -1109,6 +1092,84 @@ function randomNonce() {
   return Buffer.from(bytes).readBigUInt64LE();
 }
 
+/**
+ * Lists `series` on chain -- create_market + set_liquidity_pool_market, in one
+ * atomic transaction paid and signed by the pool manager -- when it does not
+ * exist yet. Idempotent: a rung another request just listed is a no-op.
+ *
+ * WHY THE SERVER MINTS, AND NOT THE BUYER
+ *
+ * The original design folded these two instructions into the BUYER's own fill,
+ * so the buyer became the creator and paid the rent. Measured against the real
+ * published lookup table, that four-instruction shape composes to 1265 bytes --
+ * 33 over Solana's 1232-byte packet limit -- so it could never be sent, and
+ * every 15M/1H/EOD quote failed closed with VsolTransactionTooLarge. It cannot
+ * be fixed by extending the table either: of the eight uncovered static keys,
+ * seven are the per-series market, oracle and pool-market, the per-trade
+ * position, and the per-user token account, none of which a shared table can
+ * hold, and the intraday rungs roll every 15 minutes anyway.
+ *
+ * Hoisting the listing into its own server-signed transaction leaves the buyer
+ * with the plain two-instruction fill that has always fit, with no program
+ * change and no keeper cron. The rungs that need this are exactly the ones no
+ * keeper pre-mints because they roll too fast to pre-mint.
+ *
+ * Costs the pool manager ~0.003 SOL of rent per listed rung, recoverable by
+ * close_settled_market after settlement. Only ever reached when a real quote
+ * is requested for that rung, so nothing is minted speculatively.
+ *
+ * Fails closed: with VSOL_POOL_MANAGER_SECRET_KEY unset or mismatched,
+ * vsolPoolManager() throws and the quote fails honestly rather than silently
+ * quoting a series that does not exist.
+ */
+async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection): Promise<void> {
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  let poolManager: Keypair;
+  try {
+    poolManager = vsolPoolManager();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The pool manager key is not configured";
+    const wrapped = new Error(`Listing this series is unavailable: ${message}`);
+    wrapped.name = "VsolPoolManagerUnavailable";
+    throw wrapped;
+  }
+
+  const created = await buildCreateMarketInstruction({
+    creator: poolManager.publicKey,
+    series,
+    expected: { market: series.marketKey, oracle: series.oracleKey },
+  });
+  const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
+  const authorizeInstruction = instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
+    manager: poolManager.publicKey,
+    config: VSOL_CONFIG,
+    pool: VSOL_LIQUIDITY.poolKey,
+    market: series.marketKey,
+    pool_market: derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey),
+    system_program: SystemProgram.programId,
+  }, authorizeData);
+
+  const latest = await connection.getLatestBlockhash("confirmed");
+  const transaction = new Transaction({
+    feePayer: poolManager.publicKey,
+    blockhash: latest.blockhash,
+    lastValidBlockHeight: latest.lastValidBlockHeight,
+  }).add(created.instruction, authorizeInstruction);
+  transaction.sign(poolManager);
+
+  try {
+    const signature = await connection.sendRawTransaction(transaction.serialize(), { preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight }, "confirmed");
+  } catch (error) {
+    // Two concurrent quotes on the same unlisted rung race here, and the loser
+    // fails with "account already in use". That is success, not failure -- but
+    // only confirm it by READING the chain, never by pattern-matching the
+    // error text, so a genuine failure can never be mistaken for a win.
+    const account = await connection.getAccountInfo(series.marketKey, "confirmed");
+    if (!account || !account.owner.equals(VSOL_PROGRAM_ID)) throw error;
+  }
+}
+
 export async function buildVsolQuoteTransaction(params: {
   buyer: PublicKey;
   series?: VsolSeries;
@@ -1139,33 +1200,7 @@ export async function buildVsolQuoteTransaction(params: {
   // throws and this whole quote attempt fails honestly; ordinary fills on
   // already-minted series never reach this branch at all.
   const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
-  let poolManager: Keypair | null = null;
-  let mintInstructions: TransactionInstruction[] = [];
-  if (seriesState.mintOnDemand) {
-    try {
-      poolManager = vsolPoolManager();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The pool manager key is not configured";
-      const wrapped = new Error(`Mint-on-demand is unavailable: ${message}`);
-      wrapped.name = "VsolPoolManagerUnavailable";
-      throw wrapped;
-    }
-    const created = await buildCreateMarketInstruction({
-      creator: params.buyer,
-      series,
-      expected: { market: series.marketKey, oracle: series.oracleKey },
-    });
-    const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
-    const authorizeInstruction = instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
-      manager: poolManager.publicKey,
-      config: VSOL_CONFIG,
-      pool: VSOL_LIQUIDITY.poolKey,
-      market: series.marketKey,
-      pool_market: poolMarket,
-      system_program: SystemProgram.programId,
-    }, authorizeData);
-    mintInstructions = [created.instruction, authorizeInstruction];
-  }
+  if (seriesState.mintOnDemand) await listVsolSeriesOnChain(series, connection);
 
   const buyerSource = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, params.buyer);
   if (!(await connection.getAccountInfo(buyerSource, "confirmed"))) {
@@ -1239,33 +1274,29 @@ export async function buildVsolQuoteTransaction(params: {
   }, quoteData(quote));
   const latest = await connection.getLatestBlockhash("confirmed");
   // When the manifest publishes an ALT, compile as a v0 transaction so
-  // repeated 32-byte account keys collapse into 1-byte indices -- this is
-  // what lets the 4-instruction mint-on-demand shape (otherwise ~1469 bytes)
-  // fit under the 1232-byte packet limit. Falls back to the exact legacy
-  // shape used before the ALT existed whenever no table is available.
+  // repeated 32-byte account keys collapse into 1-byte indices. The buyer's
+  // transaction is always the plain two-instruction fill now -- an unlisted
+  // rung was listed by listVsolSeriesOnChain above, in its own server-signed
+  // transaction, rather than by two extra instructions in here (which composed
+  // to 1265 bytes, over the packet limit, and so could never be sent). Falls
+  // back to the exact legacy shape whenever no table is available.
   const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
   const transaction = composeVsolFillTransaction({
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
-    instructions: [...mintInstructions, signatureInstruction, fillInstruction],
+    instructions: [signatureInstruction, fillInstruction],
     lookupTableAccount,
   });
-  // The pool manager is a required signer on set_liquidity_pool_market; sign
-  // now server-side (the buyer signs everything else, including this
-  // instruction's other accounts, in their wallet next).
-  if (poolManager) partialSignVsolTransaction(transaction, poolManager);
 
   const serialized = serializeVsolTransaction(transaction);
   if (serialized.length > MAX_TRANSACTION_BYTES) {
     // Do not ship a silently-broken oversized transaction: fail the quote
-    // honestly so the caller reports the series as unavailable rather than
-    // handing the wallet something that can never fit in a packet -- this
-    // can now only genuinely happen when no ALT is published at all, since
-    // ALT compression brings even the mint-on-demand shape back under the
-    // limit (see the size-measurement test in tests/vsol-versioned-fill.test.mjs).
+    // honestly rather than handing the wallet something that can never fit in
+    // a packet. The two-instruction fill has always fit with room to spare, so
+    // reaching this now would mean a real regression in the fill's shape.
     const error = new Error(
-      `Minting this series requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit. A versioned transaction or address lookup table is required before this series can trade.`,
+      `This fill requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit.`,
     );
     error.name = "VsolTransactionTooLarge";
     throw error;
