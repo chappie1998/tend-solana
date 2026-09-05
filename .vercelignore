@@ -1,0 +1,34 @@
+# Vercel builds ONLY the Next.js app. The repo also carries the Anchor/Rust
+# workspace, whose target/ alone is 3.2GB — uploading it blows past Vercel's
+# 15,000-file limit and kills the connection mid-transfer.
+#
+# The app imports exactly three paths out of vsol/, verified by grep:
+#   vsol/sdk, vsol/deployments/devnet.json, vsol/target/idl/vsol.json
+# Everything heavy is excluded explicitly below rather than via ignore-file
+# negation, which is fragile and silently failed here once already.
+
+node_modules
+.next
+.git
+vsol/node_modules
+vsol/programs
+vsol/tests
+vsol/.anchor
+vsol/.devnet
+vsol/target/debug
+vsol/target/release
+vsol/target/deploy
+vsol/target/sbpf-solana-solana
+vsol/target/tmp
+vsol/target/bpfel-unknown-unknown
+vsol/target/.rustc_info.json
+vsol/target/CACHEDIR.TAG
+
+web
+worker
+artifacts
+cache
+.wrangler
+examples
+*.so
+*.rlib
