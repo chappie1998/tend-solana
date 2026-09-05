@@ -43,7 +43,7 @@ import {
   findVsolSeriesCandidateForMarket,
   resolveAvailableVsolSeries,
   resolveVsolSeries,
-  resolveVsolSeriesCatalog,
+  resolveOrPlanVsolSeriesCatalog,
   type ResolvedVsolSeries,
 } from "./series-resolver.ts";
 import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
@@ -869,8 +869,30 @@ export async function buildCreateMarketInstruction(params: {
  * down the rest of the catalog (each is checked and reported independently).
  */
 export async function getVsolSeriesStates(connection = getVsolConnection()): Promise<VsolSeriesState[]> {
-  const resolutions = await resolveVsolSeriesCatalog(allMarketSymbols());
+  const resolutions = await resolveOrPlanVsolSeriesCatalog(allMarketSymbols());
   return Promise.all(resolutions.map(async (resolution): Promise<VsolSeriesState> => {
+    if (resolution.available && resolution.planned) {
+      // A rung nobody has listed yet. Its market account does not exist, so
+      // reading it would always miss -- report the planned series directly,
+      // with the reason the ticket renders as "Mints on fill". The buyer's own
+      // fill creates and authorizes it (buildVsolQuoteTransaction below), so
+      // this is genuinely selectable, not a dressed-up failure.
+      const { series } = resolution;
+      return {
+        symbol: series.symbol,
+        code: series.code,
+        market: series.marketKey.toBase58(),
+        oracle: series.oracleKey.toBase58(),
+        expiry: series.expiry,
+        observationWindowSeconds: series.observationWindowSeconds,
+        lastTradeAt: series.lastTradeAt,
+        enabled: true,
+        finalized: false,
+        poolAuthorized: true,
+        available: true,
+        availabilityReason: SERIES_NOT_YET_MINTED_REASON,
+      };
+    }
     if (!resolution.available) {
       return {
         symbol: resolution.symbol,
@@ -1439,8 +1461,17 @@ export async function inspectVsolFillTransaction(input: Transaction | ResolvedFi
     const market = fillInstruction.keys[4]?.pubkey;
     const buyer = fillInstruction.keys[0];
     if (!market || !buyer?.isSigner) return null;
+    // Discovery first: a rung someone else minted between quote and submit is
+    // a real listed market, and matching it is stricter than re-deriving.
     const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
-    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market));
+    // ...but a mint-and-fill's whole premise is that its market does NOT exist
+    // on chain yet, so discovery MISSES by construction in the normal case.
+    // Falling back to the grid's would-be candidate for this exact pubkey is
+    // what makes the branch reachable at all. Without it every genuine
+    // mint-and-fill is rejected, and the only fills that verify are ones whose
+    // market was already listed -- i.e. not mint-and-fill at all.
+    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market))
+      ?? await findVsolSeriesCandidateForMarket(allMarketSymbols(), market);
     if (!verifiedSeries) return null;
     if (!(await verifyCreateMarketInstruction(createInstruction, buyer.pubkey, verifiedSeries))) return null;
     if (!verifyAuthorizeMarketInstruction(authorizeInstruction, verifiedSeries)) return null;

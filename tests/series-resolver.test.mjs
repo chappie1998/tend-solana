@@ -225,11 +225,16 @@ test("callers resolve series from chain, not the retired manifest lookup, and is
   assert.doesNotMatch(chainCatalog, /VSOL_SERIES/);
   assert.doesNotMatch(quotesRoute, /vsolSeries\(/);
 
-  assert.match(server, /resolveVsolSeriesCatalog/);
+  // Both the catalog (/api/markets) and the quote path must use the PLANNING
+  // resolvers, not the discovery-only ones. With the discovery-only variants
+  // here, mint-on-fill is unreachable: every rung no keeper has pre-minted
+  // renders dead in the ticket and 503s on quote, which is exactly the bug
+  // these two assertions exist to prevent regressing.
+  assert.match(server, /resolveOrPlanVsolSeriesCatalog/);
   assert.match(server, /resolveAvailableVsolSeries/);
   assert.match(chainPositions, /resolveAvailableVsolSeries/);
   assert.match(chainCatalog, /resolveAvailableVsolSeries/);
-  assert.match(quotesRoute, /resolveVsolSeries/);
+  assert.match(quotesRoute, /resolveOrPlanVsolSeries\(/);
   assert.match(sendRoute, /await inspectVsolFillTransaction/);
 
   // A not-yet-minted market must surface as an honest, non-crashing reason —
@@ -245,4 +250,144 @@ test("callers resolve series from chain, not the retired manifest lookup, and is
   assert.match(vsolSource, /export const VSOL_CONFIG = new PublicKey\(deployment\.config\)/);
   assert.match(vsolSource, /export const VSOL_LIQUIDITY/);
   assert.match(vsolSource, /export const VSOL_SETTLEMENT_MINT = new PublicKey\(deployment\.settlementMint\)/);
+});
+
+// --- resolveOrPlanVsolSeriesCatalog -----------------------------------------
+//
+// The batched twin of resolveOrPlanVsolSeries, and what /api/markets serves.
+// Regression cover for a shipped bug: the catalog used the discovery-only
+// resolver, so 15M and 1H -- which no keeper pre-mints, because those slots
+// roll every 15 minutes -- rendered "Unavailable" in the ticket even though
+// the buyer's own fill can mint them.
+
+/** Lists `codes` for SOL on chain at `now`, all at STRIKE. Returns stub entries. */
+async function listSolRungs(modules, now, codes) {
+  const { resolver, launchParams, vsol, accounts } = modules;
+  const entries = [];
+  for (const code of codes) {
+    const params = launchParams.deriveLaunchSeriesParams(code, "SOL", now);
+    const candidate = await resolver.deriveVsolSeriesCandidate("SOL", code, now, STRIKE);
+    entries.push({
+      address: candidate.marketKey,
+      data: buildMarketAccountBuffer({
+        discriminator: accounts.MARKET_ACCOUNT_DISCRIMINATOR,
+        config: vsol.VSOL_CONFIG,
+        settlementMint: vsol.VSOL_SETTLEMENT_MINT,
+        oracle: candidate.oracleKey,
+        symbol: "SOL",
+        priceScale: params.priceScale,
+        expiry: params.expiry,
+        observationWindowSeconds: params.observationWindowSeconds,
+        settlementGraceSeconds: params.settlementGraceSeconds,
+        maxConfidenceBps: params.maxConfidenceBps,
+        pythFeedId: vsol.VSOL_PYTH_FEED_ID,
+        maxSettlementStalenessSeconds: params.maxSettlementStalenessSeconds,
+        strike: STRIKE,
+      }),
+    });
+  }
+  return entries;
+}
+
+test("resolveOrPlanVsolSeriesCatalog plans the unlisted rungs and leaves the listed ones discovered", async () => {
+  const modules = await loadModules();
+  const { resolver } = modules;
+  const now = Date.parse("2026-07-21T14:00:00Z");
+
+  // Chain has the three longer-dated SOL rungs listed; 15M and 1H are not.
+  const entries = await listSolRungs(modules, now, ["EOD", "7D", "30D"]);
+  const deps = { connection: stubConnection(entries), fetchSpot: async () => 210 };
+
+  const catalog = await resolver.resolveOrPlanVsolSeriesCatalog(["SOL"], now, deps);
+  assert.equal(catalog.length, 5);
+  assert.ok(catalog.every((entry) => entry.available), "every SOL rung must be tradable: listed ones by discovery, the rest by planning");
+
+  const byCode = new Map(catalog.map((entry) => [entry.code, entry]));
+  for (const code of ["EOD", "7D", "30D"]) {
+    assert.ok(!byCode.get(code).planned, `${code} is listed on chain, so it must be discovered, not planned`);
+    assert.equal(byCode.get(code).series.strike, STRIKE, `${code} must carry the strike read back from chain`);
+  }
+  for (const code of ["15M", "1H"]) {
+    const planned = byCode.get(code);
+    assert.equal(planned.planned, true, `${code} is unlisted, so it must resolve as a planned listing`);
+    assert.match(planned.strikeSelectionNote, /planned a new listing/);
+    // Planned at the live at-the-money ladder rung, NOT at whatever the
+    // already-listed rungs happen to use.
+    assert.equal(planned.series.strike, 210_000_000n);
+    assert.ok(planned.series.marketKey && planned.series.oracleKey);
+  }
+
+  // The planned market must be the SAME address the buyer's mint-and-fill
+  // would create -- otherwise the signed quote binds a market that never
+  // comes into existence.
+  const expected = await resolver.deriveVsolSeriesCandidate("SOL", "15M", now, 210_000_000n);
+  assert.equal(byCode.get("15M").series.marketKey.toBase58(), expected.marketKey.toBase58());
+});
+
+test("resolveOrPlanVsolSeriesCatalog costs one chain scan and at most one spot lookup per symbol", async () => {
+  const modules = await loadModules();
+  const { resolver } = modules;
+  const now = Date.parse("2026-07-21T14:00:00Z");
+
+  let scans = 0;
+  const spotCalls = [];
+  const deps = {
+    connection: {
+      async getProgramAccounts() {
+        scans += 1;
+        return [];
+      },
+    },
+    fetchSpot: async (symbol) => {
+      spotCalls.push(symbol);
+      return 210;
+    },
+  };
+
+  // Nothing listed, so all 10 slots (2 symbols x 5 codes) need planning --
+  // the worst case for redundant lookups.
+  const catalog = await resolver.resolveOrPlanVsolSeriesCatalog(["SOL", "BTC"], now, deps);
+  assert.equal(catalog.length, 10);
+  assert.equal(scans, 1, "the whole batch must share ONE getProgramAccounts scan");
+  assert.equal(spotCalls.length, 2, "each symbol must be priced once, not once per expiry code");
+  assert.deepEqual([...new Set(spotCalls)].sort(), ["BTC", "SOL"]);
+});
+
+test("resolveOrPlanVsolSeriesCatalog plans only UNLISTED slots — a grid-ruled-out slot keeps its own reason", async () => {
+  const modules = await loadModules();
+  const { resolver } = modules;
+  const now = Date.parse("2026-07-21T14:00:00Z");
+  const deps = { connection: stubConnection([]), fetchSpot: async () => 210 };
+
+  // SPACEX is configured coming-soon: it has no Pyth feed at all, so the grid
+  // itself rules it out. Planning must NOT paper over that.
+  const catalog = await resolver.resolveOrPlanVsolSeriesCatalog(["SPACEX"], now, deps);
+  assert.equal(catalog.length, 5);
+  assert.ok(catalog.every((entry) => !entry.available), "a coming-soon symbol must stay unavailable at every code");
+  assert.ok(
+    catalog.every((entry) => entry.reason !== resolver.SERIES_NOT_YET_LISTED_REASON),
+    "its reason must be the grid's own explanation, not 'not listed yet'",
+  );
+});
+
+test("resolveOrPlanVsolSeriesCatalog falls back to the honest reason when spot is unavailable", async () => {
+  const modules = await loadModules();
+  const { resolver } = modules;
+  const now = Date.parse("2026-07-21T14:00:00Z");
+
+  let spotCalls = 0;
+  const deps = {
+    connection: stubConnection([]),
+    fetchSpot: async () => {
+      spotCalls += 1;
+      throw new Error("Pyth is unreachable");
+    },
+  };
+
+  const catalog = await resolver.resolveOrPlanVsolSeriesCatalog(["SOL"], now, deps);
+  assert.equal(catalog.length, 5);
+  assert.ok(catalog.every((entry) => !entry.available), "with no spot there is no honest strike to plan at");
+  assert.ok(catalog.every((entry) => typeof entry.reason === "string" && entry.reason.length > 0));
+  // One failure per symbol, not one per code.
+  assert.equal(spotCalls, 1);
 });

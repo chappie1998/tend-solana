@@ -8,7 +8,7 @@ import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries"
 import { getPythRealizedVolatility, getPythSnapshot } from "../../lib/pyth-market-data";
 import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesStateOrPlan, parsePublicKey } from "../../lib/vsol-server";
 import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
-import { resolveVsolSeries } from "../../lib/series-resolver";
+import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 
 export async function POST(request: Request) {
@@ -53,7 +53,7 @@ export async function POST(request: Request) {
   const requestedAt = Date.now();
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
   if (!expiry.available) return json({ error: expiry.availabilityReason }, 422);
-  const resolution = await resolveVsolSeries(symbol, expiryCode, requestedAt);
+  const resolution = await resolveOrPlanVsolSeries(symbol, expiryCode, requestedAt);
   if (!resolution.available) {
     return json({
       error: resolution.reason,

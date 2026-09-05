@@ -360,3 +360,54 @@ test("buildVsolQuoteTransaction wraps a missing/mismatched pool manager key into
   assert.match(source, /wrapped\.name = "VsolPoolManagerUnavailable"/);
   assert.ok(typeof server.buildVsolQuoteTransaction === "function");
 });
+
+// --- the not-yet-minted case ------------------------------------------------
+//
+// Every test above resolves an ALREADY-LISTED series (resolveLiveNvda30D), so
+// they exercise the mint-and-fill SHAPE but never its premise: that the market
+// does not exist on chain yet. That gap hid a real bug --
+// inspectVsolFillTransaction matched the signed market against
+// resolveAvailableVsolSeries (discovery) alone, which misses by construction
+// for a market being minted by the very transaction under inspection, so every
+// genuine mint-and-fill was rejected. These two tests pin the fallback that
+// makes the branch reachable.
+
+test("findVsolSeriesCandidateForMarket resolves a market that chain discovery cannot see, and rejects one off the grid", async () => {
+  const { resolver, sdk } = await loadModules();
+  const now = Date.parse("2026-07-21T14:00:00Z");
+  const spot = 210;
+  const deps = { fetchSpot: async () => spot };
+
+  // The rung a brand-new SOL 15M listing would bind to right now. Nothing is
+  // listed here -- this address exists only as a prediction.
+  const strike = sdk.ladderStrike(BigInt(Math.round(spot * Number(sdk.PRICE_SCALE))), sdk.STRIKE_LADDER_STEP);
+  const candidate = await resolver.deriveVsolSeriesCandidate("SOL", "15M", now, strike);
+
+  const found = await resolver.findVsolSeriesCandidateForMarket(["SOL"], candidate.marketKey, now, deps);
+  assert.ok(found, "the grid's own would-be candidate must be resolvable by its predicted market pubkey");
+  assert.equal(found.marketKey.toBase58(), candidate.marketKey.toBase58());
+  assert.equal(found.code, "15M");
+  assert.equal(found.strike, strike);
+
+  // An address that is not any grid slot's candidate must NOT resolve -- this
+  // fallback widens what verification accepts, so it has to stay tight.
+  const offGrid = await resolver.deriveVsolSeriesCandidate("SOL", "15M", now, strike + 1n);
+  assert.equal(
+    await resolver.findVsolSeriesCandidateForMarket(["SOL"], offGrid.marketKey, now, deps),
+    null,
+    "a market one atom off the ladder rung is not a grid candidate and must be rejected",
+  );
+});
+
+test("inspectVsolFillTransaction's mint-and-fill branch falls back to the grid candidate when discovery misses", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
+  const branch = source.slice(source.indexOf("if (isVsolMintAndFillTransaction(transaction))"));
+
+  // Discovery alone cannot verify a market that does not exist yet. If this
+  // fallback is ever dropped, mint-on-fill silently stops working: quotes are
+  // issued and then every submission is rejected.
+  assert.match(branch, /findVsolSeriesCandidateForMarket\(allMarketSymbols\(\), market\)/);
+  // And it must remain a FALLBACK, not a replacement -- an already-listed
+  // market has to verify against the real chain state first.
+  assert.match(branch, /resolveAvailableVsolSeries\(allMarketSymbols\(\)\)/);
+});
