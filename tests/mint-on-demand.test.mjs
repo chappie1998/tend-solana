@@ -355,7 +355,11 @@ test("buildVsolQuoteTransaction wraps a missing/mismatched pool manager key into
   // branch -- so ordinary fills on already-listed series never call it, and
   // any failure there is re-thrown as a clearly-named, honest error rather
   // than silently proceeding without pool-manager authorization.
-  assert.match(source, /if \(seriesState\.mintOnDemand\) await listVsolSeriesOnChain\(series, connection\);/);
+  // Runs unconditionally BEFORE the state read: the states it repairs (an
+  // unlisted rung, and a half-listed one whose authorization never landed)
+  // are exactly the ones that read rejects, so reading first would 503 the
+  // quote before the repair could be attempted. It is a no-op otherwise.
+  assert.match(source, /await listVsolSeriesOnChain\(series, connection\);\n\n  const \[core, seriesState\]/);
   assert.match(source, /poolManager = vsolPoolManager\(\)/);
   assert.match(source, /Listing this series is unavailable: \$\{message\}/);
   assert.match(source, /wrapped\.name = "VsolPoolManagerUnavailable"/);
@@ -432,13 +436,21 @@ test("an unlisted rung is listed in its OWN server-signed transaction, keeping t
   // The listing must stay atomic — a market created without its pool-market
   // authorization is a rung that exists but can never be quoted.
   const listing = source.slice(source.indexOf("async function listVsolSeriesOnChain("));
-  assert.match(listing, /\.add\(created\.instruction, authorizeInstruction\)/);
+  assert.match(listing, /\.add\(\.\.\.instructions\)/);
+  // Each half is repaired independently, so a HALF-listed rung is fixable too.
+  assert.match(listing, /const needsMarket = !marketAccount;/);
+  assert.match(listing, /const needsAuthorization = !poolMarketAccount;/);
+  // But authorization is only ever CREATED, never re-sent: a pool_market that
+  // exists with enabled=false is a deliberate pool decision, and re-sending
+  // set_liquidity_pool_market with enabled=true would silently override it.
+  assert.doesNotMatch(listing, /poolMarketAccount && .*enabled/);
 
   // Idempotency must be decided by READING the chain, never by matching the
   // error text: two concurrent quotes on the same unlisted rung race, and the
   // loser's "already in use" is success — but a genuine failure must not be.
-  assert.match(listing, /getAccountInfo\(series\.marketKey, "confirmed"\)/);
-  assert.match(listing, /if \(!account \|\| !account\.owner\.equals\(VSOL_PROGRAM_ID\)\) throw error;/);
+  assert.match(listing, /getMultipleAccountsInfo\(\[series\.marketKey, poolMarketKey\], "confirmed"\)/);
+  assert.match(listing, /const listed = market\?\.owner\.equals\(VSOL_PROGRAM_ID\) && poolMarket\?\.owner\.equals\(VSOL_PROGRAM_ID\);/);
+  assert.match(listing, /if \(!listed\) throw error;/);
 
   // Availability and the reason must move together, so the catalog can never
   // advertise a rung the quote path would refuse.

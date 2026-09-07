@@ -804,8 +804,18 @@ export type VsolSeriesStateOrPlan = VsolSeriesState & { mintOnDemand: boolean };
  * still throw/report unavailable exactly as before).
  */
 export async function getVsolSeriesStateOrPlan(series: VsolSeries, connection = getVsolConnection()): Promise<VsolSeriesStateOrPlan> {
-  const marketAccount = await connection.getAccountInfo(series.marketKey, "confirmed");
-  if (marketAccount) {
+  // BOTH halves, not just the market. A rung whose create_market landed but
+  // whose set_liquidity_pool_market never did is half-listed: the market is
+  // right there on chain, so checking only that would send it down the verify
+  // path, where it throws "pool-market authorization is unavailable". It is
+  // repairable exactly like an unlisted rung -- listVsolSeriesOnChain fills in
+  // whichever half is missing -- so it reports the same way.
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  const [marketAccount, poolMarketAccount] = await connection.getMultipleAccountsInfo(
+    [series.marketKey, derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey)],
+    "confirmed",
+  );
+  if (marketAccount && poolMarketAccount) {
     const state = await getVsolSeriesState(series, connection);
     return { ...state, mintOnDemand: false };
   }
@@ -994,11 +1004,34 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
     try {
       if (batchNow === null) throw new Error("Devnet clock is unavailable");
       const { series } = resolution;
-      return verifyVsolSeriesState(series, {
+      const accounts = {
         marketAccount: accountsByKey.get(series.marketKey.toBase58()) ?? null,
         oracleAccount: accountsByKey.get(series.oracleKey.toBase58()) ?? null,
         poolMarketAccount: accountsByKey.get(derivePoolMarketAddress(series).toBase58()) ?? null,
-      }, batchNow);
+      };
+      // Half-listed: the market exists but its pool-market authorization never
+      // landed. Verification rejects that, but the quote path REPAIRS it
+      // (listVsolSeriesOnChain), so reporting it unavailable here would
+      // deadlock the rung -- the ticket would disable the chip, so nobody
+      // could request the quote that fixes it. Report it exactly like a rung
+      // that is not listed yet, which is what it effectively is.
+      if (accounts.marketAccount && !accounts.poolMarketAccount && MINT_ON_FILL_IS_EXECUTABLE) {
+        return {
+          symbol: series.symbol,
+          code: series.code,
+          market: series.marketKey.toBase58(),
+          oracle: series.oracleKey.toBase58(),
+          expiry: series.expiry,
+          observationWindowSeconds: series.observationWindowSeconds,
+          lastTradeAt: series.lastTradeAt,
+          enabled: true,
+          finalized: false,
+          poolAuthorized: false,
+          available: true,
+          availabilityReason: SERIES_NOT_YET_MINTED_REASON,
+        };
+      }
+      return verifyVsolSeriesState(series, accounts, batchNow);
     } catch (error) {
       const { series } = resolution;
       return {
@@ -1124,6 +1157,27 @@ function randomNonce() {
  */
 async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection): Promise<void> {
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  const poolMarketKey = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
+  const [marketAccount, poolMarketAccount] = await connection.getMultipleAccountsInfo(
+    [series.marketKey, poolMarketKey],
+    "confirmed",
+  );
+
+  // The two halves of a listing are checked INDEPENDENTLY, because they can
+  // genuinely come apart: a rung whose create_market landed but whose
+  // authorization never did reads as "market exists" to discovery and then
+  // fails verification with "pool-market authorization is unavailable" -- a
+  // half-listed rung that can never be quoted and that the mint-on-demand path
+  // never repairs, since the market is right there on chain. Observed on the
+  // live EOD rung (AG7MWA3J…, pool-market 4LiUfn9a… missing).
+  const needsMarket = !marketAccount;
+  // ONLY when the account is absent. A pool_market that EXISTS with
+  // enabled=false is the pool having deliberately disabled this series;
+  // re-sending set_liquidity_pool_market with enabled=true would silently
+  // override that decision. Verification reports it as disabled instead.
+  const needsAuthorization = !poolMarketAccount;
+  if (!needsMarket && !needsAuthorization) return;
+
   let poolManager: Keypair;
   try {
     poolManager = vsolPoolManager();
@@ -1134,27 +1188,33 @@ async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection)
     throw wrapped;
   }
 
-  const created = await buildCreateMarketInstruction({
-    creator: poolManager.publicKey,
-    series,
-    expected: { market: series.marketKey, oracle: series.oracleKey },
-  });
-  const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
-  const authorizeInstruction = instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
-    manager: poolManager.publicKey,
-    config: VSOL_CONFIG,
-    pool: VSOL_LIQUIDITY.poolKey,
-    market: series.marketKey,
-    pool_market: derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey),
-    system_program: SystemProgram.programId,
-  }, authorizeData);
+  const instructions: TransactionInstruction[] = [];
+  if (needsMarket) {
+    const created = await buildCreateMarketInstruction({
+      creator: poolManager.publicKey,
+      series,
+      expected: { market: series.marketKey, oracle: series.oracleKey },
+    });
+    instructions.push(created.instruction);
+  }
+  if (needsAuthorization) {
+    const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
+    instructions.push(instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
+      manager: poolManager.publicKey,
+      config: VSOL_CONFIG,
+      pool: VSOL_LIQUIDITY.poolKey,
+      market: series.marketKey,
+      pool_market: poolMarketKey,
+      system_program: SystemProgram.programId,
+    }, authorizeData));
+  }
 
   const latest = await connection.getLatestBlockhash("confirmed");
   const transaction = new Transaction({
     feePayer: poolManager.publicKey,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
-  }).add(created.instruction, authorizeInstruction);
+  }).add(...instructions);
   transaction.sign(poolManager);
 
   try {
@@ -1165,8 +1225,9 @@ async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection)
     // fails with "account already in use". That is success, not failure -- but
     // only confirm it by READING the chain, never by pattern-matching the
     // error text, so a genuine failure can never be mistaken for a win.
-    const account = await connection.getAccountInfo(series.marketKey, "confirmed");
-    if (!account || !account.owner.equals(VSOL_PROGRAM_ID)) throw error;
+    const [market, poolMarket] = await connection.getMultipleAccountsInfo([series.marketKey, poolMarketKey], "confirmed");
+    const listed = market?.owner.equals(VSOL_PROGRAM_ID) && poolMarket?.owner.equals(VSOL_PROGRAM_ID);
+    if (!listed) throw error;
   }
 }
 
@@ -1185,22 +1246,23 @@ export async function buildVsolQuoteTransaction(params: {
   if (!series) throw new Error("No verified VSOL V2 quote series is published");
   const connection = getVsolConnection();
   const authority = vsolQuoteAuthority();
+
+  // BEFORE the state read, not after it. listVsolSeriesOnChain is a no-op for
+  // a fully-listed rung (one batched read of two accounts), but it has to run
+  // first because the states it repairs are exactly the ones the read REJECTS:
+  // a market that does not exist yet, and a half-listed rung whose
+  // authorization never landed. Reading first would throw
+  // "pool-market authorization is unavailable" and 503 the quote before the
+  // repair could ever be attempted.
+  await listVsolSeriesOnChain(series, connection);
+
   const [core, seriesState] = await Promise.all([
     getPoolCore(connection),
     getVsolSeriesStateOrPlan(series, connection),
   ]);
   if (!seriesState.available) throw new Error(seriesState.availabilityReason);
 
-  // Mint-on-demand: the market this rung resolves to does not exist onchain
-  // yet. Rather than fail, the buyer becomes the market's creator (paying its
-  // rent) and the pool manager authorizes it in the same transaction, ahead
-  // of the existing Ed25519 + fill_pool_quote pair. The pool manager key is
-  // loaded fresh here (never persisted beyond this call) and fails closed --
-  // with VSOL_POOL_MANAGER_SECRET_KEY unset or mismatched, vsolPoolManager()
-  // throws and this whole quote attempt fails honestly; ordinary fills on
-  // already-minted series never reach this branch at all.
   const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
-  if (seriesState.mintOnDemand) await listVsolSeriesOnChain(series, connection);
 
   const buyerSource = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, params.buyer);
   if (!(await connection.getAccountInfo(buyerSource, "confirmed"))) {

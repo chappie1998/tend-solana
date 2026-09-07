@@ -254,7 +254,7 @@ test("callers resolve series from chain, not the retired manifest lookup, and is
   // Per-rung isolation: the catalog verifies each rung inside its own
   // try/catch, so one bad or unreadable rung cannot reject the whole
   // Promise.all batch and blank the entire expiry ladder.
-  assert.match(server, /try\s*{[\s\S]{0,400}?verifyVsolSeriesState\(series,[\s\S]{0,400}?}\s*catch \(error\)/);
+  assert.match(server, /try\s*{[\s\S]{0,1600}?verifyVsolSeriesState\(series, accounts, batchNow\);[\s\S]{0,80}?}\s*catch \(error\)/);
 
   // The manifest keeps its other roles (program id, config, pool, mints):
   // these exports must still be present and still manifest-sourced.
