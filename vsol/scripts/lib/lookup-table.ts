@@ -27,7 +27,12 @@ export const MAX_ADDRESSES_PER_EXTEND = 30;
  * The address lookup table (ALT) program enforces a hard 256-address cap and
  * has no way to delete individual entries. This deployment holds 11 stable
  * addresses plus 2 per minted market, so at the grid's continuous mint rate
- * the table fills in roughly 120 markets. scripts/create-lookup-table.ts
+ * the table fills in roughly 120 markets. That is now reached about THREE
+ * TIMES faster than when this was written: the grid mints five rungs per live
+ * market per boundary, and app/lib/markets.ts lists three live markets (SOL,
+ * BTC, ETH) rather than one. Nothing about the threshold or the rotation
+ * mechanism changes -- rotation simply happens roughly three times as often,
+ * which is exactly what it exists for. scripts/create-lookup-table.ts
  * rotates to a fresh table once the active one's stored-address count reaches
  * this threshold, leaving headroom (256 - 230 = 26 slots, i.e. ~13 more
  * markets) to finish any in-flight quotes before the old table is fully

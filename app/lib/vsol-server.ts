@@ -31,7 +31,6 @@ import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
   VSOL_LIQUIDITY,
-  VSOL_PYTH_FEED_ID,
   VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RETIRING_LOOKUP_TABLES,
@@ -39,12 +38,12 @@ import {
   VSOL_SETTLEMENT_MINT,
 } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
-import { liveMarkets } from "./markets.ts";
+import { liveMarkets, pythFeedIdFor } from "./markets.ts";
 import {
   findVsolSeriesCandidateForMarket,
   resolveAvailableVsolSeries,
   resolveVsolSeries,
-  resolveVsolSeriesCatalog,
+  resolveOrPlanVsolSeriesCatalog,
   type ResolvedVsolSeries,
 } from "./series-resolver.ts";
 import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
@@ -70,6 +69,23 @@ const PRICE_SCALE = 1_000_000n;
 // consumer in TendTerminal.tsx) can recognize "just needs minting" without
 // re-deriving or duplicating the literal.
 export const SERIES_NOT_YET_MINTED_REASON = "This series has not been minted yet.";
+
+/**
+ * Whether a rung that is not listed yet may be ADVERTISED as tradable.
+ *
+ * True, because listVsolSeriesOnChain lists it server-side when the quote is
+ * requested, leaving the buyer the plain two-instruction fill. It was false
+ * while the buyer had to mint the rung inside their own fill: that shape
+ * measured 1265 bytes against the real lookup table, 33 over the packet limit,
+ * so every such quote failed closed and the catalog would have been promising
+ * a trade the quote path always refused.
+ *
+ * Kept as a named constant rather than deleted: it is the single switch that
+ * decides whether the intraday rungs -- 15M, 1H and EOD, the ones no keeper
+ * pre-mints because they roll too fast -- are offered at all.
+ */
+const MINT_ON_FILL_IS_EXECUTABLE = true;
+
 // Solana's max transaction packet size (IPv6 MTU minus headers). The
 // mint-on-demand path adds two instructions to an already-large fill
 // transaction; if the composed size ever exceeds this, ship no path at all
@@ -649,32 +665,78 @@ async function getPoolCore(connection: Connection): Promise<PoolCore> {
 // treated as authoritative from chain rather than compared against a
 // locally-derived policy value; the caller applies it via the existing
 // before-cutoff / before-expiry availability logic.
-async function getPoolMarketState(series: VsolSeries, connection: Connection) {
-  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
-  const address = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
-  const account = await connection.getAccountInfo(address, "confirmed");
-  if (!account || !account.owner.equals(VSOL_PROGRAM_ID)) throw new Error("The VSOL pool-market authorization is unavailable");
-  // decodePoolMarketAccount enforces the account discriminator and exact size.
-  const state = decodePoolMarketAccount(Buffer.from(account.data));
-  if (!state.pool.equals(VSOL_LIQUIDITY.poolKey) || !state.market.equals(series.marketKey)) {
-    throw new Error("The published pool-market authorization does not match onchain state");
-  }
-  return { ...state, address };
-}
 
 export async function getVsolSeriesState(series: VsolSeries, connection = getVsolConnection()): Promise<VsolSeriesState> {
-  const [marketAccount, oracleAccount, poolMarket, now] = await Promise.all([
+  const [marketAccount, oracleAccount, poolMarketAccount, now] = await Promise.all([
     connection.getAccountInfo(series.marketKey, "confirmed"),
     connection.getAccountInfo(series.oracleKey, "confirmed"),
-    getPoolMarketState(series, connection),
+    connection.getAccountInfo(derivePoolMarketAddress(series), "confirmed"),
     clusterTime(connection),
   ]);
+  return verifyVsolSeriesState(series, { marketAccount, oracleAccount, poolMarketAccount }, now);
+}
+
+function derivePoolMarketAddress(series: VsolSeries): PublicKey {
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  return derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
+}
+
+// getMultipleAccounts' documented per-request ceiling. Chunking keeps this
+// correct as the market list grows rather than silently truncating.
+const MAX_ACCOUNTS_PER_BATCH = 100;
+
+/**
+ * Reads `keys` in as few round trips as the RPC allows, returning them by
+ * base58 address. Duplicates are de-duplicated first (a pool-market address is
+ * derived from its market, so a catalog naturally repeats keys); a missing
+ * account is simply absent from the map, exactly as a null getAccountInfo.
+ */
+async function fetchAccountsByKey(connection: Connection, keys: PublicKey[]) {
+  const unique = [...new Map(keys.map((key) => [key.toBase58(), key])).values()];
+  const byKey = new Map<string, { data: Uint8Array; owner: PublicKey }>();
+  for (let index = 0; index < unique.length; index += MAX_ACCOUNTS_PER_BATCH) {
+    const chunk = unique.slice(index, index + MAX_ACCOUNTS_PER_BATCH);
+    const accounts = await connection.getMultipleAccountsInfo(chunk, "confirmed");
+    accounts.forEach((account, position) => {
+      if (account) byKey.set(chunk[position].toBase58(), account);
+    });
+  }
+  return byKey;
+}
+
+/** The three accounts a series' state is verified against, already fetched. */
+type FetchedSeriesAccounts = {
+  marketAccount: { data: Uint8Array; owner: PublicKey } | null;
+  oracleAccount: { data: Uint8Array; owner: PublicKey } | null;
+  poolMarketAccount: { data: Uint8Array; owner: PublicKey } | null;
+};
+
+/**
+ * Every check that decides whether a series is tradable, with the RPC reads
+ * hoisted out. Pure on purpose: getVsolSeriesState fetches one series' accounts
+ * and getVsolSeriesStates fetches a whole catalog's in one batched call, and
+ * BOTH verify through here -- so batching can never end up enforcing less than
+ * the single-series path.
+ */
+function verifyVsolSeriesState(series: VsolSeries, accounts: FetchedSeriesAccounts, now: number): VsolSeriesState {
+  const { marketAccount, oracleAccount, poolMarketAccount } = accounts;
   if (!marketAccount || !oracleAccount) throw new Error(SERIES_NOT_YET_MINTED_REASON);
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  if (!poolMarketAccount || !poolMarketAccount.owner.equals(VSOL_PROGRAM_ID)) {
+    throw new Error("The VSOL pool-market authorization is unavailable");
+  }
+  // decodePoolMarketAccount enforces the account discriminator and exact size.
+  const decodedPoolMarket = decodePoolMarketAccount(Buffer.from(poolMarketAccount.data));
+  if (!decodedPoolMarket.pool.equals(VSOL_LIQUIDITY.poolKey) || !decodedPoolMarket.market.equals(series.marketKey)) {
+    throw new Error("The published pool-market authorization does not match onchain state");
+  }
+  const poolMarket = { ...decodedPoolMarket, address: derivePoolMarketAddress(series) };
   if (!marketAccount.owner.equals(VSOL_PROGRAM_ID) || !oracleAccount.owner.equals(VSOL_PROGRAM_ID)) {
     throw new Error("The deployed VSOL series is not owned by the verified program");
   }
   const market = decodeMarketAccount(Buffer.from(marketAccount.data));
   const oracle = decodeOracleAccount(Buffer.from(oracleAccount.data));
+  const expectedFeedId = pythFeedIdFor(series.symbol);
   const expectedMarket = PublicKey.findProgramAddressSync([MARKET_SEED, VSOL_CONFIG.toBuffer(), market.marketId], VSOL_PROGRAM_ID)[0];
   const expectedOracle = PublicKey.findProgramAddressSync([ORACLE_SEED, series.marketKey.toBuffer()], VSOL_PROGRAM_ID)[0];
   const exactBinding = expectedMarket.equals(series.marketKey)
@@ -683,8 +745,11 @@ export async function getVsolSeriesState(series: VsolSeries, connection = getVso
     && market.settlementMint.equals(VSOL_SETTLEMENT_MINT)
     && market.oracle.equals(series.oracleKey)
     && oracle.market.equals(series.marketKey)
-    && market.pythFeedId === VSOL_PYTH_FEED_ID
-    && oracle.pythFeedId === VSOL_PYTH_FEED_ID
+    // This series' OWN symbol's feed, not the manifest's single legacy
+    // `pythFeedId`: with SOL, BTC and ETH all live, one shared expected feed
+    // would reject two of the three as "not matching verified onchain state".
+    && market.pythFeedId === expectedFeedId
+    && oracle.pythFeedId === expectedFeedId
     && market.expiry === series.expiry
     && market.observationWindowSeconds === series.observationWindowSeconds
     && market.settlementGraceSeconds === series.settlementGraceSeconds
@@ -739,8 +804,18 @@ export type VsolSeriesStateOrPlan = VsolSeriesState & { mintOnDemand: boolean };
  * still throw/report unavailable exactly as before).
  */
 export async function getVsolSeriesStateOrPlan(series: VsolSeries, connection = getVsolConnection()): Promise<VsolSeriesStateOrPlan> {
-  const marketAccount = await connection.getAccountInfo(series.marketKey, "confirmed");
-  if (marketAccount) {
+  // BOTH halves, not just the market. A rung whose create_market landed but
+  // whose set_liquidity_pool_market never did is half-listed: the market is
+  // right there on chain, so checking only that would send it down the verify
+  // path, where it throws "pool-market authorization is unavailable". It is
+  // repairable exactly like an unlisted rung -- listVsolSeriesOnChain fills in
+  // whichever half is missing -- so it reports the same way.
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  const [marketAccount, poolMarketAccount] = await connection.getMultipleAccountsInfo(
+    [series.marketKey, derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey)],
+    "confirmed",
+  );
+  if (marketAccount && poolMarketAccount) {
     const state = await getVsolSeriesState(series, connection);
     return { ...state, mintOnDemand: false };
   }
@@ -799,6 +874,10 @@ export async function buildCreateMarketInstruction(params: {
   expected?: { market: PublicKey; oracle: PublicKey };
 }) {
   const symbol = symbolBytes(params.series.symbol);
+  // Per-symbol (see pythFeedIdFor in ./markets.ts). The feed is hashed into
+  // `expected_market_id`, so encoding SOL's feed into a BTC create_market
+  // would derive -- and then mint -- a market at the wrong address entirely.
+  const feedId = pythFeedIdFor(params.series.symbol);
   const { strike } = params.series;
   // create_market rejects a non-positive strike (VsolError::InvalidStrike),
   // and a wrong-but-positive one silently derives a different market. Fail
@@ -807,7 +886,7 @@ export async function buildCreateMarketInstruction(params: {
     throw new Error("A series must be listed at a positive strike (see STRIKE_LADDER_STEP in vsol/sdk).");
   }
   const marketId = await deriveMarketId({
-    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    pythFeedId: Buffer.from(feedId, "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,
     expiry: BigInt(params.series.expiry),
     observationWindowSeconds: params.series.observationWindowSeconds,
@@ -832,7 +911,7 @@ export async function buildCreateMarketInstruction(params: {
     encodeU32(params.series.observationWindowSeconds),
     encodeU32(params.series.settlementGraceSeconds),
     encodeU16(LAUNCH_MAX_CONFIDENCE_BPS),
-    Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    Buffer.from(feedId, "hex"),
     encodeU32(params.series.maxSettlementStalenessSeconds),
     // Must stay last: matches the Borsh field order of `CreateMarketArgs` in
     // vsol/programs/vsol/src/lib.rs, where `strike` was appended after
@@ -862,8 +941,50 @@ export async function buildCreateMarketInstruction(params: {
  * down the rest of the catalog (each is checked and reported independently).
  */
 export async function getVsolSeriesStates(connection = getVsolConnection()): Promise<VsolSeriesState[]> {
-  const resolutions = await resolveVsolSeriesCatalog(allMarketSymbols());
+  const resolutions = await resolveOrPlanVsolSeriesCatalog(allMarketSymbols());
+  // Every account this catalog needs, fetched in ONE batched call rather than
+  // three per listed rung. The per-rung shape cost ~5 RPC round trips (market,
+  // oracle, pool-market, getSlot, getBlockTime) x every listed rung -- ~46
+  // calls for a 15-slot catalog -- which rate-limited the RPC often enough
+  // that expiries intermittently rendered "Unavailable" in the ticket for no
+  // real reason. This is 4 calls total, and the clock is read once for the
+  // whole batch instead of once per rung.
+  const listed = resolutions.flatMap((resolution) => (resolution.available && !resolution.planned ? [resolution.series] : []));
+  const [accountsByKey, batchNow] = await Promise.all([
+    fetchAccountsByKey(
+      connection,
+      listed.flatMap((series) => [series.marketKey, series.oracleKey, derivePoolMarketAddress(series)]),
+    ),
+    clusterTime(connection).then((value) => value, () => null),
+  ]);
+
   return Promise.all(resolutions.map(async (resolution): Promise<VsolSeriesState> => {
+    if (resolution.available && resolution.planned) {
+      // A rung nobody has listed yet. Its market account does not exist, so
+      // reading it would always miss -- report the planned series directly
+      // rather than attempting a read that is guaranteed to fail.
+      //
+      // Whether it is OFFERED depends on MINT_ON_FILL_IS_EXECUTABLE. It is
+      // genuinely selectable: requesting a quote lists the rung on chain
+      // server-side (listVsolSeriesOnChain) and then returns the ordinary
+      // two-instruction fill, so nothing here promises a trade the quote path
+      // would refuse.
+      const { series } = resolution;
+      return {
+        symbol: series.symbol,
+        code: series.code,
+        market: series.marketKey.toBase58(),
+        oracle: series.oracleKey.toBase58(),
+        expiry: series.expiry,
+        observationWindowSeconds: series.observationWindowSeconds,
+        lastTradeAt: series.lastTradeAt,
+        enabled: MINT_ON_FILL_IS_EXECUTABLE,
+        finalized: false,
+        poolAuthorized: MINT_ON_FILL_IS_EXECUTABLE,
+        available: MINT_ON_FILL_IS_EXECUTABLE,
+        availabilityReason: SERIES_NOT_YET_MINTED_REASON,
+      };
+    }
     if (!resolution.available) {
       return {
         symbol: resolution.symbol,
@@ -881,7 +1002,36 @@ export async function getVsolSeriesStates(connection = getVsolConnection()): Pro
       };
     }
     try {
-      return await getVsolSeriesState(resolution.series, connection);
+      if (batchNow === null) throw new Error("Devnet clock is unavailable");
+      const { series } = resolution;
+      const accounts = {
+        marketAccount: accountsByKey.get(series.marketKey.toBase58()) ?? null,
+        oracleAccount: accountsByKey.get(series.oracleKey.toBase58()) ?? null,
+        poolMarketAccount: accountsByKey.get(derivePoolMarketAddress(series).toBase58()) ?? null,
+      };
+      // Half-listed: the market exists but its pool-market authorization never
+      // landed. Verification rejects that, but the quote path REPAIRS it
+      // (listVsolSeriesOnChain), so reporting it unavailable here would
+      // deadlock the rung -- the ticket would disable the chip, so nobody
+      // could request the quote that fixes it. Report it exactly like a rung
+      // that is not listed yet, which is what it effectively is.
+      if (accounts.marketAccount && !accounts.poolMarketAccount && MINT_ON_FILL_IS_EXECUTABLE) {
+        return {
+          symbol: series.symbol,
+          code: series.code,
+          market: series.marketKey.toBase58(),
+          oracle: series.oracleKey.toBase58(),
+          expiry: series.expiry,
+          observationWindowSeconds: series.observationWindowSeconds,
+          lastTradeAt: series.lastTradeAt,
+          enabled: true,
+          finalized: false,
+          poolAuthorized: false,
+          available: true,
+          availabilityReason: SERIES_NOT_YET_MINTED_REASON,
+        };
+      }
+      return verifyVsolSeriesState(series, accounts, batchNow);
     } catch (error) {
       const { series } = resolution;
       return {
@@ -975,6 +1125,112 @@ function randomNonce() {
   return Buffer.from(bytes).readBigUInt64LE();
 }
 
+/**
+ * Lists `series` on chain -- create_market + set_liquidity_pool_market, in one
+ * atomic transaction paid and signed by the pool manager -- when it does not
+ * exist yet. Idempotent: a rung another request just listed is a no-op.
+ *
+ * WHY THE SERVER MINTS, AND NOT THE BUYER
+ *
+ * The original design folded these two instructions into the BUYER's own fill,
+ * so the buyer became the creator and paid the rent. Measured against the real
+ * published lookup table, that four-instruction shape composes to 1265 bytes --
+ * 33 over Solana's 1232-byte packet limit -- so it could never be sent, and
+ * every 15M/1H/EOD quote failed closed with VsolTransactionTooLarge. It cannot
+ * be fixed by extending the table either: of the eight uncovered static keys,
+ * seven are the per-series market, oracle and pool-market, the per-trade
+ * position, and the per-user token account, none of which a shared table can
+ * hold, and the intraday rungs roll every 15 minutes anyway.
+ *
+ * Hoisting the listing into its own server-signed transaction leaves the buyer
+ * with the plain two-instruction fill that has always fit, with no program
+ * change and no keeper cron. The rungs that need this are exactly the ones no
+ * keeper pre-mints because they roll too fast to pre-mint.
+ *
+ * Costs the pool manager ~0.003 SOL of rent per listed rung, recoverable by
+ * close_settled_market after settlement. Only ever reached when a real quote
+ * is requested for that rung, so nothing is minted speculatively.
+ *
+ * Fails closed: with VSOL_POOL_MANAGER_SECRET_KEY unset or mismatched,
+ * vsolPoolManager() throws and the quote fails honestly rather than silently
+ * quoting a series that does not exist.
+ */
+async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection): Promise<void> {
+  if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
+  const poolMarketKey = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
+  const [marketAccount, poolMarketAccount] = await connection.getMultipleAccountsInfo(
+    [series.marketKey, poolMarketKey],
+    "confirmed",
+  );
+
+  // The two halves of a listing are checked INDEPENDENTLY, because they can
+  // genuinely come apart: a rung whose create_market landed but whose
+  // authorization never did reads as "market exists" to discovery and then
+  // fails verification with "pool-market authorization is unavailable" -- a
+  // half-listed rung that can never be quoted and that the mint-on-demand path
+  // never repairs, since the market is right there on chain. Observed on the
+  // live EOD rung (AG7MWA3J…, pool-market 4LiUfn9a… missing).
+  const needsMarket = !marketAccount;
+  // ONLY when the account is absent. A pool_market that EXISTS with
+  // enabled=false is the pool having deliberately disabled this series;
+  // re-sending set_liquidity_pool_market with enabled=true would silently
+  // override that decision. Verification reports it as disabled instead.
+  const needsAuthorization = !poolMarketAccount;
+  if (!needsMarket && !needsAuthorization) return;
+
+  let poolManager: Keypair;
+  try {
+    poolManager = vsolPoolManager();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The pool manager key is not configured";
+    const wrapped = new Error(`Listing this series is unavailable: ${message}`);
+    wrapped.name = "VsolPoolManagerUnavailable";
+    throw wrapped;
+  }
+
+  const instructions: TransactionInstruction[] = [];
+  if (needsMarket) {
+    const created = await buildCreateMarketInstruction({
+      creator: poolManager.publicKey,
+      series,
+      expected: { market: series.marketKey, oracle: series.oracleKey },
+    });
+    instructions.push(created.instruction);
+  }
+  if (needsAuthorization) {
+    const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
+    instructions.push(instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
+      manager: poolManager.publicKey,
+      config: VSOL_CONFIG,
+      pool: VSOL_LIQUIDITY.poolKey,
+      market: series.marketKey,
+      pool_market: poolMarketKey,
+      system_program: SystemProgram.programId,
+    }, authorizeData));
+  }
+
+  const latest = await connection.getLatestBlockhash("confirmed");
+  const transaction = new Transaction({
+    feePayer: poolManager.publicKey,
+    blockhash: latest.blockhash,
+    lastValidBlockHeight: latest.lastValidBlockHeight,
+  }).add(...instructions);
+  transaction.sign(poolManager);
+
+  try {
+    const signature = await connection.sendRawTransaction(transaction.serialize(), { preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight }, "confirmed");
+  } catch (error) {
+    // Two concurrent quotes on the same unlisted rung race here, and the loser
+    // fails with "account already in use". That is success, not failure -- but
+    // only confirm it by READING the chain, never by pattern-matching the
+    // error text, so a genuine failure can never be mistaken for a win.
+    const [market, poolMarket] = await connection.getMultipleAccountsInfo([series.marketKey, poolMarketKey], "confirmed");
+    const listed = market?.owner.equals(VSOL_PROGRAM_ID) && poolMarket?.owner.equals(VSOL_PROGRAM_ID);
+    if (!listed) throw error;
+  }
+}
+
 export async function buildVsolQuoteTransaction(params: {
   buyer: PublicKey;
   series?: VsolSeries;
@@ -990,48 +1246,23 @@ export async function buildVsolQuoteTransaction(params: {
   if (!series) throw new Error("No verified VSOL V2 quote series is published");
   const connection = getVsolConnection();
   const authority = vsolQuoteAuthority();
+
+  // BEFORE the state read, not after it. listVsolSeriesOnChain is a no-op for
+  // a fully-listed rung (one batched read of two accounts), but it has to run
+  // first because the states it repairs are exactly the ones the read REJECTS:
+  // a market that does not exist yet, and a half-listed rung whose
+  // authorization never landed. Reading first would throw
+  // "pool-market authorization is unavailable" and 503 the quote before the
+  // repair could ever be attempted.
+  await listVsolSeriesOnChain(series, connection);
+
   const [core, seriesState] = await Promise.all([
     getPoolCore(connection),
     getVsolSeriesStateOrPlan(series, connection),
   ]);
   if (!seriesState.available) throw new Error(seriesState.availabilityReason);
 
-  // Mint-on-demand: the market this rung resolves to does not exist onchain
-  // yet. Rather than fail, the buyer becomes the market's creator (paying its
-  // rent) and the pool manager authorizes it in the same transaction, ahead
-  // of the existing Ed25519 + fill_pool_quote pair. The pool manager key is
-  // loaded fresh here (never persisted beyond this call) and fails closed --
-  // with VSOL_POOL_MANAGER_SECRET_KEY unset or mismatched, vsolPoolManager()
-  // throws and this whole quote attempt fails honestly; ordinary fills on
-  // already-minted series never reach this branch at all.
   const poolMarket = derivePoolMarket(VSOL_LIQUIDITY.poolKey, series.marketKey);
-  let poolManager: Keypair | null = null;
-  let mintInstructions: TransactionInstruction[] = [];
-  if (seriesState.mintOnDemand) {
-    try {
-      poolManager = vsolPoolManager();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The pool manager key is not configured";
-      const wrapped = new Error(`Mint-on-demand is unavailable: ${message}`);
-      wrapped.name = "VsolPoolManagerUnavailable";
-      throw wrapped;
-    }
-    const created = await buildCreateMarketInstruction({
-      creator: params.buyer,
-      series,
-      expected: { market: series.marketKey, oracle: series.oracleKey },
-    });
-    const authorizeData = Buffer.concat([encodeI64(BigInt(series.lastTradeAt)), Buffer.from([1])]);
-    const authorizeInstruction = instructionFromIdl(idlInstruction("set_liquidity_pool_market"), {
-      manager: poolManager.publicKey,
-      config: VSOL_CONFIG,
-      pool: VSOL_LIQUIDITY.poolKey,
-      market: series.marketKey,
-      pool_market: poolMarket,
-      system_program: SystemProgram.programId,
-    }, authorizeData);
-    mintInstructions = [created.instruction, authorizeInstruction];
-  }
 
   const buyerSource = getAssociatedTokenAddressSync(VSOL_SETTLEMENT_MINT, params.buyer);
   if (!(await connection.getAccountInfo(buyerSource, "confirmed"))) {
@@ -1105,33 +1336,29 @@ export async function buildVsolQuoteTransaction(params: {
   }, quoteData(quote));
   const latest = await connection.getLatestBlockhash("confirmed");
   // When the manifest publishes an ALT, compile as a v0 transaction so
-  // repeated 32-byte account keys collapse into 1-byte indices -- this is
-  // what lets the 4-instruction mint-on-demand shape (otherwise ~1469 bytes)
-  // fit under the 1232-byte packet limit. Falls back to the exact legacy
-  // shape used before the ALT existed whenever no table is available.
+  // repeated 32-byte account keys collapse into 1-byte indices. The buyer's
+  // transaction is always the plain two-instruction fill now -- an unlisted
+  // rung was listed by listVsolSeriesOnChain above, in its own server-signed
+  // transaction, rather than by two extra instructions in here (which composed
+  // to 1265 bytes, over the packet limit, and so could never be sent). Falls
+  // back to the exact legacy shape whenever no table is available.
   const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
   const transaction = composeVsolFillTransaction({
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
-    instructions: [...mintInstructions, signatureInstruction, fillInstruction],
+    instructions: [signatureInstruction, fillInstruction],
     lookupTableAccount,
   });
-  // The pool manager is a required signer on set_liquidity_pool_market; sign
-  // now server-side (the buyer signs everything else, including this
-  // instruction's other accounts, in their wallet next).
-  if (poolManager) partialSignVsolTransaction(transaction, poolManager);
 
   const serialized = serializeVsolTransaction(transaction);
   if (serialized.length > MAX_TRANSACTION_BYTES) {
     // Do not ship a silently-broken oversized transaction: fail the quote
-    // honestly so the caller reports the series as unavailable rather than
-    // handing the wallet something that can never fit in a packet -- this
-    // can now only genuinely happen when no ALT is published at all, since
-    // ALT compression brings even the mint-on-demand shape back under the
-    // limit (see the size-measurement test in tests/vsol-versioned-fill.test.mjs).
+    // honestly rather than handing the wallet something that can never fit in
+    // a packet. The two-instruction fill has always fit with room to spare, so
+    // reaching this now would mean a real regression in the fill's shape.
     const error = new Error(
-      `Minting this series requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit. A versioned transaction or address lookup table is required before this series can trade.`,
+      `This fill requires a ${serialized.length}-byte transaction, over Solana's ${MAX_TRANSACTION_BYTES}-byte packet limit.`,
     );
     error.name = "VsolTransactionTooLarge";
     throw error;
@@ -1432,8 +1659,17 @@ export async function inspectVsolFillTransaction(input: Transaction | ResolvedFi
     const market = fillInstruction.keys[4]?.pubkey;
     const buyer = fillInstruction.keys[0];
     if (!market || !buyer?.isSigner) return null;
+    // Discovery first: a rung someone else minted between quote and submit is
+    // a real listed market, and matching it is stricter than re-deriving.
     const currentSeries = await resolveAvailableVsolSeries(allMarketSymbols());
-    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market));
+    // ...but a mint-and-fill's whole premise is that its market does NOT exist
+    // on chain yet, so discovery MISSES by construction in the normal case.
+    // Falling back to the grid's would-be candidate for this exact pubkey is
+    // what makes the branch reachable at all. Without it every genuine
+    // mint-and-fill is rejected, and the only fills that verify are ones whose
+    // market was already listed -- i.e. not mint-and-fill at all.
+    const verifiedSeries = currentSeries.find((series) => series.marketKey.equals(market))
+      ?? await findVsolSeriesCandidateForMarket(allMarketSymbols(), market);
     if (!verifiedSeries) return null;
     if (!(await verifyCreateMarketInstruction(createInstruction, buyer.pubkey, verifiedSeries))) return null;
     if (!verifyAuthorizeMarketInstruction(authorizeInstruction, verifiedSeries)) return null;

@@ -350,13 +350,117 @@ test("vsolPoolManager fails closed with a clear message when VSOL_POOL_MANAGER_S
 test("buildVsolQuoteTransaction wraps a missing/mismatched pool manager key into an honest, distinctly-named fail-closed error for the mint-on-demand path", async () => {
   const server = await import(new URL("app/lib/vsol-server.ts", root));
   const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
-  // vsolPoolManager() is only ever reached inside the `seriesState.mintOnDemand`
-  // branch, so ordinary fills on already-minted series never call it -- and
+  // vsolPoolManager() is only ever reached from listVsolSeriesOnChain, which
+  // buildVsolQuoteTransaction calls only inside the `seriesState.mintOnDemand`
+  // branch -- so ordinary fills on already-listed series never call it, and
   // any failure there is re-thrown as a clearly-named, honest error rather
   // than silently proceeding without pool-manager authorization.
-  assert.match(source, /if \(seriesState\.mintOnDemand\)/);
+  // Runs unconditionally BEFORE the state read: the states it repairs (an
+  // unlisted rung, and a half-listed one whose authorization never landed)
+  // are exactly the ones that read rejects, so reading first would 503 the
+  // quote before the repair could be attempted. It is a no-op otherwise.
+  assert.match(source, /await listVsolSeriesOnChain\(series, connection\);\n\n  const \[core, seriesState\]/);
   assert.match(source, /poolManager = vsolPoolManager\(\)/);
-  assert.match(source, /Mint-on-demand is unavailable: \$\{message\}/);
+  assert.match(source, /Listing this series is unavailable: \$\{message\}/);
   assert.match(source, /wrapped\.name = "VsolPoolManagerUnavailable"/);
   assert.ok(typeof server.buildVsolQuoteTransaction === "function");
+});
+
+// --- the not-yet-minted case ------------------------------------------------
+//
+// Every test above resolves an ALREADY-LISTED series (resolveLiveNvda30D), so
+// they exercise the mint-and-fill SHAPE but never its premise: that the market
+// does not exist on chain yet. That gap hid a real bug --
+// inspectVsolFillTransaction matched the signed market against
+// resolveAvailableVsolSeries (discovery) alone, which misses by construction
+// for a market being minted by the very transaction under inspection, so every
+// genuine mint-and-fill was rejected. These two tests pin the fallback that
+// makes the branch reachable.
+
+test("findVsolSeriesCandidateForMarket resolves a market that chain discovery cannot see, and rejects one off the grid", async () => {
+  const { resolver, sdk } = await loadModules();
+  const now = Date.parse("2026-07-21T14:00:00Z");
+  const spot = 210;
+  const deps = { fetchSpot: async () => spot };
+
+  // The rung a brand-new SOL 15M listing would bind to right now. Nothing is
+  // listed here -- this address exists only as a prediction.
+  const strike = sdk.ladderStrike(BigInt(Math.round(spot * Number(sdk.PRICE_SCALE))), sdk.STRIKE_LADDER_STEP);
+  const candidate = await resolver.deriveVsolSeriesCandidate("SOL", "15M", now, strike);
+
+  const found = await resolver.findVsolSeriesCandidateForMarket(["SOL"], candidate.marketKey, now, deps);
+  assert.ok(found, "the grid's own would-be candidate must be resolvable by its predicted market pubkey");
+  assert.equal(found.marketKey.toBase58(), candidate.marketKey.toBase58());
+  assert.equal(found.code, "15M");
+  assert.equal(found.strike, strike);
+
+  // An address that is not any grid slot's candidate must NOT resolve -- this
+  // fallback widens what verification accepts, so it has to stay tight.
+  const offGrid = await resolver.deriveVsolSeriesCandidate("SOL", "15M", now, strike + 1n);
+  assert.equal(
+    await resolver.findVsolSeriesCandidateForMarket(["SOL"], offGrid.marketKey, now, deps),
+    null,
+    "a market one atom off the ladder rung is not a grid candidate and must be rejected",
+  );
+});
+
+test("inspectVsolFillTransaction's mint-and-fill branch falls back to the grid candidate when discovery misses", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
+  const branch = source.slice(source.indexOf("if (isVsolMintAndFillTransaction(transaction))"));
+
+  // Discovery alone cannot verify a market that does not exist yet. If this
+  // fallback is ever dropped, mint-on-fill silently stops working: quotes are
+  // issued and then every submission is rejected.
+  assert.match(branch, /findVsolSeriesCandidateForMarket\(allMarketSymbols\(\), market\)/);
+  // And it must remain a FALLBACK, not a replacement -- an already-listed
+  // market has to verify against the real chain state first.
+  assert.match(branch, /resolveAvailableVsolSeries\(allMarketSymbols\(\)\)/);
+});
+
+test("an unlisted rung is listed in its OWN server-signed transaction, keeping the buyer's fill at two instructions", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("app/lib/vsol-server.ts", root), "utf8");
+
+  // The bug this pins: folding create_market + set_liquidity_pool_market into
+  // the BUYER's fill made a 4-instruction transaction that measured 1265 bytes
+  // against the real published lookup table -- 33 over the 1232-byte packet
+  // limit -- so every 15M/1H/EOD quote failed closed and those rungs could
+  // never trade. Extending the table cannot fix it: 7 of the 8 uncovered
+  // static keys are per-series, per-trade or per-user.
+  //
+  // So the listing is hoisted into its own server-signed transaction and the
+  // buyer keeps the plain 2-instruction fill that has always fit.
+  assert.match(source, /instructions: \[signatureInstruction, fillInstruction\],/);
+  assert.doesNotMatch(source, /instructions: \[\.\.\.mintInstructions/);
+  assert.match(source, /async function listVsolSeriesOnChain\(/);
+
+  // The listing must stay atomic — a market created without its pool-market
+  // authorization is a rung that exists but can never be quoted.
+  const listing = source.slice(source.indexOf("async function listVsolSeriesOnChain("));
+  assert.match(listing, /\.add\(\.\.\.instructions\)/);
+  // Each half is repaired independently, so a HALF-listed rung is fixable too.
+  assert.match(listing, /const needsMarket = !marketAccount;/);
+  assert.match(listing, /const needsAuthorization = !poolMarketAccount;/);
+  // But authorization is only ever CREATED, never re-sent: a pool_market that
+  // exists with enabled=false is a deliberate pool decision, and re-sending
+  // set_liquidity_pool_market with enabled=true would silently override it.
+  assert.doesNotMatch(listing, /poolMarketAccount && .*enabled/);
+
+  // Idempotency must be decided by READING the chain, never by matching the
+  // error text: two concurrent quotes on the same unlisted rung race, and the
+  // loser's "already in use" is success — but a genuine failure must not be.
+  assert.match(listing, /getMultipleAccountsInfo\(\[series\.marketKey, poolMarketKey\], "confirmed"\)/);
+  assert.match(listing, /const listed = market\?\.owner\.equals\(VSOL_PROGRAM_ID\) && poolMarket\?\.owner\.equals\(VSOL_PROGRAM_ID\);/);
+  assert.match(listing, /if \(!listed\) throw error;/);
+
+  // Availability and the reason must move together, so the catalog can never
+  // advertise a rung the quote path would refuse.
+  assert.match(source, /const MINT_ON_FILL_IS_EXECUTABLE = (true|false);/);
+  assert.match(source, /available: MINT_ON_FILL_IS_EXECUTABLE,/);
+
+  // The wiring that makes these rungs reachable at all must stay in place.
+  assert.match(source, /resolveOrPlanVsolSeriesCatalog/);
+  assert.match(source, /findVsolSeriesCandidateForMarket\(allMarketSymbols\(\), market\)/);
+  // And the fail-closed size guard remains the backstop.
+  assert.match(source, /VsolTransactionTooLarge/);
+  assert.match(source, /const MAX_TRANSACTION_BYTES = 1232;/);
 });

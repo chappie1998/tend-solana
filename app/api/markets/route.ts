@@ -1,5 +1,5 @@
 import "../../lib/runtime-env-worker";
-import { liveMarkets, markets } from "../../lib/markets";
+import { liveMarkets, marketsForWire } from "../../lib/markets";
 import { getPythSnapshot } from "../../lib/pyth-market-data";
 import { getVsolChainCatalog } from "../../lib/chain-catalog";
 import { describeRpcFailure, getVsolSeriesStates } from "../../lib/vsol-server";
@@ -38,7 +38,9 @@ export async function GET() {
       cluster: "solana-devnet",
       chain: "Solana",
       updatedAt: new Date().toISOString(),
-      markets,
+      // marketsForWire, not `markets`: a Market carries a bigint ladder step
+      // and Response.json() cannot serialize one -- see MarketWireEntry.
+      markets: marketsForWire,
       snapshots,
       series: seriesResult.series,
       seriesError: seriesResult.error,

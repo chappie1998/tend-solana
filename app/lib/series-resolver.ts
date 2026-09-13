@@ -58,11 +58,11 @@
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { deriveMarket, deriveMarketId, deriveOracle, ladderStrike, PRICE_SCALE, symbolBytes } from "../../vsol/sdk/index.ts";
-import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_PYTH_FEED_ID, VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
+import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
 import { deriveLaunchSeriesParams, type LaunchSeriesParams } from "./launch-params.ts";
 import { expiryCodes, type ExpiryCode } from "./expiries.ts";
-import { marketBySymbol } from "./markets.ts";
+import { marketBySymbol, pythFeedIdFor, strikeLadderStepFor } from "./markets.ts";
 import { getPythSnapshot } from "./pyth-market-data.ts";
 import { fetchAllVsolMarkets, type DiscoveredVsolMarket } from "./vsol-market-accounts.ts";
 
@@ -84,7 +84,12 @@ export type ResolvedVsolSeries = {
 };
 
 export type VsolSeriesResolution =
-  | { symbol: string; code: ExpiryCode; available: true; series: ResolvedVsolSeries; strikeSelectionNote: string }
+  // `planned` distinguishes a series DISCOVERED on chain (absent/false) from
+  // one this module PREDICTED for a slot nobody has listed yet (true). Callers
+  // must not infer that from `strikeSelectionNote`'s prose: getVsolSeriesStates
+  // keys off this flag to skip the account read it knows would miss, and to
+  // report the rung as mint-on-fill rather than as a live listing.
+  | { symbol: string; code: ExpiryCode; available: true; series: ResolvedVsolSeries; strikeSelectionNote: string; planned?: boolean }
   | { symbol: string; code: ExpiryCode; available: false; reason: string };
 
 export type VsolSeriesListResolution =
@@ -128,9 +133,14 @@ function absDiff(a: bigint, b: bigint): bigint {
 
 function matchesSlot(entry: DiscoveredVsolMarket, params: LaunchSeriesParams): boolean {
   const market = entry.market;
+  // The feed comes from THIS symbol's market config, not from the
+  // deployment manifest's single `pythFeedId`. That manifest field described
+  // the one market this deployment used to have; matching every symbol
+  // against it would make a BTC or ETH rung -- correctly minted, live on
+  // chain -- fail to match its own grid slot and vanish from the app.
   return market.config.equals(VSOL_CONFIG)
     && market.settlementMint.equals(VSOL_SETTLEMENT_MINT)
-    && market.pythFeedId.toLowerCase() === VSOL_PYTH_FEED_ID.toLowerCase()
+    && market.pythFeedId.toLowerCase() === pythFeedIdFor(params.symbol).toLowerCase()
     && market.symbol.toUpperCase() === params.symbol
     && market.priceScale === params.priceScale
     && market.maxConfidenceBps === params.maxConfidenceBps
@@ -356,7 +366,9 @@ export async function deriveVsolSeriesCandidate(symbol: string, code: ExpiryCode
   const normalizedSymbol = symbol.toUpperCase();
   const params = deriveLaunchSeriesParams(code, normalizedSymbol, nowMs);
   const marketId = await deriveMarketId({
-    pythFeedId: Buffer.from(VSOL_PYTH_FEED_ID, "hex"),
+    // Per-symbol, for the same reason matchesSlot is: predicting a BTC
+    // listing's PDA from SOL's feed yields an address nothing will ever mint.
+    pythFeedId: Buffer.from(pythFeedIdFor(normalizedSymbol), "hex"),
     settlementMint: VSOL_SETTLEMENT_MINT,
     expiry: BigInt(params.expiry),
     observationWindowSeconds: params.observationWindowSeconds,
@@ -399,20 +411,49 @@ export async function deriveVsolSeriesCandidate(symbol: string, code: ExpiryCode
  */
 export async function resolveOrPlanVsolSeries(symbol: string, code: ExpiryCode, nowMs: number = Date.now(), deps: VsolDiscoveryDeps = {}): Promise<VsolSeriesResolution> {
   const resolution = await resolveVsolSeries(symbol, code, nowMs, deps);
+  return planUnlistedSlot(resolution, nowMs, deps.fetchSpot ?? defaultFetchSpot);
+}
+
+/**
+ * The at-the-money ladder rung a NEW listing for `symbol` would bind to right
+ * now. Throws when spot is unusable, so callers fall back to the honest
+ * discovery-side reason rather than inventing a strike.
+ */
+async function atTheMoneyLadderStrike(symbol: string, fetchSpot: (symbol: string) => Promise<number>): Promise<bigint> {
+  const spot = await fetchSpot(symbol);
+  if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
+  const spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
+  // This symbol's own ladder step -- see `strikeLadderStep` in
+  // app/lib/markets.ts. Rounding BTC onto SOL's $2.50 step would plan a
+  // listing on a rung the keeper will never mint.
+  return ladderStrike(spotAtoms, strikeLadderStepFor(symbol));
+}
+
+/**
+ * Turns a single "nobody has listed this slot yet" resolution into a planned
+ * listing. THE one definition of the planning rule -- both the single-slot
+ * (resolveOrPlanVsolSeries) and batched (resolveOrPlanVsolSeriesCatalog)
+ * entry points route through here, so the two cannot drift on what a planned
+ * rung means. `strike` may be supplied by a caller that already computed this
+ * symbol's rung, to avoid re-fetching spot once per expiry code.
+ */
+async function planUnlistedSlot(
+  resolution: VsolSeriesResolution,
+  nowMs: number,
+  fetchSpot: (symbol: string) => Promise<number>,
+  strike?: bigint,
+): Promise<VsolSeriesResolution> {
   if (resolution.available || resolution.reason !== SERIES_NOT_YET_LISTED_REASON) return resolution;
-  const fetchSpot = deps.fetchSpot ?? defaultFetchSpot;
   try {
-    const spot = await fetchSpot(symbol);
-    if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
-    const spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
-    const strike = ladderStrike(spotAtoms);
-    const series = await deriveVsolSeriesCandidate(symbol, code, nowMs, strike);
+    const rung = strike ?? await atTheMoneyLadderStrike(resolution.symbol, fetchSpot);
+    const series = await deriveVsolSeriesCandidate(resolution.symbol, resolution.code, nowMs, rung);
     return {
       symbol: series.symbol,
       code: series.code,
       available: true,
       series,
-      strikeSelectionNote: `No series is listed yet; planned a new listing at the live at-the-money ladder rung ($${formatDollars(strike)}).`,
+      planned: true,
+      strikeSelectionNote: `No series is listed yet; planned a new listing at the live at-the-money ladder rung ($${formatDollars(rung)}).`,
     };
   } catch {
     // Spot unavailable (or the grid slot rejected the candidate for some
@@ -420,6 +461,68 @@ export async function resolveOrPlanVsolSeries(symbol: string, code: ExpiryCode, 
     // rather than inventing a series with no real strike behind it.
     return resolution;
   }
+}
+
+/**
+ * Wraps `fetchSpot` so each symbol is priced at most ONCE per catalog call.
+ * Two reasons, both load-bearing:
+ *
+ *   - Cost. A catalog spans (symbols x expiryCodes) slots -- 15 today. Pricing
+ *     per slot would mean 15 Hermes round trips per /api/markets request.
+ *   - Consistency. Every slot of a symbol must see the SAME spot, or the
+ *     at-the-money pick for 7D could be drawn from a different price than the
+ *     planned rung for 15M, and the catalog would contradict itself mid-response.
+ *
+ * A rejected lookup is cached too, deliberately: one honest failure per symbol
+ * per call, not one per slot.
+ */
+function memoizeSpot(fetchSpot: (symbol: string) => Promise<number>): (symbol: string) => Promise<number> {
+  const cache = new Map<string, Promise<number>>();
+  return (symbol: string) => {
+    const key = symbol.toUpperCase();
+    const hit = cache.get(key);
+    if (hit) return hit;
+    const pending = fetchSpot(key);
+    cache.set(key, pending);
+    return pending;
+  };
+}
+
+/**
+ * resolveVsolSeriesCatalog, but every slot that is merely UNLISTED resolves to
+ * a planned at-the-money listing instead of unavailable -- the batched twin of
+ * resolveOrPlanVsolSeries. This is what /api/markets serves, so a rung no
+ * keeper has minted yet still reaches the UI as tradable (the buyer's own fill
+ * mints it; see buildVsolQuoteTransaction's mint-on-demand path).
+ *
+ * A slot the grid itself rules out (no intraday feed, past its cutoff, a
+ * coming-soon symbol) stays unavailable with its original reason, exactly as
+ * in resolveVsolSeriesCatalog. Costs ONE chain scan for the whole batch and at
+ * most one spot lookup per symbol.
+ */
+export async function resolveOrPlanVsolSeriesCatalog(symbols: string[], nowMs: number = Date.now(), deps: VsolDiscoveryDeps = {}): Promise<VsolSeriesResolution[]> {
+  const connection = deps.connection ?? defaultConnection();
+  const fetchSpot = memoizeSpot(deps.fetchSpot ?? defaultFetchSpot);
+  const discovered = await fetchAllVsolMarkets(connection, VSOL_PROGRAM_ID);
+  const resolutions = await Promise.all(
+    symbols.flatMap((symbol) => expiryCodes.map((code) => resolveSlot(symbol, code, nowMs, discovered, fetchSpot))),
+  );
+  // Price each symbol that actually needs planning exactly once, then reuse
+  // that rung across all of its unlisted codes.
+  const rungs = new Map<string, bigint | null>();
+  for (const resolution of resolutions) {
+    if (resolution.available || resolution.reason !== SERIES_NOT_YET_LISTED_REASON) continue;
+    if (rungs.has(resolution.symbol)) continue;
+    rungs.set(resolution.symbol, await atTheMoneyLadderStrike(resolution.symbol, fetchSpot).catch(() => null));
+  }
+  return Promise.all(resolutions.map((resolution) => {
+    if (resolution.available) return resolution;
+    const rung = rungs.get(resolution.symbol);
+    // `null` means this symbol's spot lookup already failed once. Report the
+    // discovery-side reason rather than retrying per code.
+    if (rung === null) return resolution;
+    return planUnlistedSlot(resolution, nowMs, fetchSpot, rung);
+  }));
 }
 
 /**
@@ -449,7 +552,7 @@ export async function findVsolSeriesCandidateForMarket(
     } catch {
       continue;
     }
-    const strike = ladderStrike(spotAtoms);
+    const strike = ladderStrike(spotAtoms, strikeLadderStepFor(symbol));
     for (const code of expiryCodes) {
       try {
         const candidate = await deriveVsolSeriesCandidate(symbol, code, nowMs, strike);

@@ -23,15 +23,35 @@ export type PythMarketBars = {
   lastBarTime: number;
 };
 
-const UPSTREAM_TIMEOUT_MS = 8_000;
+// Measured: Pyth's history API returns a 1,440-bar window in ~2.1-2.8s. 8s left
+// barely 3x headroom, and a single slow response aborted the request outright
+// -- the user saw "Couldn't load real market bars" for what was really one slow
+// upstream call. 15s keeps a comfortable margin while staying far inside the
+// serverless execution ceiling.
+const UPSTREAM_TIMEOUT_MS = 15_000;
 const MAX_UPSTREAM_BYTES = 2_000_000;
 const PYTH_AUTH_REQUIRED_AT = Date.UTC(2026, 6, 31);
 const cache = new Map<string, { expiresAt: number; value: PythMarketBars }>();
 const inFlight = new Map<string, Promise<PythMarketBars>>();
 const failed = new Map<string, { expiresAt: number; error: Error }>();
 
+/**
+ * Pyth Pro's History API — the documented replacement for the Benchmarks
+ * TradingView shim, which Pyth RETIRED in the 2026-08-26 Core upgrade. The old
+ * `/v1/shims/tradingview/history` endpoint now returns 404, not 401, so an API
+ * key alone does not revive it; that retirement is why the chart rendered
+ * "Couldn't load real market bars" on every load. Pro implements the same UDF
+ * contract (`symbol`/`resolution`/`from`/`to` in, `{ s, t, o, h, l, c }` out),
+ * so only the base URL changed — the parser below is untouched.
+ *
+ * Overridable by env so a self-hosted or third-party instance can be pointed
+ * at without a code change.
+ */
+const PYTH_HISTORY_URL =
+  runtimeEnv("PYTH_HISTORY_URL")?.trim() || "https://pyth.dourolabs.app/v1/fixed_rate@200ms/history";
+
 function benchmarksHistoryUrl(market: Market, resolution: ChartResolution, nowSeconds: number) {
-  const url = new URL("https://benchmarks.pyth.network/v1/shims/tradingview/history");
+  const url = new URL(PYTH_HISTORY_URL);
   url.searchParams.set("symbol", market.pythSymbol);
   url.searchParams.set("resolution", resolution);
   url.searchParams.set("from", String(nowSeconds - chartLookbackSeconds(resolution)));
@@ -57,7 +77,7 @@ async function fetchPythHistory(url: URL) {
       redirect: "manual",
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`Pyth Benchmarks returned ${response.status}`);
+    if (!response.ok) throw new Error(`Pyth history API returned ${response.status}`);
     const contentLength = Number(response.headers.get("content-length") ?? 0);
     if (Number.isFinite(contentLength) && contentLength > MAX_UPSTREAM_BYTES) {
       throw new Error("Pyth chart response is too large");

@@ -51,3 +51,4 @@ next-env.d.ts
 .dev.vars
 .dev.vars.*
 .neon
+.shots/

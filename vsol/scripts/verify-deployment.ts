@@ -15,6 +15,10 @@ import {
 import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
 import { fetchAllMarkets, type DecodedMarketForCleanup } from "./lib/settlement.ts";
 import { type RetiringLookupTableEntry, stableFillAddresses } from "./lib/lookup-table.ts";
+// The shared market config -- the same list app/lib/markets.ts serves to the
+// UI and scripts/bootstrap.ts / scripts/keeper.ts mint against. Verification
+// must expect exactly what those two produce, so it reads the same list.
+import { liveMarkets } from "../../app/lib/markets.ts";
 
 const cluster = process.env.VSOL_CLUSTER ?? "devnet";
 const path = resolve(import.meta.dirname, "..", "deployments", `${cluster}.json`);
@@ -45,9 +49,21 @@ if (deployment.smokeStatus !== undefined && deployment.smokeStatus !== "passed")
 
 const requiredExecutable = ["programId", "pythReceiverProgram"];
 const requiredAccounts = ["config", "settlementMint", "underlyingMint", "writerVault", "writerToken", "uiMarket", "uiOracle"];
-const expectedFeedId = String(deployment.pythFeedId);
+// Every live market gets the full five-rung grid, so the manifest catalog is
+// 5 x however many markets app/lib/markets.ts lists live -- 15 today. Read
+// from the shared config rather than hardcoded, so promoting a market to live
+// does not silently leave this check asserting the old count.
+const SERIES_CODES = ["15M", "1H", "EOD", "7D", "30D"] as const;
+const liveSymbols = liveMarkets.map((market) => market.symbol);
+if (liveSymbols.length === 0) throw new Error("No market is configured live in app/lib/markets.ts; there is nothing to verify");
+const expectedRungCount = SERIES_CODES.length * liveSymbols.length;
 const markets = deployment.markets as Array<Record<string, unknown>> | undefined;
-if (!Array.isArray(markets) || markets.length !== 5) throw new Error("The rolling market catalog is incomplete");
+if (!Array.isArray(markets) || markets.length !== expectedRungCount) {
+  throw new Error(
+    `The rolling market catalog is incomplete: expected ${expectedRungCount} rungs `
+    + `(${SERIES_CODES.length} codes x ${liveSymbols.length} live markets: ${liveSymbols.join(", ")}), found ${markets?.length ?? 0}`,
+  );
+}
 const liquidityPools = deployment.liquidityPools as Array<Record<string, unknown>> | undefined;
 if (!Array.isArray(liquidityPools) || liquidityPools.length < 1) throw new Error("No passive liquidity pool is deployed");
 const smoke = deployment.smoke as Record<string, unknown> | undefined;
@@ -112,7 +128,12 @@ async function fetchTransactionWithRetry(connection: Connection, signature: stri
 // verified against anything (there is nothing to verify it against -- any
 // positive strike a keeper listed is by definition a valid ladder rung); it
 // is only reported below, for visibility.
-const MARKET_SYMBOL = "SOL"; // Not an SDK export -- mirrors the same local constant in scripts/keeper.ts and scripts/bootstrap.ts.
+//
+// AND IT IS NOW PER MARKET. With SOL, BTC and ETH live, "the current grid"
+// is five expiries x three markets; a single expected feed/symbol would
+// verify one market and silently ignore the other two. Each live market
+// therefore gets its own scan filter (its own feed id from the shared
+// config, its own symbol) and its own five-expiry expectation.
 const configAddress = new PublicKey(String(deployment.config));
 const settlementMintAddress = new PublicKey(String(deployment.settlementMint));
 
@@ -123,46 +144,67 @@ async function clusterUnixTime(): Promise<number> {
   return blockTime;
 }
 
-type CurrentGridRung = { series: ScheduledSeries; market: PublicKey; oracle: PublicKey; strike: bigint; creator: string };
+type CurrentGridRung = {
+  symbol: string;
+  series: ScheduledSeries;
+  market: PublicKey;
+  oracle: PublicKey;
+  strike: bigint;
+  creator: string;
+  /** How many live rungs matched this (symbol, expiry) -- see the ladder-rung race note. */
+  strikesAtExpiry: bigint[];
+};
 
 const now = await clusterUnixTime();
 const expectedSchedule = rollingMarketSchedule(now);
 
+// ONE scan for every market: fetchAllMarkets returns every Market account the
+// program owns regardless of symbol, so it is filtered per market below
+// rather than re-fetched three times.
 const allMarkets = await fetchAllMarkets(connection, programId);
-const liveRungByExpiry = new Map<number, DecodedMarketForCleanup>();
-for (const market of allMarkets) {
-  const matchesPolicy = market.enabled
-    && market.pythFeedId.toLowerCase() === expectedFeedId.toLowerCase()
-    && market.symbol === MARKET_SYMBOL
-    && market.observationWindowSeconds === MARKET_OBSERVATION_WINDOW_SECONDS
-    && market.settlementGraceSeconds === MARKET_SETTLEMENT_GRACE_SECONDS
-    && market.maxConfidenceBps === MARKET_MAX_CONFIDENCE_BPS
-    && market.priceScale === PRICE_SCALE
-    && market.maxSettlementStalenessSeconds === MARKET_MAX_SETTLEMENT_STALENESS_SECONDS;
-  if (!matchesPolicy) continue;
-  // Same ladder-rung race noted on ladderStrike/indexMarketsByExpiry: two
-  // markets can legitimately share an expiry (adjacent strikes), neither a
-  // duplicate contract. Keeping the first found is enough to prove SOME
-  // live, correctly-configured rung exists for this expiry -- everything
-  // this check promises.
-  if (!liveRungByExpiry.has(market.expiry)) liveRungByExpiry.set(market.expiry, market);
-}
 
 const currentGrid: CurrentGridRung[] = [];
-const missingRungs: ScheduledSeries[] = [];
-for (const series of expectedSchedule) {
-  const found = liveRungByExpiry.get(series.expiry);
-  if (!found) {
-    missingRungs.push(series);
-    continue;
+const missingRungs: Array<{ symbol: string; series: ScheduledSeries }> = [];
+for (const listing of liveMarkets) {
+  if (!listing.pythFeedId) throw new Error(`${listing.symbol} is marked live but has no Pyth feed id configured`);
+  const rungsByExpiry = new Map<number, DecodedMarketForCleanup[]>();
+  for (const market of allMarkets) {
+    const matchesPolicy = market.enabled
+      && market.pythFeedId.toLowerCase() === listing.pythFeedId.toLowerCase()
+      && market.symbol === listing.symbol
+      && market.observationWindowSeconds === MARKET_OBSERVATION_WINDOW_SECONDS
+      && market.settlementGraceSeconds === MARKET_SETTLEMENT_GRACE_SECONDS
+      && market.maxConfidenceBps === MARKET_MAX_CONFIDENCE_BPS
+      && market.priceScale === PRICE_SCALE
+      && market.maxSettlementStalenessSeconds === MARKET_MAX_SETTLEMENT_STALENESS_SECONDS;
+    if (!matchesPolicy) continue;
+    const bucket = rungsByExpiry.get(market.expiry);
+    if (bucket) bucket.push(market);
+    else rungsByExpiry.set(market.expiry, [market]);
   }
-  currentGrid.push({
-    series,
-    market: new PublicKey(found.address),
-    oracle: new PublicKey(found.oracle),
-    strike: found.strike,
-    creator: found.creator,
-  });
+
+  for (const series of expectedSchedule) {
+    // Same ladder-rung race noted on ladderStrike/indexMarketsByExpiry: two
+    // markets CAN legitimately share an expiry at adjacent strikes, and
+    // neither is a duplicate contract. Every strike found is reported below
+    // so a genuine pile-up is visible rather than silently collapsed, but the
+    // first is enough to prove SOME live, correctly-configured rung exists
+    // for this (market, expiry) -- everything this check promises.
+    const found = rungsByExpiry.get(series.expiry);
+    if (!found || found.length === 0) {
+      missingRungs.push({ symbol: listing.symbol, series });
+      continue;
+    }
+    currentGrid.push({
+      symbol: listing.symbol,
+      series,
+      market: new PublicKey(found[0].address),
+      oracle: new PublicKey(found[0].oracle),
+      strike: found[0].strike,
+      creator: found[0].creator,
+      strikesAtExpiry: found.map((rung) => rung.strike),
+    });
+  }
 }
 
 // Read the entire public deployment state in one RPC batch. Public devnet endpoints
@@ -212,23 +254,39 @@ for (const field of requiredAccounts) {
   if (!accountInfo(address)) throw new Error(`${field} ${address.toBase58()} does not exist`);
 }
 
+// The legacy single-market `uiMarket` pointer names the ANCHOR market's 30D
+// rung -- the first live entry in app/lib/markets.ts, which is what
+// scripts/bootstrap.ts writes there. So the feed it must be bound to is that
+// market's feed, not a single deployment-wide one: with three live markets
+// there is no such thing.
+const anchorSymbol = liveSymbols[0];
+const anchorFeedId = liveMarkets[0].pythFeedId;
 const marketAccount = accountInfo(new PublicKey(String(deployment.uiMarket)));
 const marketFeedId = marketAccount && marketAccount.data.length >= 243
   ? Buffer.from(marketAccount.data.subarray(211, 243)).toString("hex")
   : "";
-if (marketFeedId !== expectedFeedId) throw new Error(`UI market is not bound to Pyth feed ${expectedFeedId}`);
-
-// Structural check only -- the manifest must still list one entry per
-// expected code with no duplicates. This does NOT require any of these
-// addresses to exist onchain: see the chain-derived current-grid check
-// below for what "must be alive" means now.
-const expectedCodes = new Set(["15M", "1H", "EOD", "7D", "30D"]);
-for (const series of markets) {
-  const code = String(series.code);
-  if (!expectedCodes.delete(code)) throw new Error(`Unexpected or duplicate rolling market code ${code}`);
+if (marketFeedId.toLowerCase() !== anchorFeedId.toLowerCase()) {
+  throw new Error(`UI market is not bound to ${anchorSymbol}'s Pyth feed ${anchorFeedId}`);
 }
-if (String(deployment.uiMarket) !== String(markets.find((series) => series.code === "30D")?.address)) {
-  throw new Error("The legacy UI pointer does not reference the catalog's 30D market");
+
+// Structural check only -- the manifest must list exactly one entry per
+// (symbol, code) with no duplicates and nothing extra. `code` alone stopped
+// being unique when the catalog went multi-market: there are three "30D"
+// rungs now, and checking codes on their own would either reject a correct
+// manifest or accept one that listed the same market five times. This does
+// NOT require any of these addresses to exist onchain: see the chain-derived
+// current-grid check below for what "must be alive" means now.
+const expectedSlots = new Set(liveSymbols.flatMap((symbol) => SERIES_CODES.map((code) => `${symbol}:${code}`)));
+for (const series of markets) {
+  const slot = `${String(series.symbol)}:${String(series.code)}`;
+  if (!expectedSlots.delete(slot)) throw new Error(`Unexpected or duplicate rolling market slot ${slot}`);
+}
+if (expectedSlots.size !== 0) {
+  throw new Error(`The rolling market catalog is missing slots: ${[...expectedSlots].join(", ")}`);
+}
+const anchorThirtyDay = markets.find((series) => String(series.symbol) === anchorSymbol && String(series.code) === "30D");
+if (String(deployment.uiMarket) !== String(anchorThirtyDay?.address)) {
+  throw new Error(`The legacy UI pointer does not reference the catalog's ${anchorSymbol} 30D market`);
 }
 
 // A rung whose expiry has no live, policy-matching market at all (built into
@@ -238,9 +296,9 @@ if (String(deployment.uiMarket) !== String(markets.find((series) => series.code 
 // already-expired rung: a closed, formerly-listed address from an older
 // schedule (or from the stale deployment.markets snapshot above) is simply
 // not part of the current schedule at all.
-for (const series of missingRungs) {
+for (const { symbol, series } of missingRungs) {
   console.warn(
-    `warn: currently-live rolling market ${series.code} (expiry ${new Date(series.expiry * 1000).toISOString()}) `
+    `warn: currently-live rolling market ${symbol} ${series.code} (expiry ${new Date(series.expiry * 1000).toISOString()}) `
     + "has no live, enabled market matching the expected feed/symbol/policy parameters onchain -- treating as keeper lag, not a failure",
   );
 }
@@ -261,27 +319,37 @@ for (const series of missingRungs) {
 // fetch (e.g. closed by a concurrent cranker run) is treated the same as
 // "never found" above, not as a hard failure -- a benign race, not a bug.
 for (const rung of currentGrid) {
+  const label = `${rung.symbol} ${rung.series.code}`;
   const account = accountInfo(rung.market);
   if (!account) {
     console.warn(
-      `warn: currently-live rolling market ${rung.series.code} (expiry ${new Date(rung.series.expiry * 1000).toISOString()}) `
+      `warn: currently-live rolling market ${label} (expiry ${new Date(rung.series.expiry * 1000).toISOString()}) `
       + `discovered at ${rung.market.toBase58()} but disappeared before verification -- treating as keeper/cranker lag, not a failure`,
     );
     continue;
   }
   if (rung.creator === PublicKey.default.toBase58()) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) has no recorded creator`);
+    throw new Error(`Current rolling market ${label} (${rung.market.toBase58()}) has no recorded creator`);
   }
   const data = Buffer.from(account.data);
   const onchainSettlementMint = new PublicKey(data.subarray(105, 137));
   if (!onchainSettlementMint.equals(settlementMintAddress)) {
-    throw new Error(`Current rolling market ${rung.series.code} (${rung.market.toBase58()}) settlement mint does not match the manifest`);
+    throw new Error(`Current rolling market ${label} (${rung.market.toBase58()}) settlement mint does not match the manifest`);
   }
   const oracleAccount = accountInfo(rung.oracle);
   if (!oracleAccount || !oracleAccount.owner.equals(programId)) {
-    throw new Error(`Current rolling market ${rung.series.code}'s oracle ${rung.oracle.toBase58()} is missing or not owned by the VSOL program`);
+    throw new Error(`Current rolling market ${label}'s oracle ${rung.oracle.toBase58()} is missing or not owned by the VSOL program`);
   }
-  console.log(`  ${rung.series.code} rung: market ${rung.market.toBase58()} strike ${rung.strike.toString()} (expiry ${new Date(rung.series.expiry * 1000).toISOString()})`);
+  // Every strike live at this (market, expiry), not just the one picked. One
+  // is the healthy case; more is the documented ladder-rung race and is
+  // surfaced rather than hidden, since it is invisible from the address alone.
+  const extraStrikes = rung.strikesAtExpiry.length > 1
+    ? ` [${rung.strikesAtExpiry.length} strikes live at this expiry: ${rung.strikesAtExpiry.map((strike) => strike.toString()).join(", ")}]`
+    : "";
+  console.log(
+    `  ${label} rung: market ${rung.market.toBase58()} strike ${rung.strike.toString()} `
+    + `(expiry ${new Date(rung.series.expiry * 1000).toISOString()})${extraStrikes}`,
+  );
 }
 const legacyUnsafe = accountInfo(LEGACY_UNSAFE_UI_MARKET);
 if (legacyUnsafe && legacyUnsafe.data.at(-1) !== 0) {
@@ -557,11 +625,13 @@ console.log(JSON.stringify({
   // Discovered, not derived -- see the discovery block above for why. Each
   // entry's strike is whatever ladder rung the keeper actually listed.
   currentGrid: currentGrid.map((rung) => ({
+    symbol: rung.symbol,
     code: rung.series.code,
     market: rung.market.toBase58(),
     expiry: rung.series.expiry,
     strike: rung.strike.toString(),
+    strikesAtExpiry: rung.strikesAtExpiry.length,
   })),
-  missingRungs: missingRungs.map((series) => series.code),
+  missingRungs: missingRungs.map(({ symbol, series }) => `${symbol} ${series.code}`),
   verifiedAt: new Date().toISOString(),
 }, null, 2));

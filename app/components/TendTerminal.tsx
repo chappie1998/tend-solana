@@ -22,7 +22,7 @@ import {
   Zap,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { markets } from "../lib/markets";
+import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
@@ -72,6 +72,15 @@ type SeriesState = {
   availabilityReason: string;
 };
 
+// One entry per LIVE market in /api/markets' `snapshots` array: either a
+// Hermes price or the reason there isn't one. The route already fetches these
+// for every live market (see app/api/markets/route.ts).
+type MarketSnapshotResult = {
+  symbol: string;
+  snapshot?: { price: number };
+  error?: string;
+};
+
 type CatalogPoolState = {
   address: string;
   label: string;
@@ -83,16 +92,41 @@ type CatalogPoolState = {
 // `tradable` is read off the market config's `status` field (see
 // `MarketStatus` in app/lib/markets.ts) -- never a symbol comparison here --
 // so a market moving between live and coming-soon is a one-line config edit.
-const assets = markets.map((market) => ({
-  ticker: market.symbol,
-  name: market.name,
-  token: market.tokenAddress,
-  oracleStatus: market.oracleStatus,
-  intradayEligible: market.intradayEligible,
-  tradable: market.status === "live",
-  statusNote: market.statusNote,
-}));
+function toAsset(market: (typeof markets)[number]) {
+  return {
+    ticker: market.symbol,
+    name: market.name,
+    token: market.tokenAddress,
+    oracleStatus: market.oracleStatus,
+    intradayEligible: market.intradayEligible,
+    tradable: market.status === "live",
+    statusNote: market.statusNote,
+    statusTag: market.statusTag,
+    // Both read straight from config so no view can invent an asset class.
+    assetClass: market.assetClass,
+    blurb: market.blurb,
+    pythSymbol: market.pythSymbol,
+  };
+}
+
+const assets = markets.map(toAsset);
 const tradableAssets = assets.filter((asset) => asset.tradable);
+// Grouped for display by app/lib/markets.ts's marketsByCategory -- the
+// grouping rule and the category order live there, not here, so adding a
+// market never means editing this component. The per-group `tradable` count
+// is derived from `status` (never from the category), because a category is
+// not a proxy for tradability: today every crypto market happens to be live
+// and every stock one is not, and hardcoding that coincidence is the bug
+// this comment exists to prevent.
+const assetGroups = marketsByCategory.map((group) => {
+  const groupAssets = group.markets.map(toAsset);
+  return {
+    category: group.category,
+    label: group.label,
+    assets: groupAssets,
+    tradableCount: groupAssets.filter((asset) => asset.tradable).length,
+  };
+});
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
   { id: "market", label: "Trade", icon: Activity },
@@ -246,13 +280,17 @@ const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
 
 // Exact string app/lib/vsol-server.ts's getVsolSeriesState throws (and the
 // onchain catalog reports via /api/markets) when a rung's market account does
-// not exist yet. A buyer can still trade it -- their fill mints and
-// authorizes the series in the same transaction (see buildVsolQuoteTransaction) --
-// so this is treated as selectable, not blocked, while keeping the honest
-// underlying reason intact for anything that still needs the real one.
+// not exist yet. A buyer can still trade it -- requesting a quote lists the
+// series on chain server-side first (listVsolSeriesOnChain), then quotes the
+// ordinary fill -- so this is treated as selectable, not blocked, while
+// keeping the honest underlying reason intact for anything that needs it.
+//
+// The buyer pays no extra rent and signs nothing extra: the listing is its own
+// server-signed transaction, which is also why the buyer's fill stays at two
+// instructions and inside the packet limit.
 const MINT_ON_DEMAND_REASON = "This series has not been minted yet.";
-const MINT_ON_DEMAND_CHIP_NOTE = "Mints on fill";
-const MINT_ON_DEMAND_FULL_NOTE = "First trade mints this series onchain — you pay ~0.003 SOL rent.";
+const MINT_ON_DEMAND_CHIP_NOTE = "Lists on quote";
+const MINT_ON_DEMAND_FULL_NOTE = "No one has listed this expiry yet — requesting a quote lists it onchain first, then quotes it. Costs you nothing extra.";
 
 // Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
 function expiryChipNote(item: Pick<ExpiryDefinition, "available" | "detail" | "availabilityReason">): string {
@@ -292,6 +330,10 @@ function TradeView({
   const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
   const [seriesError, setSeriesError] = useState("Checking verified onchain series…");
   const [pools, setPools] = useState<CatalogPoolState[]>([]);
+  // Last known Hermes price per live market symbol, for the selector strip
+  // only. The SELECTED market's headline price and its live/stale badge still
+  // come from the chart's own snapshot -- this never overrides that.
+  const [stripPrices, setStripPrices] = useState<Record<string, number>>({});
   const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -343,17 +385,33 @@ function TradeView({
     const load = async () => {
       try {
         const response = await fetch("/api/markets", { cache: "no-store" });
-        const result = await response.json() as { series?: SeriesState[]; seriesError?: string | null; pools?: CatalogPoolState[]; error?: string };
+        const result = await response.json() as { series?: SeriesState[]; seriesError?: string | null; pools?: CatalogPoolState[]; snapshots?: MarketSnapshotResult[]; error?: string };
         if (!response.ok) throw new Error(result.error ?? "Onchain market catalog is unavailable.");
         if (!cancelled) {
           setSeriesStates(result.series ?? []);
           setSeriesError(result.seriesError ?? (result.series?.length ? "" : "No verified onchain series is published."));
           setPools(result.pools ?? []);
+          // /api/markets already polls Hermes for EVERY live market, and this
+          // used to throw those away and keep only the selected asset's price
+          // (which arrives separately, from the chart). With one live market
+          // that was invisible; with three it meant two of the three chips
+          // read "Pyth pending" forever, which reads as broken rather than as
+          // unselected. Same response, no extra request.
+          setStripPrices(Object.fromEntries(
+            (result.snapshots ?? [])
+              .filter((entry) => typeof entry.snapshot?.price === "number")
+              .map((entry) => [entry.symbol, entry.snapshot!.price]),
+          ));
         }
       } catch (error) {
         if (!cancelled) {
           setSeriesStates([]);
           setSeriesError(error instanceof Error ? error.message : "Onchain market catalog is unavailable.");
+          // Deliberately NOT cleared: a failed catalog poll is not evidence
+          // that the last known prices were wrong, and blanking every chip on
+          // one transient error is worse than showing a slightly stale price
+          // -- the selected market's own live/stale badge is what states
+          // freshness, and it is driven by the chart's own snapshot.
         }
       }
     };
@@ -520,15 +578,41 @@ function TradeView({
         <div className="product-intro"><span className="eyebrow">VSOL · Solana-native defined risk</span><h1>Options, without the trapdoors.</h1><p>Choose up or down. Your loss is capped at the premium, and Solana escrows the writer’s full payout before the trade opens.</p></div>
         <VsolStatus />
         <div className="market-header">
-          <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2><span>Stock Token</span></div><p>{asset.name} economic exposure</p></div></div>
+          <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2>{/* Both strings come from app/lib/markets.ts. SOL was hardcoded as "Stock Token" here, which is simply untrue — the config carries what each instrument actually is so no view can invent it. */}<span>{asset.assetClass}</span></div><p>{asset.blurb}</p></div></div>
           <span className="asset-picker">Devnet sandbox</span>
         </div>
 
         <div className="asset-strip" role="group" aria-label="Available markets">
-          {assets.map((item) => (
-            <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-              <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : "Pyth pending"}</small></span><em className={item.ticker === asset.ticker && item.tradable && marketSnapshot?.mode === "live" ? "positive" : ""}>{!item.tradable ? "—" : item.ticker === asset.ticker ? marketSnapshot?.mode ?? "—" : "—"}</em>
-            </button>
+          {assetGroups.map((group) => (
+            <section key={group.category} className="asset-group" aria-label={group.label}>
+              <h3 className="asset-group-head">{group.label}<span>{group.tradableCount > 0 ? `${group.tradableCount} tradable` : "Coming soon"}</span></h3>
+              <div className="asset-group-row">
+                {group.assets.map((item) => (
+                  <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
+                    <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : "Pyth pending"}</small></span>
+                    {/* The two coming-soon cases are different in kind (an un-entitled
+                        feed vs no feed at all) and a user cannot tell which is which
+                        from "Coming soon", so the distinction is rendered, not only
+                        tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
+                        full sentence. Three sentences inline made the UNTRADABLE
+                        markets taller than the tradable ones. The authoritative
+                        sentence is still one hover away (the button's `title`), and it
+                        is still the same string the server returns from resolveExpiry,
+                        so the reason shown is the reason enforced.
+
+                        A market that is tradable but not selected shows nothing here:
+                        it has a live price in the line above, and an em-dash beside a
+                        real price reads as missing data rather than as "not the
+                        market you are looking at". */}
+                    {item.tradable
+                      ? item.ticker === asset.ticker
+                        ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
+                        : null
+                      : <span className="asset-chip-note">{item.statusTag}</span>}
+                  </button>
+                ))}
+              </div>
+            </section>
           ))}
         </div>
 

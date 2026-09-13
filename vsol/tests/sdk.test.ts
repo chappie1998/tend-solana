@@ -284,6 +284,41 @@ test("ladderStrike clamps to a minimum of one step (create_market requires strik
   assert.equal(ladderStrike(STRIKE_LADDER_STEP / 2n - 1n), STRIKE_LADDER_STEP);
 });
 
+test("ladderStrike ladders on a PER-MARKET step, not one global constant", () => {
+  // The step is a market's own configuration (see `strikeLadderStep` in
+  // app/lib/markets.ts): roughly 2-3% of THAT asset's spot. A single global
+  // step cannot serve two assets three orders of magnitude apart -- SOL's
+  // $2.50 is 2.4% of SOL and 0.003% of BTC, which would list a new contract
+  // every quarter of a basis point.
+  const btcStep = 2_000n * PRICE_SCALE; // $2,000 -- 2.5% at BTC ~$80,016.
+  const ethStep = 50n * PRICE_SCALE;    // $50    -- 2.0% at ETH ~$2,473.52.
+
+  // BTC spot $80,016.43 rounds to the $80,000 rung (the $82,000 rung is far).
+  assert.equal(ladderStrike(80_016n * PRICE_SCALE + 430_000n, btcStep), 80_000n * PRICE_SCALE);
+  // ...and $81,200 is past the midpoint, so it rounds UP to $82,000.
+  assert.equal(ladderStrike(81_200n * PRICE_SCALE, btcStep), 82_000n * PRICE_SCALE);
+
+  // ETH spot $2,473.52 rounds to the $2,450 rung ($2,500 is $26.48 away).
+  assert.equal(ladderStrike(2_473n * PRICE_SCALE + 520_000n, ethStep), 2_450n * PRICE_SCALE);
+
+  // The default is still SOL's step, so callers with no market in hand are
+  // unchanged -- that is the ONLY reason the parameter has a default.
+  assert.equal(ladderStrike(80_016n * PRICE_SCALE), ladderStrike(80_016n * PRICE_SCALE, STRIKE_LADDER_STEP));
+
+  // The same spot on two different steps must land on two different rungs;
+  // if it did not, the step would not be doing anything.
+  assert.notEqual(ladderStrike(2_473n * PRICE_SCALE, ethStep), ladderStrike(2_473n * PRICE_SCALE, STRIKE_LADDER_STEP));
+
+  // A non-positive step is a configuration error, not something to silently
+  // fall back from: it would divide by zero or loop on a zero-width ladder.
+  assert.throws(() => ladderStrike(100n * PRICE_SCALE, 0n), RangeError);
+  assert.throws(() => ladderStrike(100n * PRICE_SCALE, -1n), RangeError);
+
+  // Clamping to one step still holds for any step, not just the default.
+  assert.equal(ladderStrike(0n, btcStep), btcStep);
+  assert.equal(ladderStrike(1n, ethStep), ethStep);
+});
+
 test("ladderStrike is idempotent on an already-listed rung", () => {
   for (const strike of [STRIKE_LADDER_STEP, 50n * PRICE_SCALE, 1_000n * PRICE_SCALE]) {
     assert.equal(ladderStrike(strike), strike);

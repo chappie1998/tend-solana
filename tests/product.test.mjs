@@ -29,7 +29,12 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(chart, /Charts by TradingView/);
   assert.doesNotMatch(chart, /embed-widget-advanced-chart|document\.createElement\("script"\)|<iframe|DEMO DATA|demoCandles/i);
   assert.match(chartRoute, /getPythMarketBars/);
-  assert.match(chartData, /benchmarks\.pyth\.network\/v1\/shims\/tradingview\/history/);
+  // Pyth RETIRED the Benchmarks TradingView shim in the 2026-08-26 Core
+  // upgrade; it now 404s. This assertion used to pin that dead URL, i.e. it
+  // asserted the bug. Pin the live endpoint instead, and assert the retired
+  // one is gone so a revert cannot pass.
+  assert.match(chartData, /pyth\.dourolabs\.app\/v1\/fixed_rate@200ms\/history/);
+  assert.doesNotMatch(chartData, /benchmarks\.pyth\.network\/v1\/shims\/tradingview/);
   assert.match(chartData, /runtimeEnv\("PYTH_API_KEY"\)/);
   assert.match(chartData, /AbortController/);
   assert.doesNotMatch(chartRoute, /PYTH_API_KEY|Authorization|Bearer/);
@@ -46,7 +51,11 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   // markets.ts legitimately names the equity feed when explaining why it is
   // not entitled here.
   const displaySymbols = [...markets.matchAll(/pythSymbol:\s*"([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(displaySymbols, ["Crypto.SOL/USD", "Crypto.NVDAX/USD"]);
+  assert.deepEqual(displaySymbols, ["Crypto.SOL/USD", "Crypto.BTC/USD", "Crypto.ETH/USD", "Crypto.NVDAX/USD", "Crypto.GOOGLX/USD"]);
+  // SpaceX is deliberately absent from that list: it has NO feed at all (see
+  // its entry), which is encoded as an empty pythSymbol and so never matches
+  // the [^"]+ above. That is the assertion -- six markets, five feeds.
+  assert.equal(displaySymbols.length, 5);
   assert.ok(displaySymbols.every((symbol) => !symbol.startsWith("Equity.")), "no market may display a session-bound equity feed");
   assert.match(layout, /Solana devnet/);
 });
@@ -107,8 +116,8 @@ test("server creates buyer-bound V2 pool RFQs and verifies fills before persiste
   // authorized after the last bootstrap snapshot).
   assert.doesNotMatch(server, /authorizedMarketKeys/);
   assert.match(server, /derivePoolMarket\(VSOL_LIQUIDITY\.poolKey, series\.marketKey\)/);
-  assert.match(server, /state\.pool\.equals\(VSOL_LIQUIDITY\.poolKey\)/);
-  assert.match(server, /state\.market\.equals\(series\.marketKey\)/);
+  assert.match(server, /decodedPoolMarket\.pool\.equals\(VSOL_LIQUIDITY\.poolKey\)/);
+  assert.match(server, /decodedPoolMarket\.market\.equals\(series\.marketKey\)/);
   assert.match(positionsRoute, /verifyVsolFill/);
   assert.match(positionsRoute, /db\.batch/);
   assert.match(positionsRoute, /persisted, passing simulation/);
@@ -262,6 +271,112 @@ test("the catalog lists SOL live and NVDA as coming soon, and coming soon cannot
   // The selector shows the coming-soon market, disabled and labelled.
   assert.match(terminal, /Coming soon/);
   assert.match(terminal, /disabled=\{!item\.tradable\}/);
+});
+
+test("the catalog is two categories: three tradable crypto markets and three coming-soon stocks", async () => {
+  const [markets, expiries, terminal] = await Promise.all([
+    import(new URL("app/lib/markets.ts", root)),
+    import(new URL("app/lib/expiries.ts", root)),
+    readFile(new URL("app/components/TendTerminal.tsx", root), "utf8"),
+  ]);
+
+  const bySymbol = Object.fromEntries(markets.markets.map((market) => [market.symbol, market]));
+  assert.deepEqual(Object.keys(bySymbol), ["SOL", "BTC", "ETH", "NVDA", "GOOGL", "SPACEX"]);
+
+  // Crypto: all three genuinely tradable, each on its OWN entitled 24/7 feed.
+  // The per-symbol feed matters beyond labelling -- the feed id is hashed into
+  // every market id, so two markets sharing one would derive the same address.
+  const crypto = ["SOL", "BTC", "ETH"];
+  const feedIds = new Set();
+  for (const symbol of crypto) {
+    const market = bySymbol[symbol];
+    assert.equal(market.category, "crypto", `${symbol} belongs to the crypto category`);
+    assert.equal(market.status, "live", `${symbol} must be tradable`);
+    assert.equal(market.statusNote, "", "a live market has no blocking reason to show");
+    assert.equal(markets.isTradableSymbol(symbol), true);
+    assert.match(market.pythSymbol, /^Crypto\./, "every live feed must be a 24/7 crypto feed");
+    assert.match(market.pythFeedId, /^[0-9a-f]{64}$/);
+    feedIds.add(market.pythFeedId);
+    // The blurb must name the very feed the market settles on.
+    assert.ok(market.blurb.includes(market.pythSymbol), `${symbol}'s blurb must name ${market.pythSymbol}`);
+  }
+  assert.equal(feedIds.size, 3, "no two markets may share a Pyth feed id");
+  assert.deepEqual(markets.liveMarkets.map((market) => market.symbol), crypto);
+
+  // Stocks: all three coming-soon, and the two REASONS are different in kind.
+  // NVDA and Google have real, published feeds this deployment is not
+  // entitled to -- a billing state. SpaceX has no feed at all, because it is
+  // a private company; no entitlement purchase produces one. Blurring those
+  // two into one sentence is the failure this pins against.
+  for (const symbol of ["NVDA", "GOOGL", "SPACEX"]) {
+    const market = bySymbol[symbol];
+    assert.equal(market.category, "stocks", `${symbol} belongs to the stocks category`);
+    assert.equal(market.status, "coming-soon");
+    assert.equal(markets.isTradableSymbol(symbol), false);
+    assert.equal(markets.tradableMarketBySymbol(symbol), undefined);
+    assert.match(market.statusNote, /coming soon/i);
+    assert.doesNotMatch(market.statusNote, /session|holiday|weekend|market (open|close)/i);
+  }
+  for (const symbol of ["NVDA", "GOOGL"]) {
+    assert.match(bySymbol[symbol].pythFeedId, /^[0-9a-f]{64}$/, `${symbol}'s feed exists and is recorded`);
+    assert.match(bySymbol[symbol].statusNote, /entitl|paid tier/i, `${symbol} is blocked by entitlement, and says so`);
+    assert.doesNotMatch(bySymbol[symbol].statusNote, /no (public )?price|does not exist/i);
+  }
+  assert.equal(bySymbol.SPACEX.pythFeedId, "", "SpaceX has no feed anywhere in Pyth's registry");
+  assert.equal(bySymbol.SPACEX.pythSymbol, "");
+  assert.match(bySymbol.SPACEX.statusNote, /private company/i);
+  assert.match(bySymbol.SPACEX.statusNote, /no (public price and no )?Pyth feed/i);
+  // pythFeedIdFor must refuse it rather than hand back an empty feed that
+  // would derive a market id from 32 zero bytes.
+  assert.throws(() => markets.pythFeedIdFor("SPACEX"), /no Pyth feed/i);
+
+  // The ladder step is per market and roughly 2-3% of that asset's spot.
+  // Measured 2026-09-05: SOL $103.36, BTC $80,016, ETH $2,473.52.
+  const scale = 1_000_000n;
+  assert.equal(markets.strikeLadderStepFor("SOL"), 2n * scale + scale / 2n); // $2.50
+  assert.equal(markets.strikeLadderStepFor("BTC"), 2_000n * scale);          // $2,000
+  assert.equal(markets.strikeLadderStepFor("ETH"), 50n * scale);             // $50
+  for (const [symbol, spot] of [["SOL", 103.36], ["BTC", 80016], ["ETH", 2473.52]]) {
+    const pct = (Number(markets.strikeLadderStepFor(symbol)) / Number(scale)) / spot * 100;
+    assert.ok(pct >= 2 && pct <= 3, `${symbol}'s ladder step is ${pct.toFixed(2)}% of spot, outside the 2-3% band`);
+  }
+
+  // Every non-live market is refused at EVERY expiry code, with its own
+  // reason -- the single gate that keeps it out of launch, series resolution
+  // and quoting. Category is never consulted here; status is.
+  const now = Date.parse("2026-07-17T14:00:00Z");
+  for (const code of expiries.expiryCodes) {
+    for (const symbol of crypto) {
+      assert.equal(expiries.resolveExpiry(code, symbol, now).available, true, `${symbol}/${code} must be tradable`);
+    }
+    for (const symbol of ["NVDA", "GOOGL", "SPACEX"]) {
+      const soon = expiries.resolveExpiry(code, symbol, now);
+      assert.equal(soon.available, false, `${symbol}/${code} must never be tradable`);
+      assert.equal(soon.availabilityReason, bySymbol[symbol].statusNote);
+    }
+  }
+
+  // Grouping is config-driven: the view renders marketsByCategory, and never
+  // re-derives the groups (or worse, uses a category as a tradability test).
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.category), ["crypto", "stocks"]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.label), ["Crypto", "Stocks"]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.markets.length), [3, 3]);
+  assert.match(terminal, /marketsByCategory/);
+  assert.match(terminal, /asset-group-head/);
+  // WHICH kind of blocker a coming-soon market has is rendered, not just
+  // tooltipped -- as the two-word `statusTag`, so these untradable rows never
+  // outweigh the tradable ones. The authoritative sentence stays reachable as
+  // the chip's title, and stays the same string the gates return.
+  assert.match(terminal, /asset-chip-note/);
+  assert.match(terminal, /\{item\.statusTag\}/);
+  assert.match(terminal, /title=\{item\.tradable \? undefined : item\.statusNote\}/);
+  // Every coming-soon market must carry both, and the tag must preserve the
+  // distinction the sentence makes rather than collapsing to one label.
+  const soonMarkets = markets.markets.filter((market) => market.status !== "live");
+  assert.equal(soonMarkets.length, 3);
+  assert.ok(soonMarkets.every((market) => market.statusTag.length > 0 && market.statusTag.length <= 20));
+  assert.equal(new Set(soonMarkets.map((market) => market.statusTag)).size, 2);
+  assert.ok(markets.markets.filter((market) => market.status === "live").every((market) => market.statusTag === ""));
 });
 
 test("expiry grid stays strictly increasing and collision-free across every UTC clock position", async () => {

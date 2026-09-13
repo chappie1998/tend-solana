@@ -16,6 +16,11 @@ import {
 } from "@solana/web3.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
+// The shared market config -- the same list app/lib/markets.ts serves to the
+// UI, and the same import vsol/scripts/prove-complete-set.ts already uses.
+// Reading it here (rather than keeping a second, drifting copy of the
+// tradable set in this file) is what makes "a market is live" one edit.
+import { liveMarkets, type Market } from "../../app/lib/markets.ts";
 import { rollingMarketSchedule, type ScheduledSeries } from "./lib/expiry-grid.ts";
 import {
   ALT_NOT_DEACTIVATED_SENTINEL,
@@ -70,34 +75,56 @@ const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);
 // on the deterministic factory inputs, which is why both scripts import the
 // shared policy constants from ../sdk/index.ts rather than each hardcoding
 // their own copies.
-// Crypto.SOL/USD. Pyth's own feed metadata declares its schedule
-// "America/New_York;O,O,O,O,O,O,O;" -- open all seven days, no holiday
-// closures -- which is the property Tend's 24/7 UTC expiry grid requires and
-// the property the previous NVDAX move was chasing. The original equity feed
-// (Equity.US.NVDA/USD) declared "0930-1600" Mon-Fri, closed weekends, plus
-// seven holiday closures: 32.5h of a 168h week, 19.3%. ~80% of markets
-// expired while it was dark and settled on a price already fixed and public
-// before expiry. A real market proved that was not merely theoretical:
-// expiry 04:45Z settled on a stale pre-close print at $209.46 (DOWN won)
-// while the live print AT expiry was $210.32 -- above the $210 strike, so UP
-// should have won.
 //
-// WHY THIS IS NOT NVDAX ANY MORE: Pyth made Hermes authentication mandatory
-// on 2026-08-26. This deployment's API key is entitled to crypto SPOT feeds
-// only; both Equity.US.NVDA/USD and the tokenized Crypto.NVDAX/USD return
-// 403 "Not entitled: ... no grant accepts this feed". Equity and
-// tokenized-equity feeds sit behind a paid Pyth tier this devnet deployment
-// does not buy, so the keeper could not fetch a price and minted nothing for
-// over a week.
+// WHICH MARKETS THIS KEEPER MINTS: every market app/lib/markets.ts marks
+// `status: "live"` -- SOL, BTC and ETH today. This used to be a pair of
+// module constants (PYTH_FEED_ID / MARKET_SYMBOL) naming exactly one market,
+// which meant the tradable set was defined in two places that could disagree:
+// a market could be live in the UI with nothing on chain behind it, or minted
+// on chain while the app refused to quote it. There is now one list.
 //
-// This is a DEVNET settlement choice, made to keep the protocol exercised on
-// a feed that is actually readable here. It is NOT a change of product
-// direction -- the RWA/equity positioning is a mainnet decision and is
-// untouched. NVDA stays listed in app/lib/markets.ts as a coming-soon
-// market, and nothing in this keeper mints, authorizes or settles it.
-const PYTH_FEED_ID = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-const PYTH_FEED_BYTES = [...Buffer.from(PYTH_FEED_ID, "hex")];
-const MARKET_SYMBOL = "SOL";
+// A market's feed must publish on all seven days, because Tend's expiry grid
+// is 24/7 UTC and has no market calendar. Every live entry is a Pyth crypto
+// spot feed, whose schedule metadata reads "O,O,O,O,O,O,O" -- open every day,
+// no holiday closures. That is also the only tier this deployment's Pyth key
+// is entitled to: equity and tokenized-equity feeds (Equity.US.NVDA/USD,
+// Crypto.NVDAX/USD, Crypto.GOOGLX/USD) return 403 "Not entitled" since Pyth
+// made Hermes auth mandatory on 2026-08-26, which is why NVDA and Google stay
+// coming-soon in that config and nothing here mints, authorizes or settles
+// them. The RWA/equity positioning is a mainnet decision and is untouched.
+//
+// The earlier equity feed also showed WHY the seven-day property matters:
+// Equity.US.NVDA/USD declared "0930-1600" Mon-Fri, closed weekends, plus
+// seven holiday closures -- 32.5h of a 168h week. ~80% of markets expired
+// while it was dark and settled on a price already fixed and public before
+// expiry. One real market settled at 04:45Z on a stale pre-close print of
+// $209.46 (DOWN won) while the live print AT expiry was $210.32 -- above the
+// $210 strike, so UP should have won.
+
+/**
+ * Everything a single pass needs to know about one market. Built from the
+ * shared config so the feed, the symbol and the ladder step can never drift
+ * apart from what the app derives addresses with.
+ */
+type KeeperMarket = {
+  symbol: string;
+  pythFeedId: string;
+  pythFeedBytes: number[];
+  /** This market's rung size -- see `strikeLadderStep` in app/lib/markets.ts. */
+  strikeLadderStep: bigint;
+};
+
+function toKeeperMarket(market: Market): KeeperMarket {
+  if (!market.pythFeedId) {
+    throw new Error(`${market.symbol} is marked live but has no Pyth feed id configured`);
+  }
+  return {
+    symbol: market.symbol,
+    pythFeedId: market.pythFeedId,
+    pythFeedBytes: [...Buffer.from(market.pythFeedId, "hex")],
+    strikeLadderStep: market.strikeLadderStep,
+  };
+}
 // USER_MARKET_OBSERVATION_SECONDS, USER_MARKET_SETTLEMENT_GRACE_SECONDS,
 // MAX_CONFIDENCE_BPS, and MARKET_MAX_SETTLEMENT_STALENESS_SECONDS now live in
 // ../sdk/index.ts (see the import above) — the single shared home with
@@ -538,21 +565,26 @@ async function ensureMarketRung(params: {
   config: PublicKey;
   settlementMint: PublicKey;
   underlyingMint: PublicKey;
+  market: KeeperMarket;
   series: ScheduledSeries;
   existingByExpiry: ReadonlyMap<number, DecodedMarketForCleanup>;
   counters: Counters;
   addressLookupTable?: PublicKey;
   now: number;
 }): Promise<CreatedMarketRung | undefined> {
-  const { series } = params;
-  const symbol = symbolBytes(MARKET_SYMBOL);
+  const { series, market: listing } = params;
+  const symbol = symbolBytes(listing.symbol);
+  // Every log line in this function names the symbol: with three markets
+  // interleaved in one pass, "skip: 15M market already exists" on its own no
+  // longer says which market it is about.
+  const code = `${listing.symbol} ${series.code}`;
 
   const existing = params.existingByExpiry.get(series.expiry);
   if (existing) {
     const market = new PublicKey(existing.address);
     const oracle = deriveOracle(market);
     console.log(
-      `skip: ${series.code} market already exists at ${market.toBase58()} (strike ${existing.strike.toString()}); ` +
+      `skip: ${code} market already exists at ${market.toBase58()} (strike ${existing.strike.toString()}); ` +
         "discovered on-chain, no Hermes call needed",
     );
     params.counters.skipped += 1;
@@ -573,7 +605,7 @@ async function ensureMarketRung(params: {
     })
   ) {
     console.log(
-      `skip: ${series.code} market not created -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is already within the ${MIN_MARKET_LEAD_SECONDS + CREATE_AUTHORIZE_MARGIN_SECONDS}s minimum-lead-plus-margin window of the current cluster time; it would only fail authorization and this rung is about to roll onto the next boundary`,
+      `skip: ${code} market not created -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is already within the ${MIN_MARKET_LEAD_SECONDS + CREATE_AUTHORIZE_MARGIN_SECONDS}s minimum-lead-plus-margin window of the current cluster time; it would only fail authorization and this rung is about to roll onto the next boundary`,
     );
     params.counters.skipped += 1;
     return undefined;
@@ -586,18 +618,20 @@ async function ensureMarketRung(params: {
   let strike: bigint;
   try {
     const hermes = getHermesClient();
-    const { update } = await fetchLatestPythUpdate(hermes, PYTH_FEED_ID);
+    const { update } = await fetchLatestPythUpdate(hermes, listing.pythFeedId);
     const parsed = update.parsed?.[0];
-    if (!parsed) throw new Error(`Hermes returned no parsed price data for feed ${PYTH_FEED_ID}`);
+    if (!parsed) throw new Error(`Hermes returned no parsed price data for feed ${listing.pythFeedId}`);
     const spot = pythPriceToScaledAtoms(BigInt(parsed.price.price), parsed.price.expo, PRICE_SCALE);
-    strike = ladderStrike(spot);
+    // This market's OWN ladder step. A $2.50 rung is 2.4% of SOL and 0.003%
+    // of BTC -- see `strikeLadderStep` in app/lib/markets.ts.
+    strike = ladderStrike(spot, listing.strikeLadderStep);
   } catch (error) {
     // A Hermes outage must never stop the keeper from maintaining rungs that
     // already exist (handled entirely above, with no Hermes dependency) --
     // it only means this one genuinely-new expiry is not minted THIS pass.
     // It recovers on the very next pass once Hermes is reachable again.
     console.log(
-      `warn: ${series.code} market not created this pass -- Hermes spot price unavailable for feed ${PYTH_FEED_ID} ` +
+      `warn: ${code} market not created this pass -- Hermes spot price unavailable for feed ${listing.pythFeedId} ` +
         `(${describeError(error)}); existing rungs are unaffected, will retry next pass`,
     );
     params.counters.skipped += 1;
@@ -605,7 +639,7 @@ async function ensureMarketRung(params: {
   }
 
   const id = await deriveMarketId({
-    pythFeedId: PYTH_FEED_BYTES,
+    pythFeedId: listing.pythFeedBytes,
     settlementMint: params.settlementMint,
     expiry: BigInt(series.expiry),
     observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
@@ -624,7 +658,7 @@ async function ensureMarketRung(params: {
   // exact (feed, symbol, expiry, policy, strike) market between this pass's
   // discovery scan and now.
   if (await accountExists(market)) {
-    console.log(`skip: ${series.code} market already exists at ${market.toBase58()} (strike ${strike.toString()}); lost a create race since this pass's scan`);
+    console.log(`skip: ${code} market already exists at ${market.toBase58()} (strike ${strike.toString()}); lost a create race since this pass's scan`);
     params.counters.skipped += 1;
     return { market, oracle };
   }
@@ -640,7 +674,7 @@ async function ensureMarketRung(params: {
         observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
         settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
         maxConfidenceBps: MAX_CONFIDENCE_BPS,
-        pythFeedId: PYTH_FEED_BYTES,
+        pythFeedId: listing.pythFeedBytes,
         maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
         strike: new BN(strike.toString()),
       })
@@ -655,7 +689,7 @@ async function ensureMarketRung(params: {
       })
       .rpc();
     console.log(
-      `created: ${series.code} market ${market.toBase58()} strike ${strike.toString()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
+      `created: ${code} market ${market.toBase58()} strike ${strike.toString()} expiring ${new Date(series.expiry * 1000).toISOString()}`,
     );
     params.counters.created += 1;
 
@@ -663,22 +697,22 @@ async function ensureMarketRung(params: {
       await extendLookupTableWithMarket({
         authority: params.creator,
         lookupTable: params.addressLookupTable,
-        code: series.code,
+        code,
         market,
         oracle,
         counters: params.counters,
       });
     } else {
-      console.log(`skip: ALT extension for ${series.code} -- no addressLookupTable is published in the manifest`);
+      console.log(`skip: ALT extension for ${code} -- no addressLookupTable is published in the manifest`);
     }
     return { market, oracle };
   } catch (error) {
     if (isLostCreateRace(error) || (await accountExists(market))) {
-      console.log(`skip: ${series.code} market creation lost a create race at ${market.toBase58()}`);
+      console.log(`skip: ${code} market creation lost a create race at ${market.toBase58()}`);
       params.counters.skipped += 1;
       return { market, oracle };
     }
-    throw new Error(`Failed to create ${series.code} market ${market.toBase58()}: ${describeError(error)}`);
+    throw new Error(`Failed to create ${code} market ${market.toBase58()}: ${describeError(error)}`);
   }
 }
 
@@ -748,6 +782,7 @@ async function resolvePoolAuthorizationContext(params: {
  * still allowed to throw and fail the run.
  */
 async function authorizeRung(params: {
+  symbol: string;
   series: ScheduledSeries;
   market: PublicKey;
   managerProgram: Program<Vsol>;
@@ -758,6 +793,7 @@ async function authorizeRung(params: {
   counters: Counters;
 }): Promise<void> {
   const { series, market, pool, authContext, counters } = params;
+  const code = `${params.symbol} ${series.code}`;
 
   if (!authContext.canAuthorize) {
     // The one-time pool-missing/wrong-manager line was already logged by
@@ -770,14 +806,14 @@ async function authorizeRung(params: {
   const poolMarket = deriveLiquidityPoolMarket(pool, market);
   const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
   if (existing && existing.enabled && existing.lastTradeAt.toNumber() === series.lastTradeAt) {
-    console.log(`skip: ${series.code} pool authorization already current on ${pool.toBase58()}`);
+    console.log(`skip: ${code} pool authorization already current on ${pool.toBase58()}`);
     counters.skipped += 1;
     return;
   }
 
   if (authContext.poolBusy) {
     console.log(
-      `skip: ${series.code} pool authorization deferred -- pool ${pool.toBase58()} has open positions (${authContext.openPositions}) or locked collateral (${authContext.lockedCollateral}); will retry once positions settle`,
+      `skip: ${code} pool authorization deferred -- pool ${pool.toBase58()} has open positions (${authContext.openPositions}) or locked collateral (${authContext.lockedCollateral}); will retry once positions settle`,
     );
     counters.skipped += 1;
     return;
@@ -791,7 +827,7 @@ async function authorizeRung(params: {
   const authorizeNow = await clusterUnixTime();
   if (!isRungAuthorizable({ now: authorizeNow, lastTradeAt: series.lastTradeAt, expiry: series.expiry })) {
     console.log(
-      `skip: ${series.code} pool authorization deferred -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of the cluster clock (or has passed expiry); this rung aged out during this keeper run and will be retried (or superseded by the next rolling rung) on the next pass`,
+      `skip: ${code} pool authorization deferred -- its trade cutoff (${new Date(series.lastTradeAt * 1000).toISOString()}) is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of the cluster clock (or has passed expiry); this rung aged out during this keeper run and will be retried (or superseded by the next rolling rung) on the next pass`,
     );
     counters.skipped += 1;
     return;
@@ -809,12 +845,12 @@ async function authorizeRung(params: {
         systemProgram: SystemProgram.programId,
       })
       .rpc();
-    console.log(`authorized: ${series.code} series on pool ${pool.toBase58()} (lastTradeAt ${series.lastTradeAt})`);
+    console.log(`authorized: ${code} series on pool ${pool.toBase58()} (lastTradeAt ${series.lastTradeAt})`);
     counters.authorized += 1;
   } catch (error) {
     if (anchorErrorCode(error) === "PoolHasOpenPositions") {
       console.log(
-        `skip: ${series.code} pool authorization deferred -- pool ${pool.toBase58()} reported open positions at submit time; will retry once positions settle`,
+        `skip: ${code} pool authorization deferred -- pool ${pool.toBase58()} reported open positions at submit time; will retry once positions settle`,
       );
       counters.skipped += 1;
       return;
@@ -827,13 +863,13 @@ async function authorizeRung(params: {
     // the other four with it.
     if (anchorErrorCode(error) === "InvalidLastTradeCutoff") {
       console.log(
-        `skip: ${series.code} pool authorization rejected onchain (InvalidLastTradeCutoff) -- its trade cutoff is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of (or has passed) the cluster clock; will retry (or be superseded) on the next keeper pass (${describeError(error)})`,
+        `skip: ${code} pool authorization rejected onchain (InvalidLastTradeCutoff) -- its trade cutoff is no longer at least ${MIN_MARKET_LEAD_SECONDS}s ahead of (or has passed) the cluster clock; will retry (or be superseded) on the next keeper pass (${describeError(error)})`,
       );
       counters.skipped += 1;
       return;
     }
     if (isLostCreateRace(error)) {
-      console.log(`skip: ${series.code} pool authorization lost a race on ${pool.toBase58()}`);
+      console.log(`skip: ${code} pool authorization lost a race on ${pool.toBase58()}`);
       counters.skipped += 1;
       return;
     }
@@ -854,28 +890,31 @@ async function authorizeRung(params: {
     // itself at the next expiry boundary, when it derives a fresh address.
     if (anchorErrorCode(error) === "MarketDisabled") {
       console.log(
-        `skip: ${series.code} market is disabled onchain -- it was retired by the guardian (or by a prior ` +
+        `skip: ${code} market is disabled onchain -- it was retired by the guardian (or by a prior ` +
           `bootstrap) and cannot be authorized. The remaining rungs continue; this one recovers on its own ` +
           `once the grid rolls to a fresh expiry. (${describeError(error)})`,
       );
       counters.skipped += 1;
       return;
     }
-    throw new Error(`Failed to authorize ${series.code} series on pool ${pool.toBase58()}: ${describeError(error)}`);
+    throw new Error(`Failed to authorize ${code} series on pool ${pool.toBase58()}: ${describeError(error)}`);
   }
 }
 
 /**
- * Drives the full per-rung pass: for every scheduled rung, in order (15M
- * first -- the most time-critical), ensure its market exists and then
+ * Drives one market's full per-rung pass: for every scheduled rung, in order
+ * (15M first -- the most time-critical), ensure its market exists and then
  * immediately attempt its pool authorization, before moving on to the next
  * rung. This is the interleaving fix for the cold-start bug: previously all
  * five markets were created first and only then were all five
  * authorizations attempted, so by the time the loop reached the 15M rung's
  * authorization its trade cutoff (barely a quarter-hour out to begin with)
- * had often already aged past the program's minimum lead window. The pool
- * existence/manager-key check happens exactly once, up front, and never
- * blocks market creation (which is permissionless).
+ * had often already aged past the program's minimum lead window.
+ *
+ * The pool existence/manager-key check is resolved ONCE for the whole pass
+ * by the caller and threaded in here, not re-resolved per market: it is a
+ * whole-pool fact, and all live markets are authorized on the same pool.
+ * It never blocks market creation, which is permissionless.
  */
 async function processRungs(params: {
   creatorProgram: Program<Vsol>;
@@ -886,18 +925,14 @@ async function processRungs(params: {
   pool: PublicKey;
   settlementMint: PublicKey;
   underlyingMint: PublicKey;
+  market: KeeperMarket;
   schedule: ScheduledSeries[];
   existingByExpiry: ReadonlyMap<number, DecodedMarketForCleanup>;
+  authContext: PoolAuthorizationContext;
   counters: Counters;
   addressLookupTable?: PublicKey;
   now: number;
 }): Promise<void> {
-  const authContext = await resolvePoolAuthorizationContext({
-    creatorProgram: params.creatorProgram,
-    manager: params.manager,
-    pool: params.pool,
-  });
-
   for (const series of params.schedule) {
     const rung = await ensureMarketRung({
       creatorProgram: params.creatorProgram,
@@ -905,6 +940,7 @@ async function processRungs(params: {
       config: params.config,
       settlementMint: params.settlementMint,
       underlyingMint: params.underlyingMint,
+      market: params.market,
       series,
       existingByExpiry: params.existingByExpiry,
       counters: params.counters,
@@ -914,13 +950,14 @@ async function processRungs(params: {
     if (!rung) continue; // No market exists (and none was worth creating) -- nothing to authorize.
 
     await authorizeRung({
+      symbol: params.market.symbol,
       series,
       market: rung.market,
       managerProgram: params.managerProgram,
       manager: params.manager,
       config: params.config,
       pool: params.pool,
-      authContext,
+      authContext: params.authContext,
       counters: params.counters,
     });
   }
@@ -962,48 +999,108 @@ async function main(): Promise<void> {
 
   const now = await clusterUnixTime();
   const schedule = rollingMarketSchedule(now);
-  // Bounded by construction: rollingMarketSchedule always returns exactly
-  // the five current rungs, so this run can never create more than five
-  // markets or authorize more than five series.
+  // Bounded by construction: rollingMarketSchedule always returns exactly the
+  // five current rungs, so this run can never create more than five markets
+  // (or authorize more than five series) PER live market -- 15 and 15 today.
   const counters: Counters = { created: 0, authorized: 0, skipped: 0, altExtended: 0, altDeactivated: 0, altClosed: 0 };
 
   // Read-only, best-effort: the keeper's market creation must not depend on
   // the manifest existing at all, let alone publishing an ALT yet.
   const addressLookupTable = await readAddressLookupTable();
 
-  // Discover-first: one getProgramAccounts scan for the whole pass, indexed
-  // by expiry, so ensureMarketRung never re-derives a rung's strike (or even
-  // calls Hermes) for an expiry that already has a live market -- see
-  // ensureMarketRung's and indexMarketsByExpiry's doc comments above.
+  // ONE getProgramAccounts scan for the whole pass, shared by every market.
+  // This deliberately stays outside the per-market loop: the scan returns
+  // every Market account the program owns regardless of symbol, so scanning
+  // once and filtering it per market (indexMarketsByExpiry, below) costs one
+  // RPC round trip for three markets instead of three. Discover-first is the
+  // property that keeps ensureMarketRung from re-deriving a listed rung's
+  // strike -- or even calling Hermes -- for an expiry that already exists;
+  // see ensureMarketRung's and indexMarketsByExpiry's doc comments above.
   const allMarkets = await fetchAllMarkets(connection, VSOL_PROGRAM_ID);
-  const existingByExpiry = indexMarketsByExpiry(allMarkets, {
-    pythFeedId: PYTH_FEED_ID,
-    symbol: MARKET_SYMBOL,
-    observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
-    settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
-    maxConfidenceBps: MAX_CONFIDENCE_BPS,
-    priceScale: PRICE_SCALE,
-    maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+
+  // Also once, not per market: pool existence and the manager key are
+  // whole-pool facts, and all live markets are authorized on the same pool.
+  const authContext = await resolvePoolAuthorizationContext({
+    creatorProgram,
+    manager: poolManager,
+    pool,
   });
 
-  // Interleaved per-rung pass (create, then immediately authorize) -- see
-  // processRungs's docstring for why this replaced the old
-  // create-all-then-authorize-all two-pass structure.
-  await processRungs({
-    creatorProgram,
-    creator,
-    managerProgram,
-    manager: poolManager,
-    config,
-    pool,
-    settlementMint,
-    underlyingMint,
-    schedule,
-    existingByExpiry,
-    counters,
-    addressLookupTable,
-    now,
-  });
+  // Every market app/lib/markets.ts marks live, in config order. The set is
+  // read from that one shared list rather than from constants in this file,
+  // so "which markets exist" cannot disagree between the chain and the app.
+  const listings = liveMarkets;
+  if (listings.length === 0) {
+    console.log("skip: no market is configured live in app/lib/markets.ts; there is nothing to mint or authorize");
+  }
+  console.log(`Maintaining ${listings.length} live market(s): ${listings.map((market) => market.symbol).join(", ")}`);
+
+  const skippedMarkets: string[] = [];
+  for (const listing of listings) {
+    // PER-MARKET ISOLATION. Anything that goes wrong for one market -- an
+    // un-entitled or misconfigured feed, an RPC failure mid-mint, a rung
+    // whose creation genuinely throws -- must cost that market only. Three
+    // markets minting on one shared pool means a thrown error here would
+    // otherwise take the other two down with it, and the failure mode is
+    // silent: the app would simply show no series at some tenors. So each
+    // market is fully wrapped, logged by name, and the pass continues.
+    //
+    // This is deliberately BROADER than the fine-grained skips inside
+    // ensureMarketRung/authorizeRung (which already swallow Hermes outages,
+    // aged-out cutoffs, lost races and disabled markets rung-by-rung). Those
+    // handle the expected cases; this handles the unexpected ones without
+    // letting them become a whole-pass abort.
+    try {
+      const market = toKeeperMarket(listing);
+      // A FRESH cluster clock per market, while the schedule itself stays the
+      // one computed at the top of the pass. Three markets means up to 30
+      // sequential transactions, so by the time the third market's turn comes
+      // the `now` captured at the start can be minutes stale -- stale enough
+      // that its 15M rung has aged past the create/authorize margin. Reusing
+      // the stale value would mint that rung and only then have the
+      // authorization rejected (InvalidLastTradeCutoff), paying rent for a
+      // market nothing can trade. The SCHEDULE is deliberately not recomputed:
+      // every market in one pass should list the same five expiries, so the
+      // catalog is coherent even if a boundary rolls mid-pass.
+      const marketNow = await clusterUnixTime();
+      const existingByExpiry = indexMarketsByExpiry(allMarkets, {
+        pythFeedId: market.pythFeedId,
+        symbol: market.symbol,
+        observationWindowSeconds: USER_MARKET_OBSERVATION_SECONDS,
+        settlementGraceSeconds: USER_MARKET_SETTLEMENT_GRACE_SECONDS,
+        maxConfidenceBps: MAX_CONFIDENCE_BPS,
+        priceScale: PRICE_SCALE,
+        maxSettlementStalenessSeconds: MARKET_MAX_SETTLEMENT_STALENESS_SECONDS,
+      });
+
+      // Interleaved per-rung pass (create, then immediately authorize) -- see
+      // processRungs's docstring for why this replaced the old
+      // create-all-then-authorize-all two-pass structure.
+      await processRungs({
+        creatorProgram,
+        creator,
+        managerProgram,
+        manager: poolManager,
+        config,
+        pool,
+        settlementMint,
+        underlyingMint,
+        market,
+        schedule,
+        existingByExpiry,
+        authContext,
+        counters,
+        addressLookupTable,
+        now: marketNow,
+      });
+    } catch (error) {
+      skippedMarkets.push(listing.symbol);
+      console.log(
+        `warn: SKIPPING market ${listing.symbol} for this pass -- ${describeError(error)}. ` +
+          "Its existing rungs are untouched and the remaining markets continue; it retries on the next pass.",
+      );
+    }
+  }
 
   // ALT lifecycle bookkeeping runs last and is best-effort (see
   // processRetiringLookupTables's docstring): a failure here must never mask
@@ -1014,7 +1111,8 @@ async function main(): Promise<void> {
   console.log(
     `Keeper summary: created ${counters.created} markets, authorized ${counters.authorized} series, ` +
       `ALT-extended ${counters.altExtended} addresses, ALT-deactivated ${counters.altDeactivated}, ` +
-      `ALT-closed ${counters.altClosed}, skipped ${counters.skipped}`,
+      `ALT-closed ${counters.altClosed}, skipped ${counters.skipped}` +
+      (skippedMarkets.length > 0 ? `, SKIPPED MARKETS: ${skippedMarkets.join(", ")}` : ""),
   );
 }
 
