@@ -19,13 +19,19 @@ import {
   TrendingUp,
   Wallet,
   X,
-  Zap,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import {
+  AUTO_QUOTE_DEBOUNCE_MS,
+  MAX_AUTO_REFRESHES,
+  quoteInputIssue,
+  quoteReadiness,
+  type QuoteReadiness,
+} from "../lib/quote-readiness";
 import {
   VSOL_PROGRAM_ID,
   solanaExplorerUrl,
@@ -38,7 +44,9 @@ import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarket
 
 type Tab = "market" | "portfolio" | "earn" | "launch";
 type Direction = "up" | "down";
-type QuoteState = "idle" | "loading" | "success" | "error";
+// "expired" is a distinct value (not "error"): it's the neutral, no-fault
+// state after MAX_AUTO_REFRESHES silent re-quotes, versus a real fetch failure.
+type QuoteState = "idle" | "loading" | "success" | "error" | "expired";
 
 type MakerQuote = {
   id: string;
@@ -175,9 +183,14 @@ function QuotePanel({
   errorMessage,
   secondsLeft,
   selectedQuoteId,
+  readiness,
+  inputIssue,
+  catalogSettled,
   onQuote,
   onSelect,
   onExecute,
+  onConnect,
+  onSignIn,
 }: {
   state: QuoteState;
   notional: number;
@@ -185,25 +198,101 @@ function QuotePanel({
   errorMessage: string;
   secondsLeft: number;
   selectedQuoteId: string;
+  readiness: QuoteReadiness;
+  inputIssue: string | null;
+  catalogSettled: boolean;
   onQuote: () => void;
   onSelect: (quoteId: string) => void;
   onExecute: () => void;
+  onConnect: () => void | Promise<void>;
+  onSignIn: () => void | Promise<void>;
 }) {
-  if (state === "idle") {
+  if (state === "success") {
     return (
-      <div className="quote-empty">
-        <div className="empty-icon"><Sparkles size={20} aria-hidden="true" /></div>
-        <div><strong>Ready for an executable quote</strong><p>The deployed V2 pool authority signs a one-shot RFQ.</p></div>
-        <button type="button" className="button primary" onClick={onQuote}>Request live quotes <Zap size={16} aria-hidden="true" /></button>
+      <div className="quote-results">
+        <div className="quote-results-head"><div><span className="eyebrow">Executable for {secondsLeft}s</span><h3>Signed devnet quote</h3></div><span className="live-dot">Onchain</span></div>
+        <div className="quote-list">
+          {quotes.map((maker, index) => (
+            <button type="button" className={maker.id === selectedQuoteId ? "quote-row selected" : "quote-row"} key={maker.id} onClick={() => onSelect(maker.id)} aria-pressed={maker.id === selectedQuoteId}>
+              <span className="maker-rank">0{index + 1}</span>
+              <span><strong>{maker.maker}</strong><small>{(maker.latencyMs / 1000).toFixed(1)}s response</small></span>
+              <span className="maker-badge">{maker.badge}</span>
+              <span className="quote-price"><strong>${maker.premium.toLocaleString()}</strong><small>{((maker.premium / notional) * 100).toFixed(2)}% premium</small></span>
+            </button>
+          ))}
+        </div>
+        <button type="button" className="button primary full" onClick={onExecute}>Review & execute <ArrowUpRight size={16} aria-hidden="true" /></button>
       </div>
     );
   }
 
-  if (state === "loading") {
+  if (readiness.kind === "no-provider") {
+    return (
+      <div className="quote-empty">
+        <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
+        <div><strong>No Solana wallet detected</strong><p>Quotes are signed for your wallet address. Install Phantom or another Solana wallet, then reload.</p></div>
+        <a className="button primary" href="https://phantom.com/download" target="_blank" rel="noreferrer"><Wallet size={16} aria-hidden="true" /> Get Phantom</a>
+      </div>
+    );
+  }
+
+  if (readiness.kind === "connect") {
+    return (
+      <div className="quote-empty">
+        <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
+        <div><strong>Connect a wallet to see your price</strong><p>Your quote is signed for your exact wallet address.</p></div>
+        <button type="button" className="button primary" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet</button>
+      </div>
+    );
+  }
+
+  if (readiness.kind === "busy") {
+    return (
+      <div className="quote-empty">
+        <button type="button" className="button primary full" disabled aria-busy="true"><LoaderCircle size={16} className="spin" aria-hidden="true" /> Waiting for wallet…</button>
+      </div>
+    );
+  }
+
+  if (readiness.kind === "sign-in") {
+    return (
+      <div className="quote-empty">
+        <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
+        <div><strong>Sign in to get a quote</strong><p>{readiness.reason || "Sign a message to prove this wallet is yours. It is not a transaction and costs nothing."}</p></div>
+        <button type="button" className="button primary" onClick={onSignIn}><Wallet size={16} aria-hidden="true" /> Sign in</button>
+      </div>
+    );
+  }
+
+  // readiness.kind === "ready" from here on.
+
+  // The onchain catalog hasn't answered yet, so every expiry still reads as
+  // unavailable. That's loading, not a ticket the user has to fix -- show the
+  // skeleton and let the auto-quote fire the moment the catalog lands.
+  if (!catalogSettled) {
     return (
       <div className="quote-loading" role="status" aria-live="polite">
-        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Requesting an executable quote</div>
+        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Checking verified onchain series…</div>
         <div className="quote-skeleton"><span /><span /><span /></div>
+      </div>
+    );
+  }
+
+  if (inputIssue) {
+    return (
+      <div className="quote-empty">
+        <div className="empty-icon"><Sparkles size={20} aria-hidden="true" /></div>
+        <div><strong>Can’t price this ticket yet</strong><p>{inputIssue}</p></div>
+      </div>
+    );
+  }
+
+  if (state === "expired") {
+    return (
+      <div className="quote-empty">
+        <div className="empty-icon"><Clock3 size={20} aria-hidden="true" /></div>
+        <div><strong>Quote expired</strong><p>Request a fresh executable price.</p></div>
+        <button type="button" className="button secondary" onClick={onQuote}><RefreshCw size={15} aria-hidden="true" /> Refresh quote</button>
       </div>
     );
   }
@@ -217,20 +306,12 @@ function QuotePanel({
     );
   }
 
+  // "idle" (debounce pending) or "loading": the request is either about to
+  // fire or already in flight -- same skeleton either way.
   return (
-    <div className="quote-results">
-      <div className="quote-results-head"><div><span className="eyebrow">Executable for {secondsLeft}s</span><h3>Signed devnet quote</h3></div><span className="live-dot">Onchain</span></div>
-      <div className="quote-list">
-        {quotes.map((maker, index) => (
-          <button type="button" className={maker.id === selectedQuoteId ? "quote-row selected" : "quote-row"} key={maker.id} onClick={() => onSelect(maker.id)} aria-pressed={maker.id === selectedQuoteId}>
-            <span className="maker-rank">0{index + 1}</span>
-            <span><strong>{maker.maker}</strong><small>{(maker.latencyMs / 1000).toFixed(1)}s response</small></span>
-            <span className="maker-badge">{maker.badge}</span>
-            <span className="quote-price"><strong>${maker.premium.toLocaleString()}</strong><small>{((maker.premium / notional) * 100).toFixed(2)}% premium</small></span>
-          </button>
-        ))}
-      </div>
-      <button type="button" className="button primary full" onClick={onExecute}>Review & execute <ArrowUpRight size={16} aria-hidden="true" /></button>
+    <div className="quote-loading" role="status" aria-live="polite">
+      <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Pricing your position…</div>
+      <div className="quote-skeleton"><span /><span /><span /></div>
     </div>
   );
 }
@@ -315,10 +396,22 @@ function TradeView({
   walletAddress,
   onConnect,
   onPositionSaved,
+  providerDetected,
+  walletBusy,
+  sessionWallet,
+  sessionNotice,
+  onSignIn,
+  onSessionExpired,
 }: {
   walletAddress: string;
   onConnect: () => void | Promise<void>;
   onPositionSaved: (position: SavedPosition) => void;
+  providerDetected: boolean | null;
+  walletBusy: boolean;
+  sessionWallet: string | null;
+  sessionNotice: string;
+  onSignIn: () => void | Promise<void>;
+  onSessionExpired: () => void;
 }) {
   const [assetTicker, setAssetTicker] = useState(() => tradableAssets[0]?.ticker ?? "");
   const [direction, setDirection] = useState<Direction>("up");
@@ -328,7 +421,7 @@ function TradeView({
   const [quoteState, setQuoteState] = useState<QuoteState>("idle");
   const [quotes, setQuotes] = useState<MakerQuote[]>([]);
   const [selectedQuoteId, setSelectedQuoteId] = useState("");
-  const [quoteError, setQuoteError] = useState("Use an amount between $100 and $5,000, then retry.");
+  const [quoteError, setQuoteError] = useState("");
   const [secondsLeft, setSecondsLeft] = useState(30);
   const [complete, setComplete] = useState(false);
   const [showPricing, setShowPricing] = useState(false);
@@ -337,6 +430,10 @@ function TradeView({
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
   const [seriesError, setSeriesError] = useState("Checking verified onchain series…");
+  // False only until the first /api/markets response (success OR failure).
+  // Until then the ticket can't be priced simply because the catalog hasn't
+  // arrived, which is a loading state -- not something the user must fix.
+  const [catalogSettled, setCatalogSettled] = useState(false);
   const [pools, setPools] = useState<CatalogPoolState[]>([]);
   // Last known spot price per live market symbol, for the selector strip
   // only. The SELECTED market's headline price and its live/stale badge still
@@ -386,6 +483,20 @@ function TradeView({
     : [];
   const defaultPool = authorizedPools.find((pool) => pool.quotable) ?? authorizedPools[0] ?? null;
   const activePool = authorizedPools.find((pool) => pool.address === selectedPool) ?? defaultPool;
+  const readiness = quoteReadiness({ providerDetected, walletAddress, walletBusy, sessionWallet, sessionNotice });
+  const inputIssue = quoteInputIssue({
+    notional,
+    expiryAvailable: expiryDefinition.available,
+    expiryReason: expiryDefinition.availabilityReason,
+    poolQuotable: activePool ? activePool.quotable : null,
+  });
+  // Bumped by invalidateQuote() and by every new runQuote() call so a
+  // response for inputs that no longer match the ticket is ignored, even if
+  // it lands after a newer request has already started (see requestQuote).
+  const requestSeqRef = useRef(0);
+  // Consecutive silent expiry auto-refreshes, reset on any user input change
+  // or manual request; capped at MAX_AUTO_REFRESHES (see the expiry effect).
+  const autoRefreshCountRef = useRef(0);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15_000);
@@ -427,6 +538,8 @@ function TradeView({
           // -- the selected market's own live/stale badge is what states
           // freshness, and it is driven by the chart's own snapshot.
         }
+      } finally {
+        if (!cancelled) setCatalogSettled(true);
       }
     };
     void load();
@@ -453,20 +566,36 @@ function TradeView({
       const remaining = Math.max(0, Math.ceil((bestQuote.expiresAt - Date.now()) / 1000));
       setSecondsLeft(remaining);
       if (remaining === 0 && executionState !== "loading") {
+        // The review modal always closes on expiry, whether or not this
+        // expiry goes on to auto-refresh -- a stale signed quote must never
+        // sit behind an open "Execute" button.
+        const wasReviewing = complete;
         setComplete(false);
         setExecutionState("idle");
         setExecutionError("");
         setQuotes([]);
         setSelectedQuoteId("");
         setVsolQuote(null);
-        setQuoteError("The signed quote expired. Request a fresh executable price.");
-        setQuoteState("error");
+        const canAutoRefresh = !wasReviewing
+          && document.visibilityState === "visible"
+          && autoRefreshCountRef.current < MAX_AUTO_REFRESHES;
+        if (canAutoRefresh) {
+          // Idle + ready + no input issue is exactly what the auto-quote
+          // effect below watches for, so this alone re-triggers a request.
+          autoRefreshCountRef.current += 1;
+          setQuoteState("idle");
+        } else {
+          // Past the cap (or the user was mid-review, or the tab is
+          // backgrounded): stop refreshing silently and show a neutral
+          // "expired" state with a manual refresh button instead.
+          setQuoteState("expired");
+        }
       }
     };
     update();
     const timer = window.setInterval(update, 250);
     return () => window.clearInterval(timer);
-  }, [quoteState, bestQuote, executionState]);
+  }, [quoteState, bestQuote, executionState, complete]);
 
   // Signed quotes bind the exact buyer, so switching wallets invalidates them mid-render.
   const [quotedWallet, setQuotedWallet] = useState(walletAddress);
@@ -481,35 +610,43 @@ function TradeView({
     setExecutionError("");
   }
 
+  // Refs are read/written outside render (event handlers, effects) only --
+  // this mirrors the wallet-switch reset above without mutating a ref
+  // during render.
+  useEffect(() => {
+    requestSeqRef.current += 1;
+    autoRefreshCountRef.current = 0;
+  }, [walletAddress]);
+
   function invalidateQuote() {
+    // Any input change orphans an in-flight request (if there is one) and
+    // resets the expiry auto-refresh budget for the new inputs.
+    requestSeqRef.current += 1;
+    autoRefreshCountRef.current = 0;
     setQuoteState("idle");
     setQuotes([]);
     setSelectedQuoteId("");
     setVsolQuote(null);
   }
 
-  async function requestQuote(event?: FormEvent) {
-    event?.preventDefault();
-    if (!walletAddress) {
-      setQuoteError("Connect a Solana wallet first; the RFQ is signed for that exact buyer address.");
-      setQuoteState("error");
-      return;
-    }
-    if (notional < 100 || notional > 5000) {
-      setQuoteError("Use a devnet amount between $100 and $5,000, then retry.");
-      setQuoteState("error");
-      return;
-    }
-    if (!expiryDefinition.available) {
-      setQuoteError(expiryDefinition.availabilityReason);
-      setQuoteState("error");
-      return;
-    }
-    if (activePool && !activePool.quotable) {
-      setQuoteError("Executable quotes come from the Tend pool today. Other authorized pools are listed honestly, but no quote service is integrated for them yet.");
-      setQuoteState("error");
-      return;
-    }
+  async function runQuote({ manual }: { manual: boolean }) {
+    // Not ready (no wallet, no provider, mid wallet-action, not signed in):
+    // the panel already shows the missing step, so there's nothing to error.
+    if (readiness.kind !== "ready") return;
+    // Invalid inputs: the panel already shows the issue text with no button,
+    // so a stray Enter keypress should just no-op rather than show an error.
+    if (inputIssue) return;
+    // A request is already in flight for these exact inputs. Without this,
+    // submitting the form (Enter) mid-debounce could race the pending
+    // auto-quote timer and fire two requests -- and a quote request can list
+    // a strike rung on chain, so a duplicate is not free.
+    if (quoteState === "loading") return;
+    // Only a MANUAL request (Enter, Retry, Refresh quote) refills the expiry
+    // auto-refresh budget. Resetting it here for automatic requests too would
+    // make the MAX_AUTO_REFRESHES cap unreachable, and an abandoned tab would
+    // re-quote -- and re-list rungs on chain -- forever.
+    if (manual) autoRefreshCountRef.current = 0;
+    const seq = ++requestSeqRef.current;
     setQuoteState("loading");
     setQuotes([]);
     try {
@@ -519,6 +656,17 @@ function TradeView({
         body: JSON.stringify({ symbol: asset.ticker, direction, amount: notional, expiryCode: expiry, payoff, walletAddress }),
       });
       const result = await response.json() as { quotes?: MakerQuote[]; vsol?: VsolQuotePayload; error?: string };
+      // Inputs (or the wallet) moved on while this request was in flight --
+      // invalidateQuote() or a newer runQuote() already bumped the
+      // sequence, so this response is for a ticket that no longer exists.
+      if (seq !== requestSeqRef.current) return;
+      if (response.status === 401) {
+        // The session cookie expired or was cleared server-side mid-flight.
+        // Drop back to the sign-in step instead of showing a fetch error.
+        onSessionExpired();
+        setQuoteState("idle");
+        return;
+      }
       if (!response.ok || !result.quotes?.length) {
         setQuoteError(result.error ?? "Market makers did not return an executable price. Try again.");
         setQuoteState("error");
@@ -529,10 +677,37 @@ function TradeView({
       setSelectedQuoteId(result.quotes[0].id);
       setQuoteState("success");
     } catch {
+      if (seq !== requestSeqRef.current) return;
       setQuoteError("The quote service is unreachable. Check your connection and retry.");
       setQuoteState("error");
     }
   }
+
+  function requestQuote(event?: FormEvent) {
+    event?.preventDefault();
+    void runQuote({ manual: true });
+  }
+
+  // Always-fresh ref to runQuote so the auto-quote effect below can depend on
+  // the primitive quote-input values (stable across unrelated re-renders,
+  // e.g. the price ticker) instead of this function's identity, which is
+  // recreated every render. Assigned in an effect (not during render) so refs
+  // are never written mid-render.
+  const runQuoteRef = useRef(runQuote);
+  useEffect(() => {
+    runQuoteRef.current = runQuote;
+  });
+
+  // One string per distinct "ticket" the user could request a quote for.
+  // Changing any of these -- or the catalog/session state settling into
+  // "ready" -- should (re)start the auto-quote debounce.
+  const quoteInputsKey = [walletAddress, asset.ticker, direction, expiry, payoff, notional, activePool?.address ?? ""].join("|");
+
+  useEffect(() => {
+    if (readiness.kind !== "ready" || quoteState !== "idle" || inputIssue !== null || complete) return;
+    const timer = window.setTimeout(() => { void runQuoteRef.current({ manual: false }); }, AUTO_QUOTE_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [quoteInputsKey, readiness.kind, quoteState, inputIssue, complete]);
 
   async function confirmPreviewPosition() {
     if (!bestQuote || !walletAddress || !vsolQuote) return;
@@ -702,7 +877,7 @@ function TradeView({
             <div className="economics-total"><span>Maximum payout</span><strong>${notional.toLocaleString()}</strong></div>
           </div>
 
-          <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} />
+          <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
         </form>
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
@@ -738,11 +913,16 @@ export function TendTerminal() {
   const [walletError, setWalletError] = useState("");
   const [walletConnecting, setWalletConnecting] = useState(false);
   const [walletFunding, setWalletFunding] = useState(false);
+  const [walletSigning, setWalletSigning] = useState(false);
   const [sessionWallet, setSessionWallet] = useState<string | null>(null);
   const [sessionNotice, setSessionNotice] = useState("");
   const [positions, setPositions] = useState<SavedPosition[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [positionsError, setPositionsError] = useState("");
+  // null until checked client-side (see the effect below) -- rendering "not
+  // detected" from the server would flip to "detected" on hydration for
+  // anyone with a wallet installed, which is exactly the mismatch to avoid.
+  const [providerDetected, setProviderDetected] = useState<boolean | null>(null);
   const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Trade", [activeTab]);
 
   useEffect(() => {
@@ -751,6 +931,19 @@ export function TendTerminal() {
       if (!cancelled && wallet) setSessionWallet(wallet);
     });
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const check = () => setProviderDetected(Boolean(injectedSolanaWallet()));
+    check();
+    // Some wallet extensions inject after the initial script evaluates, so
+    // re-check once the page finishes loading and once more shortly after.
+    window.addEventListener("load", check);
+    const timer = window.setTimeout(check, 1500);
+    return () => {
+      window.removeEventListener("load", check);
+      window.clearTimeout(timer);
+    };
   }, []);
 
   const loadPositions = useCallback(async () => {
@@ -801,6 +994,39 @@ export function TendTerminal() {
     setSessionNotice(result.reason);
   }, []);
 
+  // Sign in an already-connected wallet (the "Sign in" step in the quote
+  // panel, as opposed to the silent SIWS attempt inside connectWallet).
+  // establishWalletSession never throws for a declined signature -- signSolanaMessage's
+  // rejection is caught inside it and turned into `{ status: "failed", reason }`,
+  // where `reason` is whatever raw text the injected wallet returned. A manual
+  // "Sign in" click that doesn't succeed is overwhelmingly a dismissed
+  // signature prompt, so show one clear, wallet-agnostic message instead of
+  // unpredictable provider copy. The try/catch stays as a defensive backstop
+  // in case a future wallet integration throws instead of returning.
+  const signIn = useCallback(async () => {
+    if (!walletAddress) return;
+    setWalletSigning(true);
+    try {
+      const result = await establishWalletSession(walletAddress);
+      if (result.status === "active") {
+        setSessionWallet(walletAddress);
+        setSessionNotice("");
+      } else if (result.status === "unsupported") {
+        setSessionWallet(null);
+        setSessionNotice(result.reason);
+      } else {
+        setSessionWallet(null);
+        setSessionNotice("Sign-in was cancelled.");
+      }
+    } catch {
+      setSessionNotice("Sign-in was cancelled.");
+    } finally {
+      setWalletSigning(false);
+    }
+  }, [walletAddress]);
+
+  const onSessionExpired = useCallback(() => setSessionWallet(null), []);
+
   async function connectWallet() {
     const provider = injectedSolanaWallet();
     if (!provider) {
@@ -847,7 +1073,7 @@ export function TendTerminal() {
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} providerDetected={providerDetected} walletBusy={walletConnecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );
