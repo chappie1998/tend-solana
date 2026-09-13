@@ -10,7 +10,10 @@ export type MarketBar = {
   close: number;
 };
 
-const MAX_BARS = 2_000;
+// Exported so every provider-specific bars fetcher (Pyth's UDF parser here,
+// Coinbase's paginated candle merger in coinbase-market-bars.ts) enforces the
+// exact same ceiling rather than each guessing its own number.
+export const MAX_BARS = 2_000;
 
 const resolutionSeconds: Record<ChartResolution, number> = {
   "1": 60,

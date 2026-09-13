@@ -28,7 +28,7 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(chart, /\/api\/market-bars/);
   assert.match(chart, /Charts by TradingView/);
   assert.doesNotMatch(chart, /embed-widget-advanced-chart|document\.createElement\("script"\)|<iframe|DEMO DATA|demoCandles/i);
-  assert.match(chartRoute, /getPythMarketBars/);
+  assert.match(chartRoute, /getMarketBars/);
   // Pyth RETIRED the Benchmarks TradingView shim in the 2026-08-26 Core
   // upgrade; it now 404s. This assertion used to pin that dead URL, i.e. it
   // asserted the bug. Pin the live endpoint instead, and assert the retired
@@ -489,7 +489,7 @@ test("market-data stays real and the verified deployment remains fail-closed on 
     readFile(new URL("vsol/scripts/bootstrap.ts", root), "utf8"),
     readFile(new URL("vsol/scripts/verify-deployment.ts", root), "utf8"),
   ]);
-  assert.match(marketData, /getPythSnapshot/);
+  assert.match(marketData, /getMarketSnapshot/);
   assert.match(pythData, /Pyth Core Hermes/);
   assert.match(pythData, /historical coverage is insufficient/);
   assert.doesNotMatch(marketData, /demo|simulat/i);

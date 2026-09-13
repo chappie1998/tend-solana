@@ -5,7 +5,7 @@ import { ensureDb, getDb } from "../../../db";
 import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
-import { getPythRealizedVolatility, getPythSnapshot } from "../../lib/pyth-market-data";
+import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
 import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesStateOrPlan, parsePublicKey } from "../../lib/vsol-server";
 import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
 import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
@@ -81,12 +81,12 @@ export async function POST(request: Request) {
   let volatility;
   try {
     [snapshot, volatility] = await Promise.all([
-      getPythSnapshot(market),
-      getPythRealizedVolatility(market),
+      getMarketSnapshot(market),
+      getMarketRealizedVolatility(market),
     ]);
   } catch (error) {
-    const reason = error instanceof Error ? error.message : "Pyth pricing is unavailable";
-    return json({ error: `Executable pricing requires fresh Pyth spot and historical observations: ${reason}` }, 503);
+    const reason = error instanceof Error ? error.message : "Market pricing data is unavailable";
+    return json({ error: `Executable pricing requires a fresh spot reference and historical observations: ${reason}` }, 503);
   }
   const economics = quoteFor({
     spot: snapshot.price,
@@ -198,7 +198,14 @@ export async function POST(request: Request) {
     referencePublishTime: snapshot.publishTime,
     referenceAgeSeconds: snapshot.ageSeconds,
     pricingMode: snapshot.mode,
-    referenceSource: "Pyth Core Hermes · exact onchain feed id",
+    // Honest about which provider actually produced `referencePrice`: only
+    // Pyth's exact onchain feed id is the same id settlement will verify
+    // against. Coinbase's number is an off-chain spot reference only --
+    // settlement below still requires its own separately verified Pyth
+    // update regardless of which one priced this quote.
+    referenceSource: snapshot.source === "Pyth Core Hermes"
+      ? "Pyth Core Hermes · exact onchain feed id"
+      : `${snapshot.source} · off-chain reference; settlement still verifies the exact onchain Pyth feed id`,
     settlement: "European cash-settled · fully verified Pyth PriceUpdateV2",
     expiry: {
       code: expiry.code,

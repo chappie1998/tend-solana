@@ -51,10 +51,10 @@
 //
 // Every discovery function accepts an optional trailing `deps` object
 // (`{ connection?, fetchSpot? }`) purely so tests can inject a stub
-// connection and a canned spot price instead of hitting devnet RPC / Pyth
-// Hermes -- see tests/helpers/vsol-market-fixture.mjs and
-// tests/series-resolver.test.mjs. Every production call site omits `deps`
-// and gets the real connection/Hermes-backed defaults below.
+// connection and a canned spot price instead of hitting devnet RPC / the
+// configured market-data provider -- see tests/helpers/vsol-market-fixture.mjs
+// and tests/series-resolver.test.mjs. Every production call site omits `deps`
+// and gets the real connection/provider-backed defaults below.
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { deriveMarket, deriveMarketId, deriveOracle, ladderStrike, PRICE_SCALE, symbolBytes } from "../../vsol/sdk/index.ts";
@@ -63,7 +63,7 @@ import { runtimeEnv } from "./runtime-env.ts";
 import { deriveLaunchSeriesParams, type LaunchSeriesParams } from "./launch-params.ts";
 import { expiryCodes, type ExpiryCode } from "./expiries.ts";
 import { marketBySymbol, pythFeedIdFor, strikeLadderStepFor } from "./markets.ts";
-import { getPythSnapshot } from "./pyth-market-data.ts";
+import { getMarketSnapshot } from "./market-data.ts";
 import { fetchAllVsolMarkets, type DiscoveredVsolMarket } from "./vsol-market-accounts.ts";
 
 export type ResolvedVsolSeries = {
@@ -106,9 +106,9 @@ export const SERIES_NOT_YET_LISTED_REASON = "No series has been listed for this 
 export type VsolDiscoveryDeps = {
   connection?: Connection;
   // Returns live spot for `symbol` in whole-dollar units (the same
-  // convention as PythMarketSnapshot.price). Injectable purely for tests;
-  // every production call site omits this and gets the real Hermes-backed
-  // getPythSnapshot below.
+  // convention as MarketSnapshot.price). Injectable purely for tests; every
+  // production call site omits this and gets the real provider-backed
+  // getMarketSnapshot below.
   fetchSpot?: (symbol: string) => Promise<number>;
 };
 
@@ -123,7 +123,7 @@ function defaultConnection(): Connection {
 async function defaultFetchSpot(symbol: string): Promise<number> {
   const market = marketBySymbol(symbol);
   if (!market) throw new Error(`No market metadata is configured for ${symbol}`);
-  const snapshot = await getPythSnapshot(market);
+  const snapshot = await getMarketSnapshot(market);
   return snapshot.price;
 }
 
@@ -192,7 +192,7 @@ async function pickAtTheMoney(
   }
   try {
     const spot = await fetchSpot(symbol);
-    if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
+    if (!Number.isFinite(spot) || spot <= 0) throw new Error("Market data returned an invalid spot price");
     const spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
     let best = sorted[0];
     let bestDiff = absDiff(best.strike, spotAtoms);
@@ -421,7 +421,7 @@ export async function resolveOrPlanVsolSeries(symbol: string, code: ExpiryCode, 
  */
 async function atTheMoneyLadderStrike(symbol: string, fetchSpot: (symbol: string) => Promise<number>): Promise<bigint> {
   const spot = await fetchSpot(symbol);
-  if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
+  if (!Number.isFinite(spot) || spot <= 0) throw new Error("Market data returned an invalid spot price");
   const spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
   // This symbol's own ladder step -- see `strikeLadderStep` in
   // app/lib/markets.ts. Rounding BTC onto SOL's $2.50 step would plan a
@@ -468,7 +468,7 @@ async function planUnlistedSlot(
  * Two reasons, both load-bearing:
  *
  *   - Cost. A catalog spans (symbols x expiryCodes) slots -- 15 today. Pricing
- *     per slot would mean 15 Hermes round trips per /api/markets request.
+ *     per slot would mean 15 market-data round trips per /api/markets request.
  *   - Consistency. Every slot of a symbol must see the SAME spot, or the
  *     at-the-money pick for 7D could be drawn from a different price than the
  *     planned rung for 15M, and the catalog would contradict itself mid-response.
@@ -547,7 +547,7 @@ export async function findVsolSeriesCandidateForMarket(
     let spotAtoms: bigint;
     try {
       const spot = await fetchSpot(symbol);
-      if (!Number.isFinite(spot) || spot <= 0) throw new Error("Pyth returned an invalid spot price");
+      if (!Number.isFinite(spot) || spot <= 0) throw new Error("Market data returned an invalid spot price");
       spotAtoms = BigInt(Math.round(spot * Number(PRICE_SCALE)));
     } catch {
       continue;

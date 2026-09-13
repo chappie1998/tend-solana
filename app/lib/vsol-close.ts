@@ -40,7 +40,7 @@ import {
   type DecodedPoolPosition,
 } from "./pool-position";
 import { marketBySymbol } from "./markets";
-import { getPythSnapshot } from "./pyth-market-data";
+import { getMarketSnapshot } from "./market-data";
 import { buybackFor } from "./options";
 
 const CLOSE_POOL_POSITION_ACCOUNT_COUNT = 14;
@@ -152,7 +152,7 @@ export async function buildVsolCloseTransaction(params: {
   // time value to the premium already paid rather than re-deriving it from
   // volatility (volatility is already priced into that premium by `quoteFor`
   // at inception), so realized volatility is not needed for a close quote.
-  const snapshot = await getPythSnapshot(marketDefinition);
+  const snapshot = await getMarketSnapshot(marketDefinition);
 
   const priceDecimals = priceScaleDecimals(market.priceScale);
   const strikeFloat = atomsToNumber(position.strike, priceDecimals);

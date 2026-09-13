@@ -3,25 +3,15 @@ import {
   chartResolutionSeconds,
   parsePythUdfBars,
   type ChartResolution,
-  type MarketBar,
 } from "./market-bars.ts";
+import type { MarketDataBars } from "./market-data-types.ts";
 import type { Market } from "./markets.ts";
 import { runtimeEnv } from "./runtime-env.ts";
 
-export type PythMarketBars = {
-  symbol: string;
-  resolution: ChartResolution;
-  source: "Pyth Benchmarks";
-  // Whether the most recent bar is inside the normal publish cadence for this
-  // resolution. There is no "market closed" state — Tend quotes 24/7 — this
-  // just tells the chart whether to poll fast or slow.
-  freshness: "live" | "stale";
-  bars: MarketBar[];
-  from: number;
-  to: number;
-  asOf: number;
-  lastBarTime: number;
-};
+// The shape itself now lives in market-data-types.ts, shared with the
+// Coinbase path -- kept under its historical name here since this file's own
+// callers and tests still spell it PythMarketBars.
+export type PythMarketBars = MarketDataBars;
 
 // Measured: Pyth's history API returns a 1,440-bar window in ~2.1-2.8s. 8s left
 // barely 3x headroom, and a single slow response aborted the request outright

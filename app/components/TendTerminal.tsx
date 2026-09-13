@@ -73,8 +73,9 @@ type SeriesState = {
 };
 
 // One entry per LIVE market in /api/markets' `snapshots` array: either a
-// Hermes price or the reason there isn't one. The route already fetches these
-// for every live market (see app/api/markets/route.ts).
+// spot price (from whichever provider /api/markets' `dataSource` names) or
+// the reason there isn't one. The route already fetches these for every live
+// market (see app/api/markets/route.ts).
 type MarketSnapshotResult = {
   symbol: string;
   snapshot?: { price: number };
@@ -303,6 +304,13 @@ function expiryChipTitle(item: Pick<ExpiryDefinition, "available" | "label" | "d
   return item.availabilityReason === MINT_ON_DEMAND_REASON ? MINT_ON_DEMAND_FULL_NOTE : `${item.label}, settles ${item.detail}`;
 }
 
+/** Short, provider-accurate label for on-screen copy -- never a hardcoded provider name. */
+function shortDataSourceLabel(source: string | null | undefined): string {
+  if (source === "Pyth Core Hermes") return "Pyth";
+  if (source === "Coinbase Exchange") return "Coinbase";
+  return "Market";
+}
+
 function TradeView({
   walletAddress,
   onConnect,
@@ -330,10 +338,14 @@ function TradeView({
   const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
   const [seriesError, setSeriesError] = useState("Checking verified onchain series…");
   const [pools, setPools] = useState<CatalogPoolState[]>([]);
-  // Last known Hermes price per live market symbol, for the selector strip
+  // Last known spot price per live market symbol, for the selector strip
   // only. The SELECTED market's headline price and its live/stale badge still
   // come from the chart's own snapshot -- this never overrides that.
   const [stripPrices, setStripPrices] = useState<Record<string, number>>({});
+  // Which off-chain provider /api/markets is currently reading from (see
+  // app/lib/market-data.ts) -- drives the "<provider> pending" chip label
+  // below. Never a hardcoded name.
+  const [dataSourceLabel, setDataSourceLabel] = useState("Market");
   const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -385,18 +397,20 @@ function TradeView({
     const load = async () => {
       try {
         const response = await fetch("/api/markets", { cache: "no-store" });
-        const result = await response.json() as { series?: SeriesState[]; seriesError?: string | null; pools?: CatalogPoolState[]; snapshots?: MarketSnapshotResult[]; error?: string };
+        const result = await response.json() as { series?: SeriesState[]; seriesError?: string | null; pools?: CatalogPoolState[]; snapshots?: MarketSnapshotResult[]; dataSource?: string; error?: string };
         if (!response.ok) throw new Error(result.error ?? "Onchain market catalog is unavailable.");
         if (!cancelled) {
           setSeriesStates(result.series ?? []);
           setSeriesError(result.seriesError ?? (result.series?.length ? "" : "No verified onchain series is published."));
           setPools(result.pools ?? []);
-          // /api/markets already polls Hermes for EVERY live market, and this
-          // used to throw those away and keep only the selected asset's price
-          // (which arrives separately, from the chart). With one live market
-          // that was invisible; with three it meant two of the three chips
-          // read "Pyth pending" forever, which reads as broken rather than as
-          // unselected. Same response, no extra request.
+          if (result.dataSource) setDataSourceLabel(result.dataSource);
+          // /api/markets already polls every live market's configured
+          // provider, and this used to throw those away and keep only the
+          // selected asset's price (which arrives separately, from the
+          // chart). With one live market that was invisible; with three it
+          // meant two of the three chips read "pending" forever, which reads
+          // as broken rather than as unselected. Same response, no extra
+          // request.
           setStripPrices(Object.fromEntries(
             (result.snapshots ?? [])
               .filter((entry) => typeof entry.snapshot?.price === "number")
@@ -589,7 +603,7 @@ function TradeView({
               <div className="asset-group-row">
                 {group.assets.map((item) => (
                   <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-                    <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : "Pyth pending"}</small></span>
+                    <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : `${shortDataSourceLabel(dataSourceLabel)} pending`}</small></span>
                     {/* The two coming-soon cases are different in kind (an un-entitled
                         feed vs no feed at all) and a user cannot tell which is which
                         from "Coming soon", so the distinction is rendered, not only
@@ -618,8 +632,8 @@ function TradeView({
 
         <div className="market-card">
           <div className="price-row">
-            <div><span className="eyebrow">Pyth settlement reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div>{marketSnapshot?.mode === "stale" && <small className="reference-gap-note">Reference {Math.max(1, Math.round(marketSnapshot.ageSeconds / 60))} min old · gap risk priced</small>}</div>
-            <div className="market-stats"><div><span>Pyth confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div><div><span>Oracle slot</span><strong>{marketSnapshot?.slot?.toLocaleString() ?? "—"}</strong></div><div><span>Pricing vol</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div></div>
+            <div><span className="eyebrow">{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div>{marketSnapshot?.mode === "stale" && <small className="reference-gap-note">Reference {Math.max(1, Math.round(marketSnapshot.ageSeconds / 60))} min old · gap risk priced</small>}</div>
+            <div className="market-stats"><div><span>{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div><div><span>Oracle slot</span><strong>{marketSnapshot?.slot?.toLocaleString() ?? "—"}</strong></div><div><span>Pricing vol</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
           <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> TradingView is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Pyth feed · mock RWA mint</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
@@ -690,7 +704,7 @@ function TradeView({
 
           <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} />
         </form>
-        <p className="risk-note" id="risk">Devnet only: mock tokens, real Pyth reference data, no real asset value. Options can lose their full premium.</p>
+        <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
 
       {complete && (
