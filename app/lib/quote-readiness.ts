@@ -41,8 +41,12 @@ export function quoteReadiness(input: QuoteReadinessInput): QuoteReadiness {
 }
 
 export type QuoteInputIssueInput = {
-  /** The requested position size in tUSDC. */
-  notional: number;
+  /** What the buyer pays, in tUSDC -- the premium, not the payout. */
+  stake: number;
+  /** Smallest stake whose payout the pool will underwrite at this payoff tier. */
+  stakeMin: number;
+  /** Largest stake whose payout the pool will underwrite at this payoff tier. */
+  stakeMax: number;
   /** Whether the selected expiry has a tradeable onchain series. */
   expiryAvailable: boolean;
   /** Why the selected expiry is unavailable, shown verbatim when it is. */
@@ -57,9 +61,11 @@ export type QuoteInputIssueInput = {
  * inline so the auto-quote effect and the manual submit path can't drift.
  */
 export function quoteInputIssue(input: QuoteInputIssueInput): string | null {
-  if (input.notional < 100 || input.notional > 5000) {
-    // No "then retry": quoting is automatic, so a valid amount is enough.
-    return "Enter a devnet amount between $100 and $5,000.";
+  if (input.stake < input.stakeMin || input.stake > input.stakeMax) {
+    // Bounds are per payoff tier: the buyer types what they pay, and the
+    // payout it buys has to stay inside what the devnet pool underwrites.
+    // No "then retry" -- quoting is automatic, so a valid amount is enough.
+    return `Pay between $${input.stakeMin.toLocaleString()} and $${input.stakeMax.toLocaleString()}.`;
   }
   if (!input.expiryAvailable) {
     return input.expiryReason;

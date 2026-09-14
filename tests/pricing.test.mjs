@@ -316,3 +316,52 @@ test("width floor and strike-offset bound are the documented, defensible values 
   // floor that broke short-dated pricing -- this is the whole point of the fix.
   assert.ok(WIDTH_MIN_FRACTION < 0.03, "the new floor must be smaller than the old 3% floor it replaces");
 });
+
+// --- Stake -> payout inversion (app/lib/options.ts payoutForStake) ---------
+// The buyer types what they PAY; the engine prices from the payout. These
+// pin the property that makes the inversion exact rather than a search.
+
+test("premium is exactly linear in payout, so one reference quote inverts it", async () => {
+  const { quoteFor } = await loadOptions();
+  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 60 };
+  const small = quoteFor({ ...inputs, amount: 100 });
+  const large = quoteFor({ ...inputs, amount: 5_000 });
+  // Strike/width/probability are size-independent: the solver matches
+  // premium == payout / payoff, and payout cancels out of that target.
+  assert.equal(small.strike, large.strike);
+  assert.equal(small.cap, large.cap);
+  assert.equal(small.probabilityItm, large.probabilityItm);
+  // ...so the premium ratio is identical at both sizes.
+  assert.ok(Math.abs(small.premium / 100 - large.premium / 5_000) < 1e-9);
+});
+
+test("payoutForStake returns the payout whose premium is the requested stake", async () => {
+  const { quoteFor, payoutForStake } = await loadOptions();
+  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 60 };
+  const reference = quoteFor({ ...inputs, amount: 1_000 });
+  for (const stake of [25, 100, 250, 900]) {
+    const payout = payoutForStake({ stake, referencePremium: reference.premium, referenceNotional: 1_000 });
+    const repriced = quoteFor({ ...inputs, amount: payout });
+    // Re-pricing at the derived payout must cost what the buyer asked to pay.
+    assert.ok(Math.abs(repriced.premium - stake) < 0.02, `stake ${stake} -> premium ${repriced.premium}`);
+  }
+});
+
+test("payoutForStake clamps to what the pool underwrites, and rejects nonsense", async () => {
+  const { payoutForStake, MIN_PAYOUT_NOTIONAL, MAX_PAYOUT_NOTIONAL } = await loadOptions();
+  const ref = { referencePremium: 200, referenceNotional: 1_000 }; // 5x
+  assert.equal(payoutForStake({ stake: 1, ...ref }), MIN_PAYOUT_NOTIONAL);
+  assert.equal(payoutForStake({ stake: 10_000, ...ref }), MAX_PAYOUT_NOTIONAL);
+  assert.throws(() => payoutForStake({ stake: 0, ...ref }), /positive/);
+  assert.throws(() => payoutForStake({ stake: Number.NaN, ...ref }), /positive/);
+});
+
+test("stakeBoundsForPayoff keeps the implied payout inside the pool's limits", async () => {
+  const { stakeBoundsForPayoff, MIN_PAYOUT_NOTIONAL, MAX_PAYOUT_NOTIONAL } = await loadOptions();
+  for (const payoff of [2, 5, 10]) {
+    const { min, max } = stakeBoundsForPayoff(payoff);
+    assert.ok(min * payoff >= MIN_PAYOUT_NOTIONAL, `${payoff}x min`);
+    assert.ok(max * payoff <= MAX_PAYOUT_NOTIONAL, `${payoff}x max`);
+  }
+  assert.deepEqual(stakeBoundsForPayoff(5), { min: 20, max: 1_000 });
+});

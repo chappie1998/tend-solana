@@ -612,3 +612,56 @@ export function buybackFor(params: {
   }
   return { fairValue, buyback, spreadBps };
 }
+
+// ---------------------------------------------------------------------------
+// Stake -> payout inversion.
+//
+// The buyer types what they are willing to PAY. The engine prices from the
+// payout, so the payout that costs exactly that stake has to be derived.
+//
+// This is exact, not a search. `quoteFor` solves the strike such that
+// premium == maxPayout / payoff, and `spreadFairValue` is
+// maxPayout * unitValue / width, so maxPayout cancels out of the solver's
+// target: the strike, width, cap, probability and the premium RATIO depend
+// only on (spot, vol, duration, direction, payoff) -- never on size. Premium
+// is therefore exactly linear in maxPayout, and one reference quote inverts
+// it in closed form.
+//
+// The caller re-prices at the returned notional rather than scaling the
+// reference numbers, because `quoteFor` applies two absolute clamps to the
+// premium (a $1 floor and a 95%-of-payout ceiling) that are not linear. Those
+// only bite at extreme sizes, and re-pricing means the quote the buyer signs
+// is always the quote they were shown.
+
+/** Smallest and largest payout the devnet pool will underwrite, in tUSDC. */
+export const MIN_PAYOUT_NOTIONAL = 100;
+export const MAX_PAYOUT_NOTIONAL = 5_000;
+
+/**
+ * The payout notional whose premium is `stake`, given one reference quote
+ * priced at `referenceNotional`. Clamped to what the pool can underwrite --
+ * callers must re-price at the result and show THAT premium, which is the
+ * one the buyer actually pays when the clamp binds.
+ */
+export function payoutForStake(params: {
+  stake: number;
+  referencePremium: number;
+  referenceNotional: number;
+}): number {
+  const { stake, referencePremium, referenceNotional } = params;
+  if (!Number.isFinite(stake) || stake <= 0) throw new RangeError("Stake must be a positive finite value");
+  if (!Number.isFinite(referencePremium) || referencePremium <= 0) throw new RangeError("Reference premium must be positive");
+  if (!Number.isFinite(referenceNotional) || referenceNotional <= 0) throw new RangeError("Reference notional must be positive");
+  const premiumFraction = referencePremium / referenceNotional;
+  const notional = stake / premiumFraction;
+  const clamped = Math.min(MAX_PAYOUT_NOTIONAL, Math.max(MIN_PAYOUT_NOTIONAL, notional));
+  return Number(clamped.toFixed(2));
+}
+
+/** The stake range that keeps the derived payout inside the pool's limits at this payoff tier. */
+export function stakeBoundsForPayoff(payoff: number): { min: number; max: number } {
+  return {
+    min: Math.ceil(MIN_PAYOUT_NOTIONAL / payoff),
+    max: Math.floor(MAX_PAYOUT_NOTIONAL / payoff),
+  };
+}

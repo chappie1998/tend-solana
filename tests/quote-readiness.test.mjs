@@ -89,23 +89,32 @@ test("wallet connected and session matches: ready", async () => {
 });
 
 const baseInputIssueInput = Object.freeze({
-  notional: 1000,
+  stake: 100,
+  stakeMin: 20,
+  stakeMax: 1000,
   expiryAvailable: true,
   expiryReason: "",
   poolQuotable: true,
 });
 
-test("quoteInputIssue: amount boundaries at 99/100/5000/5001", async () => {
+// The buyer types a STAKE (what they pay) and the bounds move with the payoff
+// tier, so the message quotes the tier's own limits rather than fixed ones.
+test("quoteInputIssue: stake boundaries are inclusive and quote the tier's limits", async () => {
   const { quoteInputIssue } = await loadQuoteReadiness();
   assert.equal(
-    quoteInputIssue({ ...baseInputIssueInput, notional: 99 }),
-    "Enter a devnet amount between $100 and $5,000.",
+    quoteInputIssue({ ...baseInputIssueInput, stake: 19 }),
+    "Pay between $20 and $1,000.",
   );
-  assert.equal(quoteInputIssue({ ...baseInputIssueInput, notional: 100 }), null);
-  assert.equal(quoteInputIssue({ ...baseInputIssueInput, notional: 5000 }), null);
+  assert.equal(quoteInputIssue({ ...baseInputIssueInput, stake: 20 }), null);
+  assert.equal(quoteInputIssue({ ...baseInputIssueInput, stake: 1000 }), null);
   assert.equal(
-    quoteInputIssue({ ...baseInputIssueInput, notional: 5001 }),
-    "Enter a devnet amount between $100 and $5,000.",
+    quoteInputIssue({ ...baseInputIssueInput, stake: 1001 }),
+    "Pay between $20 and $1,000.",
+  );
+  // A different tier reports different limits from the same helper.
+  assert.equal(
+    quoteInputIssue({ ...baseInputIssueInput, stakeMin: 10, stakeMax: 500, stake: 501 }),
+    "Pay between $10 and $500.",
   );
 });
 
@@ -135,11 +144,11 @@ test("quoteInputIssue: valid inputs return null", async () => {
   assert.equal(quoteInputIssue(baseInputIssueInput), null);
 });
 
-test("quoteInputIssue: amount check takes priority over expiry/pool issues", async () => {
+test("quoteInputIssue: stake check takes priority over expiry/pool issues", async () => {
   const { quoteInputIssue } = await loadQuoteReadiness();
   assert.equal(
-    quoteInputIssue({ notional: 50, expiryAvailable: false, expiryReason: "Cutoff passed.", poolQuotable: false }),
-    "Enter a devnet amount between $100 and $5,000.",
+    quoteInputIssue({ stake: 5, stakeMin: 20, stakeMax: 1000, expiryAvailable: false, expiryReason: "Cutoff passed.", poolQuotable: false }),
+    "Pay between $20 and $1,000.",
   );
 });
 

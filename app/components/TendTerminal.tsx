@@ -23,6 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
+import { stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { useWalletBridge, type WalletBridge } from "../lib/wallet-bridge";
 import {
@@ -178,7 +179,6 @@ function ProductNav({ active, onChange }: { active: Tab; onChange: (tab: Tab) =>
 
 function QuotePanel({
   state,
-  notional,
   quotes,
   errorMessage,
   secondsLeft,
@@ -193,7 +193,6 @@ function QuotePanel({
   onSignIn,
 }: {
   state: QuoteState;
-  notional: number;
   quotes: MakerQuote[];
   errorMessage: string;
   secondsLeft: number;
@@ -217,7 +216,7 @@ function QuotePanel({
               <span className="maker-rank">0{index + 1}</span>
               <span><strong>{maker.maker}</strong><small>{(maker.latencyMs / 1000).toFixed(1)}s response</small></span>
               <span className="maker-badge">{maker.badge}</span>
-              <span className="quote-price"><strong>${maker.premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong><small>{((maker.premium / notional) * 100).toFixed(2)}% premium</small></span>
+              <span className="quote-price"><strong>${maker.premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong><small>{((maker.premium / maker.maxPayout) * 100).toFixed(2)}% of payout</small></span>
             </button>
           ))}
         </div>
@@ -431,7 +430,7 @@ function TradeView({
   const [direction, setDirection] = useState<Direction>("up");
   const [expiry, setExpiry] = useState<ExpiryCode>("30D");
   const [payoff, setPayoff] = useState(5);
-  const [amount, setAmount] = useState("1000");
+  const [amount, setAmount] = useState("100");
   const [quoteState, setQuoteState] = useState<QuoteState>("idle");
   const [quotes, setQuotes] = useState<MakerQuote[]>([]);
   const [selectedQuoteId, setSelectedQuoteId] = useState("");
@@ -463,7 +462,10 @@ function TradeView({
   // Only ever a tradable asset: the coming-soon chips are disabled, so
   // `assetTicker` can never hold one, and the fallback stays on the live set.
   const asset = tradableAssets.find((item) => item.ticker === assetTicker) ?? tradableAssets[0] ?? assets[0];
-  const notional = Number(amount) || 0;
+  // What the buyer typed is what they PAY. The payout it buys is solved
+  // server-side and only known once a quote exists (see payoutForStake).
+  const stake = Number(amount) || 0;
+  const stakeBounds = stakeBoundsForPayoff(payoff);
   const expiryOptions = expiryCodes.map((code) => {
     const definition = resolveExpiry(code, asset.ticker, now);
     const series = seriesStates.find((item) => item.symbol === asset.ticker && item.code === code);
@@ -488,6 +490,8 @@ function TradeView({
   });
   const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
   const bestQuote = quotes.find((quote) => quote.id === selectedQuoteId) ?? quotes[0];
+  // Solved server-side from the stake, so it only exists once a quote does.
+  const maxPayout = bestQuote?.maxPayout ?? null;
   const premium = bestQuote?.premium ?? 0;
   const target = bestQuote?.strike ?? null;
   const displayedPrice = marketSnapshot?.price ?? null;
@@ -505,7 +509,9 @@ function TradeView({
   const providerDetected = !bridge.ready ? null : bridge.configured;
   const readiness = quoteReadiness({ providerDetected, walletAddress, walletBusy, sessionWallet, sessionNotice });
   const inputIssue = quoteInputIssue({
-    notional,
+    stake,
+    stakeMin: stakeBounds.min,
+    stakeMax: stakeBounds.max,
     expiryAvailable: expiryDefinition.available,
     expiryReason: expiryDefinition.availabilityReason,
     poolQuotable: activePool ? activePool.quotable : null,
@@ -638,6 +644,17 @@ function TradeView({
     autoRefreshCountRef.current = 0;
   }, [walletAddress]);
 
+  // Clamps the stake into the new tier's bounds as the tier changes, so the
+  // ticket is never left in a state that cannot be quoted.
+  function selectPayoff(next: number) {
+    const bounds = stakeBoundsForPayoff(next);
+    const current = Number(amount) || 0;
+    const clamped = Math.min(bounds.max, Math.max(bounds.min, current));
+    if (clamped !== current) setAmount(String(clamped));
+    setPayoff(next);
+    invalidateQuote();
+  }
+
   function invalidateQuote() {
     // Any input change orphans an in-flight request (if there is one) and
     // resets the expiry auto-refresh budget for the new inputs.
@@ -673,7 +690,7 @@ function TradeView({
       const response = await fetch("/api/quotes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: asset.ticker, direction, amount: notional, expiryCode: expiry, payoff, walletAddress }),
+        body: JSON.stringify({ symbol: asset.ticker, direction, stake, expiryCode: expiry, payoff, walletAddress }),
       });
       const result = await response.json() as { quotes?: MakerQuote[]; vsol?: VsolQuotePayload; error?: string };
       // Inputs (or the wallet) moved on while this request was in flight --
@@ -721,7 +738,7 @@ function TradeView({
   // One string per distinct "ticket" the user could request a quote for.
   // Changing any of these -- or the catalog/session state settling into
   // "ready" -- should (re)start the auto-quote debounce.
-  const quoteInputsKey = [walletAddress, asset.ticker, direction, expiry, payoff, notional, activePool?.address ?? ""].join("|");
+  const quoteInputsKey = [walletAddress, asset.ticker, direction, expiry, payoff, stake, activePool?.address ?? ""].join("|");
 
   useEffect(() => {
     if (readiness.kind !== "ready" || quoteState !== "idle" || inputIssue !== null || complete) return;
@@ -755,7 +772,7 @@ function TradeView({
           maker: bestQuote.maker,
           symbol: asset.ticker,
           direction,
-          amount: notional,
+          amount: bestQuote.maxPayout,
           premium: bestQuote.premium,
           strike: bestQuote.strike,
           cap: bestQuote.cap,
@@ -886,9 +903,16 @@ function TradeView({
             </fieldset>
           )}
 
-          <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{[2, 5, 10].map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { setPayoff(item); invalidateQuote(); }}>{item}×<small>{item === 2 ? "Balanced" : item === 5 ? "Popular" : "Aggressive"}</small></button>)}</div></fieldset>
+          <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{[2, 5, 10].map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { selectPayoff(item); }}>{item}×<small>{item === 2 ? "Balanced" : item === 5 ? "Popular" : "Aggressive"}</small></button>)}</div></fieldset>
 
-          <div className="field-group"><label htmlFor="amount">Position size</label><div className="amount-input"><span>$</span><input id="amount" type="number" inputMode="decimal" min="100" max="5000" step="100" value={amount} onChange={(event) => { setAmount(event.target.value); invalidateQuote(); }} autoComplete="off" aria-describedby="amount-note" /><span>tUSDC</span></div><div id="amount-note" className="input-note"><span>Min $100</span><span>Devnet max $5,000</span></div></div>
+          {/* The buyer types what LEAVES THEIR WALLET, not the payout. It
+              used to be labelled "Position size" and carried the payout
+              notional, so someone typing 100 was quoted a $20 premium -- the
+              number they entered was never the number they paid. The payout
+              that stake buys is solved server-side and shown below. Bounds
+              move with the payoff tier, because the payout they imply has to
+              stay inside what the devnet pool can underwrite. */}
+          <div className="field-group"><label htmlFor="amount">You pay</label><div className="amount-input"><span>$</span><input id="amount" type="number" inputMode="decimal" min={stakeBounds.min} max={stakeBounds.max} step="10" value={amount} onChange={(event) => { setAmount(event.target.value); invalidateQuote(); }} autoComplete="off" aria-describedby="amount-note" /><span>tUSDC</span></div><div id="amount-note" className="input-note"><span>Min ${stakeBounds.min}</span><span>Max ${stakeBounds.max.toLocaleString()}</span></div></div>
 
           {/* Two numbers decide the trade: what leaves the wallet, and what
               can come back. Everything else is pricing evidence, and it now
@@ -904,8 +928,8 @@ function TradeView({
               half the payout), so 2x can settle at 3.3x. Showing the tier here
               would state a multiple the buyer is not getting. */}
           <div className="economics">
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>You pay</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div className="economics-total"><span>Max payout</span><strong>{`$${notional.toLocaleString()}`}{bestQuote && <small>{bestQuote.effectiveLeverage.toFixed(1)}× your premium</small>}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Signed premium</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div>
             <details className="econ-detail">
               <summary>Pricing detail</summary>
               <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
@@ -920,7 +944,7 @@ function TradeView({
             </details>
           </div>
 
-          <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
+          <QuotePanel state={quoteState} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
         </form>
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
@@ -933,7 +957,7 @@ function TradeView({
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
