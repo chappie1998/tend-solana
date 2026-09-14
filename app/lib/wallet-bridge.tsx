@@ -135,9 +135,16 @@ function PrivyWalletBridge({ children }: { children: ReactNode }) {
     login();
   }, [login]);
 
+  // logout() alone only ends a Privy-authenticated session -- it never
+  // touches an externally-connected wallet-standard wallet (Phantom,
+  // Solflare, ...), which stays in `wallets` and keeps re-resolving the same
+  // `address`. The wallet's own disconnect() (a wrapper around the
+  // standard:disconnect feature) is what actually drops that connection;
+  // logout() still runs after for the embedded-wallet / Privy-session case.
   const disconnect = useCallback(async () => {
+    if (activeWallet) await activeWallet.disconnect();
     await logout();
-  }, [logout]);
+  }, [activeWallet, logout]);
 
   const signTransactionBase64 = useCallback(
     async (encoded: string) => {

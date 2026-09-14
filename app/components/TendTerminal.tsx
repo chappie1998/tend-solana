@@ -1212,9 +1212,17 @@ export function TendTerminal() {
     await bridge.connect();
   }, [bridge]);
 
+  // bridge.disconnect() throws when the connected wallet never implemented
+  // the (optional) wallet-standard disconnect feature -- rare, but silently
+  // swallowing it would look identical to the bug this fixed: clicking
+  // Disconnect and nothing happening. Surface it instead of hiding it.
   const disconnectWallet = useCallback(async () => {
     setWalletMenuOpen(false);
-    await bridge.disconnect();
+    try {
+      await bridge.disconnect();
+    } catch {
+      setWalletError("This wallet doesn't support disconnecting from a page. Disconnect this site from inside your wallet extension instead.");
+    }
   }, [bridge]);
 
   const copyWalletAddress = useCallback(async () => {
