@@ -1,0 +1,148 @@
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import BN from "bn.js";
+import idl from "../target/idl/vsol.json" with { type: "json" };
+import type { Vsol } from "../target/types/vsol.ts";
+// Reuses the app's already-built, already-tested Coinbase provider rather
+// than writing a second HTTP client here -- see CLAUDE.md's Coinbase
+// migration note for why this is the off-chain spot source on this
+// deployment.
+import { getCoinbaseSnapshot } from "../../app/lib/coinbase-market-data.ts";
+// The live market set, read from the one shared list (never hardcoded here)
+// so this pusher can never drift from what the app/keeper consider tradable.
+import { liveMarkets, type Market } from "../../app/lib/markets.ts";
+import { deriveConfig, deriveCustomPriceFeed, PRICE_SCALE, VSOL_PROGRAM_ID } from "../sdk/index.ts";
+
+// The custom-oracle pusher is the off-chain half of the backup/demo
+// settlement path added alongside `CustomPriceFeed` in
+// vsol/programs/vsol/src/lib.rs: on a fixed cadence it fetches each live
+// symbol's Coinbase spot, scales it to `PRICE_SCALE` atoms, and calls
+// `update_custom_price_feed`. It is intentionally simple and centralized --
+// see that account's own doc comment for the honest trust-model disclosure
+// this script's signer check is the entirety of. This exists only so the
+// product can still settle expired markets while Pyth access is
+// unavailable; it is NOT a replacement for `publish_pyth_settlement` and
+// carries none of its cryptographic verification.
+//
+// This key (`devnet-custom-oracle-authority`) is dedicated and low-privilege
+// by design -- separate from maker/pool-manager/admin -- so compromising it
+// can only ever move the custom feed's price, never touch a vault, a
+// position, or `config` itself. It is deliberately NOT `config.admin`; it
+// must be set as `config.oracle_authority` (via the existing `update_config`
+// instruction) before `update_custom_price_feed` will accept its signature.
+
+const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
+const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
+const commitment = "confirmed" as const;
+const connection = new Connection(rpcUrl, commitment);
+const workspace = resolve(import.meta.dirname, "..");
+const devnetDir = resolve(workspace, ".devnet");
+
+// "~45-60s" per the design spec for CUSTOM_ORACLE_MAX_STALENESS_SECONDS
+// (300s on-chain) -- generous headroom under that ceiling even if a single
+// tick is slow or briefly fails.
+const PUSH_INTERVAL_MS = 55_000;
+
+async function loadRequiredKeypair(name: string): Promise<Keypair> {
+  const path = resolve(devnetDir, `${name}.json`);
+  if (!existsSync(path)) {
+    throw new Error(
+      `Missing required signer "${name}" (expected ${path}). Generate it once with ` +
+        `"solana-keygen new --no-bip39-passphrase --silent --outfile ${path}" and fund it ` +
+        "with devnet SOL, then have an admin rotate config.oracle_authority to its public key " +
+        "via the existing update_config instruction, before running this pusher.",
+    );
+  }
+  const secret = Uint8Array.from(JSON.parse(await readFile(path, "utf8")) as number[]);
+  return Keypair.fromSecretKey(secret);
+}
+
+function programFor(signer: Keypair): Program<Vsol> {
+  const provider = new AnchorProvider(connection, new AnchorWallet(signer), { commitment, preflightCommitment: commitment });
+  return new Program<Vsol>(idl, provider);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+/** Rounds a human spot price/confidence to the nearest `PRICE_SCALE` atom -- the same rounding convention `toPoolAtoms` uses in app/lib/vsol-server.ts. */
+function toPriceScaleAtoms(humanAmount: number): bigint {
+  return BigInt(Math.round(humanAmount * Number(PRICE_SCALE)));
+}
+
+async function pushOneSymbol(params: {
+  program: Program<Vsol>;
+  authority: Keypair;
+  config: PublicKey;
+  market: Market;
+}): Promise<void> {
+  const { program, authority, config, market } = params;
+  const feed = deriveCustomPriceFeed(market.symbol);
+  const snapshot = await getCoinbaseSnapshot(market);
+  const price = toPriceScaleAtoms(snapshot.price);
+  const confidence = toPriceScaleAtoms(Math.max(0, snapshot.confidence));
+  if (price <= 0n) {
+    throw new Error(`Coinbase returned a non-positive price for ${market.symbol} (${snapshot.price})`);
+  }
+
+  const signature = await program.methods
+    .updateCustomPriceFeed(new BN(price.toString()), new BN(confidence.toString()))
+    .accountsStrict({
+      oracleAuthority: authority.publicKey,
+      config,
+      feed,
+    })
+    .rpc();
+
+  console.log(
+    `pushed: ${market.symbol} price $${snapshot.price} (${price.toString()} atoms), confidence ${confidence.toString()} atoms (signature ${signature})`,
+  );
+}
+
+async function runOnePass(program: Program<Vsol>, authority: Keypair, config: PublicKey): Promise<void> {
+  for (const market of liveMarkets) {
+    try {
+      await pushOneSymbol({ program, authority, config, market });
+    } catch (error) {
+      // Per-symbol isolation: a Coinbase outage, an un-initialized feed
+      // (init_custom_price_feed not yet called for this symbol), or a single
+      // failed RPC must cost only that symbol's tick, never the whole pass.
+      console.log(`skip: ${market.symbol} -- ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  console.log(`VSOL custom-oracle pusher on ${cluster} through the configured RPC`);
+
+  const programAccount = await connection.getAccountInfo(VSOL_PROGRAM_ID, commitment);
+  if (!programAccount?.executable) {
+    throw new Error(`VSOL program ${VSOL_PROGRAM_ID.toBase58()} is not deployed on ${cluster}`);
+  }
+
+  const authority = await loadRequiredKeypair("devnet-custom-oracle-authority");
+  const program = programFor(authority);
+  const config = deriveConfig();
+
+  console.log(
+    `Pushing ${liveMarkets.length} live symbol(s) every ${Math.round(PUSH_INTERVAL_MS / 1000)}s: ` +
+      `${liveMarkets.map((market) => market.symbol).join(", ")} (signer ${authority.publicKey.toBase58()})`,
+  );
+
+  // Runs forever. Each pass is fully isolated per symbol (see the try/catch
+  // in runOnePass above), so this loop itself never throws in the steady
+  // state; only a startup failure (missing key, program not deployed) exits.
+  for (;;) {
+    await runOnePass(program, authority, config);
+    await sleep(PUSH_INTERVAL_MS);
+  }
+}
+
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

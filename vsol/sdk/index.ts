@@ -7,6 +7,10 @@ export const VSOL_PROGRAM_ID = new PublicKey("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6
 export const CONFIG_SEED = Buffer.from("config");
 export const MARKET_SEED = Buffer.from("market");
 export const ORACLE_SEED = Buffer.from("oracle");
+// Seeds the centrally-sourced backup/demo `CustomPriceFeed` PDA -- one per
+// symbol (see `deriveCustomPriceFeed`), independent of `ORACLE_SEED`'s
+// per-market `SettlementOracle`.
+export const CUSTOM_FEED_SEED = Buffer.from("custom-feed");
 export const WRITER_SEED = Buffer.from("writer");
 export const WRITER_TOKEN_SEED = Buffer.from("writer-token");
 export const NONCE_SEED = Buffer.from("nonce");
@@ -378,6 +382,11 @@ export function deriveMarket(config: PublicKey, id: Uint8Array, programId = VSOL
 
 export function deriveOracle(market: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {
   return PublicKey.findProgramAddressSync([ORACLE_SEED, market.toBuffer()], programId)[0];
+}
+
+/** One `CustomPriceFeed` PDA per symbol (e.g. "SOL"), shared across every expiry/rung of that asset -- see `CUSTOM_FEED_SEED`. */
+export function deriveCustomPriceFeed(symbol: string, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync([CUSTOM_FEED_SEED, Buffer.from(symbolBytes(symbol))], programId)[0];
 }
 
 export function deriveWriterVault(config: PublicKey, maker: PublicKey, mint: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {

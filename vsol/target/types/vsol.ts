@@ -1841,6 +1841,102 @@ export type Vsol = {
       ]
     },
     {
+      "name": "initCustomPriceFeed",
+      "docs": [
+        "One-time per symbol (e.g. SOL/BTC/ETH): creates the `CustomPriceFeed`",
+        "PDA a later `update_custom_price_feed`/`publish_custom_settlement`",
+        "call will read. Admin-gated, mirroring every other config-owned",
+        "`init` instruction in this file. `published_at` starts at 0, which",
+        "deliberately fails `publish_custom_settlement`'s freshness check",
+        "forever until a real `update_custom_price_feed` call lands."
+      ],
+      "discriminator": [
+        85,
+        173,
+        225,
+        40,
+        138,
+        220,
+        118,
+        10
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "feed",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "symbol"
+              }
+            ]
+          }
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "symbol",
+          "type": {
+            "array": [
+              "u8",
+              16
+            ]
+          }
+        },
+        {
+          "name": "priceScale",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "initializeConfig",
       "discriminator": [
         208,
@@ -2398,6 +2494,111 @@ export type Vsol = {
           "type": "pubkey"
         }
       ]
+    },
+    {
+      "name": "publishCustomSettlement",
+      "docs": [
+        "Mirrors `publish_pyth_settlement`'s shape but reads `CustomPriceFeed`",
+        "instead of verifying a Pyth `price_update`. No caller signer is",
+        "required: authentication already happened at `update_custom_price_feed`",
+        "time -- the same permissionless-relay principle `publish_pyth_settlement`",
+        "itself relies on, where the settlement CALLER isn't what's trusted,",
+        "the upstream signed write is."
+      ],
+      "discriminator": [
+        245,
+        183,
+        205,
+        35,
+        21,
+        122,
+        11,
+        27
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market",
+          "relations": [
+            "oracle"
+          ]
+        },
+        {
+          "name": "oracle",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  114,
+                  97,
+                  99,
+                  108,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.symbol",
+                "account": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
     },
     {
       "name": "publishPythSettlement",
@@ -4015,6 +4216,91 @@ export type Vsol = {
       ]
     },
     {
+      "name": "updateCustomPriceFeed",
+      "docs": [
+        "Called every pusher tick to refresh `CustomPriceFeed`. The signer",
+        "must equal `config.oracle_authority` -- see that account's doc",
+        "comment for the full trust-model disclosure this check is the whole",
+        "of."
+      ],
+      "discriminator": [
+        216,
+        177,
+        206,
+        143,
+        69,
+        217,
+        255,
+        16
+      ],
+      "accounts": [
+        {
+          "name": "oracleAuthority",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "feed",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "feed.symbol",
+                "account": "customPriceFeed"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "confidence",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "updateLiquidityPool",
       "docs": [
         "Updates a liquidity pool's risk configuration. Split into an",
@@ -4422,6 +4708,19 @@ export type Vsol = {
       ]
     },
     {
+      "name": "customPriceFeed",
+      "discriminator": [
+        149,
+        188,
+        117,
+        83,
+        50,
+        81,
+        52,
+        72
+      ]
+    },
+    {
       "name": "eligibility",
       "discriminator": [
         53,
@@ -4642,6 +4941,32 @@ export type Vsol = {
         19,
         198,
         194
+      ]
+    },
+    {
+      "name": "customPriceFeedUpdated",
+      "discriminator": [
+        128,
+        191,
+        210,
+        106,
+        72,
+        168,
+        156,
+        168
+      ]
+    },
+    {
+      "name": "customSettlementPublished",
+      "discriminator": [
+        78,
+        56,
+        135,
+        154,
+        187,
+        2,
+        76,
+        108
       ]
     },
     {
@@ -5318,6 +5643,16 @@ export type Vsol = {
       "code": 6066,
       "name": "nothingToRedeem",
       "msg": "There is no outstanding conditional-token supply left to redeem."
+    },
+    {
+      "code": 6067,
+      "name": "customFeedNotYetFresh",
+      "msg": "The custom price feed has not yet updated past this market's expiry."
+    },
+    {
+      "code": 6068,
+      "name": "customFeedStale",
+      "msg": "The custom price feed has not updated recently enough to settle with."
     }
   ],
   "types": [
@@ -5545,6 +5880,121 @@ export type Vsol = {
           {
             "name": "strike",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "customPriceFeed",
+      "docs": [
+        "A centrally-sourced backup/demo settlement price feed, one per `symbol`",
+        "(seeded off `market.symbol`, not `market.pyth_feed_id`, so it is shared",
+        "across every expiry/rung of the same underlying and kept in its own",
+        "namespace independent of Pyth's). It exists so the product can still",
+        "settle expired markets when Pyth access is unavailable -- see",
+        "`publish_custom_settlement`.",
+        "",
+        "Be honest about the tradeoff this is: unlike `SettlementOracle` when",
+        "populated via `publish_pyth_settlement`, a price written here is NOT",
+        "cryptographically verified by any independent oracle network. Its entire",
+        "trust model is the signer check in `update_custom_price_feed` -- whoever",
+        "holds `config.oracle_authority`'s key can write any price into this",
+        "account. That is intentional, disclosed centralization -- a deliberate",
+        "short-term fallback while Pyth access is unavailable, not something this",
+        "comment is trying to obscure."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "symbol",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "priceScale",
+            "type": "u64"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "confidence",
+            "type": "u64"
+          },
+          {
+            "name": "publishedAt",
+            "type": "i64"
+          },
+          {
+            "name": "publisher",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "customPriceFeedUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "symbol",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "confidence",
+            "type": "u64"
+          },
+          {
+            "name": "publishedAt",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "customSettlementPublished",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "confidence",
+            "type": "u64"
+          },
+          {
+            "name": "publishedAt",
+            "type": "i64"
           }
         ]
       }
