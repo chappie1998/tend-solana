@@ -1469,23 +1469,45 @@ export async function buildVsolQuoteTransaction(params: {
     rent: SYSVAR_RENT_PUBKEY,
   }, quoteData(quote));
   const latest = await connection.getLatestBlockhash("confirmed");
-  // When the manifest publishes an ALT, compile as a v0 transaction so
-  // repeated 32-byte account keys collapse into 1-byte indices. The buyer's
-  // transaction is always the plain two-instruction fill now -- an unlisted
-  // rung was listed by listVsolSeriesOnChain above, in its own server-signed
+  // Prefer the plain legacy shape, and reach for the ALT only if the bytes
+  // genuinely don't fit.
+  //
+  // The buyer's transaction is always the two-instruction fill -- an unlisted
+  // rung is listed by listVsolSeriesOnChain above in its own server-signed
   // transaction, rather than by two extra instructions in here (which composed
-  // to 1265 bytes, over the packet limit, and so could never be sent). Falls
-  // back to the exact legacy shape whenever no table is available.
-  const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
-  const transaction = composeVsolFillTransaction({
+  // to 1265 bytes, over the packet limit, and so could never be sent). That
+  // two-instruction form measures ~1154 bytes as a legacy transaction, so it
+  // already fits with room to spare, and the v0+ALT encoding was only ever a
+  // size optimisation on top of that (repeated 32-byte keys collapsing into
+  // 1-byte indices).
+  //
+  // That optimisation costs real money in wallets: a v0 transaction can only
+  // be simulated by first resolving its lookup table, and third-party wallet
+  // scanners are mainnet-oriented -- Solflare's returns a hard "Security
+  // verification failed / server error" on a devnet ALT it cannot resolve,
+  // leaving the signature blocked with no way to proceed. A legacy fill has no
+  // table to resolve and scans normally.
+  //
+  // The ALT stays as an automatic fallback, so if the fill's shape ever grows
+  // past the packet limit the v0 encoding still rescues it rather than the
+  // quote failing outright. resolveSignedVsolFillTransaction accepts both
+  // shapes, so nothing downstream cares which one this returns.
+  const composeParams = {
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
     instructions: [signatureInstruction, fillInstruction],
-    lookupTableAccount,
-  });
+  };
+  let transaction = composeVsolFillTransaction(composeParams);
+  let serialized = serializeVsolTransaction(transaction);
+  if (serialized.length > MAX_TRANSACTION_BYTES) {
+    const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
+    if (lookupTableAccount) {
+      transaction = composeVsolFillTransaction({ ...composeParams, lookupTableAccount });
+      serialized = serializeVsolTransaction(transaction);
+    }
+  }
 
-  const serialized = serializeVsolTransaction(transaction);
   if (serialized.length > MAX_TRANSACTION_BYTES) {
     // Do not ship a silently-broken oversized transaction: fail the quote
     // honestly rather than handing the wallet something that can never fit in
