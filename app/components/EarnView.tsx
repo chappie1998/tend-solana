@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { formatAtoms } from "../lib/format";
-import { signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import { useWalletBridge } from "../lib/wallet-bridge";
 import { solanaExplorerUrl, VSOL_PROGRAM_ID } from "../lib/vsol";
 
 type LiquidityState = {
@@ -59,6 +59,7 @@ type Receipt = {
 };
 
 export function EarnView({ walletAddress, onConnect }: { walletAddress: string; onConnect: () => void | Promise<void> }) {
+  const bridge = useWalletBridge();
   const [state, setState] = useState<LiquidityState | null>(null);
   const [history, setHistory] = useState<LiquidityAction[]>([]);
   const [amount, setAmount] = useState("1000");
@@ -146,7 +147,7 @@ export function EarnView({ walletAddress, onConnect }: { walletAddress: string; 
       if (!prepareResponse.ok || !prepared.intentId || !prepared.transaction) {
         throw new Error(prepared.error ?? "The liquidity transaction could not be prepared.");
       }
-      const signedTransaction = await signSerializedSolanaTransaction(prepared.transaction);
+      const signedTransaction = await bridge.signTransactionBase64(prepared.transaction);
       const sendResponse = await fetch("/api/vsol/liquidity/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

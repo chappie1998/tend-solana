@@ -3,7 +3,7 @@
 import { ArrowUpRight, BadgeCheck, LoaderCircle, LockKeyhole, RefreshCw, ShieldCheck, Target, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { formatAtoms } from "../lib/format";
-import { signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import { useWalletBridge } from "../lib/wallet-bridge";
 import { solanaExplorerUrl } from "../lib/vsol";
 import type { ExpiryCode } from "../lib/expiries";
 
@@ -119,6 +119,7 @@ export function PortfolioView({
   onRetry: () => void;
   onTrade: () => void;
 }) {
+  const bridge = useWalletBridge();
   const [chain, setChain] = useState<ChainState>({ phase: "loading" });
   const [closeTarget, setCloseTarget] = useState<ChainPositionRow | null>(null);
   const [closeState, setCloseState] = useState<CloseState>({ phase: "idle" });
@@ -200,7 +201,7 @@ export function PortfolioView({
     const { quote } = closeState;
     setCloseState({ phase: "submitting", quote });
     try {
-      const signedTransaction = await signSerializedSolanaTransaction(quote.transaction);
+      const signedTransaction = await bridge.signTransactionBase64(quote.transaction);
       const response = await fetch("/api/vsol/close/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

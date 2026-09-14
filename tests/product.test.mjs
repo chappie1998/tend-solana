@@ -19,7 +19,11 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
-  assert.match(terminal, /signSerializedSolanaTransaction/);
+  // Wallet connection + signing go through the Privy-backed bridge (see
+  // app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper this
+  // used to call directly -- that helper is kept only for
+  // tests/vsol-versioned-fill.test.mjs's legacy/v0 round-trip coverage.
+  assert.match(terminal, /bridge\.signTransactionBase64/);
   assert.match(walletHelper, /signTransaction/);
   assert.doesNotMatch(terminal, /"Devnet confirmed"/);
   assert.match(chart, /lightweight-charts/);
@@ -461,7 +465,7 @@ test("liquidity page uses real V2 pool state, wallet signatures, persisted simul
   ]);
   assert.match(terminal, /<EarnView walletAddress=/);
   assert.match(earn, /no invented APY/i);
-  assert.match(earn, /signSerializedSolanaTransaction/);
+  assert.match(earn, /bridge\.signTransactionBase64/);
   assert.match(earn, /\/api\/vsol\/liquidity\/prepare/);
   assert.match(server, /deposit_liquidity/);
   assert.match(server, /withdraw_liquidity/);
