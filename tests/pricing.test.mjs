@@ -75,49 +75,111 @@ test("Black-Scholes call and put values are monotonically non-decreasing in time
   }
 });
 
-test("spreadUnitValue stays bounded in [0, width] and spreadFairValue in [0, maxPayout]", async () => {
-  const { spreadUnitValue, spreadFairValue } = await loadOptions();
+test("digitalFairValue stays bounded in [0, maxPayout] across direction x strike x vol x time", async () => {
+  const { digitalFairValue } = await loadOptions();
   const spot = 100;
   const maxPayout = 1_000;
   for (const direction of ["up", "down"]) {
-    for (const strikeFrac of [0.85, 0.95, 1, 1.05, 1.2]) {
-      for (const widthFrac of [0.006, 0.05, 0.4]) {
-        for (const volAnnual of [0.1, 0.5, 2.0, 4.0]) {
-          for (const timeYears of [15 / 525_600, 30 / 365]) {
-            const strike = spot * strikeFrac;
-            const width = spot * widthFrac;
-            const unitValue = spreadUnitValue({ direction, spot, strike, width, volAnnual, timeYears });
-            assert.ok(unitValue >= -1e-9, `unitValue negative: ${unitValue}`);
-            assert.ok(unitValue <= width + 1e-6 * width, `unitValue ${unitValue} exceeded width ${width}`);
-            const fair = spreadFairValue(maxPayout, width, unitValue);
-            assert.ok(fair >= -1e-9 && fair <= maxPayout + 1e-6 * maxPayout, `fairValue ${fair} outside [0, maxPayout]`);
-          }
+    for (const strikeFrac of [0.6, 0.85, 0.95, 1, 1.05, 1.2, 1.6]) {
+      for (const volAnnual of [0.1, 0.5, 2.0, 4.0]) {
+        for (const timeYears of [0, 15 / 525_600, 30 / 365]) {
+          const strike = spot * strikeFrac;
+          const fair = digitalFairValue({ direction, spot, strike, maxPayout, volAnnual, timeYears });
+          assert.ok(fair >= -1e-9 && fair <= maxPayout + 1e-6 * maxPayout, `fairValue ${fair} outside [0, maxPayout]`);
         }
       }
     }
   }
 });
 
-test("the payout ramp saturates near maxPayout deep in the money and floors near 0 deep out of the money", async () => {
-  const { spreadUnitValue, spreadFairValue } = await loadOptions();
-  const spot = 100;
-  const width = 2;
+// The required "payout shape" regression: with the on-chain minimum width
+// (BINARY_WIDTH, one atom) `definedRiskPayout` is no longer a ramp -- it is
+// an EXACT step function. Below/at the strike it must pay exactly 0; one
+// atom above (the cap), exactly maxPayout. Mirrored for DOWN.
+test("definedRiskPayout is an exact step function at BINARY_WIDTH: 0 at/below strike, maxPayout one atom above", async () => {
+  const { definedRiskPayout, BINARY_WIDTH } = await loadOptions();
+  const maxPayout = 1_000;
+
+  for (const strike of [0.01, 1, 100, 101.64, 12_345.67]) {
+    // UP: cap = strike + BINARY_WIDTH.
+    const capUp = strike + BINARY_WIDTH;
+    assert.equal(definedRiskPayout({ direction: "up", settlement: strike, strike, cap: capUp, maxPayout }), 0, `up @ strike=${strike}: at strike must pay 0`);
+    assert.equal(definedRiskPayout({ direction: "up", settlement: strike - 10, strike, cap: capUp, maxPayout }), 0, `up @ strike=${strike}: below strike must pay 0`);
+    assert.equal(definedRiskPayout({ direction: "up", settlement: capUp, strike, cap: capUp, maxPayout }), maxPayout, `up @ strike=${strike}: one atom above must pay maxPayout exactly`);
+    assert.equal(definedRiskPayout({ direction: "up", settlement: strike + 10, strike, cap: capUp, maxPayout }), maxPayout, `up @ strike=${strike}: well above must still pay exactly maxPayout`);
+
+    // DOWN: cap = strike - BINARY_WIDTH.
+    const capDown = strike - BINARY_WIDTH;
+    assert.equal(definedRiskPayout({ direction: "down", settlement: strike, strike, cap: capDown, maxPayout }), 0, `down @ strike=${strike}: at strike must pay 0`);
+    assert.equal(definedRiskPayout({ direction: "down", settlement: strike + 10, strike, cap: capDown, maxPayout }), 0, `down @ strike=${strike}: above strike must pay 0`);
+    assert.equal(definedRiskPayout({ direction: "down", settlement: capDown, strike, cap: capDown, maxPayout }), maxPayout, `down @ strike=${strike}: one atom below must pay maxPayout exactly`);
+    assert.equal(definedRiskPayout({ direction: "down", settlement: strike - 10, strike, cap: capDown, maxPayout }), maxPayout, `down @ strike=${strike}: well below must still pay exactly maxPayout`);
+  }
+});
+
+test("digitalFairValue saturates near maxPayout deep in the money and floors near 0 deep out of the money", async () => {
+  const { digitalFairValue } = await loadOptions();
   const maxPayout = 1_000;
   const volAnnual = 0.4;
   const timeYears = 60 / 525_600;
 
-  // Deep ITM: spot far past strike+width (up) / strike-width (down).
-  const deepItmUp = spreadFairValue(maxPayout, width, spreadUnitValue({ direction: "up", spot: 400, strike: 100, width, volAnnual, timeYears }));
-  const deepItmDown = spreadFairValue(maxPayout, width, spreadUnitValue({ direction: "down", spot: 10, strike: 100, width, volAnnual, timeYears }));
+  const deepItmUp = digitalFairValue({ direction: "up", spot: 400, strike: 100, maxPayout, volAnnual, timeYears });
+  const deepItmDown = digitalFairValue({ direction: "down", spot: 10, strike: 100, maxPayout, volAnnual, timeYears });
   assert.ok(deepItmUp > maxPayout * 0.999, `deep ITM up should saturate near maxPayout, got ${deepItmUp}`);
   assert.ok(deepItmDown > maxPayout * 0.999, `deep ITM down should saturate near maxPayout, got ${deepItmDown}`);
 
-  // Deep OTM: spot far below strike (up) / far above strike (down).
-  const deepOtmUp = spreadFairValue(maxPayout, width, spreadUnitValue({ direction: "up", spot: 10, strike: 100, width, volAnnual, timeYears }));
-  const deepOtmDown = spreadFairValue(maxPayout, width, spreadUnitValue({ direction: "down", spot: 400, strike: 100, width, volAnnual, timeYears }));
+  const deepOtmUp = digitalFairValue({ direction: "up", spot: 10, strike: 100, maxPayout, volAnnual, timeYears });
+  const deepOtmDown = digitalFairValue({ direction: "down", spot: 400, strike: 100, maxPayout, volAnnual, timeYears });
   assert.ok(deepOtmUp < maxPayout * 0.001, `deep OTM up should floor near 0, got ${deepOtmUp}`);
   assert.ok(deepOtmDown < maxPayout * 0.001, `deep OTM down should floor near 0, got ${deepOtmDown}`);
-  assert.equal(spot, 100); // spot fixture unused directly above; keeps intent explicit for readers.
+});
+
+// Task-required digital sanity check: an at-the-money binary must price near
+// 2x BEFORE edge (P ~= 0.5, so premium/maxPayout ~= 0.5 pre-edge), and the
+// achieved multiple must rise monotonically as the strike moves further out
+// of the money. This is the one invariant that holds universally, for every
+// vol/time: probabilityItm (N(d2)/N(-d2)) is strictly monotonic in STRIKE by
+// construction (d2 is strictly decreasing in K), so 1/(P*(1+edge)) is
+// strictly increasing as the strike moves OTM -- independent of the
+// spot-vs-strike SIGN, which (see the strike-offset-fraction sweep below)
+// can itself flip at extreme vol x time because a lognormal's median sits
+// below its mean for any vol > 0.
+test("digital sanity check: at-the-money prices near 2x before edge, and the multiple rises monotonically further out of the money", async () => {
+  const { digitalFairValue, probabilityItm, applyMakerEdge } = await loadOptions();
+  const spot = 100;
+  const maxPayout = 1_000;
+  // Short tenor, moderate vol: the median-drag term (0.5 * sigma^2 * T) is
+  // negligible here, so at-the-money genuinely sits close to P = 0.5.
+  const volAnnual = 0.5;
+  const atmTimeYears = 60 / 525_600;
+
+  for (const direction of ["up", "down"]) {
+    const atmFair = digitalFairValue({ direction, spot, strike: spot, maxPayout, volAnnual, timeYears: atmTimeYears });
+    const atmP = atmFair / maxPayout;
+    assert.ok(Math.abs(atmP - 0.5) < 0.01, `at-the-money P should be ~0.5, got ${atmP} (direction=${direction})`);
+    const atmMultiplePreEdge = maxPayout / atmFair;
+    assert.ok(Math.abs(atmMultiplePreEdge - 2) < 0.05, `at-the-money should price near 2x before edge, got ${atmMultiplePreEdge}x (direction=${direction})`);
+
+    // Monotonic rise in achieved multiple as the strike moves further OTM --
+    // strike sweep is direction-aware (UP: increasing strike is further OTM;
+    // DOWN: decreasing strike is further OTM). A 30-day window keeps the
+    // strike range below (a wide-enough spread of standard deviations that
+    // the rise is genuinely visible, but not so wide that distant strikes
+    // saturate P to the same float at both ends, which would make a strict
+    // "always rises" comparison flaky rather than false.
+    const timeYears = 30 / 365;
+    const strikes = direction === "up"
+      ? [70, 80, 90, 95, 100, 105, 110, 120, 140]
+      : [140, 120, 110, 105, 100, 95, 90, 80, 70];
+    let prevMultiple = -Infinity;
+    for (const strike of strikes) {
+      const p = probabilityItm(direction, spot, strike, volAnnual, timeYears);
+      const premium = applyMakerEdge(maxPayout * p);
+      const multiple = maxPayout / premium;
+      assert.ok(multiple > prevMultiple, `achieved multiple must rise moving further OTM (direction=${direction}): ${prevMultiple} -> ${multiple} at strike=${strike}`);
+      prevMultiple = multiple;
+    }
+  }
 });
 
 test("quoteFor achieves the requested 5×/10× payoff exactly across the measured audit matrix, both directions", async () => {
@@ -155,20 +217,20 @@ test("quoteFor achieves the requested 5×/10× payoff exactly across the measure
   }
 });
 
-test("quoteFor reaches the 2× tier exactly via an in-the-money strike, at every duration in the reviewer's matrix", async () => {
+test("quoteFor reaches the 2× tier exactly, via an out-of-the-money strike, at every duration in the reviewer's matrix", async () => {
   const { quoteFor } = await loadOptions();
-  // This used to be a "never shortchanges when it clamps" test: a fair,
-  // cherry-pick-safe 2x ("pay 50% of maxPayout") is NOT reachable as an
-  // OUT-of-the-money capped spread at this width across the reviewer's own
-  // matrix -- an at-the-money spread this wide is worth well under 50% of
-  // maxPayout at these vol/duration combinations, so the old one-sided
-  // (out-of-the-money-only) solver had no choice but to clamp at-the-money
-  // and overdeliver leverage the trader never asked for. Widening the
-  // solver's search to include in-the-money strikes (see
-  // solveStrikeForTargetPremium) fixes the actual problem: moving the
-  // strike in-the-money raises the spread's value, so the requested 2x is
-  // now genuinely reachable and SOLVED exactly, with no clamp and no
-  // leverage the buyer didn't ask for, at every one of these combinations.
+  // TRUE BINARY correction: 2x is priced as a digital now, not a capped
+  // spread. `premium = maxPayout * P * (1 + edge)`, so 2x needs
+  // P = 1 / (2 * 1.15) ~= 0.435 -- BELOW 0.5. Since a lognormal's median
+  // sits below its mean for any vol > 0, at-the-money (P at strike = spot)
+  // is itself already close to or below 0.5 at ordinary tenors (see the
+  // "digital sanity check" test), so reaching P ~= 0.435 lands
+  // out-of-the-money here -- the OPPOSITE of the old capped-spread engine,
+  // where an at-the-money spread this wide was worth well under 50% of
+  // maxPayout and 2x could only be reached by moving in-the-money. Both are
+  // the solver correctly finding whichever side the target premium actually
+  // lives on for the instrument being priced; what must hold either way is
+  // that 2x is reached SOLVED (not clamped), at every duration.
   const cases = [
     { volatility: 33, durationMinutes: 60 },
     { volatility: 60, durationMinutes: 60 },
@@ -188,52 +250,48 @@ test("quoteFor reaches the 2× tier exactly via an in-the-money strike, at every
       );
       assert.ok(quote.premium >= 1 && quote.premium <= quote.maxPayout * 0.95, "premium must still be bounded");
       assert.equal(quote.reachability, "solved");
-      // The strike that makes this reachable is genuinely in-the-money:
-      // below spot for UP, above spot for DOWN.
-      if (direction === "up") assert.ok(quote.strike < spot, `UP 2x strike ${quote.strike} should be below spot ${spot} (ITM)`);
-      else assert.ok(quote.strike > spot, `DOWN 2x strike ${quote.strike} should be above spot ${spot} (ITM)`);
+      // The strike that makes this reachable is out-of-the-money: above
+      // spot for UP, below spot for DOWN.
+      if (direction === "up") assert.ok(quote.strike > spot, `UP 2x strike ${quote.strike} should be above spot ${spot} (OTM)`);
+      else assert.ok(quote.strike < spot, `DOWN 2x strike ${quote.strike} should be below spot ${spot} (OTM)`);
     }
   }
 });
 
-test("premium moves meaningfully with volatility for a fixed payoff target -- the bug this port fixes", async () => {
-  const { quoteFor } = await loadOptions();
+test("strike distance from spot moves meaningfully with volatility for a fixed payoff target -- the bug this port fixes", async () => {
+  const { quoteFor, BINARY_WIDTH } = await loadOptions();
   // Reviewer's own numbers: at spot=63,900, 10x payoff, $2,500 notional, the
   // OLD engine's premium moved 1.07x (from $201 to $215) while fair value
   // moved 55x across this same vol/duration span. The premium itself is
-  // ALWAYS ~amount/payoff by construction in the new engine (that's the
+  // ALWAYS ~amount/payoff by construction in this engine (that's the
   // definition of hitting the target multiple) -- what must move with vol is
-  // how far out-of-the-money the strike needs to be to still be worth that
+  // how far out-of-the-money the STRIKE needs to be to still be worth that
   // much, which the achieved-leverage test above already pins to <1% error
-  // at every vol level. This test instead pins the WIDTH (the payout ramp)
-  // to scale with vol, which is the mechanism that used to be flat.
+  // at every vol level. TRUE BINARY correction: the old engine pinned this
+  // via the payout ramp's WIDTH scaling with vol; a binary's width is always
+  // exactly BINARY_WIDTH (one atom, see the dedicated width test below) --
+  // it is the STRIKE OFFSET that now does the work the width used to.
   const spot = 63_900;
   const amount = 2_500;
   // durationMinutes: 90, not 60 -- 60 minutes now sells the intraday
   // 1.5x/2x/3x ladder (see payoffTiersFor), and 10x is only valid on the
   // standard ladder.
-  const widths = [33, 60, 120].map((volatility) => {
+  const distances = [33, 60, 120].map((volatility) => {
     const q = quoteFor({ spot, amount, durationMinutes: 90, direction: "up", payoff: 10, volatility });
-    return q.cap - q.strike;
+    assert.ok(Math.abs((q.cap - q.strike) - BINARY_WIDTH) < 1e-9, "width must stay pinned at BINARY_WIDTH regardless of vol");
+    return q.strike - spot;
   });
-  assert.ok(widths[0] < widths[1] && widths[1] < widths[2], `width must strictly widen with vol: ${widths}`);
+  assert.ok(distances[0] < distances[1] && distances[1] < distances[2], `strike distance from spot must strictly widen with vol: ${distances}`);
 });
 
 test("the strike solver reaches for an in-the-money strike only when the tier genuinely needs it -- the cheapest standard tier (10x) stays out-of-the-money", async () => {
   const { quoteFor } = await loadOptions();
-  // Superseded the old "solver never returns ITM" invariant: that was true
-  // only because the search domain used to be one-sided. Now that the
-  // domain is symmetric (see solveStrikeForTargetPremium), the solver CAN
-  // return an ITM strike, but it should still only do so when the tier
-  // genuinely requires more value than an out-of-the-money strike can
-  // offer. 10x (the cheapest tier on the standard ladder, target 10% of
-  // maxPayout) is comfortably below what an at-the-money spread is worth
-  // once duration and vol are past the very shortest/thinnest combinations,
-  // so it should stay out-of-the-money here. (The intraday ladder's own
-  // richest tier, 3x, is NOT included in this invariant -- measured: even
-  // 3x's 33.3% target exceeds a 15M/1H at-the-money spread's ~21-24% value,
-  // so intraday tiers are generally ITM, and that is expected, not a bug --
-  // see the 1.5x test below.)
+  // Digital pricing: target P = 1 / (payoff * 1.15). 10x needs P ~= 0.087,
+  // deep below the ~0.5-ish at-the-money value (see the "digital sanity
+  // check" test), so it should stay comfortably out-of-the-money here across
+  // vol/duration. (This test only covers the standard ladder's cheapest
+  // tier, 10x -- the intraday ladder's own genuinely in-the-money tier,
+  // 1.5x, is covered by the dedicated test below.)
   for (const direction of ["up", "down"]) {
     for (const volatility of [33, 400]) {
       for (const durationMinutes of [90, 1_440, 43_200]) { // standard-ladder tenors only
@@ -248,11 +306,12 @@ test("the strike solver reaches for an in-the-money strike only when the tier ge
 
 test("the 1.5x intraday tier is reached with a genuinely in-the-money strike, at every intraday tenor x realistic vol", async () => {
   const { quoteFor } = await loadOptions();
-  // The whole point of widening the solver's search domain: at 15M/1H, an
-  // at-the-money spread is worth far less than the 66.7% of maxPayout a
-  // 1.5x tier needs (see the module comment in options.ts), so 1.5x is only
+  // 1.5x is the one tier whose target win probability sits ABOVE 0.5:
+  // P = 1 / (1.5 * 1.15) ~= 0.58, richer than an at-the-money digital's
+  // ~0.5-ish value (see the "digital sanity check" test) -- so it is only
   // reachable by moving the strike in-the-money -- below spot for UP, above
-  // spot for DOWN.
+  // spot for DOWN. Every other tier in the ladder needs P < 0.5 and is
+  // reached out-of-the-money instead (see the 2x test above).
   const spot = 101.47;
   const amount = 500;
   for (const durationMinutes of [15, 60]) {
@@ -328,18 +387,31 @@ test("per-tenor payoff ladder: every advertised tier lands within 10% of its tar
   }
 });
 
-test("cap distance from spot grows monotonically with tenor, for the 2x tier every ladder shares", async () => {
+test("cap distance from spot grows monotonically with tenor at moderate volatility, for the 2x tier every ladder shares", async () => {
   const { quoteFor } = await loadOptions();
   // 2x is the one tier present on BOTH the intraday [1.5,2,3] and standard
   // [2,5,10] ladders, so it is the only tier comparable across all five
-  // tenors on one axis. Cap distance (not just width) must widen with
-  // tenor: it is strike-to-cap PLUS however far the solved strike itself
-  // sits from spot, and it is what a buyer actually reads off the ticket's
-  // "Target" row.
+  // tenors on one axis. Cap distance (not just width, which is now pinned at
+  // BINARY_WIDTH regardless of tenor -- see the dedicated width test below)
+  // widens with tenor at ORDINARY vol, because it is dominated by how far
+  // the solved strike itself sits from spot, and more time to expiry means a
+  // wider distribution to hit the same target probability.
+  //
+  // NOT tested at vol=120%: a lognormal's median sits below its mean for any
+  // vol > 0 (median = spot * exp(-0.5 * sigma^2 * T)), and at high vol x long
+  // duration that median-drag term is no longer negligible -- measured, UP,
+  // 30D, 120% vol: the 2x strike needed actually pulls BACK toward (and
+  // slightly past) spot relative to 7D's, because the drift term does more
+  // work than the extra time does. This is correct digital pricing, not a
+  // bug (see MAX_STRIKE_OFFSET_FRACTION's comment in options.ts for the
+  // same effect showing up in the solver's search domain) -- it just means
+  // "distance grows with tenor" is not a universal invariant of a true
+  // binary the way it happened to be for the old capped-spread engine, so
+  // this test is scoped to the vol range where the drag term stays small.
   const spot = 101.47;
   const amount = 500;
   const tenorDurations = [15, 60, 720, 10_080, 43_200]; // 15M, 1H, EOD, 7D, 30D
-  for (const volatility of [20, 60, 120]) {
+  for (const volatility of [20, 60]) {
     for (const direction of ["up", "down"]) {
       let prevDistance = -Infinity;
       for (const durationMinutes of tenorDurations) {
@@ -355,29 +427,30 @@ test("cap distance from spot grows monotonically with tenor, for the 2x tier eve
   }
 });
 
-test("intraday width stays at the unchanged 0.6% floor -- narrowing it for intraday tenors was tried and reverted", async () => {
-  const { quoteFor, WIDTH_MIN_FRACTION } = await loadOptions();
-  // A concurrent on-chain audit found the real settlement window is an
-  // unsigned, flat 30 seconds for every expiry with no on-chain width
-  // floor, which makes the width floor MORE load-bearing than this file
-  // originally assumed -- so it must not be narrowed for 15M/1H quotes.
-  // The near-binary intraday ladder is delivered entirely by moving the
-  // strike in-the-money (see the tests above), never by thinning the ramp.
-  // At low vol the floor binds and width should sit at exactly
-  // WIDTH_MIN_FRACTION of spot; this pins that it is still the unchanged
-  // 0.6%, not a narrower, per-tenor value.
-  assert.equal(WIDTH_MIN_FRACTION, 0.006);
+test("quote width is always exactly BINARY_WIDTH (one atom), for every tenor, tier and vol", async () => {
+  const { quoteFor, payoffTiersFor, BINARY_WIDTH } = await loadOptions();
+  // TRUE BINARY correction: width used to scale with vol/duration between a
+  // 0.6% floor and a 40% ceiling (see git history). A true binary has no
+  // ramp to shape -- every quote signs the smallest legal on-chain width,
+  // always, regardless of tenor/tier/vol/direction. This is what turns
+  // `definedRiskPayout` into an exact step function (see the dedicated
+  // payout-shape test above).
+  assert.equal(BINARY_WIDTH, 0.000001);
   const spot = 101.47;
   const amount = 500;
-  for (const durationMinutes of [15, 60]) {
-    for (const direction of ["up", "down"]) {
-      const quote = quoteFor({ spot, amount, durationMinutes, direction, payoff: 2, volatility: 20 });
-      const width = Math.abs(quote.cap - quote.strike);
-      const widthFraction = width / spot;
-      assert.ok(
-        Math.abs(widthFraction - WIDTH_MIN_FRACTION) < 1e-6,
-        `intraday width should sit at the unchanged ${WIDTH_MIN_FRACTION * 100}% floor at low vol, got ${(widthFraction * 100).toFixed(4)}% at duration=${durationMinutes} dir=${direction}`,
-      );
+  const tenorDurations = { "15M": 15, "1H": 60, EOD: 720, "7D": 10_080, "30D": 43_200 };
+  for (const [, durationMinutes] of Object.entries(tenorDurations)) {
+    for (const payoff of payoffTiersFor(durationMinutes)) {
+      for (const volatility of [20, 60, 120]) {
+        for (const direction of ["up", "down"]) {
+          const quote = quoteFor({ spot, amount, durationMinutes, direction, payoff, volatility });
+          const width = Math.abs(quote.cap - quote.strike);
+          assert.ok(
+            Math.abs(width - BINARY_WIDTH) < 1e-9,
+            `width should always be exactly BINARY_WIDTH, got ${width} at duration=${durationMinutes} payoff=${payoff} vol=${volatility} dir=${direction}`,
+          );
+        }
+      }
     }
   }
 });
@@ -511,13 +584,12 @@ test("maker edge is applied inside the strike solve, not added to fair value aft
   // fair-value-only solve would have produced for the same strike.
   const { solveStrikeForTargetPremium } = await loadOptions();
   const spot = 100;
-  const width = 1;
   const maxPayout = 1_000;
   const targetPremium = 100; // 10x
   const volAnnual = 0.4;
   const timeYears = 60 / 525_600;
 
-  const solved = solveStrikeForTargetPremium({ direction: "up", spot, width, maxPayout, targetPremium, volAnnual, timeYears });
+  const solved = solveStrikeForTargetPremium({ direction: "up", spot, maxPayout, targetPremium, volAnnual, timeYears });
   assert.ok(Math.abs(solved.premium - targetPremium) < 1e-4, "premium (edge included) must hit the target");
   assert.ok(solved.fairValue < targetPremium, "fair value (no edge) must sit strictly below the edge-inclusive target");
   const impliedEdgeBps = (solved.premium / solved.fairValue - 1) * 10_000;
@@ -540,16 +612,19 @@ test("probabilityItm and impliedVolatility are surfaced honestly by quoteFor", a
   assert.ok(Math.abs(fresh.impliedVolatility - 40) < 1e-9, "a fresh reference prices at exactly the raw input vol (no gap-risk bump)");
 });
 
-test("width floor and strike-offset bound are the documented, defensible values (regression guard)", async () => {
-  const { WIDTH_MIN_FRACTION, WIDTH_MAX_FRACTION, WIDTH_EXPECTED_MOVE_MULTIPLIER, MAX_STRIKE_OFFSET_FRACTION, MAKER_EDGE_BPS } = await loadOptions();
-  assert.equal(WIDTH_MIN_FRACTION, 0.006, "width floor must stay at the documented 0.6% of spot");
-  assert.equal(WIDTH_MAX_FRACTION, 0.4);
-  assert.equal(WIDTH_EXPECTED_MOVE_MULTIPLIER, 1.25);
-  assert.equal(MAX_STRIKE_OFFSET_FRACTION, 0.4);
+test("BINARY_WIDTH and strike-offset bound are the documented, defensible values (regression guard)", async () => {
+  const { BINARY_WIDTH, MAX_STRIKE_OFFSET_FRACTION, MAKER_EDGE_BPS } = await loadOptions();
+  // One atom at the on-chain 1e6 price scale -- see BINARY_WIDTH's comment
+  // in options.ts and PRICE_SCALE in vsol-server.ts.
+  assert.equal(BINARY_WIDTH, 0.000001, "width must stay pinned at exactly one atom");
+  // Widened from the old spread engine's 40%: a true digital needs to search
+  // further OTM than a capped spread did to reach the same rich target
+  // premium (measured worst case in the tier x tenor x vol matrix this
+  // product sells: 30D 10x at 120% vol needs ~50.5% OTM). See
+  // MAX_STRIKE_OFFSET_FRACTION's comment in options.ts for the full
+  // derivation.
+  assert.equal(MAX_STRIKE_OFFSET_FRACTION, 0.6);
   assert.equal(MAKER_EDGE_BPS, 1_500);
-  // The floor must be strictly smaller than the old, audit-identified 3%
-  // floor that broke short-dated pricing -- this is the whole point of the fix.
-  assert.ok(WIDTH_MIN_FRACTION < 0.03, "the new floor must be smaller than the old 3% floor it replaces");
 });
 
 // --- Stake -> payout inversion (app/lib/options.ts payoutForStake) ---------

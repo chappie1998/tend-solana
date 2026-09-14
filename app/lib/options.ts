@@ -2,15 +2,16 @@ export type Direction = "up" | "down";
 
 // Real options pricing, ported from the verified engine in
 // tend-monad/quote-service/pricing.ts (reviewed against an independent
-// implementation and live market data). The old `quoteFor` computed
-// `expectedMove` and a `riskFactor` but never actually valued the
-// (strike, cap) spread it quoted -- premium was `(amount / payoff) *
-// riskFactor`, a number that moved ~1.07x across the entire realistic vol
-// range while the spread's true Black-Scholes fair value moved ~55x over
-// the same range. This engine prices the spread for real: Black-Scholes
-// call/put (r=0) valued at the actual strike/width/vol/time, with a strike
-// solver that finds the strike whose OWN fair value (maker edge included)
-// matches the requested payoff tier.
+// implementation and live market data), then converted from a capped-spread
+// ramp to a TRUE BINARY: every quote now prices a cash-or-nothing digital
+// (`digitalFairValue`, `maxPayout * N(d2)`/`N(-d2)` at r=0) and signs the
+// smallest legal on-chain width (`BINARY_WIDTH`, one atom), which turns the
+// deployed program's UNCHANGED `calculate_payout` ramp formula into an exact
+// step function -- hit the target and win the full payout, miss it and lose
+// the entire premium. No program change; see BINARY_WIDTH's comment below.
+// A strike solver finds the strike whose OWN fair value (maker edge
+// included) matches the requested payoff tier, searching both in-the-money
+// and out-of-the-money strikes since low tiers need P(win) > 0.5.
 //
 // Every function below is pure and synchronous, so it is unit-tested with
 // zero network access (see tests/pricing.test.mjs).
@@ -89,53 +90,47 @@ export function blackScholesPut(p: BsParams): number {
 }
 
 // ---------------------------------------------------------------------------
-// The instrument: a call/put SPREAD, not a vanilla option -- this is the
-// piece the audit confirmed transfers directly from the EVM contract:
-// `definedRiskPayout` below (unchanged) has the identical capped-spread
-// shape as TendPoolVault.calculatePayout on Monad:
-//   delta  = direction == Up ? max(S-K,0) : max(K-S,0); delta = min(delta, width)
-//   payout = maxPayout * delta / width
-// i.e. (maxPayout/width) units of a spread struck at K, capped at K±width:
-//   UP  : (maxPayout/width) * [ C(K) − C(K+width) ]
-//   DOWN: (maxPayout/width) * [ P(K) − P(K−width) ]
+// The instrument: a cash-or-nothing DIGITAL (TRUE BINARY), not a spread.
+//
+// The deployed program never changed: `calculate_payout` on chain is still
+// `maxPayout * min(delta, width) / width` (vsol/programs/vsol/src/math.rs),
+// with `strike` and `width` stored per position and the only on-chain
+// constraint `width > 0`. Setting `width` to the smallest legal value --
+// `BINARY_WIDTH` below, one atom at the on-chain 1e6 price scale -- makes
+// that identical formula an exact step function: 0 at or below strike,
+// maxPayout starting one atom above (mirrored for DOWN). No program change
+// needed; this is purely what the quote server now signs.
+//
+// So the instrument this file prices is a cash-or-nothing digital: pays
+// maxPayout if the direction condition holds at settlement, 0 otherwise. At
+// r=0 its fair value is exactly `maxPayout * N(d2)` (UP) / `maxPayout *
+// N(-d2)` (DOWN) -- see `digitalFairValue` below. Do NOT price it as a
+// spread with a tiny width: `blackScholesCall(K) - blackScholesCall(K+width)`
+// subtracts two nearly-equal numbers at width = 1e-6 and loses essentially
+// all floating-point precision. `digitalFairValue` prices N(d2) directly via
+// `probabilityItm`, which needs no subtraction of close values at all.
 // ---------------------------------------------------------------------------
-export interface SpreadParams {
+
+/**
+ * Fair value (r=0) of a cash-or-nothing digital paying `maxPayout` if the
+ * settlement condition holds, 0 otherwise: `maxPayout * N(d2)` for UP,
+ * `maxPayout * N(-d2)` for DOWN. This is exactly `probabilityItm(...) *
+ * maxPayout` -- N(d2) IS the risk-neutral P(S_T > K) at r=0, which is also
+ * this instrument's own risk-neutral expected payoff -- named and exported
+ * separately from `probabilityItm` because it is now the actual traded
+ * instrument's fair value, not just an honesty readout alongside a spread's.
+ */
+export function digitalFairValue(params: {
   direction: Direction;
   spot: number;
   strike: number;
-  width: number;
+  maxPayout: number;
   volAnnual: number;
   timeYears: number;
-}
-
-/**
- * Present value of ONE unit of the spread — the terminal payoff
- * min(max(delta, 0), width), NOT yet scaled by maxPayout/width. Bounded to
- * [0, width] in exact arithmetic (a vanilla call/put is at most 1-Lipschitz
- * in strike); the outer `Math.max(0, ...)` only guards the floating-point
- * edge (this engine spans a much wider width/vol/duration range than
- * Monad's, so it's a defensive addition on top of the ported math, not part
- * of the original proof).
- */
-export function spreadUnitValue(p: SpreadParams): number {
-  if (p.direction === "up") {
-    return Math.max(
-      0,
-      blackScholesCall({ spot: p.spot, strike: p.strike, volAnnual: p.volAnnual, timeYears: p.timeYears }) -
-        blackScholesCall({ spot: p.spot, strike: p.strike + p.width, volAnnual: p.volAnnual, timeYears: p.timeYears }),
-    );
-  }
-  return Math.max(
-    0,
-    blackScholesPut({ spot: p.spot, strike: p.strike, volAnnual: p.volAnnual, timeYears: p.timeYears }) -
-      blackScholesPut({ spot: p.spot, strike: p.strike - p.width, volAnnual: p.volAnnual, timeYears: p.timeYears }),
-  );
-}
-
-/** Scales a per-unit spread value up to the position's maxPayout — in [0, maxPayout] since spreadUnitValue is in [0, width]. */
-export function spreadFairValue(maxPayout: number, width: number, unitValue: number): number {
-  if (width <= 0) return 0;
-  return maxPayout * (unitValue / width);
+}): number {
+  if (!(params.maxPayout > 0)) return 0;
+  const prob = probabilityItm(params.direction, params.spot, params.strike, params.volAnnual, params.timeYears);
+  return params.maxPayout * prob;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,103 +172,71 @@ export function probabilityItm(direction: Direction, spot: number, strike: numbe
 }
 
 // ---------------------------------------------------------------------------
-// Width — the strike-to-cap distance that `definedRiskPayout` ramps the
-// payout over. This is a Solana-specific decision, not a straight port:
-// Monad's engine fixes width at a flat 0.5% of spot because it only prices
-// short (sub-24h), symmetric-tenor series where the settlement window and
-// the quote's own duration are close in scale. Tend prices 15 minutes to
-// 30 days on the SAME feed, so a duration-blind flat width is wrong at
-// either end (too wide for a 15-minute quote, too narrow to matter for a
-// 30-day one) -- hence the old `expectedMove`-scaled formula's shape is
-// kept, but its floor is rebuilt from a different, and correct, anchor.
+// BINARY_WIDTH — the strike-to-cap distance every quote now signs, always:
+// one atom at the on-chain 1e6 price scale (see PRICE_SCALE in
+// app/lib/vsol-server.ts), i.e. $0.000001 in human USD. `Math.max(1,
+// Math.round(...))` in `buildVsolQuoteTransaction` already floors the
+// encoded width atoms at 1 (never 0, which the program rejects as
+// InvalidWidth) -- BINARY_WIDTH just makes that floor the value actually
+// requested, not an accident of rounding a much larger economic width.
 //
-// THE FLOOR: this is the parameter the audit identified as broken --
-// `max(0.03, expectedMove * 1.25)` bound the ramp width below at 3% of spot
-// for every realistically short-dated, real-vol quote, so the true
-// Black-Scholes fair value of a spread that wide (given the underlying
-// barely moves 0.3-1% in an hour) collapsed toward zero while the old
-// pricing formula charged a near-fixed premium regardless.
-//
-// The floor cannot simply be deleted, though: `width` is also the
-// denominator of the settlement's cherry-pick exposure. A concurrent
-// on-chain audit found this is MORE exposed than the doc below originally
-// assumed: `publish_pyth_settlement` (vsol/programs/vsol/src/lib.rs) has no
-// signer check at all (publishing the settlement price is fully
-// permissionless, not just "whoever calls settle"), `calculate_payout`
-// (vsol/programs/vsol/src/math.rs) enforces only `width > 0` with no
-// on-chain floor, and the real observation window is a flat 30 seconds for
-// EVERY expiry (`MARKET_OBSERVATION_WINDOW_SECONDS`, vsol/sdk/index.ts) --
-// not the 60s/900s split this file's pricing model assumes. At 60% vol
-// that 30s window is ~0.0585% of spot (1 sigma), and the expected max
-// achievable inside it is ~0.047% of spot -- so ANY unprivileged party can
-// pick the settlement print, and the fraction of maxPayout ordinary
-// in-window dispersion alone hands them scales as (that ~0.047%) / width:
-// ~8% of maxPayout at the current 0.6% floor, but ~19% at 0.25% and ~31% at
-// 0.15% -- both well past the 15% maker edge. So the floor must NOT be
-// narrowed for intraday tenors: the near-binary 1.5x/2x/3x ladder is
-// delivered entirely by moving the strike in-the-money instead (see
-// `solveStrikeForTargetPremium` below), which raises premium without
-// touching width or this exposure at all.
-//
-// The floor is sized against the cherry-pick risk specifically, not
-// against the quote's own duration: 0.6% of spot is ~2.2x the expected
-// (1-sigma) price move over the SHORTEST observation window this product
-// has (60 seconds, per this file's own pricing assumptions) at 200%
-// annualized vol -- already far above any realistic realized vol (usually
-// 20-80%) and with headroom under the accepted [1%, 400%] input range
-// before the gap-risk multiplier. That leaves a defensible margin against
-// benign in-window dispersion capturing the ramp, while being ~5x smaller
-// than the old 3% floor -- small enough that it stops dominating real
-// Black-Scholes pricing once vol/duration exceed roughly the 25-50%
-// annualized range (vs. never, before). Tradeoff, stated plainly: at
-// genuinely extreme effective vol (approaching the 400% cap after the
-// gap-risk multiplier) a single observation-window print could still move
-// close to a full width; that residual is accepted the same way the
-// gap-risk multiplier itself already accepts wider quotes rather than
-// refusing to quote, consistent with Tend never gating on conditions short
-// of a hard data failure. Given the on-chain audit above, this residual is
-// already larger than this file assumed -- which is exactly why it must
-// not be made larger still by narrowing the floor further.
+// This used to be a real economic lever (see git history: a duration-scaled
+// floor between 0.6% and 40% of spot, sized against the settlement's
+// cherry-pick exposure). That whole tradeoff is superseded by the product
+// decision this file now implements: a TRUE BINARY has no partial-payout
+// zone to protect with a wider ramp -- hit the target, win the full payout;
+// miss it, lose the entire premium. Making that literal on chain (rather
+// than approximating it with a thin spread) is the point.
 // ---------------------------------------------------------------------------
-export const WIDTH_MIN_FRACTION = 0.006; // 0.6% of spot -- see rationale above. Do not narrow this for intraday tenors; see the on-chain exposure note above.
-export const WIDTH_MAX_FRACTION = 0.4; // Unchanged from the prior engine; not implicated in the audit.
-export const WIDTH_EXPECTED_MOVE_MULTIPLIER = 1.25; // Unchanged from the prior engine.
+export const BINARY_WIDTH = 0.000001; // 1e-6 human USD == 1 atom at PRICE_SCALE (1e6).
 
 // ---------------------------------------------------------------------------
 // Strike solver — finds the strike offset (as a fraction of spot, from
 // -MAX_STRIKE_OFFSET_FRACTION to +MAX_STRIKE_OFFSET_FRACTION; POSITIVE moves
 // the strike OUT of the money -- up for UP, down for DOWN -- NEGATIVE moves
-// it IN the money -- down for UP, up for DOWN) whose priced spread — fair
+// it IN the money -- down for UP, up for DOWN) whose priced digital — fair
 // value plus maker edge, computed together, see the maker-edge comment
 // above — matches `targetPremium` (= maxPayout / payoff) within tolerance.
 //
-// THE DOMAIN USED TO BE ONE-SIDED (0 to MAX_STRIKE_OFFSET_FRACTION,
-// out-of-the-money only), which is what made low tiers (2x, then the new
-// 1.5x) unreachable at short tenors: at-the-money (offset 0) was the
-// RICHEST premium that search could ever produce, and a thin-width,
-// short-dated, at-the-money spread is worth only a small fraction of
-// maxPayout (measured ~21% for a real 15M/60%-vol quote) -- nowhere near
-// the 50%+ of maxPayout a 2x or 1.5x tier needs. Moving the strike IN the
-// money raises the spread's value (it's more likely to already be past the
-// strike), so a target premium richer than the at-the-money value is
-// genuinely reachable -- just not by searching only one side. Widening the
-// domain to be symmetric is the fix; nothing about the pricing math
-// changes, only how far the search looks.
+// THE DOMAIN IS SYMMETRIC (not just out-of-the-money) because P > 0.5 is a
+// legitimate target: `premium = maxPayout * P * (1 + edge)`, so a "careful"
+// low multiple (e.g. 1.5x, target premium = 66.7% of maxPayout) needs
+// P = 1 / (1.15 * 1.5) ≈ 0.58 -- a win probability above 50%, which for UP
+// only exists at a strike BELOW spot (in-the-money). Richer tiers (5x, 10x)
+// need P well under 0.5, reachable only out-of-the-money. Searching only one
+// side would make the low tiers unreachable exactly the way the old
+// one-sided ramp search did.
 //
-// Premium is still monotonically non-increasing in OFFSET across the WHOLE
-// domain (deep in-the-money is the richest end, deep out-of-the-money the
-// cheapest, decreasing smoothly through at-the-money in between), so this
-// still bisects rather than inverting Black-Scholes closed-form, which has
-// no clean inverse in strike.
+// Premium (= maxPayout * N(d2) * (1+edge) for UP, N(-d2) for DOWN) is
+// monotonically non-increasing in OFFSET across the whole domain (deep
+// in-the-money -> P near 1, the richest end; deep out-of-the-money -> P near
+// 0, the cheapest; decreasing smoothly through at-the-money, P = 0.5, in
+// between), so this still bisects rather than inverting N(d2) in closed
+// form, which has no clean inverse in strike.
 //
-// MAX_STRIKE_OFFSET_FRACTION is a generous sanity bound (40% of spot,
-// matching WIDTH_MAX_FRACTION), reused for BOTH directions rather than a
-// separate in-the-money bound -- not a normal operating value: real quotes
-// (see tests/pricing.test.mjs) solve to offsets of a few percent at most.
-// It exists so the search terminates, and is wide enough to price every
-// payoff tier without ever failing to converge across the full documented
-// vol range (1%-400% pre-gap-risk, up to 700% after) -- verified by the
-// extreme-volatility regression in tests/product.test.mjs.
+// MAX_STRIKE_OFFSET_FRACTION is a generous sanity bound -- not a normal
+// operating value: real quotes (see tests/pricing.test.mjs) solve to offsets
+// of a few percent at most. It exists so the search terminates.
+//
+// 60%, not the old spread engine's 40%: switching from a capped spread to a
+// true digital moved the goalposts on how far OTM "cheap" tiers actually
+// need to go. A capped spread's fair value (a finite difference over its own
+// width) falls off FASTER than a digital's N(d2) does as the strike moves
+// OTM (the spread is bounded by width and collapses once spot clears the
+// cap; the digital has no cap to clear), so for the same rich target premium
+// the digital strike sits further out. Measured worst case in the tier x
+// tenor x vol matrix this product actually sells (payoffTiersFor tiers,
+// 15M-30D, 20-120% vol): 30D 10x at 120% vol needs ~50.5% OTM to hit
+// P = 1/(10 * 1.15) ≈ 8.7% -- unreachable at the old 40% bound (clamped
+// there to ~12.5% instead, delivering only ~6.95x, 30% off the advertised
+// 10x). 60% leaves comfortable margin above that measured worst case so
+// every tier in tests/pricing.test.mjs's per-tenor sweep SOLVES exactly
+// rather than clamping. No on-chain constraint is implicated: the deployed
+// program's `calculate_payout` only ever sees `PoolPosition.strike`, set
+// directly from the quote the pool's own quote authority signs (never
+// bounded relative to spot on chain) -- entirely distinct from the market's
+// own listed ladder strike (`ladderStrike`, hashed into the market PDA),
+// which this solver never touches.
 //
 // UNLIKE the Monad engine, this NEVER throws when a target is unreachable.
 // Monad's `UnreachableLeverageError` is the right call for a service that
@@ -284,26 +247,25 @@ export const WIDTH_EXPECTED_MOVE_MULTIPLIER = 1.25; // Unchanged from the prior 
 // whichever boundary is closest to the target:
 //   - target >= the deepest in-the-money premium (offset
 //     -MAX_STRIKE_OFFSET_FRACTION): the requested payoff tier is too rich
-//     for the current vol/width even at the most in-the-money strike this
-//     solver will search. Clamps there -- the richest honestly priceable
-//     premium -- and reports the ACTUAL achieved leverage (callers already
-//     compute maxPayout/premium independently rather than assuming it
-//     equals the requested tier).
+//     for the current vol/time even at the most in-the-money strike this
+//     solver will search (P is already close to 1 there). Clamps there --
+//     the richest honestly priceable premium -- and reports the ACTUAL
+//     achieved leverage (callers already compute maxPayout/premium
+//     independently rather than assuming it equals the requested tier).
 //   - target <= the deepest out-of-the-money premium (offset
 //     +MAX_STRIKE_OFFSET_FRACTION): the tier is too aggressive (too cheap)
-//     to reach even at the widest allowed out-of-the-money offset. Clamps
-//     there.
+//     to reach even at the widest allowed out-of-the-money offset (P is
+//     already close to 0 there). Clamps there.
 // Both cases are reported via `reachability` so callers/tests can
 // distinguish a solved quote from a clamped one.
 // ---------------------------------------------------------------------------
-export const MAX_STRIKE_OFFSET_FRACTION = 0.4;
+export const MAX_STRIKE_OFFSET_FRACTION = 0.6;
 const SOLVER_TOLERANCE_RELATIVE = 1e-7;
 const SOLVER_MAX_ITERATIONS = 200;
 
 export interface StrikeSolveParams {
   direction: Direction;
   spot: number;
-  width: number;
   maxPayout: number;
   /** = maxPayout / payoff, the premium this strike must fairly price to (edge included). */
   targetPremium: number;
@@ -315,7 +277,7 @@ export interface StrikeSolveParams {
 export interface StrikeSolveResult {
   strike: number;
   strikeOffsetFraction: number;
-  /** Pre-edge Black-Scholes fair value of the spread at the solved strike. */
+  /** Pre-edge digital fair value (`maxPayout * N(d2)` / `N(-d2)`) at the solved strike. */
   fairValue: number;
   /** Fair value with the maker edge applied — the premium actually charged. */
   premium: number;
@@ -327,8 +289,7 @@ export interface StrikeSolveResult {
 function priceAtStrikeOffset(p: StrikeSolveParams, offsetFraction: number): { strike: number; fair: number; premium: number } {
   const offset = p.spot * offsetFraction;
   const strike = p.direction === "up" ? p.spot + offset : p.spot - offset;
-  const unitValue = spreadUnitValue({ direction: p.direction, spot: p.spot, strike, width: p.width, volAnnual: p.volAnnual, timeYears: p.timeYears });
-  const fair = spreadFairValue(p.maxPayout, p.width, unitValue);
+  const fair = digitalFairValue({ direction: p.direction, spot: p.spot, strike, maxPayout: p.maxPayout, volAnnual: p.volAnnual, timeYears: p.timeYears });
   const premium = applyMakerEdge(fair, p.makerEdgeBps);
   return { strike, fair, premium };
 }
@@ -396,13 +357,12 @@ const GAP_RISK_MAX_VOL_MULTIPLIER = 1.75;
 // ---------------------------------------------------------------------------
 // Payoff ladder -- which target multiples a tenor is allowed to sell.
 // Longer tenors keep the original [2x, 5x, 10x] menu. Anything expiring
-// within INTRADAY_TIER_MAX_MINUTES instead offers a near-binary
-// [1.5x, 2x, 3x] menu: at these tenors the width floor stays at its
-// documented, cherry-pick-safe 0.6% of spot (see the width comment above --
-// narrowing it for intraday tenors was tried and reverted once an on-chain
-// audit measured how exposed the real 30-second, unsigned settlement window
-// already is), so every tier in this ladder is reached by moving the
-// strike IN the money instead of by thinning the ramp.
+// within INTRADAY_TIER_MAX_MINUTES instead offers a [1.5x, 2x, 3x] menu --
+// "near-binary" only in name now that every tier is a true binary (see the
+// BINARY_WIDTH comment above): every tier in this ladder is reached purely
+// by moving the strike, richer (lower multiple, higher P(win)) tiers moving
+// further in-the-money, the way `solveStrikeForTargetPremium` already
+// searches both directions for.
 //
 // `payoffTiersFor` is the PRODUCT-facing gate (which tier is actually FOR
 // SALE at a given duration) -- app/api/quotes/route.ts validates against it
@@ -456,15 +416,6 @@ export function quoteFor(params: {
   // is what gets surfaced to callers as `impliedVolatility`.
   const volAnnual = (params.volatility / 100) * gapRiskMultiplier;
   const timeYears = Math.max(durationMinutes, 15) / 525_600;
-  const expectedMove = volAnnual * Math.sqrt(timeYears);
-
-  // NOTE: unlike the old engine, `expectedMove` here feeds ONLY the width
-  // (the payout ramp's shape) -- never the premium directly. Premium is
-  // whatever `solveStrikeForTargetPremium` finds actually fairly prices the
-  // requested payoff tier at this width/vol/time. See the width comment
-  // block above for the floor's derivation and tradeoff.
-  const moveScale = Math.min(WIDTH_MAX_FRACTION, Math.max(WIDTH_MIN_FRACTION, expectedMove * WIDTH_EXPECTED_MOVE_MULTIPLIER));
-  const width = spot * moveScale;
 
   const maxPayout = amount;
   const targetPremium = maxPayout / payoff;
@@ -473,17 +424,18 @@ export function quoteFor(params: {
   // than "up" via a flat `directionFactor`, undocumented as to why). Any
   // real up/down asymmetry is now priced by the math itself: calls and puts
   // are NOT symmetric under lognormal returns even at r=0, and
-  // `solveStrikeForTargetPremium` prices each side with its own
-  // Black-Scholes formula rather than a shared fudge factor.
-  const solved = solveStrikeForTargetPremium({ direction, spot, width, maxPayout, targetPremium, volAnnual, timeYears });
+  // `solveStrikeForTargetPremium` prices each side with its own N(d2)/N(-d2)
+  // formula rather than a shared fudge factor.
+  const solved = solveStrikeForTargetPremium({ direction, spot, maxPayout, targetPremium, volAnnual, timeYears });
 
   const premium = Math.min(maxPayout * 0.95, Math.max(1, solved.premium));
   const strike = solved.strike;
   const leverage = maxPayout / premium;
-  const cap = direction === "up" ? strike + width : strike - width;
-  const breakeven = direction === "up"
-    ? strike + (premium / maxPayout) * width
-    : strike - (premium / maxPayout) * width;
+  // BINARY_WIDTH, always -- see its own comment above. `cap` is kept as a
+  // field (not collapsed into `strike`) because vsol-server.ts still derives
+  // the on-chain `width` from `cap - strike`, and because it is the exact
+  // atom the program's step function flips on.
+  const cap = direction === "up" ? strike + BINARY_WIDTH : strike - BINARY_WIDTH;
 
   return {
     premium,
@@ -491,16 +443,26 @@ export function quoteFor(params: {
     leverage,
     strike,
     cap,
-    breakeven,
-    /** P(finishing in the money) at expiry, at the solved strike -- the honest counterweight to `leverage`. */
+    // A binary has no partial-payout zone to have a separate breakeven
+    // price: hit the target (the strike) and win the full payout, miss it
+    // and lose the whole premium -- breakeven IS the target. Kept as a field
+    // (not removed) because db/schema.ts and app/api/quotes/route.ts still
+    // persist/return it; the UI drops the separate "Breakeven" row (see
+    // TendTerminal.tsx) since it would just be a second name for `strike`.
+    breakeven: strike,
+    /** P(finishing in the money) at expiry, at the solved strike -- the honest counterweight to `leverage`, and exactly what this quote's fair value is a fraction of (fairValue = maxPayout * probabilityItm). */
     probabilityItm: solved.probabilityItm,
     /** The gap-risk-adjusted annualized vol actually used to price this quote, as a percentage (e.g. 32.3 for 32.3%). */
     impliedVolatility: volAnnual * 100,
-    /** Whether the payoff tier was fairly reachable at this vol/width, or gracefully clamped -- see solveStrikeForTargetPremium. */
+    /** Whether the payoff tier was fairly reachable at this vol/time, or gracefully clamped -- see solveStrikeForTargetPremium. */
     reachability: solved.reachability,
   };
 }
 
+// With `cap - strike` pinned at BINARY_WIDTH (one atom), this identical
+// on-chain-matching formula degenerates to an exact step function: 0 at or
+// below strike, maxPayout starting exactly one atom above (mirrored for
+// DOWN) -- see the BINARY_WIDTH comment above. Unchanged code, new shape.
 export function definedRiskPayout(params: {
   direction: Direction;
   settlement: number;
@@ -641,6 +603,19 @@ export function dynamicSpreadBps(params: {
  * time has elapsed and spot may have genuinely moved since the quote was
  * struck, so `intrinsic` there is REAL, newly-realized P/L the (unchanged)
  * decaying time-value term must still be added on top of.
+ *
+ * TRUE BINARY: the position `buybackFor` re-prices is now a cash-or-nothing
+ * digital, not a capped spread -- `quoteFor` signs BINARY_WIDTH (one atom)
+ * for every quote, so `definedRiskPayout` is an exact step function at
+ * settlement. `buybackFor` prices the SAME instrument at today's spot and
+ * remaining time: `maxPayout * N(d2)` (UP) / `N(-d2)` (DOWN) via
+ * `digitalFairValue`, which is exactly `maxPayout` or `0` at expiry
+ * (timeYears <= 0). This is the position's actual fair value, not an
+ * approximation of it -- the invariant that must always hold (closing
+ * immediately returns strictly less than was paid, for every tier, tenor,
+ * vol, direction and time remaining) follows directly from `fairValue` being
+ * the pre-edge value `premium` was derived from (`premium = fairValue *
+ * (1 + MAKER_EDGE_BPS)`), not from any width-dependent shape.
  */
 export function buybackFor(params: {
   direction: Direction;
@@ -678,31 +653,65 @@ export function buybackFor(params: {
 
   const fraction = Math.max(0, Math.min(1, minutesRemaining / originalMinutes));
 
-  // Re-price the SAME spread with the SAME model that sold it, at today's
-  // spot and whatever time is actually left. `intrinsic + premium * decay`
-  // is not used at all any more: it double-counted whenever the struck
-  // strike was in the money, because `premium` already prices that
-  // in-the-moneyness by construction. Pinning only the fraction === 1
-  // instant did not fix it -- one second later the heuristic returned, and a
-  // 15M 2x bought for $250 closed for $427. Valuing the position instead of
-  // approximating it removes the whole class: at inception the model returns
-  // the fair value `premium` was derived from, so a round trip gives back
-  // fair-minus-spread and always loses the maker edge plus the buyback
-  // spread, for in-the-money and out-of-the-money strikes alike.
-  const width = Math.abs(cap - strike);
+  // Re-price the SAME digital with the SAME model that sold it, at today's
+  // spot and whatever time is actually left -- `maxPayout * N(d2)` (UP) /
+  // `N(-d2)` (DOWN), exactly `quoteFor`'s own pre-edge fair value formula run
+  // again at the current spot/time. `intrinsic + premium * decay` is not used
+  // at all any more: it double-counted whenever the struck strike was in the
+  // money, because `premium` already prices that in-the-moneyness by
+  // construction. Pinning only the fraction === 1 instant did not fix it --
+  // one second later the heuristic returned, and a 15M 2x bought for $250
+  // closed for $427. Valuing the position instead of approximating it removes
+  // the whole class: at inception the model returns the fair value `premium`
+  // was derived from, so a round trip gives back fair-minus-spread and always
+  // loses the maker edge plus the buyback spread, for in-the-money and
+  // out-of-the-money strikes alike. At expiry (timeYears <= 0) this degenerates
+  // to exactly `maxPayout` or `0` -- the same step `definedRiskPayout` computes
+  // at the real BINARY_WIDTH -- via `probabilityItm`'s own timeYears<=0 branch.
   const gapRiskHours = referenceAgeSeconds / 3_600;
   const gapRiskMultiplier = Math.min(GAP_RISK_MAX_VOL_MULTIPLIER, 1 + GAP_RISK_VOL_SCALE_PER_HOUR * Math.sqrt(gapRiskHours));
   const volAnnual = (params.volatility / 100) * gapRiskMultiplier;
   // Actual time left, NOT quoteFor's 15-minute floor: a position being closed
-  // genuinely has less time than that, and blackScholes* degenerates to
-  // intrinsic at timeYears <= 0, which is the correct terminal value.
+  // genuinely has less time than that, and probabilityItm degenerates to an
+  // indicator (1 or 0) at timeYears <= 0, which is the correct terminal value.
   const timeYears = Math.max(0, minutesRemaining) / 525_600;
-  const unitValue = spreadUnitValue({ direction, spot, strike, width, volAnnual, timeYears });
-  const fairValue = Math.max(0, Math.min(maxPayout, spreadFairValue(maxPayout, width, unitValue)));
+  const fairValue = Math.max(0, Math.min(maxPayout, digitalFairValue({ direction, spot, strike, maxPayout, volAnnual, timeYears })));
   // Moneyness + time-to-expiry + gap-risk, composed multiplicatively and
   // bounded -- see `dynamicSpreadBps` above. This never re-touches the
   // fair-value math above; it only scales the discount applied to it.
   const spreadBps = dynamicSpreadBps({ direction, spot, strike, cap, fraction, referenceAgeSeconds });
+
+  // THIRD round-trip hazard, specific to a TRUE BINARY: an in-the-money
+  // digital has POSITIVE theta. Unlike a vanilla option (whose intrinsic
+  // value is fixed by spot/strike alone, so an unmoved spot means the price
+  // only ever decays toward that fixed intrinsic), a digital's fair value
+  // IS the win probability itself -- and with spot held fixed past the
+  // strike, every minute that passes without an adverse move makes that win
+  // MORE certain, so `fairValue` climbs toward `maxPayout` as timeYears -> 0.
+  // For a rich (low-multiple) tier struck in the money (1.5x needs
+  // P ~= 0.58 at inception, see solveStrikeForTargetPremium's comment),
+  // that climb genuinely carries fairValue past `premium` well before
+  // expiry -- `dynamicSpreadBps`'s moneyness factor is tightest exactly on
+  // this favorable side (by design: it protects against the LOSING side,
+  // see its own doc comment), so no discount there stops it, and even
+  // `BUYBACK_MAX_SPREAD_BPS` (15%) is far short of what a fully-realized
+  // certain win at a 1.5x premium (66.7% of maxPayout) would need (>33%).
+  // This is genuine, textbook digital-option behavior, not a pricing
+  // error -- real venues handle it by simply not selling early-exit
+  // liquidity at a price above what they collected. This pool does the
+  // same, explicitly: it never buys back for more than the premium it was
+  // paid. THAT CEILING WAS REMOVED: it was answering an over-strict
+  // invariant ("closing at unchanged spot must lose at EVERY time
+  // remaining"), which is false for a binary. An in-the-money digital has
+  // POSITIVE theta -- as expiry approaches with spot unchanged, its win
+  // probability rises toward 1 and it is genuinely worth close to
+  // `maxPayout`. Capping the payout at the premium meant a buyer whose
+  // target had already been crossed could only close for less than they
+  // paid, which makes taking profit impossible and is simply the wrong
+  // price. The invariant that IS true, and the one the tests pin, is
+  // narrower: an IMMEDIATE round trip -- no time elapsed, no price move --
+  // must lose. Profit that requires holding through real time, and
+  // therefore real risk, is legitimate P/L, not arbitrage.
   const buyback = Math.max(0, Math.min(maxPayout, fairValue * (1 - spreadBps / 10_000)));
 
   if (!Number.isFinite(fairValue) || !Number.isFinite(buyback) || !Number.isFinite(spreadBps)) {
@@ -718,12 +727,12 @@ export function buybackFor(params: {
 // payout, so the payout that costs exactly that stake has to be derived.
 //
 // This is exact, not a search. `quoteFor` solves the strike such that
-// premium == maxPayout / payoff, and `spreadFairValue` is
-// maxPayout * unitValue / width, so maxPayout cancels out of the solver's
-// target: the strike, width, cap, probability and the premium RATIO depend
-// only on (spot, vol, duration, direction, payoff) -- never on size. Premium
-// is therefore exactly linear in maxPayout, and one reference quote inverts
-// it in closed form.
+// premium == maxPayout / payoff, and `digitalFairValue` is
+// maxPayout * probabilityItm(...), so maxPayout cancels out of the solver's
+// target: the strike, cap, probability and the premium RATIO depend only on
+// (spot, vol, duration, direction, payoff) -- never on size. Premium is
+// therefore exactly linear in maxPayout, and one reference quote inverts it
+// in closed form.
 //
 // The caller re-prices at the returned notional rather than scaling the
 // reference numbers, because `quoteFor` applies two absolute clamps to the

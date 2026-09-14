@@ -4,80 +4,92 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("buybackFor prices an early close strictly below fair value with the expected spread and decay shape", async () => {
-  const { buybackFor, definedRiskPayout, BUYBACK_SPREAD_BPS, BUYBACK_BASE_SPREAD_BPS, BUYBACK_MAX_SPREAD_BPS } =
+test("buybackFor prices an early close strictly below premium, with the expected spread and true-binary decay shape", async () => {
+  const { buybackFor, definedRiskPayout, digitalFairValue, applyMakerEdge, BINARY_WIDTH, BUYBACK_SPREAD_BPS, BUYBACK_BASE_SPREAD_BPS, BUYBACK_MAX_SPREAD_BPS } =
     await import(new URL("app/lib/options.ts", root));
 
   assert.equal(BUYBACK_SPREAD_BPS, 250);
   assert.equal(BUYBACK_BASE_SPREAD_BPS, 250);
   assert.ok(BUYBACK_MAX_SPREAD_BPS > BUYBACK_BASE_SPREAD_BPS);
 
-  const base = {
-    direction: "up",
-    spot: 210,
-    strike: 200,
-    cap: 220,
-    maxPayout: 1_000,
-    premium: 150,
-    originalMinutes: 10_080,
-    // buybackFor now re-prices with the model, so it needs the same
-    // volatility input quoteFor takes (see its doc comment).
-    volatility: 60,
-  };
+  // `cap` is BINARY_WIDTH away from `strike`, exactly like every real quote
+  // -- not an arbitrary wide test width. `premium` is derived from the SAME
+  // model buybackFor re-prices with (digitalFairValue + the maker edge), the
+  // way a real quoteFor-issued premium would be, so this test's inception
+  // fair value is self-consistent rather than an arbitrary hand-picked number.
+  const originalMinutes = 10_080; // 7D
+  const volatility = 60;
+  const strike = 200;
+  const cap = strike + BINARY_WIDTH;
+  const inceptionFair = digitalFairValue({ direction: "up", spot: 210, strike, maxPayout: 1_000, volAnnual: volatility / 100, timeYears: originalMinutes / 525_600 });
+  const premium = applyMakerEdge(inceptionFair);
+  const base = { direction: "up", spot: 210, strike, cap, maxPayout: 1_000, premium, originalMinutes, volatility };
 
-  // At expiry (minutesRemaining -> 0), fair value collapses to intrinsic and
-  // the buyback is intrinsic minus the spread -- no time value survives.
+  // At expiry (minutesRemaining -> 0), fair value is EXACTLY the on-chain
+  // step function's terminal value -- `definedRiskPayout` at the real
+  // BINARY_WIDTH, which for a settlement well past the strike is exactly
+  // maxPayout (see the payout-shape test in pricing.test.mjs).
   const atExpiry = buybackFor({ ...base, minutesRemaining: 0 });
   const intrinsic = definedRiskPayout({ direction: base.direction, settlement: base.spot, strike: base.strike, cap: base.cap, maxPayout: base.maxPayout });
-  assert.ok(Math.abs(atExpiry.fairValue - intrinsic) < 1e-9, "fair value at expiry equals intrinsic");
-  assert.ok(Math.abs(atExpiry.buyback - intrinsic * (1 - atExpiry.spreadBps / 10_000)) < 1e-9);
+  assert.equal(intrinsic, 1_000, "settlement well past the strike pays the full step");
+  assert.ok(Math.abs(atExpiry.fairValue - intrinsic) < 1e-6, "fair value at expiry equals intrinsic exactly");
   assert.equal(atExpiry.spreadBps, BUYBACK_SPREAD_BPS, "no gap-risk widening with a fresh reference");
 
-  // Monotonic CONVERGENCE TO INTRINSIC, which is the real invariant -- not
-  // "fair value always decays". `base` is struck in the money (spot 210 vs
-  // strike 200, cap 220), and an in-the-money capped spread trades BELOW its
-  // intrinsic value and rises toward it as expiry approaches: with the upside
-  // capped, remaining time can only take value away. The old assertion here
-  // ("fair value decays as time remaining shrinks") encoded the previous
-  // heuristic's assumption, which was never true for an ITM strike -- and
-  // ITM strikes are exactly what the intraday ladder now sells.
+  // TRUE BINARY shape, the opposite direction from the old capped-spread
+  // engine: an in-the-money digital has POSITIVE theta. `fairValue` RISES
+  // monotonically toward intrinsic (maxPayout) as time runs out, because
+  // every minute that passes without spot dropping back below the strike
+  // makes the win MORE certain -- see buybackFor's own doc comment ("THIRD
+  // round-trip hazard"). This is standard digital-option behavior, not a bug.
   const far = buybackFor({ ...base, minutesRemaining: 5_000 });
   const mid = buybackFor({ ...base, minutesRemaining: 2_000 });
   const near = buybackFor({ ...base, minutesRemaining: 200 });
-  const gap = (quote) => Math.abs(quote.fairValue - intrinsic);
-  assert.ok(gap(far) >= gap(mid), "fair value converges toward intrinsic as time runs out");
-  assert.ok(gap(mid) >= gap(near), "fair value converges toward intrinsic as time runs out");
-  assert.ok(gap(near) >= gap(atExpiry), "expiry sits exactly at intrinsic");
-  assert.ok(far.fairValue <= intrinsic && near.fairValue <= intrinsic, "an ITM capped spread never exceeds intrinsic");
+  assert.ok(base.premium <= 1_000, "sanity: premium must stay below maxPayout for this scenario to be meaningful");
+  assert.ok(far.fairValue < mid.fairValue, "fair value rises as expiry approaches for an unmoved in-the-money strike");
+  assert.ok(mid.fairValue < near.fairValue, "fair value rises as expiry approaches for an unmoved in-the-money strike");
+  assert.ok(near.fairValue < atExpiry.fairValue + 1e-9, "fair value converges to intrinsic exactly at expiry");
+  assert.ok(far.fairValue <= 1_000 && near.fairValue <= 1_000, "fair value never exceeds maxPayout");
+
+  // `buyback` tracks fair value minus the spread -- it is NOT capped at the
+  // premium. A ceiling there was tried and removed: an in-the-money digital's
+  // fair value legitimately climbs toward maxPayout as expiry nears, and
+  // capping the payout meant a buyer whose target had been crossed could only
+  // exit below what they paid. What must hold is that buyback never exceeds
+  // the spread-discounted fair value, and never exceeds the payout itself.
+  for (const quote of [far, mid, near, atExpiry]) {
+    assert.ok(
+      quote.buyback <= quote.fairValue * (1 - quote.spreadBps / 10_000) + 1e-6,
+      "buyback must never exceed the spread-discounted fair value",
+    );
+    assert.ok(quote.buyback <= 1_000 + 1e-6, "buyback must never exceed maxPayout");
+  }
 
   // The opposite case, to pin the direction of the effect: struck OUT of the
-  // money, value decays toward zero as time runs out.
-  const decaying = { direction: "up", spot: 200, strike: 210, cap: 230, maxPayout: 1_000, premium: 150, originalMinutes: 10_080, volatility: 60 };
+  // money, value decays toward zero as time runs out (ordinary negative
+  // theta -- a true binary's positive-theta property above is specific to
+  // being on the winning side).
+  const decaying = { direction: "up", spot: 200, strike: 210, cap: 210 + BINARY_WIDTH, maxPayout: 1_000, premium: 150, originalMinutes: 10_080, volatility: 60 };
   const dFar = buybackFor({ ...decaying, minutesRemaining: 5_000 });
   const dNear = buybackFor({ ...decaying, minutesRemaining: 200 });
   assert.ok(dFar.fairValue > dNear.fairValue, "an OTM position loses value as time runs out");
   assert.ok(buybackFor({ ...decaying, minutesRemaining: 0 }).fairValue === 0, "worthless at expiry when it never crossed");
+  // No premium comparison here on purpose: `decaying.premium` is a
+  // hand-written 150 with no pricing relationship to this synthetic
+  // position, so "buyback < premium" would assert nothing about the engine.
+  // The real anti-arbitrage invariant is the sweep below, which derives
+  // premium and payout from quoteFor so the two are actually consistent.
 
-  // The buyback is always strictly below fair value whenever fair value is positive.
-  for (const quote of [far, mid, near]) {
-    assert.ok(quote.fairValue > 0);
-    assert.ok(quote.buyback < quote.fairValue, "buyback must sit strictly below fair value");
-  }
-
-  // At full time remaining with the strike struck away from spot (intrinsic
-  // zero -- unlike `base` above, whose spot is already past its strike),
-  // fair value must be anchored to exactly the premium paid, not a
-  // volatility-inflated multiple of it. This is the core anti-arbitrage
-  // property: time value is `premium * decay`, never `premium * decay * X` for X > 1.
-  // Fair value at inception is now the MODEL's value for the spread, which is
-  // the pre-edge value `premium` was derived from (premium = fair * 1.15, see
-  // MAKER_EDGE_BPS) -- not `premium` itself. The anti-arbitrage property is
-  // unchanged and stated directly: closing immediately always returns less
-  // than was paid. The exhaustive version of this is the sweep below.
-  const otm = { direction: "up", spot: 200, strike: 210, cap: 230, maxPayout: 1_000, premium: 150, originalMinutes: 10_080, volatility: 60 };
-  const atInception = buybackFor({ ...otm, minutesRemaining: otm.originalMinutes });
-  assert.ok(atInception.fairValue < otm.premium, "fair value at inception sits below the premium paid, by the maker edge");
-  assert.ok(atInception.buyback < otm.premium, "an immediate round trip always costs at least the spread");
+  // At full time remaining, fair value must be anchored to exactly the
+  // premium paid divided by (1 + maker edge) -- the pre-edge value `premium`
+  // was itself derived from -- not a volatility-inflated multiple of it.
+  // This is the core anti-arbitrage property the earlier double-count bugs
+  // broke: time value is the MODEL's own value, never approximated as
+  // `premium * decay * X` for X > 1. The exhaustive version of this sweep
+  // (every tier x tenor x vol x direction x time fraction) lives below.
+  const atInception = buybackFor({ ...base, minutesRemaining: base.originalMinutes });
+  assert.ok(Math.abs(atInception.fairValue - inceptionFair) < 1e-6, "fair value at full time remaining equals the model's own inception value");
+  assert.ok(atInception.fairValue < premium, "fair value at inception sits below the premium paid, by the maker edge");
+  assert.ok(atInception.buyback < premium, "an immediate round trip always costs at least the spread");
 
   // Hard clamp to [0, maxPayout] even for extreme inputs.
   const deepItm = buybackFor({ ...base, spot: 1_000, minutesRemaining: 5_000 });
@@ -350,7 +362,16 @@ test("the close-position flow reuses the audited session-wallet-only, message-ha
 // with the same Black-Scholes model that sold it, so this sweep must hold for
 // EVERY tier (including the ITM ones), at every fraction of time remaining --
 // not just at full time remaining, which is where the old test only looked.
-test("no fill-then-close round trip is profitable, for any tier, tenor, vol or elapsed time", async () => {
+// The invariant is about an IMMEDIATE round trip: no time elapsed, no price
+// move. It is deliberately NOT "closing at unchanged spot loses at every time
+// remaining" -- that stricter version is FALSE for a binary and, when it was
+// asserted here, forced a blanket ceiling (buyback <= premium) that made a
+// winning position impossible to close for profit: a buyer whose target had
+// already been crossed, holding a position genuinely worth $150, could only
+// exit at $97.50 on a $100 premium. An in-the-money digital has positive
+// theta -- its value rises toward the payout as expiry nears -- and realising
+// that gain after carrying real risk through real time is P/L, not arbitrage.
+test("no IMMEDIATE fill-then-close round trip is profitable, for any tier, tenor, vol or direction", async () => {
   const { quoteFor, buybackFor, payoffTiersFor } = await import(new URL("app/lib/options.ts", root));
 
   const spot = 101.47;
@@ -363,8 +384,10 @@ test("no fill-then-close round trip is profitable, for any tier, tenor, vol or e
       for (const payoff of payoffTiersFor(minutes)) {
         for (const direction of ["up", "down"]) {
           const quote = quoteFor({ spot, amount, durationMinutes: minutes, direction, payoff, volatility });
-          // Spot UNCHANGED: any profit here is pure pricing arbitrage, not P/L.
-          for (const fraction of [1, 0.999, 0.99, 0.9, 0.5, 0.1, 0]) {
+          // Spot UNCHANGED and effectively no time elapsed: any profit in
+          // this window is pure pricing arbitrage, not P/L. (0.999 of a 15M
+          // contract is ~0.9 seconds.)
+          for (const fraction of [1, 0.9999, 0.999]) {
             const { buyback } = buybackFor({
               direction,
               spot,
@@ -388,4 +411,42 @@ test("no fill-then-close round trip is profitable, for any tier, tenor, vol or e
   }
 
   assert.deepEqual(failures, [], `profitable round trips found:\n${failures.join("\n")}`);
+});
+
+
+// The other half of the same invariant, pinned so the anti-arbitrage guard can
+// never again be "fixed" by capping payouts at the premium: a position whose
+// target has been crossed MUST be closeable for more than it cost. Without
+// this, taking profit early is impossible and the close feature is a trap.
+test("a winning binary can be closed for a real profit, and a losing one pays nothing", async () => {
+  const { quoteFor, buybackFor, payoffTiersFor } = await import(new URL("app/lib/options.ts", root));
+
+  const spot = 101.64;
+  const volatility = 60;
+  const minutes = 15;
+
+  for (const payoff of payoffTiersFor(minutes)) {
+    for (const direction of ["up", "down"]) {
+      const quote = quoteFor({ spot, amount: 500, durationMinutes: minutes, direction, payoff, volatility });
+      // Move spot decisively through the target, then close near expiry.
+      const through = direction === "up" ? quote.strike * 1.01 : quote.strike * 0.99;
+      const won = buybackFor({
+        direction, spot: through, strike: quote.strike, cap: quote.cap, maxPayout: quote.maxPayout,
+        premium: quote.premium, minutesRemaining: minutes * 0.1, originalMinutes: minutes, volatility,
+      });
+      assert.ok(
+        won.buyback > quote.premium,
+        `${payoff}x ${direction}: a crossed target must close above the $${quote.premium.toFixed(2)} premium, got $${won.buyback.toFixed(2)}`,
+      );
+      assert.ok(won.buyback < quote.maxPayout, "but never above the payout itself");
+
+      // The mirror case: decisively on the wrong side, near expiry, pays ~nothing.
+      const missed = direction === "up" ? quote.strike * 0.99 : quote.strike * 1.01;
+      const lost = buybackFor({
+        direction, spot: missed, strike: quote.strike, cap: quote.cap, maxPayout: quote.maxPayout,
+        premium: quote.premium, minutesRemaining: minutes * 0.1, originalMinutes: minutes, volatility,
+      });
+      assert.ok(lost.buyback < quote.premium * 0.05, `${payoff}x ${direction}: a missed target must be near worthless`);
+    }
+  }
 });
