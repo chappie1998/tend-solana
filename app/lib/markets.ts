@@ -115,6 +115,29 @@ export type Market = {
    * settlement source in principle.
    */
   statusTag: string;
+  /**
+   * Optional per-market pricing overrides -- infrastructure only, not a
+   * pricing-policy decision. Every market below leaves this undefined, which
+   * keeps quoted prices byte-identical to before this field existed (see
+   * the "per-market override defaults are inert" test in
+   * tests/market-pricing-overrides.test.mjs). Only the MECHANISM lives here;
+   * a real decision to price one market differently from another (its own
+   * volatility seed, markup, floor, ceiling, or jump calibration) is a
+   * pricing call for later, with real data behind it -- not something this
+   * field invents.
+   *
+   * - `makerEdgeBps`: overrides the global `MAKER_EDGE_BPS`
+   *   (app/lib/options.ts) for this market's quotes.
+   * - `volFloor` / `volCeil`: clamp bounds on the realized-vol reading
+   *   (annualized, as a percentage -- same units `getMarketRealizedVolatility`
+   *   already returns) before it reaches `quoteFor`. Undefined means "no
+   *   clamp", identical to current behavior.
+   */
+  pricingOverrides?: {
+    makerEdgeBps?: number;
+    volFloor?: number;
+    volCeil?: number;
+  };
 };
 
 // Ladder steps in dollars, converted once here so each market's entry reads
@@ -351,6 +374,22 @@ export function pythFeedIdFor(symbol: string): string {
   if (!market) throw new Error(`No market metadata is configured for ${symbol}`);
   if (!market.pythFeedId) throw new Error(`${market.name} has no Pyth feed, so no series can bind to one.`);
   return market.pythFeedId;
+}
+
+/**
+ * Applies `market.pricingOverrides.volFloor`/`volCeil` to a realized-vol
+ * reading (same units as `getMarketRealizedVolatility`'s `.value`: annualized
+ * percentage, e.g. 32.3 for 32.3%). A market with no overrides (every market
+ * today) returns `volatility` unchanged -- this is a pass-through clamp, not
+ * a pricing decision, and inert until a market's `pricingOverrides` is
+ * actually set to something other than the default `undefined`.
+ */
+export function clampVolatilityForMarket(market: Pick<Market, "pricingOverrides">, volatility: number): number {
+  const { volFloor, volCeil } = market.pricingOverrides ?? {};
+  let clamped = volatility;
+  if (typeof volFloor === "number") clamped = Math.max(clamped, volFloor);
+  if (typeof volCeil === "number") clamped = Math.min(clamped, volCeil);
+  return clamped;
 }
 
 /**

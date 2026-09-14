@@ -23,7 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
-import { payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
+import { otherSidePremium, payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { useWalletBridge, type WalletBridge } from "../lib/wallet-bridge";
 import {
@@ -532,6 +532,23 @@ function TradeView({
   const maxPayout = bestQuote?.maxPayout ?? null;
   const premium = bestQuote?.premium ?? 0;
   const target = bestQuote?.strike ?? null;
+  // Two-sided "cents on the dollar" display (Split's framing: UP + DOWN
+  // premiums at one strike sum to the payout). Derived client-side, purely
+  // from numbers this quote already returned (maxPayout, probabilityItm) --
+  // no second /api/quotes call, and not the executable price for the
+  // opposite direction (which would solve its own strike -- see
+  // otherSidePremium's doc comment in app/lib/options.ts). Indicative only.
+  // Reads the same market's pricingOverrides.makerEdgeBps the server priced
+  // this quote's own side with (app/api/quotes/route.ts), inert today since
+  // no market sets one, but keeps this estimate consistent with the server
+  // if/when one does.
+  const otherSideEstimate = bestQuote
+    ? otherSidePremium({
+        maxPayout: bestQuote.maxPayout,
+        probabilityItm: bestQuote.probabilityItm,
+        makerEdgeBps: markets.find((item) => item.symbol === asset.ticker)?.pricingOverrides?.makerEdgeBps,
+      })
+    : null;
   const displayedPrice = marketSnapshot?.price ?? null;
   const currentSeries = seriesStates.find((item) => item.symbol === asset.ticker && item.code === expiry);
   const authorizedPools = currentSeries
@@ -964,7 +981,23 @@ function TradeView({
               half the payout), so 2x can settle at 3.3x. Showing the tier here
               would state a multiple the buyer is not getting. */}
           <div className="economics">
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Signed premium</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}>
+              <span>Signed premium</span>
+              <strong className={bestQuote ? "risk" : undefined}>
+                {bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
+                {/* Indicative only, never executable: the fair-value-plus-edge
+                    price of the OPPOSITE direction at this SAME strike (see
+                    otherSidePremium's doc comment). A real quote for the
+                    opposite direction would solve its own strike, so this is
+                    not what /api/quotes would actually return for it -- only
+                    the direction above is ever signed. */}
+                {bestQuote && otherSideEstimate !== null && (
+                  <small title="Indicative: the fair value of the opposite direction at this same strike, plus the maker edge. Not an executable price -- only the direction above is ever signed.">
+                    ≈${otherSideEstimate.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} for the other side
+                  </small>
+                )}
+              </strong>
+            </div>
             {/* TRUE BINARY: the payout is a SWITCH, not a ramp
                 (definedRiskPayout at BINARY_WIDTH, the smallest legal
                 on-chain width -- one price atom). Hit the target and win the

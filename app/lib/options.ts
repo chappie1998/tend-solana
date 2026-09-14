@@ -397,6 +397,8 @@ export function quoteFor(params: {
   payoff: number;
   volatility: number;
   referenceAgeSeconds?: number;
+  /** Overrides `MAKER_EDGE_BPS` for this quote -- e.g. a per-market override (see `pricingOverrides` on `Market` in app/lib/markets.ts). Undefined means "use the global default", identical to today's behavior. */
+  makerEdgeBps?: number;
 }) {
   const { spot, amount, direction, durationMinutes } = params;
   if (!Number.isFinite(spot) || spot <= 0 || !Number.isFinite(amount) || amount <= 0) {
@@ -431,7 +433,7 @@ export function quoteFor(params: {
   // are NOT symmetric under lognormal returns even at r=0, and
   // `solveStrikeForTargetPremium` prices each side with its own N(d2)/N(-d2)
   // formula rather than a shared fudge factor.
-  const solved = solveStrikeForTargetPremium({ direction, spot, maxPayout, targetPremium, volAnnual, timeYears });
+  const solved = solveStrikeForTargetPremium({ direction, spot, maxPayout, targetPremium, volAnnual, timeYears, makerEdgeBps: params.makerEdgeBps });
 
   const premium = Math.min(maxPayout * 0.95, Math.max(1, solved.premium));
   const strike = solved.strike;
@@ -776,4 +778,53 @@ export function stakeBoundsForPayoff(payoff: number): { min: number; max: number
     min: Math.ceil(MIN_PAYOUT_NOTIONAL / payoff),
     max: Math.floor(MAX_PAYOUT_NOTIONAL / payoff),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Two-sided display -- "cents on the dollar" framing (Split's docs: for one
+// strike, UP + DOWN premiums sum to the payout width; "pay 30c to win a
+// dollar, or pay 70c for the other side of the same dollar"). Tend's TRUE
+// BINARY has the identical shape at r=0: `probabilityItm` IS N(d2) (UP) or
+// N(-d2) (DOWN), and N(d2) + N(-d2) == 1 EXACTLY for any d2 (normalCdf's own
+// symmetry, pinned by the "normalCdf is a sane standard normal CDF" test) --
+// so the opposite direction's pre-edge fair value at THIS SAME STRIKE is
+// exactly `maxPayout * (1 - probabilityItm)`, no second Black-Scholes call
+// and no network round trip needed.
+// ---------------------------------------------------------------------------
+
+/**
+ * The fair-value-plus-edge premium of the OPPOSITE direction's digital, at
+ * the SAME STRIKE a quote already solved to. Exact (not a heuristic
+ * approximation): derived from the same `probabilityItm` a real quote
+ * already returns, via the N(d2) + N(-d2) == 1 identity above.
+ *
+ * NOT the executable premium a real quote for the opposite direction would
+ * carry -- an actual opposite-direction quote solves its OWN strike to hit
+ * the same payoff tier (see `solveStrikeForTargetPremium`), which lands at a
+ * different strike than this one. This is the honest complementary price at
+ * THIS quote's own strike, for indicative display only -- callers must never
+ * sign or submit it as a fill (only the requested direction's own quote from
+ * `/api/quotes` is ever executable).
+ */
+export function otherSidePremium(params: {
+  maxPayout: number;
+  /** `probabilityItm` from a `quoteFor` result for the quoted direction, at its solved strike. */
+  probabilityItm: number;
+  makerEdgeBps?: number;
+}): number {
+  const { maxPayout, probabilityItm, makerEdgeBps } = params;
+  if (!Number.isFinite(maxPayout) || maxPayout <= 0) throw new RangeError("Max payout must be a positive finite value");
+  if (!Number.isFinite(probabilityItm) || probabilityItm < 0 || probabilityItm > 1) {
+    throw new RangeError("probabilityItm must be within [0, 1]");
+  }
+  const otherFairValue = maxPayout * (1 - probabilityItm);
+  const withEdge = applyMakerEdge(otherFairValue, makerEdgeBps);
+  // Same clamp `quoteFor` applies to every real premium (line ~438: `Math.min(
+  // maxPayout * 0.95, Math.max(1, solved.premium))`) -- without it, a low-P
+  // side (any tier at 5x+, where the OTHER side is the near-certain one) puts
+  // `withEdge` past `maxPayout` itself: measured, a 10x tier's other side
+  // priced at $525 to win a $500 payout. That is not "indicative", it is
+  // arithmetically impossible as a real price (guaranteed loss even on a
+  // win), and it would have sat right next to the real premium on the ticket.
+  return Math.min(maxPayout * 0.95, Math.max(1, withEdge));
 }

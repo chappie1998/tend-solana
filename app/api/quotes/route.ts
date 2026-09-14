@@ -1,5 +1,5 @@
 import "../../lib/runtime-env-worker";
-import { tradableMarketBySymbol } from "../../lib/markets";
+import { clampVolatilityForMarket, tradableMarketBySymbol } from "../../lib/markets";
 import { payoffTiersFor, payoutForStake, quoteFor, stakeBoundsForPayoff, type Direction } from "../../lib/options";
 
 // Any positive size works as the reference: the premium/payout ratio the
@@ -11,7 +11,16 @@ import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
-import { buildVsolQuoteTransaction, describeRpcFailure, getVsolSeriesStateOrPlan, parsePublicKey } from "../../lib/vsol-server";
+import {
+  buildVsolQuoteTransaction,
+  checkVsolPoolDepth,
+  describeRpcFailure,
+  fromPoolAtoms,
+  getPoolCore,
+  getVsolSeriesStateOrPlan,
+  parsePublicKey,
+  toPoolAtoms,
+} from "../../lib/vsol-server";
 import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
 import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
@@ -125,13 +134,19 @@ export async function POST(request: Request) {
   // reference quote -- premium is exactly linear in payout, see
   // payoutForStake -- and then re-priced below so the buyer signs the quote
   // they were shown.
+  //
+  // volatility and makerEdgeBps go through the market's own pricingOverrides
+  // (app/lib/markets.ts) -- a no-op clamp/pass-through for every market today
+  // (see tests/market-pricing-overrides.test.mjs), infrastructure for a
+  // pricing decision made later, per market, with real data behind it.
   const pricingInputs = {
     spot: snapshot.price,
     durationMinutes,
     direction,
     payoff,
-    volatility: volatility.value,
+    volatility: clampVolatilityForMarket(market, volatility.value),
     referenceAgeSeconds: snapshot.ageSeconds,
+    makerEdgeBps: market.pricingOverrides?.makerEdgeBps,
   };
   const notional = stakeMode
     ? payoutForStake({
@@ -140,15 +155,50 @@ export async function POST(request: Request) {
         referencePremium: quoteFor({ ...pricingInputs, amount: STAKE_REFERENCE_NOTIONAL }).premium,
       })
     : amount;
-  const economics = quoteFor({
-    spot: snapshot.price,
-    amount: notional,
-    durationMinutes,
-    direction,
-    payoff,
-    volatility: volatility.value,
-    referenceAgeSeconds: snapshot.ageSeconds,
-  });
+  const economics = quoteFor({ ...pricingInputs, amount: notional });
+
+  // Pool-depth pre-check (Split's "max stake = free pool / payout multiple",
+  // checked before quoting): mirrors fill_pool_quote's on-chain
+  // utilization/position/liquidity gate EXACTLY (checkVsolPoolDepth, using
+  // calculate_bps_limit's own formula -- see vsol/programs/vsol/src/lib.rs
+  // and math.rs), so a quote rejected here would always revert on chain, and
+  // a quote accepted here can never revert on chain for exceeding pool
+  // depth. Runs BEFORE buildVsolQuoteTransaction, which would otherwise call
+  // listVsolSeriesOnChain (a real listing transaction for an unlisted rung)
+  // and build/sign a doomed fill for nothing. One read-only account fetch,
+  // reused below via poolCore instead of fetched twice.
+  let poolCore;
+  try {
+    poolCore = await getPoolCore();
+  } catch (error) {
+    return json({ error: describeRpcFailure(error, "The VSOL V2 pool state could not be verified.") }, 503);
+  }
+  const depthCheck = checkVsolPoolDepth(
+    {
+      poolAssetsAtoms: poolCore.poolAssets,
+      lockedCollateralAtoms: poolCore.pool.lockedCollateral,
+      maxUtilizationBps: poolCore.pool.maxUtilizationBps,
+      maxPositionBps: poolCore.pool.maxPositionBps,
+    },
+    toPoolAtoms(economics.maxPayout),
+  );
+  if (!depthCheck.ok) {
+    const maxFittingPayout = fromPoolAtoms(depthCheck.maxFittingPayoutAtoms);
+    // premium is exactly linear in maxPayout for a fixed tier/spot/vol (see
+    // payoutForStake's own comment), so the same ratio converts "largest
+    // payout that fits" into "largest stake that fits" without re-quoting.
+    const premiumFraction = economics.premium / economics.maxPayout;
+    const maxFittingStake = Math.max(0, Math.floor(maxFittingPayout * premiumFraction * 100) / 100);
+    return json({
+      error: maxFittingPayout > 0
+        ? `${depthCheck.message} The pool can currently underwrite at most $${maxFittingPayout.toFixed(2)} of payout at this tier (about $${maxFittingStake.toFixed(2)} in stake) -- take a smaller size, or a lower payoff multiple.`
+        : `${depthCheck.message} The pool cannot underwrite any payout at this tier right now.`,
+      code: "VSOL_POOL_DEPTH_EXCEEDED",
+      maxStake: maxFittingStake,
+      maxPayout: maxFittingPayout,
+    }, 422);
+  }
+
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   let vsol;
@@ -161,6 +211,7 @@ export async function POST(request: Request) {
       cap: economics.cap,
       premium: economics.premium,
       maxPayout: economics.maxPayout,
+      poolCore,
     });
   } catch (error) {
     if (error instanceof Error && error.name === "VsolTestFundsRequired") {
