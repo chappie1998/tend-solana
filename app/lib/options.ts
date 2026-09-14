@@ -374,9 +374,14 @@ const GAP_RISK_MAX_VOL_MULTIPLIER = 1.75;
 // isolation) are not forced through the product's own sales restrictions.
 // ---------------------------------------------------------------------------
 export const INTRADAY_TIER_MAX_MINUTES = 60; // 15M and 1H.
-export const PAYOFF_TIERS_INTRADAY: readonly number[] = [1.5, 2, 3];
+// Intraday starts AT the money, not below it. A 1.5x binary needs P(win) ~58%,
+// which puts its target BELOW spot -- you win if the price merely holds. That
+// is a real product, but it is not a directional bet, and the whole point of a
+// binary here is "win big, lose big". 2x sits essentially at the entry price,
+// 3x and 6x are genuine moves.
+export const PAYOFF_TIERS_INTRADAY: readonly number[] = [2, 3, 6];
 export const PAYOFF_TIERS_STANDARD: readonly number[] = [2, 5, 10];
-export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3, 5, 10];
+export const PAYOFF_TIERS_ALL: readonly number[] = [2, 3, 5, 6, 10];
 
 export function payoffTiersFor(durationMinutes: number): number[] {
   return durationMinutes <= INTRADAY_TIER_MAX_MINUTES

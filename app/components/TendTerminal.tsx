@@ -415,10 +415,10 @@ function clampedAmountForPayoff(nextPayoff: number, currentAmount: string): stri
 
 /** Short marketing label for a payoff tier button -- covers every value across both the intraday and standard ladders (see payoffTiersFor). */
 function payoffTierLabel(tier: number): string {
-  if (tier === 1.5) return "Careful";
-  if (tier === 2) return "Balanced";
+  if (tier === 2) return "Even odds";
   if (tier === 3) return "Bold";
   if (tier === 5) return "Popular";
+  if (tier === 6) return "Long shot";
   return "Aggressive";
 }
 

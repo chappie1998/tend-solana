@@ -190,7 +190,7 @@ test("quoteFor achieves the requested 5×/10× payoff exactly across the measure
   // actually prices to the requested multiple across that same matrix, for
   // the 5x/10x tiers ("Popular"/"Aggressive" in the UI copy). durationMinutes
   // is 90, not the originally-measured 60: 60 minutes now sells the
-  // intraday 1.5x/2x/3x ladder (see payoffTiersFor), and 5x/10x are only
+  // intraday 2x/3x/6x ladder (see payoffTiersFor), and 5x/10x are only
   // valid on the standard ladder (tenors over an hour).
   const cases = [
     { volatility: 33, durationMinutes: 90 },
@@ -274,7 +274,7 @@ test("strike distance from spot moves meaningfully with volatility for a fixed p
   const spot = 63_900;
   const amount = 2_500;
   // durationMinutes: 90, not 60 -- 60 minutes now sells the intraday
-  // 1.5x/2x/3x ladder (see payoffTiersFor), and 10x is only valid on the
+  // 2x/3x/6x ladder (see payoffTiersFor), and 10x is only valid on the
   // standard ladder.
   const distances = [33, 60, 120].map((volatility) => {
     const q = quoteFor({ spot, amount, durationMinutes: 90, direction: "up", payoff: 10, volatility });
@@ -291,7 +291,7 @@ test("the strike solver reaches for an in-the-money strike only when the tier ge
   // check" test), so it should stay comfortably out-of-the-money here across
   // vol/duration. (This test only covers the standard ladder's cheapest
   // tier, 10x -- the intraday ladder's own genuinely in-the-money tier,
-  // 1.5x, is covered by the dedicated test below.)
+  // the directional-target property, is covered by the dedicated test below.)
   for (const direction of ["up", "down"]) {
     for (const volatility of [33, 400]) {
       for (const durationMinutes of [90, 1_440, 43_200]) { // standard-ladder tenors only
@@ -304,33 +304,36 @@ test("the strike solver reaches for an in-the-money strike only when the tier ge
   }
 });
 
-test("the 1.5x intraday tier is reached with a genuinely in-the-money strike, at every intraday tenor x realistic vol", async () => {
-  const { quoteFor } = await loadOptions();
-  // 1.5x is the one tier whose target win probability sits ABOVE 0.5:
-  // P = 1 / (1.5 * 1.15) ~= 0.58, richer than an at-the-money digital's
-  // ~0.5-ish value (see the "digital sanity check" test) -- so it is only
-  // reachable by moving the strike in-the-money -- below spot for UP, above
-  // spot for DOWN. Every other tier in the ladder needs P < 0.5 and is
-  // reached out-of-the-money instead (see the 2x test above).
-  const spot = 101.47;
-  const amount = 500;
+test("the intraday ladder is directional: every tier's target sits AT or ABOVE spot for UP", async () => {
+  // The 1.5x tier was removed precisely because it was NOT directional: a
+  // 1.5x binary needs P(win) ~58%, which places its target BELOW spot -- you
+  // win if the price merely holds. The ladder now starts at 2x (essentially
+  // the entry price) so every intraday tier is a real directional bet.
+  const { quoteFor, payoffTiersFor } = await loadOptions();
+  const spot = 101.64;
   for (const durationMinutes of [15, 60]) {
-    for (const volatility of [20, 60, 120]) {
-      const up = quoteFor({ spot, amount, durationMinutes, direction: "up", payoff: 1.5, volatility });
-      assert.ok(up.strike < spot, `UP 1.5x strike ${up.strike} should be below spot ${spot} (ITM) at dur=${durationMinutes} vol=${volatility}`);
-      assert.equal(up.reachability, "solved");
-      const down = quoteFor({ spot, amount, durationMinutes, direction: "down", payoff: 1.5, volatility });
-      assert.ok(down.strike > spot, `DOWN 1.5x strike ${down.strike} should be above spot ${spot} (ITM) at dur=${durationMinutes} vol=${volatility}`);
-      assert.equal(down.reachability, "solved");
+    for (const payoff of payoffTiersFor(durationMinutes)) {
+      for (const volatility of [20, 60, 120]) {
+        const up = quoteFor({ spot, amount: 500, durationMinutes, direction: "up", payoff, volatility });
+        assert.ok(
+          up.strike >= spot,
+          `UP ${payoff}x @${durationMinutes}m vol=${volatility}: target ${up.strike} must sit at or above spot ${spot}`,
+        );
+        const down = quoteFor({ spot, amount: 500, durationMinutes, direction: "down", payoff, volatility });
+        assert.ok(
+          down.strike <= spot,
+          `DOWN ${payoff}x @${durationMinutes}m vol=${volatility}: target ${down.strike} must sit at or below spot ${spot}`,
+        );
+      }
     }
   }
 });
 
 test("payoffTiersFor offers a near-binary intraday ladder at or under an hour, and the standard ladder beyond it", async () => {
   const { payoffTiersFor } = await loadOptions();
-  assert.deepEqual(payoffTiersFor(1), [1.5, 2, 3]);
-  assert.deepEqual(payoffTiersFor(15), [1.5, 2, 3]);
-  assert.deepEqual(payoffTiersFor(60), [1.5, 2, 3]);
+  assert.deepEqual(payoffTiersFor(1), [2, 3, 6]);
+  assert.deepEqual(payoffTiersFor(15), [2, 3, 6]);
+  assert.deepEqual(payoffTiersFor(60), [2, 3, 6]);
   assert.deepEqual(payoffTiersFor(61), [2, 5, 10]);
   assert.deepEqual(payoffTiersFor(720), [2, 5, 10]); // a typical EOD duration
   assert.deepEqual(payoffTiersFor(10_080), [2, 5, 10]); // 7D
@@ -350,7 +353,7 @@ test("quoteFor rejects a payoff outside the known tier set, but is duration-agno
   // duration on purpose (see tests/close-position.test.mjs, which prices
   // payoff=5 at a 15-minute duration to test buybackFor in isolation).
   const { quoteFor, PAYOFF_TIERS_ALL } = await loadOptions();
-  assert.deepEqual(PAYOFF_TIERS_ALL, [1.5, 2, 3, 5, 10]);
+  assert.deepEqual(PAYOFF_TIERS_ALL, [2, 3, 5, 6, 10]);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 15, direction: "up", payoff: 7, volatility: 40 }), /Payoff must be one of/);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 1_440, direction: "up", payoff: 4, volatility: 40 }), /Payoff must be one of/);
   // Every known tier prices at every duration without throwing.
@@ -389,7 +392,7 @@ test("per-tenor payoff ladder: every advertised tier lands within 10% of its tar
 
 test("cap distance from spot grows monotonically with tenor at moderate volatility, for the 2x tier every ladder shares", async () => {
   const { quoteFor } = await loadOptions();
-  // 2x is the one tier present on BOTH the intraday [1.5,2,3] and standard
+  // 2x is the one tier present on BOTH the intraday [2,3,6] and standard
   // [2,5,10] ladders, so it is the only tier comparable across all five
   // tenors on one axis. Cap distance (not just width, which is now pinned at
   // BINARY_WIDTH regardless of tenor -- see the dedicated width test below)
@@ -515,7 +518,7 @@ test("regression: an immediate round trip on an in-the-money-struck intraday quo
   // (`intrinsic + premium * decay`) relied on: every quote used to be
   // struck out-of-the-money, so `intrinsic` -- the raw definedRiskPayout
   // ramp evaluated at TODAY's spot -- was always exactly 0 at inception.
-  // For the intraday ladder specifically, 1.5x/2x/3x are ITM-struck
+  // For the intraday ladder specifically, 2x/3x/6x are ITM-struck
   // essentially always (measured: 1.5x and 3x 100% of the time, 2x ~96%,
   // across a 15M/1H/EOD/7D/30D x 10%-400% vol sweep), and at inception
   // `intrinsic` there is genuinely nonzero while `premium` ALREADY prices

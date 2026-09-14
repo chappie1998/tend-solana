@@ -534,6 +534,6 @@ test("the quote route validates the payoff tier against the tenor's OWN ladder, 
   // fallback and the strict tier check).
   assert.match(quotesRoute, /payoffTiersFor/);
   assert.doesNotMatch(quotesRoute, /\[2,\s*5,\s*10\]/);
-  assert.deepEqual(options.payoffTiersFor(15), [1.5, 2, 3]);
+  assert.deepEqual(options.payoffTiersFor(15), [2, 3, 6]);
   assert.deepEqual(options.payoffTiersFor(1_440), [2, 5, 10]);
 });
