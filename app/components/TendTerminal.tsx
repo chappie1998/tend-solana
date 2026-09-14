@@ -272,7 +272,7 @@ function QuotePanel({
   if (!catalogSettled) {
     return (
       <div className="quote-loading" role="status" aria-live="polite">
-        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> Checking verified onchain series…</div>
+        <div className="loading-title"><LoaderCircle size={17} className="spin" aria-hidden="true" /> {CHECKING_SERIES}</div>
         <div className="quote-skeleton"><span /><span /><span /></div>
       </div>
     );
@@ -355,9 +355,18 @@ function VsolStatus() {
   );
 }
 
+// Shown while the onchain catalog request is still in flight (see the
+// EXPIRY_NOTE_RULES entry that maps it to a "Checking…" chip note).
+const CHECKING_SERIES = "Checking verified onchain series…";
+
 const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
   [/cutoff/i, "Cutoff passed"],
   [/already settled/i, "Settled"],
+  // Until /api/markets answers, every rung carries the catalog's loading
+  // message and so fell through to "Unavailable" -- which states something
+  // false about the market rather than about the request still being in
+  // flight. Matches the CHECKING_SERIES text below.
+  [/^checking verified onchain series/i, "Checking…"],
 ];
 
 // Exact string app/lib/vsol-server.ts's getVsolSeriesState throws (and the
@@ -371,12 +380,17 @@ const EXPIRY_NOTE_RULES: Array<[RegExp, string]> = [
 // server-signed transaction, which is also why the buyer's fill stays at two
 // instructions and inside the packet limit.
 const MINT_ON_DEMAND_REASON = "This series has not been minted yet.";
-const MINT_ON_DEMAND_CHIP_NOTE = "Lists on quote";
 const MINT_ON_DEMAND_FULL_NOTE = "No one has listed this expiry yet — requesting a quote lists it onchain first, then quotes it. Costs you nothing extra.";
 
 // Chips show a short label because the full reason is already surfaced in the policy line below and on hover.
 function expiryChipNote(item: Pick<ExpiryDefinition, "available" | "detail" | "availabilityReason">): string {
-  if (item.available) return item.availabilityReason === MINT_ON_DEMAND_REASON ? MINT_ON_DEMAND_CHIP_NOTE : item.detail;
+  // Every tradeable rung shows its settlement date, including one that still
+  // has to be listed on chain. "Lists on quote" used to replace the date on
+  // those, which made four of five chips read identically and hid the one
+  // thing that actually distinguishes them. The listing caveat is not lost:
+  // MINT_ON_DEMAND_FULL_NOTE states it in full under the rows for the
+  // SELECTED expiry, and expiryChipTitle keeps it one hover away on each.
+  if (item.available) return item.detail;
   return EXPIRY_NOTE_RULES.find(([test]) => test.test(item.availabilityReason))?.[1] ?? "Unavailable";
 }
 
@@ -429,7 +443,7 @@ function TradeView({
   const [executionError, setExecutionError] = useState("");
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
-  const [seriesError, setSeriesError] = useState("Checking verified onchain series…");
+  const [seriesError, setSeriesError] = useState(CHECKING_SERIES);
   // False only until the first /api/markets response (success OR failure).
   // Until then the ticket can't be priced simply because the catalog hasn't
   // arrived, which is a loading state -- not something the user must fix.
@@ -774,7 +788,8 @@ function TradeView({
         <VsolStatus />
         <div className="market-header">
           <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2>{/* Both strings come from app/lib/markets.ts. SOL was hardcoded as "Stock Token" here, which is simply untrue — the config carries what each instrument actually is so no view can invent it. */}<span>{asset.assetClass}</span></div><p>{asset.blurb}</p></div></div>
-          <span className="asset-picker">Devnet sandbox</span>
+          {/* The "Devnet sandbox" pill that used to sit here said the same
+              thing as the header's "Devnet · VSOL" network pill, one row up. */}
         </div>
 
         <div className="asset-strip" role="group" aria-label="Available markets">
@@ -814,7 +829,13 @@ function TradeView({
         <div className="market-card">
           <div className="price-row">
             <div><span className="eyebrow">{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} reference</span><div className="spot-price"><strong>{displayedPrice === null ? "—" : `$${displayedPrice.toFixed(2)}`}</strong><span className={`price-mode ${marketSnapshot?.mode ?? "loading"}`}>{marketSnapshot?.mode === "live" ? "Live" : marketSnapshot?.mode === "stale" ? "Stale" : "Loading"}</span></div>{marketSnapshot?.mode === "stale" && <small className="reference-gap-note">Reference {Math.max(1, Math.round(marketSnapshot.ageSeconds / 60))} min old · gap risk priced</small>}</div>
-            <div className="market-stats"><div><span>{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div><div><span>Oracle slot</span><strong>{marketSnapshot?.slot?.toLocaleString() ?? "—"}</strong></div><div><span>Pricing vol</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div></div>
+            {/* Only the confidence stat survives here. "Oracle slot" read
+                marketSnapshot.slot, which only a Pyth snapshot ever carried --
+                under the Coinbase reference it is structurally always "—".
+                "Pricing vol" was the same number the ticket already shows as
+                "Realized volatility", blank until a quote exists. Two of three
+                slots permanently showing em-dashes read as broken data. */}
+            <div className="market-stats"><div><span>{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
           <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> TradingView is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Pyth feed · mock RWA mint</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
