@@ -217,7 +217,7 @@ function QuotePanel({
               <span className="maker-rank">0{index + 1}</span>
               <span><strong>{maker.maker}</strong><small>{(maker.latencyMs / 1000).toFixed(1)}s response</small></span>
               <span className="maker-badge">{maker.badge}</span>
-              <span className="quote-price"><strong>${maker.premium.toLocaleString()}</strong><small>{((maker.premium / notional) * 100).toFixed(2)}% premium</small></span>
+              <span className="quote-price"><strong>${maker.premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong><small>{((maker.premium / notional) * 100).toFixed(2)}% premium</small></span>
             </button>
           ))}
         </div>
@@ -890,18 +890,34 @@ function TradeView({
 
           <div className="field-group"><label htmlFor="amount">Position size</label><div className="amount-input"><span>$</span><input id="amount" type="number" inputMode="decimal" min="100" max="5000" step="100" value={amount} onChange={(event) => { setAmount(event.target.value); invalidateQuote(); }} autoComplete="off" aria-describedby="amount-note" /><span>tUSDC</span></div><div id="amount-note" className="input-note"><span>Min $100</span><span>Devnet max $5,000</span></div></div>
 
+          {/* Two numbers decide the trade: what leaves the wallet, and what
+              can come back. Everything else is pricing evidence, and it now
+              sits behind "Pricing detail" instead of ahead of the answer.
+
+              "Max payout" deliberately restates the position size: the payoff
+              dial does NOT move it -- it moves the PREMIUM. That reads as a
+              frozen number unless the ratio is on screen, so the multiple the
+              quote actually achieved is shown beside it. It is the quote's own
+              effectiveLeverage (maxPayout / premium), not the tier the user
+              clicked: the strike solver clamps when a tier's target premium is
+              unreachable (a short-dated at-the-money spread simply cannot cost
+              half the payout), so 2x can settle at 3.3x. Showing the tier here
+              would state a multiple the buyer is not getting. */}
           <div className="economics">
-            <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Signed premium</span><strong>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Maximum loss</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
-            {/* Honest counterweight to the payoff multiple, and the vol
-                actually priced into the premium above (can run hotter than
-                "Realized volatility" when the reference is stale and the
-                gap-risk bump kicks in) -- additive, next to the payoff dial. */}
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Win probability</span><strong>{bestQuote ? `${(bestQuote.probabilityItm * 100).toFixed(1)}%` : "—"}</strong></div>
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Implied volatility</span><strong>{bestQuote ? `${bestQuote.impliedVolatility.toFixed(1)}%` : "—"}</strong></div>
-            <div className="economics-total"><span>Maximum payout</span><strong>${notional.toLocaleString()}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>You pay</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className="economics-total"><span>Max payout</span><strong>{`$${notional.toLocaleString()}`}{bestQuote && <small>{bestQuote.effectiveLeverage.toFixed(1)}× your premium</small>}</strong></div>
+            <details className="econ-detail">
+              <summary>Pricing detail</summary>
+              <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
+              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Maximum loss</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
+              {/* Honest counterweight to the payoff multiple, and the vol
+                  actually priced into the premium above (can run hotter than
+                  "Realized volatility" when the reference is stale and the
+                  gap-risk bump kicks in). */}
+              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Win probability</span><strong>{bestQuote ? `${(bestQuote.probabilityItm * 100).toFixed(1)}%` : "—"}</strong></div>
+              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
+              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Implied volatility</span><strong>{bestQuote ? `${bestQuote.impliedVolatility.toFixed(1)}%` : "—"}</strong></div>
+            </details>
           </div>
 
           <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
@@ -917,7 +933,7 @@ function TradeView({
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>${notional.toLocaleString()}</strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
