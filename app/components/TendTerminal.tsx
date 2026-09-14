@@ -7,10 +7,13 @@ import {
   BadgeCheck,
   BookOpen,
   Clock3,
+  Copy,
+  ExternalLink,
   Info,
   LayoutDashboard,
   LoaderCircle,
   LockKeyhole,
+  LogOut,
   Menu,
   RefreshCw,
   Rocket,
@@ -1066,6 +1069,9 @@ export function TendTerminal() {
   const walletAddress = bridge.address;
   const [activeTab, setActiveTab] = useState<Tab>("market");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [walletMenuOpen, setWalletMenuOpen] = useState(false);
+  const [addressCopied, setAddressCopied] = useState(false);
+  const walletMenuRef = useRef<HTMLDivElement>(null);
   const [walletError, setWalletError] = useState("");
   const [walletFunding, setWalletFunding] = useState(false);
   const [walletSigning, setWalletSigning] = useState(false);
@@ -1181,6 +1187,7 @@ export function TendTerminal() {
 
     setSessionWallet(null);
     setSessionNotice("");
+    setWalletMenuOpen(false);
     if (!walletAddress) {
       void endWalletSession();
       return;
@@ -1205,6 +1212,32 @@ export function TendTerminal() {
     await bridge.connect();
   }, [bridge]);
 
+  const disconnectWallet = useCallback(async () => {
+    setWalletMenuOpen(false);
+    await bridge.disconnect();
+  }, [bridge]);
+
+  const copyWalletAddress = useCallback(async () => {
+    if (!walletAddress) return;
+    await navigator.clipboard.writeText(walletAddress);
+    setAddressCopied(true);
+    window.setTimeout(() => setAddressCopied(false), 1500);
+  }, [walletAddress]);
+
+  // Close the wallet menu on an outside click or a disconnect -- there is no
+  // other way to dismiss it (it has no backdrop), so both cases need to be
+  // handled explicitly rather than relying on losing focus.
+  useEffect(() => {
+    if (!walletMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (walletMenuRef.current && !walletMenuRef.current.contains(event.target as Node)) {
+        setWalletMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [walletMenuOpen]);
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -1213,7 +1246,31 @@ export function TendTerminal() {
         <div className="desktop-nav"><ProductNav active={activeTab} onChange={selectTab} /></div>
         <div className="header-actions">
           <div className="network-pill"><span /><strong>Solana</strong><small>Devnet · VSOL</small></div>
-          <button type="button" className={walletAddress ? "wallet-button connected" : "wallet-button"} onClick={() => { void connectWallet(); }} aria-busy={bridge.connecting || walletFunding}><Wallet size={16} aria-hidden="true" /> {bridge.connecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}</button>
+          <div className="wallet-control" ref={walletMenuRef}>
+            <button
+              type="button"
+              className={walletAddress ? "wallet-button connected" : "wallet-button"}
+              onClick={() => { if (walletAddress) { setWalletMenuOpen((value) => !value); } else { void connectWallet(); } }}
+              aria-busy={bridge.connecting || walletFunding}
+              aria-haspopup={walletAddress ? "menu" : undefined}
+              aria-expanded={walletAddress ? walletMenuOpen : undefined}
+            >
+              <Wallet size={16} aria-hidden="true" /> {bridge.connecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}
+            </button>
+            {walletMenuOpen && walletAddress && (
+              <div className="wallet-menu" role="menu">
+                <button type="button" role="menuitem" onClick={() => { void copyWalletAddress(); }}>
+                  <Copy size={14} aria-hidden="true" /> {addressCopied ? "Copied" : "Copy address"}
+                </button>
+                <a role="menuitem" href={solanaExplorerUrl("address", walletAddress)} target="_blank" rel="noreferrer" onClick={() => setWalletMenuOpen(false)}>
+                  <ExternalLink size={14} aria-hidden="true" /> View on Explorer
+                </a>
+                <button type="button" role="menuitem" className="wallet-menu-disconnect" onClick={() => { void disconnectWallet(); }}>
+                  <LogOut size={14} aria-hidden="true" /> Disconnect
+                </button>
+              </div>
+            )}
+          </div>
           <button type="button" className="icon-button mobile-menu" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button>
         </div>
       </header>

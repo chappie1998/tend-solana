@@ -169,6 +169,11 @@ code, .tabular, .num {
 .wallet-button:hover, .icon-button:hover { border-color: var(--border-strong); background: var(--surface-2); }
 .wallet-button.connected { color: var(--positive); border-color: color-mix(in srgb, var(--positive) 34%, var(--border)); }
 .icon-button { width: 32px; padding: 0; }
+.wallet-control { position: relative; }
+.wallet-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; min-width: 180px; padding: 4px; display: flex; flex-direction: column; gap: 2px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-control); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
+.wallet-menu button, .wallet-menu a { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 10px; border: 0; border-radius: calc(var(--r-control) - 2px); background: transparent; color: var(--ink); font-size: var(--t-sm); font-family: inherit; text-decoration: none; cursor: pointer; }
+.wallet-menu button:hover, .wallet-menu a:hover { background: var(--surface-2); }
+.wallet-menu-disconnect { color: var(--negative); }
 .mobile-menu, .mobile-nav { display: none; }
 .wallet-error { min-height: 32px; padding: 6px 12px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--negative); background: color-mix(in srgb, var(--negative) 12%, var(--surface)); border-bottom: 1px solid color-mix(in srgb, var(--negative) 30%, var(--border)); font-size: var(--t-sm); }
 .wallet-error button { width: 26px; height: 26px; border: 0; border-radius: var(--r-control); display: inline-grid; place-items: center; color: var(--negative); background: transparent; cursor: pointer; }
