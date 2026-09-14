@@ -521,3 +521,19 @@ test("maker pricing remains bounded under extreme real volatility inputs", async
   assert.ok(quotes[0].premium > quotes[1].premium && quotes[1].premium > quotes[2].premium);
   assert.equal(definedRiskPayout({ direction: "up", settlement: quotes[0].cap + 100, strike: quotes[0].strike, cap: quotes[0].cap, maxPayout: 1_000 }), 1_000);
 });
+
+test("the quote route validates the payoff tier against the tenor's OWN ladder, not a fixed [2,5,10] list", async () => {
+  const [quotesRoute, options] = await Promise.all([
+    readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
+    import(new URL("app/lib/options.ts", root)),
+  ]);
+  // The route resolves the ACTUAL onchain duration before it can know which
+  // tiers are for sale (payoffTiersFor(durationMinutes)) -- so it must
+  // import and call payoffTiersFor, and must NOT hardcode the old
+  // [2, 5, 10] list anywhere (it used to, in two places: the stake-bounds
+  // fallback and the strict tier check).
+  assert.match(quotesRoute, /payoffTiersFor/);
+  assert.doesNotMatch(quotesRoute, /\[2,\s*5,\s*10\]/);
+  assert.deepEqual(options.payoffTiersFor(15), [1.5, 2, 3]);
+  assert.deepEqual(options.payoffTiersFor(1_440), [2, 5, 10]);
+});

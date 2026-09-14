@@ -20,6 +20,9 @@ test("buybackFor prices an early close strictly below fair value with the expect
     maxPayout: 1_000,
     premium: 150,
     originalMinutes: 10_080,
+    // buybackFor now re-prices with the model, so it needs the same
+    // volatility input quoteFor takes (see its doc comment).
+    volatility: 60,
   };
 
   // At expiry (minutesRemaining -> 0), fair value collapses to intrinsic and
@@ -30,14 +33,30 @@ test("buybackFor prices an early close strictly below fair value with the expect
   assert.ok(Math.abs(atExpiry.buyback - intrinsic * (1 - atExpiry.spreadBps / 10_000)) < 1e-9);
   assert.equal(atExpiry.spreadBps, BUYBACK_SPREAD_BPS, "no gap-risk widening with a fresh reference");
 
-  // Monotonic decay: less time remaining never increases fair value.
+  // Monotonic CONVERGENCE TO INTRINSIC, which is the real invariant -- not
+  // "fair value always decays". `base` is struck in the money (spot 210 vs
+  // strike 200, cap 220), and an in-the-money capped spread trades BELOW its
+  // intrinsic value and rises toward it as expiry approaches: with the upside
+  // capped, remaining time can only take value away. The old assertion here
+  // ("fair value decays as time remaining shrinks") encoded the previous
+  // heuristic's assumption, which was never true for an ITM strike -- and
+  // ITM strikes are exactly what the intraday ladder now sells.
   const far = buybackFor({ ...base, minutesRemaining: 5_000 });
   const mid = buybackFor({ ...base, minutesRemaining: 2_000 });
   const near = buybackFor({ ...base, minutesRemaining: 200 });
-  assert.ok(far.fairValue >= mid.fairValue, "fair value decays as time remaining shrinks");
-  assert.ok(mid.fairValue >= near.fairValue, "fair value decays as time remaining shrinks");
-  assert.ok(near.fairValue >= atExpiry.fairValue, "expiry has the least fair value");
-  assert.ok(far.buyback >= mid.buyback && mid.buyback >= near.buyback, "buyback decays alongside fair value");
+  const gap = (quote) => Math.abs(quote.fairValue - intrinsic);
+  assert.ok(gap(far) >= gap(mid), "fair value converges toward intrinsic as time runs out");
+  assert.ok(gap(mid) >= gap(near), "fair value converges toward intrinsic as time runs out");
+  assert.ok(gap(near) >= gap(atExpiry), "expiry sits exactly at intrinsic");
+  assert.ok(far.fairValue <= intrinsic && near.fairValue <= intrinsic, "an ITM capped spread never exceeds intrinsic");
+
+  // The opposite case, to pin the direction of the effect: struck OUT of the
+  // money, value decays toward zero as time runs out.
+  const decaying = { direction: "up", spot: 200, strike: 210, cap: 230, maxPayout: 1_000, premium: 150, originalMinutes: 10_080, volatility: 60 };
+  const dFar = buybackFor({ ...decaying, minutesRemaining: 5_000 });
+  const dNear = buybackFor({ ...decaying, minutesRemaining: 200 });
+  assert.ok(dFar.fairValue > dNear.fairValue, "an OTM position loses value as time runs out");
+  assert.ok(buybackFor({ ...decaying, minutesRemaining: 0 }).fairValue === 0, "worthless at expiry when it never crossed");
 
   // The buyback is always strictly below fair value whenever fair value is positive.
   for (const quote of [far, mid, near]) {
@@ -50,9 +69,14 @@ test("buybackFor prices an early close strictly below fair value with the expect
   // fair value must be anchored to exactly the premium paid, not a
   // volatility-inflated multiple of it. This is the core anti-arbitrage
   // property: time value is `premium * decay`, never `premium * decay * X` for X > 1.
-  const otm = { direction: "up", spot: 200, strike: 210, cap: 230, maxPayout: 1_000, premium: 150, originalMinutes: 10_080 };
+  // Fair value at inception is now the MODEL's value for the spread, which is
+  // the pre-edge value `premium` was derived from (premium = fair * 1.15, see
+  // MAKER_EDGE_BPS) -- not `premium` itself. The anti-arbitrage property is
+  // unchanged and stated directly: closing immediately always returns less
+  // than was paid. The exhaustive version of this is the sweep below.
+  const otm = { direction: "up", spot: 200, strike: 210, cap: 230, maxPayout: 1_000, premium: 150, originalMinutes: 10_080, volatility: 60 };
   const atInception = buybackFor({ ...otm, minutesRemaining: otm.originalMinutes });
-  assert.ok(Math.abs(atInception.fairValue - otm.premium) < 1e-9, "fair value at inception equals the premium paid, not a multiple of it");
+  assert.ok(atInception.fairValue < otm.premium, "fair value at inception sits below the premium paid, by the maker edge");
   assert.ok(atInception.buyback < otm.premium, "an immediate round trip always costs at least the spread");
 
   // Hard clamp to [0, maxPayout] even for extreme inputs.
@@ -130,6 +154,7 @@ test("a fill-then-immediately-close round trip is never profitable, across every
           premium: quote.premium,
           minutesRemaining: tenor.minutes,
           originalMinutes: tenor.minutes,
+          volatility,
         });
         const loss = quote.premium - closed.buyback;
         const minExpectedLoss = quote.premium * (BUYBACK_BASE_SPREAD_BPS / 10_000);
@@ -312,4 +337,55 @@ test("the close-position flow reuses the audited session-wallet-only, message-ha
   // way the rest of the server does.
   assert.match(vsolServer, /export function decodeConfigAccount/);
   assert.match(vsolServer, /export function decodeOracleAccount/);
+});
+
+
+// Regression for the SECOND round-trip bug, found when the intraday ladder
+// started solving in-the-money strikes. `buybackFor` used to value an open
+// position as `intrinsic + premium * sqrt(timeLeft)`. For an ITM-struck quote
+// `intrinsic` is already inside `premium`, so that sum double-counted it.
+// Pinning only the fraction === 1 instant did NOT fix it: one second later the
+// heuristic returned, and a 15M 2x bought for $250.00 closed for $427.37 --
+// +$177 risk-free, repeatable, draining the pool. The fix re-prices the spread
+// with the same Black-Scholes model that sold it, so this sweep must hold for
+// EVERY tier (including the ITM ones), at every fraction of time remaining --
+// not just at full time remaining, which is where the old test only looked.
+test("no fill-then-close round trip is profitable, for any tier, tenor, vol or elapsed time", async () => {
+  const { quoteFor, buybackFor, payoffTiersFor } = await import(new URL("app/lib/options.ts", root));
+
+  const spot = 101.47;
+  const amount = 500;
+  const tenors = [["15M", 15], ["1H", 60], ["EOD", 720], ["7D", 10_080], ["30D", 43_200]];
+  const failures = [];
+
+  for (const volatility of [20, 60, 120]) {
+    for (const [label, minutes] of tenors) {
+      for (const payoff of payoffTiersFor(minutes)) {
+        for (const direction of ["up", "down"]) {
+          const quote = quoteFor({ spot, amount, durationMinutes: minutes, direction, payoff, volatility });
+          // Spot UNCHANGED: any profit here is pure pricing arbitrage, not P/L.
+          for (const fraction of [1, 0.999, 0.99, 0.9, 0.5, 0.1, 0]) {
+            const { buyback } = buybackFor({
+              direction,
+              spot,
+              strike: quote.strike,
+              cap: quote.cap,
+              maxPayout: quote.maxPayout,
+              premium: quote.premium,
+              minutesRemaining: minutes * fraction,
+              originalMinutes: minutes,
+              volatility,
+            });
+            if (buyback >= quote.premium) {
+              failures.push(
+                `${label} ${payoff}x ${direction} vol=${volatility} f=${fraction}: paid ${quote.premium.toFixed(2)}, closed ${buyback.toFixed(2)}`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  assert.deepEqual(failures, [], `profitable round trips found:\n${failures.join("\n")}`);
 });

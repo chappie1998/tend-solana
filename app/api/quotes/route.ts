@@ -1,6 +1,6 @@
 import "../../lib/runtime-env-worker";
 import { tradableMarketBySymbol } from "../../lib/markets";
-import { payoutForStake, quoteFor, stakeBoundsForPayoff, type Direction } from "../../lib/options";
+import { payoffTiersFor, payoutForStake, quoteFor, stakeBoundsForPayoff, type Direction } from "../../lib/options";
 
 // Any positive size works as the reference: the premium/payout ratio the
 // inversion needs is size-independent (see payoutForStake). 1,000 sits in the
@@ -60,13 +60,20 @@ export async function POST(request: Request) {
     return json({ error: "Devnet order size must be between $100 and $5,000." }, 422);
   }
   if (stakeMode) {
-    const bounds = stakeBoundsForPayoff([2, 5, 10].includes(payoff) ? payoff : 5);
+    // The exact tier ladder is tenor-dependent (see payoffTiersFor) and the
+    // tenor isn't resolved yet at this point in the request -- 5 is just a
+    // reasonable fallback for bounds-checking an as-yet-unvalidated payoff;
+    // the real tier check happens below, once durationMinutes is known.
+    const bounds = stakeBoundsForPayoff(Number.isFinite(payoff) && payoff > 0 ? payoff : 5);
     if (stake < bounds.min || stake > bounds.max) {
       return json({ error: `At ${payoff}x, pay between $${bounds.min} and $${bounds.max.toLocaleString()}.` }, 422);
     }
   }
   if (requestedExpiry && !expiryCodes.includes(requestedExpiry as ExpiryCode)) return json({ error: "Choose a supported expiry." }, 422);
-  if (![2, 5, 10].includes(payoff)) return json({ error: "Target payoff must be 2×, 5×, or 10×." }, 422);
+  // Coarse sanity check only -- the exact set of valid tiers depends on the
+  // resolved onchain series' actual duration, checked against
+  // payoffTiersFor once durationMinutes is known below.
+  if (!Number.isFinite(payoff) || payoff <= 0) return json({ error: "Choose a valid target payoff." }, 422);
 
   const requestedAt = Date.now();
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
@@ -95,6 +102,14 @@ export async function POST(request: Request) {
   const onchainExpiryAt = seriesState.expiry * 1_000;
   const durationMinutes = Math.ceil((onchainExpiryAt - requestedAt) / 60_000);
   if (durationMinutes <= 5) return json({ error: "The published devnet series is too close to expiry. A new series must be deployed." }, 503);
+  // The tier ladder is per-tenor (see payoffTiersFor): short-dated series
+  // sell a near-binary 1.5x/2x/3x menu, longer ones the original 2x/5x/10x.
+  // Only reachable here (not in the coarse check above) because it depends
+  // on the ACTUAL resolved onchain duration, not the requested expiry code.
+  const validPayoffTiers = payoffTiersFor(durationMinutes);
+  if (!validPayoffTiers.includes(payoff)) {
+    return json({ error: `Target payoff must be ${validPayoffTiers.map((tier) => `${tier}×`).join(", ")} for this expiry.` }, 422);
+  }
   let snapshot;
   let volatility;
   try {

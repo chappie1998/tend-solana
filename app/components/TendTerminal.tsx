@@ -23,7 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
-import { stakeBoundsForPayoff } from "../lib/options";
+import { payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { useWalletBridge, type WalletBridge } from "../lib/wallet-bridge";
 import {
@@ -405,6 +405,23 @@ function shortDataSourceLabel(source: string | null | undefined): string {
   return "Market";
 }
 
+/** The "you pay" input, re-clamped into the stake bounds a new payoff tier implies -- unchanged if it's already inside them. */
+function clampedAmountForPayoff(nextPayoff: number, currentAmount: string): string {
+  const bounds = stakeBoundsForPayoff(nextPayoff);
+  const current = Number(currentAmount) || 0;
+  const clamped = Math.min(bounds.max, Math.max(bounds.min, current));
+  return clamped !== current ? String(clamped) : currentAmount;
+}
+
+/** Short marketing label for a payoff tier button -- covers every value across both the intraday and standard ladders (see payoffTiersFor). */
+function payoffTierLabel(tier: number): string {
+  if (tier === 1.5) return "Careful";
+  if (tier === 2) return "Balanced";
+  if (tier === 3) return "Bold";
+  if (tier === 5) return "Popular";
+  return "Aggressive";
+}
+
 function TradeView({
   walletAddress,
   onConnect,
@@ -489,6 +506,27 @@ function TradeView({
     return exact;
   });
   const expiryDefinition = expiryOptions.find((item) => item.code === expiry) ?? resolveExpiry(expiry, asset.ticker, now);
+  // Short-dated series sell a near-binary 1.5x/2x/3x ladder; longer ones the
+  // original 2x/5x/10x (see payoffTiersFor) -- purely a function of the
+  // RESOLVED duration, so this tracks the clock even when the expiry code
+  // itself doesn't change (e.g. EOD's remaining time falling under an hour).
+  const payoffTiers = payoffTiersFor(expiryDefinition.durationMinutes);
+  // Re-clamp the selected tier into the new ladder the moment it stops
+  // being valid -- mirrors the wallet-switch reset below (state repair
+  // during render, so a stale tier is never shown selected for even one
+  // frame) rather than selectPayoff/invalidateQuote directly, which also
+  // bump requestSeqRef -- a ref mutation that belongs in an effect, not
+  // render, the same reasoning the wallet-switch reset below already follows.
+  if (!payoffTiers.includes(payoff)) {
+    const nextPayoff = payoffTiers[0];
+    const clampedAmount = clampedAmountForPayoff(nextPayoff, amount);
+    if (clampedAmount !== amount) setAmount(clampedAmount);
+    setPayoff(nextPayoff);
+    setQuoteState("idle");
+    setQuotes([]);
+    setSelectedQuoteId("");
+    setVsolQuote(null);
+  }
   const bestQuote = quotes.find((quote) => quote.id === selectedQuoteId) ?? quotes[0];
   // Solved server-side from the stake, so it only exists once a quote does.
   const maxPayout = bestQuote?.maxPayout ?? null;
@@ -647,10 +685,8 @@ function TradeView({
   // Clamps the stake into the new tier's bounds as the tier changes, so the
   // ticket is never left in a state that cannot be quoted.
   function selectPayoff(next: number) {
-    const bounds = stakeBoundsForPayoff(next);
-    const current = Number(amount) || 0;
-    const clamped = Math.min(bounds.max, Math.max(bounds.min, current));
-    if (clamped !== current) setAmount(String(clamped));
+    const clamped = clampedAmountForPayoff(next, amount);
+    if (clamped !== amount) setAmount(clamped);
     setPayoff(next);
     invalidateQuote();
   }
@@ -903,7 +939,7 @@ function TradeView({
             </fieldset>
           )}
 
-          <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{[2, 5, 10].map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { selectPayoff(item); }}>{item}×<small>{item === 2 ? "Balanced" : item === 5 ? "Popular" : "Aggressive"}</small></button>)}</div></fieldset>
+          <fieldset className="field-group"><legend>Target payoff</legend><div className="choice-row">{payoffTiers.map((item) => <button type="button" key={item} className={payoff === item ? "choice active" : "choice"} onClick={() => { selectPayoff(item); }}>{item}×<small>{payoffTierLabel(item)}</small></button>)}</div></fieldset>
 
           {/* The buyer types what LEAVES THEIR WALLET, not the payout. It
               used to be labelled "Position size" and carried the payout
@@ -937,6 +973,11 @@ function TradeView({
                 caps, where the premium is repaid, and where it pays nothing --
                 are stated next to it. */}
             <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>at ${bestQuote.cap.toFixed(2)}{direction === "up" ? "+" : " or lower"}</small>}</strong></div>
+            {/* The price the buyer needs for the FULL payout, stated as its
+                own headline number rather than only the small annotation
+                above -- direction-aware, since the cap sits on opposite
+                sides of the strike for up vs. down. */}
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Target {direction === "up" ? "(at or above)" : "(at or below)"}</span><strong>{bestQuote ? `$${bestQuote.cap.toFixed(2)}` : "—"}</strong></div>
             <div className={bestQuote ? undefined : "econ-row--empty"}><span>Breakeven</span><strong>{bestQuote ? `$${bestQuote.breakeven.toFixed(2)}` : "—"}</strong></div>
             <div className={bestQuote ? undefined : "econ-row--empty"}><span>Pays nothing {direction === "up" ? "below" : "above"}</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${bestQuote.strike.toFixed(2)}` : "—"}</strong></div>
             <details className="econ-detail">
