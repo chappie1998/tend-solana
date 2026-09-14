@@ -24,6 +24,7 @@ import {
   type ReactNode,
 } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
+import type { WalletName } from "@solana/wallet-adapter-base";
 import { VersionedTransaction } from "@solana/web3.js";
 import { base64ToBytes, bytesToBase64, deserializeSolanaTransaction } from "./solana-wallet";
 import { WalletPicker } from "../components/WalletPicker";
@@ -70,7 +71,17 @@ function subscribeNever() {
  * this without one.
  */
 function WalletAdapterBridge({ children }: { children: ReactNode }) {
-  const { wallets, publicKey, connecting, select, disconnect, signTransaction, signMessage } = useWallet();
+  const {
+    wallets,
+    wallet,
+    publicKey,
+    connecting,
+    select,
+    connect: adapterConnect,
+    disconnect,
+    signTransaction,
+    signMessage,
+  } = useWallet();
 
   // Haven't checked for wallets yet (SSR / before hydration) vs. checked and
   // ready -- see quoteReadiness's `providerDetected: boolean | null`, which
@@ -78,9 +89,8 @@ function WalletAdapterBridge({ children }: { children: ReactNode }) {
   const ready = useSyncExternalStore(subscribeNever, () => true, () => false);
 
   // Our own wallet picker modal, not the stock wallet-adapter-react-ui one
-  // (see app/components/WalletPicker.tsx for why). `connect()` just opens
-  // it; the picker itself calls `select()` on the chosen adapter, which --
-  // with `autoConnect` on -- is what actually triggers the connection.
+  // (see app/components/WalletPicker.tsx for why). `connect()` just opens it;
+  // picking an entry routes through selectWallet below.
   const [pickerOpen, setPickerOpen] = useState(false);
 
   const connect = useCallback(async () => {
@@ -88,6 +98,30 @@ function WalletAdapterBridge({ children }: { children: ReactNode }) {
   }, []);
 
   const closePicker = useCallback(() => setPickerOpen(false), []);
+
+  // Picking a wallet normally means select(): wallet-adapter stores the name,
+  // and with `autoConnect` on its own effect then calls adapter.connect().
+  //
+  // But select() routes through changeWallet(), which EARLY-RETURNS when the
+  // chosen name equals the one already stored -- and that name lives in
+  // localStorage, so it survives reloads and failed connections. After a
+  // silent autoConnect that didn't take (the wallet hasn't trusted this
+  // origin yet), the name is still stored while nothing is connected, so
+  // clicking that same wallet changes no state, never re-runs the autoConnect
+  // effect, and does nothing at all. Connect it explicitly instead.
+  const selectWallet = useCallback(
+    (name: WalletName) => {
+      setPickerOpen(false);
+      if (wallet?.adapter.name === name) {
+        // Rejections are already reported through WalletProvider's onError;
+        // this catch only stops an unhandled promise rejection.
+        void adapterConnect().catch(() => {});
+        return;
+      }
+      select(name);
+    },
+    [wallet, adapterConnect, select],
+  );
 
   const disconnectWallet = useCallback(async () => {
     await disconnect();
@@ -155,7 +189,7 @@ function WalletAdapterBridge({ children }: { children: ReactNode }) {
   return (
     <WalletBridgeContext.Provider value={bridge}>
       {children}
-      {pickerOpen && <WalletPicker wallets={wallets} onSelect={select} onClose={closePicker} />}
+      {pickerOpen && <WalletPicker wallets={wallets} onSelect={selectWallet} onClose={closePicker} />}
     </WalletBridgeContext.Provider>
   );
 }
