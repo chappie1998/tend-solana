@@ -24,7 +24,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { marketsByCategory, markets } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
-import { injectedSolanaWallet, signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import { setActiveSolanaWalletId, signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import { detectSolanaWallets, type DetectedWallet } from "../lib/solana-wallets";
 import {
   AUTO_QUOTE_DEBOUNCE_MS,
   MAX_AUTO_REFRESHES,
@@ -186,6 +187,7 @@ function QuotePanel({
   readiness,
   inputIssue,
   catalogSettled,
+  connectLabel,
   onQuote,
   onSelect,
   onExecute,
@@ -201,6 +203,8 @@ function QuotePanel({
   readiness: QuoteReadiness;
   inputIssue: string | null;
   catalogSettled: boolean;
+  /** "Connect wallet" with several detected, "Connect <Name>" with exactly one. */
+  connectLabel: string;
   onQuote: () => void;
   onSelect: (quoteId: string) => void;
   onExecute: () => void;
@@ -230,8 +234,8 @@ function QuotePanel({
     return (
       <div className="quote-empty">
         <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
-        <div><strong>No Solana wallet detected</strong><p>Quotes are signed for your wallet address. Install Phantom or another Solana wallet, then reload.</p></div>
-        <a className="button primary" href="https://phantom.com/download" target="_blank" rel="noreferrer"><Wallet size={16} aria-hidden="true" /> Get Phantom</a>
+        <div><strong>No Solana wallet detected</strong><p>Quotes are signed for your wallet address. Install a Solana wallet, then reload.</p></div>
+        <a className="button primary" href="https://solana.com/wallets" target="_blank" rel="noreferrer"><Wallet size={16} aria-hidden="true" /> Get a Solana wallet</a>
       </div>
     );
   }
@@ -241,7 +245,7 @@ function QuotePanel({
       <div className="quote-empty">
         <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
         <div><strong>Connect a wallet to see your price</strong><p>Your quote is signed for your exact wallet address.</p></div>
-        <button type="button" className="button primary" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet</button>
+        <button type="button" className="button primary" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> {connectLabel}</button>
       </div>
     );
   }
@@ -396,7 +400,7 @@ function TradeView({
   walletAddress,
   onConnect,
   onPositionSaved,
-  providerDetected,
+  wallets,
   walletBusy,
   sessionWallet,
   sessionNotice,
@@ -406,7 +410,7 @@ function TradeView({
   walletAddress: string;
   onConnect: () => void | Promise<void>;
   onPositionSaved: (position: SavedPosition) => void;
-  providerDetected: boolean | null;
+  wallets: DetectedWallet[] | null;
   walletBusy: boolean;
   sessionWallet: string | null;
   sessionNotice: string;
@@ -483,6 +487,10 @@ function TradeView({
     : [];
   const defaultPool = authorizedPools.find((pool) => pool.quotable) ?? authorizedPools[0] ?? null;
   const activePool = authorizedPools.find((pool) => pool.address === selectedPool) ?? defaultPool;
+  // `wallets` is null until the client-side detection effect in TendTerminal
+  // runs once; that's the same "not checked yet" state quoteReadiness expects.
+  const providerDetected = wallets === null ? null : wallets.length > 0;
+  const connectLabel = wallets && wallets.length === 1 ? `Connect ${wallets[0].name}` : "Connect wallet";
   const readiness = quoteReadiness({ providerDetected, walletAddress, walletBusy, sessionWallet, sessionNotice });
   const inputIssue = quoteInputIssue({
     notional,
@@ -877,7 +885,7 @@ function TradeView({
             <div className="economics-total"><span>Maximum payout</span><strong>${notional.toLocaleString()}</strong></div>
           </div>
 
-          <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
+          <QuotePanel state={quoteState} notional={notional} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} connectLabel={connectLabel} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
         </form>
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
@@ -922,7 +930,10 @@ export function TendTerminal() {
   // null until checked client-side (see the effect below) -- rendering "not
   // detected" from the server would flip to "detected" on hydration for
   // anyone with a wallet installed, which is exactly the mismatch to avoid.
-  const [providerDetected, setProviderDetected] = useState<boolean | null>(null);
+  const [wallets, setWallets] = useState<DetectedWallet[] | null>(null);
+  // Open only when connectWallet() is called with more than one wallet
+  // detected and no explicit choice -- see connectWallet below.
+  const [pickerOpen, setPickerOpen] = useState(false);
   const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Trade", [activeTab]);
 
   useEffect(() => {
@@ -934,7 +945,7 @@ export function TendTerminal() {
   }, []);
 
   useEffect(() => {
-    const check = () => setProviderDetected(Boolean(injectedSolanaWallet()));
+    const check = () => setWallets(detectSolanaWallets());
     check();
     // Some wallet extensions inject after the initial script evaluates, so
     // re-check once the page finishes loading and once more shortly after.
@@ -945,6 +956,13 @@ export function TendTerminal() {
       window.clearTimeout(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const close = (event: KeyboardEvent) => event.key === "Escape" && setPickerOpen(false);
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [pickerOpen]);
 
   const loadPositions = useCallback(async () => {
     setPositionsLoading(true);
@@ -1027,19 +1045,45 @@ export function TendTerminal() {
 
   const onSessionExpired = useCallback(() => setSessionWallet(null), []);
 
-  async function connectWallet() {
-    const provider = injectedSolanaWallet();
-    if (!provider) {
-      setWalletError("No Solana wallet found. Install Phantom or another injected Solana wallet.");
+  // `id` picks a specific detected wallet (from the picker below). Called
+  // with no id -- including as a bare event handler, e.g. `onClick={onConnect}`
+  // several components down, which hands this a MouseEvent as its first
+  // argument -- it falls back to auto-detection: connect the one wallet that
+  // was found, or open the picker when there's more than one to choose from.
+  async function connectWallet(id?: string) {
+    const requestedId = typeof id === "string" ? id : undefined;
+    const detected = wallets ?? [];
+    if (detected.length === 0) {
+      setWalletError("No Solana wallet detected. Install a Solana wallet, then reload.");
       return;
     }
+    const chosen = requestedId
+      ? detected.find((wallet) => wallet.id === requestedId)
+      : detected.length === 1
+        ? detected[0]
+        : undefined;
+    if (!chosen) {
+      setPickerOpen(true);
+      return;
+    }
+    setPickerOpen(false);
+    setActiveSolanaWalletId(chosen.id);
     setWalletConnecting(true);
     setWalletError("");
     try {
-      const connected = await provider.connect();
-      const address = connected.publicKey.toBase58();
+      // Phantom resolves connect() with { publicKey }; others (Solflare and
+      // Backpack builds among them) resolve with void/true and expose the key
+      // on the provider itself, so read both before deciding this failed --
+      // otherwise a perfectly good wallet reads as "connection cancelled".
+      const connected = await chosen.provider.connect();
+      const publicKey = connected?.publicKey ?? chosen.provider.publicKey;
+      if (!publicKey) {
+        setWalletError(`${chosen.name} connected but didn't return an address. Unlock it and try again.`);
+        return;
+      }
+      const address = publicKey.toBase58();
       setWalletAddress(address);
-      provider.on?.("accountChanged", (publicKey) => {
+      chosen.provider.on?.("accountChanged", (publicKey) => {
         const next = publicKey?.toBase58() ?? "";
         setWalletAddress(next);
         setSessionWallet(null);
@@ -1066,15 +1110,26 @@ export function TendTerminal() {
         <div className="desktop-nav"><ProductNav active={activeTab} onChange={selectTab} /></div>
         <div className="header-actions">
           <div className="network-pill"><span /><strong>Solana</strong><small>Devnet · VSOL</small></div>
-          <button type="button" className={walletAddress ? "wallet-button connected" : "wallet-button"} onClick={connectWallet} aria-busy={walletConnecting || walletFunding}><Wallet size={16} aria-hidden="true" /> {walletConnecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}</button>
+          <button type="button" className={walletAddress ? "wallet-button connected" : "wallet-button"} onClick={() => { void connectWallet(); }} aria-busy={walletConnecting || walletFunding}><Wallet size={16} aria-hidden="true" /> {walletConnecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}</button>
           <button type="button" className="icon-button mobile-menu" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button>
         </div>
       </header>
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} providerDetected={providerDetected} walletBusy={walletConnecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} wallets={wallets} walletBusy={walletConnecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
+      {pickerOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setPickerOpen(false)}>
+          <div className="review-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-picker-title">
+            <button type="button" className="icon-button close" aria-label="Close wallet picker" onClick={() => setPickerOpen(false)}><X size={20} /></button>
+            <h2 id="wallet-picker-title">Choose a wallet</h2>
+            {(wallets ?? []).map((wallet) => (
+              <button key={wallet.id} type="button" className="button secondary full" onClick={() => { setPickerOpen(false); void connectWallet(wallet.id); }}>{wallet.name}</button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

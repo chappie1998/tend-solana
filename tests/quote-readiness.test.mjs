@@ -151,7 +151,7 @@ test("exports the documented auto-quote constants", async () => {
 
 // --- Source-level wiring checks (product.test.mjs style: regex over source) ---
 
-test("TendTerminal wires quote readiness, the auto-quote debounce, 401 session-expiry handling, and the Phantom install link", async () => {
+test("TendTerminal wires quote readiness, the auto-quote debounce, 401 session-expiry handling, and a wallet-agnostic install link", async () => {
   const terminal = await readFile(new URL("app/components/TendTerminal.tsx", root), "utf8");
   assert.match(terminal, /quoteReadiness/);
   assert.match(terminal, /quoteInputIssue/);
@@ -159,7 +159,7 @@ test("TendTerminal wires quote readiness, the auto-quote debounce, 401 session-e
   assert.match(terminal, /MAX_AUTO_REFRESHES/);
   assert.match(terminal, /onSessionExpired/);
   assert.match(terminal, /response\.status === 401/);
-  assert.match(terminal, /https:\/\/phantom\.com\/download/);
+  assert.match(terminal, /https:\/\/solana\.com\/wallets/);
 });
 
 // Regression: the expiry auto-refresh budget must be refilled ONLY by a manual
