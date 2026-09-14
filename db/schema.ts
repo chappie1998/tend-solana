@@ -101,7 +101,11 @@ export const rfqQuotes = pgTable(
     optionExpiryAt: timestamp("option_expiry_at", { mode: "date", withTimezone: true }).notNull().default(sql`to_timestamp(0)`),
     observationWindowSeconds: integer("observation_window_seconds").notNull().default(900),
     tradeLockSeconds: integer("trade_lock_seconds").notNull().default(300),
-    payoff: integer("payoff").notNull(),
+    // doublePrecision, not integer: the intraday ladder sells a 1.5x tier, and
+    // an integer column would silently round it to 2 (or reject the insert),
+    // recording a quote that was never priced. Every other numeric column on
+    // this table is already doublePrecision.
+    payoff: doublePrecision("payoff").notNull(),
     expiresAt: timestamp("expires_at", { mode: "date", withTimezone: true }).notNull(),
     consumedAt: timestamp("consumed_at", { mode: "date", withTimezone: true }),
     createdAt: timestamp("created_at", { mode: "date", withTimezone: true }).notNull(),

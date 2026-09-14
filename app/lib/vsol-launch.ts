@@ -32,7 +32,7 @@ import {
 } from "./launch-params";
 import type { ExpiryCode } from "./expiries";
 import { liveMarkets, strikeLadderStepFor, tradableMarketBySymbol } from "./markets";
-import { getPythSnapshot } from "./pyth-market-data";
+import { getMarketSnapshot } from "./market-data";
 
 export type LaunchKind = "create_market" | "create_pool" | "authorize_market";
 
@@ -71,12 +71,13 @@ export function launchSymbol(): string {
  */
 async function fetchLadderSpot(symbol: string): Promise<bigint> {
   // tradableMarketBySymbol, not a raw lookup: a coming-soon market has no
-  // entitled Pyth feed, so there is no spot to round into a ladder rung.
+  // usable feed on either provider, so there is no spot to round into a
+  // ladder rung.
   const market = tradableMarketBySymbol(symbol);
   if (!market) throw new Error(`${symbol} is not a tradable Tend market`);
-  const snapshot = await getPythSnapshot(market);
+  const snapshot = await getMarketSnapshot(market);
   if (!Number.isFinite(snapshot.price) || snapshot.price <= 0) {
-    throw new Error("Pyth has no usable spot price right now, so a strike cannot be chosen. Try again shortly.");
+    throw new Error("Market data has no usable spot price right now, so a strike cannot be chosen. Try again shortly.");
   }
   return BigInt(Math.round(snapshot.price * Number(PRICE_SCALE)));
 }

@@ -1,0 +1,1 @@
+ALTER TABLE "rfq_quotes" ALTER COLUMN "payoff" SET DATA TYPE double precision;

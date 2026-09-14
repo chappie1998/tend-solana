@@ -393,7 +393,21 @@ code, .tabular, .num {
 .economics .risk { color: var(--negative); }
 .economics-total { margin-top: 3px; padding-top: 6px !important; padding-bottom: 8px !important; border-top: 1px solid var(--border); }
 .economics-total span { color: var(--ink); font-weight: 500; }
-.economics-total strong { color: var(--positive); font-size: var(--t-base); }
+.economics-total strong { color: var(--positive); font-size: var(--t-base); display: inline-flex; align-items: baseline; gap: 7px; }
+/* The achieved multiple rides with the payout it describes, so the pair reads
+   as one fact ("$100, 3.3x your premium") rather than two competing numbers. */
+.economics-total strong small { color: var(--ink-3); font: 500 var(--t-micro) var(--sans); letter-spacing: 0.02em; }
+
+/* Pricing evidence: present, one click away, never ahead of the answer. */
+.econ-detail { padding: 0 !important; display: block !important; border-top: 1px solid var(--border); }
+.econ-detail > summary { padding: 6px 12px; cursor: pointer; list-style: none; color: var(--ink-3); font-size: var(--t-micro); font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase; }
+.econ-detail > summary::-webkit-details-marker { display: none; }
+.econ-detail > summary::after { content: "+"; float: right; font-size: var(--t-xs); }
+.econ-detail[open] > summary::after { content: "−"; }
+.econ-detail > summary:hover { color: var(--ink-2); }
+.econ-detail > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.econ-detail > div { padding: 3px 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 22px; }
+.econ-detail > div:last-child { padding-bottom: 8px; }
 
 /* Pending values occupy exactly the space the number will, so nothing
    reflows on arrival and nothing reads as broken or missing. */

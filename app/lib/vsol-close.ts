@@ -40,7 +40,7 @@ import {
   type DecodedPoolPosition,
 } from "./pool-position";
 import { marketBySymbol } from "./markets";
-import { getPythSnapshot } from "./pyth-market-data";
+import { getMarketRealizedVolatility, getMarketSnapshot } from "./market-data";
 import { buybackFor } from "./options";
 
 const CLOSE_POOL_POSITION_ACCOUNT_COUNT = 14;
@@ -148,11 +148,15 @@ export async function buildVsolCloseTransaction(params: {
 
   const marketDefinition = marketBySymbol(market.symbol);
   if (!marketDefinition) throw new Error(`No supported pricing feed is published for ${market.symbol || "this market"}.`);
-  // Only the spot price and its staleness matter here: `buybackFor` anchors
-  // time value to the premium already paid rather than re-deriving it from
-  // volatility (volatility is already priced into that premium by `quoteFor`
-  // at inception), so realized volatility is not needed for a close quote.
-  const snapshot = await getPythSnapshot(marketDefinition);
+  // Realized volatility IS needed here: `buybackFor` re-prices the spread
+  // with the same Black-Scholes model that sold it, at today's spot and the
+  // time actually left. The old formula anchored time value to the premium
+  // paid, which double-counted an in-the-money strike's intrinsic value and
+  // made a buy-then-close round trip profitable (see buybackFor's comment).
+  const [snapshot, volatility] = await Promise.all([
+    getMarketSnapshot(marketDefinition),
+    getMarketRealizedVolatility(marketDefinition),
+  ]);
 
   const priceDecimals = priceScaleDecimals(market.priceScale);
   const strikeFloat = atomsToNumber(position.strike, priceDecimals);
@@ -176,6 +180,7 @@ export async function buildVsolCloseTransaction(params: {
     premium: premiumFloat,
     minutesRemaining,
     originalMinutes,
+    volatility: volatility.value,
     referenceAgeSeconds: snapshot.ageSeconds,
   });
 

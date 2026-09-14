@@ -47,6 +47,19 @@ export type Market = {
   pythFeedId: string;
   /** Pyth's own symbol for `pythFeedId`. Empty exactly when that is. */
   pythSymbol: string;
+  /**
+   * The Coinbase Exchange product this market's off-chain spot/volatility/
+   * chart data reads from when MARKET_DATA_PROVIDER=coinbase (the default;
+   * see app/lib/market-data.ts) -- e.g. "SOL-USD". Settlement is unaffected:
+   * it always verifies Pyth, never Coinbase.
+   *
+   * EMPTY STRING means the same thing it does for `pythFeedId`: not "unset",
+   * but "no product exists for this market on Coinbase Exchange". Every
+   * coming-soon market carries an empty string here regardless of the reason
+   * its Pyth feed is blocked, because none of them (tokenized equities,
+   * SpaceX) trade on Coinbase's spot market at all.
+   */
+  coinbaseProductId: string;
   intradayEligible: boolean;
   status: MarketStatus;
   /**
@@ -102,6 +115,29 @@ export type Market = {
    * settlement source in principle.
    */
   statusTag: string;
+  /**
+   * Optional per-market pricing overrides -- infrastructure only, not a
+   * pricing-policy decision. Every market below leaves this undefined, which
+   * keeps quoted prices byte-identical to before this field existed (see
+   * the "per-market override defaults are inert" test in
+   * tests/market-pricing-overrides.test.mjs). Only the MECHANISM lives here;
+   * a real decision to price one market differently from another (its own
+   * volatility seed, markup, floor, ceiling, or jump calibration) is a
+   * pricing call for later, with real data behind it -- not something this
+   * field invents.
+   *
+   * - `makerEdgeBps`: overrides the global `MAKER_EDGE_BPS`
+   *   (app/lib/options.ts) for this market's quotes.
+   * - `volFloor` / `volCeil`: clamp bounds on the realized-vol reading
+   *   (annualized, as a percentage -- same units `getMarketRealizedVolatility`
+   *   already returns) before it reaches `quoteFor`. Undefined means "no
+   *   clamp", identical to current behavior.
+   */
+  pricingOverrides?: {
+    makerEdgeBps?: number;
+    volFloor?: number;
+    volCeil?: number;
+  };
 };
 
 // Ladder steps in dollars, converted once here so each market's entry reads
@@ -126,6 +162,8 @@ export const markets: Market[] = [
     // closures -- which is what Tend's 24/7 UTC expiry grid requires.
     pythFeedId: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     pythSymbol: "Crypto.SOL/USD",
+    // Verified live: GET /products/SOL-USD/ticker -> 200.
+    coinbaseProductId: "SOL-USD",
     intradayEligible: true,
     status: "live",
     // $2.50 at SOL ~$103.36 (measured 2026-09-05) is 2.4% -- mid-band.
@@ -146,6 +184,8 @@ export const markets: Market[] = [
     // live: 200), and 24/7 like every crypto spot feed.
     pythFeedId: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
     pythSymbol: "Crypto.BTC/USD",
+    // Verified live: GET /products/BTC-USD/ticker -> 200.
+    coinbaseProductId: "BTC-USD",
     intradayEligible: true,
     status: "live",
     // $2,000 at BTC ~$80,016 (measured 2026-09-05) is 2.50% -- mid-band, and
@@ -170,6 +210,8 @@ export const markets: Market[] = [
     // live: 200), and 24/7 like every crypto spot feed.
     pythFeedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     pythSymbol: "Crypto.ETH/USD",
+    // Verified live: GET /products/ETH-USD/ticker -> 200.
+    coinbaseProductId: "ETH-USD",
     intradayEligible: true,
     status: "live",
     // $50 at ETH ~$2,473.52 (measured 2026-09-05) is 2.02% -- the bottom of
@@ -212,6 +254,8 @@ export const markets: Market[] = [
     // required once the entitlement exists.
     pythFeedId: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f",
     pythSymbol: "Crypto.NVDAX/USD",
+    // Tokenized NVDA does not trade on Coinbase's spot market either.
+    coinbaseProductId: "",
     intradayEligible: true,
     status: "coming-soon",
     // Unused while this market is coming-soon (nothing lists a strike for
@@ -239,6 +283,8 @@ export const markets: Market[] = [
     // below carries none.
     pythFeedId: "b911b0329028cd0283e4259c33809d62942bd2716a58084e5f31d64c00b5424e",
     pythSymbol: "Crypto.GOOGLX/USD",
+    // Tokenized GOOGL does not trade on Coinbase's spot market either.
+    coinbaseProductId: "",
     intradayEligible: true,
     status: "coming-soon",
     // Unused while coming-soon; ~2.4% at GOOGL's ~$210 level, same as NVDA.
@@ -269,6 +315,8 @@ export const markets: Market[] = [
     // `status` alone, because there would still be no feed to settle on.
     pythFeedId: "",
     pythSymbol: "",
+    // No public market anywhere for SpaceX equity, Coinbase included.
+    coinbaseProductId: "",
     intradayEligible: false,
     status: "coming-soon",
     // No feed means no spot, so no ladder can be sized. The value is inert
@@ -326,6 +374,22 @@ export function pythFeedIdFor(symbol: string): string {
   if (!market) throw new Error(`No market metadata is configured for ${symbol}`);
   if (!market.pythFeedId) throw new Error(`${market.name} has no Pyth feed, so no series can bind to one.`);
   return market.pythFeedId;
+}
+
+/**
+ * Applies `market.pricingOverrides.volFloor`/`volCeil` to a realized-vol
+ * reading (same units as `getMarketRealizedVolatility`'s `.value`: annualized
+ * percentage, e.g. 32.3 for 32.3%). A market with no overrides (every market
+ * today) returns `volatility` unchanged -- this is a pass-through clamp, not
+ * a pricing decision, and inert until a market's `pricingOverrides` is
+ * actually set to something other than the default `undefined`.
+ */
+export function clampVolatilityForMarket(market: Pick<Market, "pricingOverrides">, volatility: number): number {
+  const { volFloor, volCeil } = market.pricingOverrides ?? {};
+  let clamped = volatility;
+  if (typeof volFloor === "number") clamped = Math.max(clamped, volFloor);
+  if (typeof volCeil === "number") clamped = Math.min(clamped, volCeil);
+  return clamped;
 }
 
 /**

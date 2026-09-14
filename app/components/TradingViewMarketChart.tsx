@@ -19,6 +19,12 @@ import {
   type MarketBar,
 } from "../lib/market-bars";
 
+// Widened, not a single literal: the off-chain reference this app shows can
+// come from either provider (see app/lib/market-data.ts), and `source` must
+// always name whichever one actually produced this snapshot -- never a
+// hardcoded label independent of what the API returned.
+export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes";
+
 export type MarketSnapshot = {
   price: number;
   confidence: number;
@@ -28,7 +34,7 @@ export type MarketSnapshot = {
   slot: number | null;
   ageSeconds: number;
   mode: "live" | "stale";
-  source: "Pyth Core Hermes";
+  source: MarketDataSource;
   warning: string;
 };
 
@@ -37,12 +43,19 @@ type ChartState = "loading" | "success" | "error";
 type MarketBarsPayload = {
   symbol: string;
   resolution: ChartResolution;
-  source: "Pyth Benchmarks";
+  source: "Coinbase Exchange" | "Pyth Benchmarks";
   freshness: "live" | "stale";
   bars: MarketBar[];
   asOf: number;
   lastBarTime: number;
 };
+
+/** Short, provider-accurate label for on-screen copy -- never a hardcoded provider name. */
+function shortSourceLabel(source: string | undefined): string {
+  if (source === "Pyth Core Hermes" || source === "Pyth Benchmarks") return "Pyth";
+  if (source === "Coinbase Exchange") return "Coinbase";
+  return "Market";
+}
 
 const resolutions: Array<{ value: ChartResolution; label: string }> = [
   { value: "1", label: "1m" },
@@ -174,7 +187,7 @@ export function TradingViewMarketChart({
           cache: "no-store",
         });
         const result = await response.json() as { snapshot?: MarketSnapshot; error?: string };
-        if (!response.ok || !result.snapshot) throw new Error(result.error ?? "Pyth market data is unavailable.");
+        if (!response.ok || !result.snapshot) throw new Error(result.error ?? "Market data is unavailable.");
         if (stopped) return;
         hasLoadedOnce = true;
         setSnapshot(result.snapshot);
@@ -190,8 +203,8 @@ export function TradingViewMarketChart({
           return;
         }
         const message = timedOut
-          ? "Pyth reference request timed out."
-          : error instanceof Error ? error.message : "Pyth market data is unavailable.";
+          ? "Market reference request timed out."
+          : error instanceof Error ? error.message : "Market data is unavailable.";
         setSnapshot(null);
         setSnapshotError(message);
         onSnapshot(null);
@@ -247,7 +260,7 @@ export function TradingViewMarketChart({
         });
         const result = await response.json() as Partial<MarketBarsPayload> & { error?: string };
         if (!response.ok || !Array.isArray(result.bars) || result.bars.length === 0) {
-          throw new Error(result.error ?? "Pyth returned no chart bars.");
+          throw new Error(result.error ?? "No chart bars were returned.");
         }
         if (stopped) return;
         hasLoadedOnce = true;
@@ -272,8 +285,8 @@ export function TradingViewMarketChart({
           return;
         }
         const message = timedOut
-          ? "Real Pyth chart data timed out."
-          : error instanceof Error ? error.message : "Real Pyth chart data is unavailable.";
+          ? "Real market chart data timed out."
+          : error instanceof Error ? error.message : "Real market chart data is unavailable.";
         setChartError(message);
         setState((current) => current === "success" ? current : "error");
         pollTimer = window.setTimeout(loadBars, 30_000);
@@ -446,21 +459,22 @@ export function TradingViewMarketChart({
   };
 
   const refreshFailed = state === "success" && chartError.length > 0;
+  const sourceLabel = shortSourceLabel(snapshot?.source ?? barsMeta?.source);
   const sourceStatus = refreshFailed
     ? "Chart refresh delayed"
     : snapshot?.mode === "live"
-    ? "Pyth live"
+    ? `${sourceLabel} live`
     : snapshot?.mode === "stale"
-      ? "Pyth stale"
-      : "Checking Pyth";
+      ? `${sourceLabel} stale`
+      : `Checking ${sourceLabel}`;
   const sourceMode = refreshFailed ? "stale" : snapshot?.mode ?? "loading";
 
   return (
-    <section className="tv-chart" aria-label={`${ticker} real Pyth market chart`}>
+    <section className="tv-chart" aria-label={`${ticker} real market chart`}>
       <div className="chart-toolbar">
         <div>
-          <strong>Pyth market chart</strong>
-          <span>Pyth Benchmarks OHLC in New York market time, rendered locally with TradingView Lightweight Charts.</span>
+          <strong>Market chart</strong>
+          <span>{barsMeta?.source ?? "Market"} OHLC in New York market time, rendered locally with TradingView Lightweight Charts.</span>
         </div>
         <div className="resolution-picker" role="group" aria-label="Chart interval">
           {resolutions.map((item) => <button type="button" key={item.value} className={resolution === item.value ? "active" : ""} aria-pressed={resolution === item.value} onClick={() => selectResolution(item.value)}>{item.label}</button>)}
@@ -468,16 +482,16 @@ export function TradingViewMarketChart({
       </div>
       {target !== null && <div className={`chart-target ${direction}`}><span>RFQ strike</span><strong>${target.toFixed(2)}</strong></div>}
       <div className="chart-canvas-wrap">
-        {state === "loading" && <div className="chart-state" role="status"><LoaderCircle className="spin" size={20} aria-hidden="true" /><strong>Loading real Pyth bars</strong><span>Fetching verified market history from Tend’s first-party API…</span></div>}
+        {state === "loading" && <div className="chart-state" role="status"><LoaderCircle className="spin" size={20} aria-hidden="true" /><strong>Loading real market bars</strong><span>Fetching verified market history from Tend’s first-party API…</span></div>}
         {state === "error" && <div className="chart-state error" role="alert"><AlertTriangle size={20} aria-hidden="true" /><strong>Couldn’t load real market bars</strong><span>{chartError}</span><button type="button" className="button secondary" onClick={retry}><RefreshCw size={14} aria-hidden="true" /> Retry</button></div>}
         <div ref={containerRef} className={state === "success" ? "chart-canvas visible" : "chart-canvas"} />
       </div>
       <div className="chart-source" aria-live="polite">
         <span className={`data-mode ${sourceMode}`}>{sourceStatus}</span>
-        <span>{snapshot ? `Pyth ${snapshot.price.toFixed(2)} ± ${snapshot.confidence.toFixed(4)} · ${snapshot.ageSeconds}s old` : snapshotError || "Pyth reference pending"}</span>
+        <span>{snapshot ? `${sourceLabel} ${snapshot.price.toFixed(2)} ± ${snapshot.confidence.toFixed(4)} · ${snapshot.ageSeconds}s old` : snapshotError || "Market reference pending"}</span>
         <span>{refreshFailed
-          ? `${chartError} Last good Pyth bar remains displayed.`
-          : barsMeta ? `${barsMeta.source} · ${bars.length.toLocaleString()} real bars · no simulated candles` : "Chart history is served by Pyth Benchmarks."}</span>
+          ? `${chartError} Last good bar remains displayed.`
+          : barsMeta ? `${barsMeta.source} · ${bars.length.toLocaleString()} real bars · no simulated candles` : "Chart history loads from the configured market-data provider."}</span>
         {refreshFailed && <button type="button" className="chart-source-retry" onClick={retry}><RefreshCw size={12} aria-hidden="true" /> Retry</button>}
         <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView</a>
       </div>

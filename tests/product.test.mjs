@@ -19,7 +19,11 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
-  assert.match(terminal, /signSerializedSolanaTransaction/);
+  // Wallet connection + signing go through the Privy-backed bridge (see
+  // app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper this
+  // used to call directly -- that helper is kept only for
+  // tests/vsol-versioned-fill.test.mjs's legacy/v0 round-trip coverage.
+  assert.match(terminal, /bridge\.signTransactionBase64/);
   assert.match(walletHelper, /signTransaction/);
   assert.doesNotMatch(terminal, /"Devnet confirmed"/);
   assert.match(chart, /lightweight-charts/);
@@ -28,7 +32,7 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(chart, /\/api\/market-bars/);
   assert.match(chart, /Charts by TradingView/);
   assert.doesNotMatch(chart, /embed-widget-advanced-chart|document\.createElement\("script"\)|<iframe|DEMO DATA|demoCandles/i);
-  assert.match(chartRoute, /getPythMarketBars/);
+  assert.match(chartRoute, /getMarketBars/);
   // Pyth RETIRED the Benchmarks TradingView shim in the 2026-08-26 Core
   // upgrade; it now 404s. This assertion used to pin that dead URL, i.e. it
   // asserted the bug. Pin the live endpoint instead, and assert the retired
@@ -461,7 +465,7 @@ test("liquidity page uses real V2 pool state, wallet signatures, persisted simul
   ]);
   assert.match(terminal, /<EarnView walletAddress=/);
   assert.match(earn, /no invented APY/i);
-  assert.match(earn, /signSerializedSolanaTransaction/);
+  assert.match(earn, /bridge\.signTransactionBase64/);
   assert.match(earn, /\/api\/vsol\/liquidity\/prepare/);
   assert.match(server, /deposit_liquidity/);
   assert.match(server, /withdraw_liquidity/);
@@ -489,7 +493,7 @@ test("market-data stays real and the verified deployment remains fail-closed on 
     readFile(new URL("vsol/scripts/bootstrap.ts", root), "utf8"),
     readFile(new URL("vsol/scripts/verify-deployment.ts", root), "utf8"),
   ]);
-  assert.match(marketData, /getPythSnapshot/);
+  assert.match(marketData, /getMarketSnapshot/);
   assert.match(pythData, /Pyth Core Hermes/);
   assert.match(pythData, /historical coverage is insufficient/);
   assert.doesNotMatch(marketData, /demo|simulat/i);
@@ -516,4 +520,20 @@ test("maker pricing remains bounded under extreme real volatility inputs", async
   assert.ok(quotes.every((quote) => quote.premium >= 1 && quote.premium <= quote.maxPayout * 0.95));
   assert.ok(quotes[0].premium > quotes[1].premium && quotes[1].premium > quotes[2].premium);
   assert.equal(definedRiskPayout({ direction: "up", settlement: quotes[0].cap + 100, strike: quotes[0].strike, cap: quotes[0].cap, maxPayout: 1_000 }), 1_000);
+});
+
+test("the quote route validates the payoff tier against the tenor's OWN ladder, not a fixed [2,5,10] list", async () => {
+  const [quotesRoute, options] = await Promise.all([
+    readFile(new URL("app/api/quotes/route.ts", root), "utf8"),
+    import(new URL("app/lib/options.ts", root)),
+  ]);
+  // The route resolves the ACTUAL onchain duration before it can know which
+  // tiers are for sale (payoffTiersFor(durationMinutes)) -- so it must
+  // import and call payoffTiersFor, and must NOT hardcode the old
+  // [2, 5, 10] list anywhere (it used to, in two places: the stake-bounds
+  // fallback and the strict tier check).
+  assert.match(quotesRoute, /payoffTiersFor/);
+  assert.doesNotMatch(quotesRoute, /\[2,\s*5,\s*10\]/);
+  assert.deepEqual(options.payoffTiersFor(15), [2, 3, 6]);
+  assert.deepEqual(options.payoffTiersFor(1_440), [2, 5, 10]);
 });

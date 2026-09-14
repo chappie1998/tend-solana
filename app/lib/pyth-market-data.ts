@@ -1,4 +1,5 @@
 import type { Market } from "./markets.ts";
+import type { MarketSnapshot, RealizedVolatility } from "./market-data-types.ts";
 import { getPythMarketBars } from "./pyth-market-bars.ts";
 import { runtimeEnv } from "./runtime-env.ts";
 
@@ -18,25 +19,11 @@ type HermesParsedPrice = {
 
 type HermesResponse = { parsed?: HermesParsedPrice[] };
 
-export type PythMarketSnapshot = {
-  price: number;
-  confidence: number;
-  confidenceBps: number;
-  exponent: number;
-  publishTime: number;
-  slot: number | null;
-  ageSeconds: number;
-  mode: "live" | "stale";
-  source: "Pyth Core Hermes";
-  warning: string;
-};
-
-export type RealizedVolatility = {
-  value: number;
-  observations: number;
-  source: "Pyth Benchmarks 20-session realized volatility";
-  asOf: number;
-};
+// Re-exported under its historical name: this file's own callers (and tests
+// that import it directly) still spell it PythMarketSnapshot. The shape
+// itself now lives in market-data-types.ts, shared with the Coinbase path.
+export type PythMarketSnapshot = MarketSnapshot;
+export type { RealizedVolatility };
 
 const PYTH_AUTH_REQUIRED_AT = Date.UTC(2026, 6, 31);
 const HERMES_TIMEOUT_MS = 8_000;

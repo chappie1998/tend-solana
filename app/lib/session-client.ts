@@ -4,7 +4,6 @@
 // server sets an HTTP-only session cookie on success; this module never
 // touches the cookie directly.
 
-import { signSolanaMessage } from "./solana-wallet";
 import { buildSiwsMessage } from "./siws";
 
 export type WalletSessionResult =
@@ -23,7 +22,20 @@ export async function fetchSessionWallet(): Promise<string | null> {
   }
 }
 
-export async function establishWalletSession(walletAddress: string): Promise<WalletSessionResult> {
+// The default when no signer is supplied: no wallet is available to sign, so
+// this degrades exactly the way the pre-Privy signSolanaMessage did when it
+// had no usable provider -- return null (unsupported), never throw. In
+// practice every real call site (TendTerminal) always passes the wallet
+// bridge's signMessageBase64 explicitly; this default only keeps the
+// single-argument call shape working.
+async function noWalletSignMessage(): Promise<string | null> {
+  return null;
+}
+
+export async function establishWalletSession(
+  walletAddress: string,
+  signMessage: (message: string) => Promise<string | null> = noWalletSignMessage,
+): Promise<WalletSessionResult> {
   const existing = await fetchSessionWallet();
   if (existing === walletAddress) return { status: "active", wallet: walletAddress };
 
@@ -48,7 +60,7 @@ export async function establishWalletSession(walletAddress: string): Promise<Wal
 
   let signature: string | null;
   try {
-    signature = await signSolanaMessage(message);
+    signature = await signMessage(message);
   } catch (error) {
     return { status: "failed", reason: error instanceof Error ? error.message : "The wallet did not sign the message." };
   }

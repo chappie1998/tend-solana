@@ -11,7 +11,7 @@ import {
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../lib/expiries";
 import { liveMarkets } from "../lib/markets";
-import { signSerializedSolanaTransaction } from "../lib/solana-wallet";
+import { useWalletBridge } from "../lib/wallet-bridge";
 import { solanaExplorerUrl } from "../lib/vsol";
 
 // Mirrors app/lib/vsol-launch.ts's launchSymbol(): Launch has no symbol
@@ -33,7 +33,7 @@ type SeriesOption = {
   verified: boolean;
 };
 
-async function runLaunchFlow(payload: Record<string, unknown>) {
+async function runLaunchFlow(payload: Record<string, unknown>, signTransactionBase64: (encoded: string) => Promise<string>) {
   const prepareResponse = await fetch("/api/vsol/launch/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -43,7 +43,7 @@ async function runLaunchFlow(payload: Record<string, unknown>) {
   if (!prepareResponse.ok || !prepared.intentId || !prepared.transaction) {
     throw new Error(prepared.error ?? "The launch transaction could not be prepared.");
   }
-  const signedTransaction = await signSerializedSolanaTransaction(prepared.transaction);
+  const signedTransaction = await signTransactionBase64(prepared.transaction);
   const sendResponse = await fetch("/api/vsol/launch/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -57,6 +57,7 @@ async function runLaunchFlow(payload: Record<string, unknown>) {
 }
 
 export function LaunchView({ walletAddress, onConnect }: { walletAddress: string; onConnect: () => void | Promise<void> }) {
+  const bridge = useWalletBridge();
   const [expiry, setExpiry] = useState<ExpiryCode>("30D");
   const [quoteAuthority, setQuoteAuthority] = useState("");
   const [maxUtilizationBps, setMaxUtilizationBps] = useState("8000");
@@ -126,7 +127,7 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
     setErrors((current) => ({ ...current, [panel]: undefined }));
     try {
       if (panel === "series") {
-        const { sent } = await runLaunchFlow({ walletAddress, kind: "create_market", expiryCode: expiry });
+        const { sent } = await runLaunchFlow({ walletAddress, kind: "create_market", expiryCode: expiry }, bridge.signTransactionBase64);
         setReceipts((current) => [{ kind: "Series created", signature: sent.signature!, targetAddress: sent.targetAddress!, label: `${launchTicker} ${expiry}` }, ...current]);
       } else if (panel === "pool") {
         const { sent } = await runLaunchFlow({
@@ -135,7 +136,7 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
           quoteAuthority: quoteAuthority.trim() || walletAddress,
           maxUtilizationBps: Number(maxUtilizationBps),
           maxPositionBps: Number(maxPositionBps),
-        });
+        }, bridge.signTransactionBase64);
         setPoolAddress(sent.targetAddress!);
         setReceipts((current) => [{ kind: "Pool created", signature: sent.signature!, targetAddress: sent.targetAddress!, label: "You are the manager" }, ...current]);
       } else {
@@ -145,7 +146,7 @@ export function LaunchView({ walletAddress, onConnect }: { walletAddress: string
           kind: "authorize_market",
           poolAddress: poolAddress.trim(),
           marketAddress: seriesMarket,
-        });
+        }, bridge.signTransactionBase64);
         setReceipts((current) => [{ kind: "Series authorized", signature: sent.signature!, targetAddress: sent.targetAddress!, label: "Pool ↔ series binding" }, ...current]);
       }
       await loadSeriesOptions();

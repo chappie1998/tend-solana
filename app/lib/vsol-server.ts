@@ -319,7 +319,7 @@ type DecodedPool = {
   totalAssets: bigint;
 };
 
-type PoolCore = {
+export type PoolCore = {
   config: ReturnType<typeof decodeConfigAccount>;
   pool: DecodedPool;
   poolAssets: bigint;
@@ -606,7 +606,7 @@ function manifestPoolId() {
   return Buffer.from(VSOL_LIQUIDITY.id, "hex");
 }
 
-async function getPoolCore(connection: Connection): Promise<PoolCore> {
+export async function getPoolCore(connection: Connection = getVsolConnection()): Promise<PoolCore> {
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
   const [programAccount, configAccount, poolAccount, mint, poolToken] = await Promise.all([
     connection.getAccountInfo(VSOL_PROGRAM_ID, "confirmed"),
@@ -1231,6 +1231,124 @@ async function listVsolSeriesOnChain(series: VsolSeries, connection: Connection)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pool-depth pre-check -- mirrors fill_pool_quote's on-chain solvency gate
+// (vsol/programs/vsol/src/lib.rs, using calculate_bps_limit from math.rs)
+// EXACTLY: same total_collateral derivation, same bps-limit rounding, same
+// three requires in the same order. A quote checkVsolPoolDepth accepts can
+// never revert on chain for exceeding pool depth, and a quote it rejects
+// would always revert on chain -- so app/api/quotes/route.ts can reject it
+// here, before spending a listing transaction or building/signing anything,
+// with zero risk of disagreeing with the program at a rounding boundary.
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts a human USD amount (e.g. quoteFor's `maxPayout`/`premium`, in
+ * dollars) to atoms at the pool's on-chain token scale, rounding to the
+ * nearest atom -- the exact conversion `buildVsolQuoteTransaction` applies to
+ * `maxPayout` before encoding it on chain, centralized here so a pre-check
+ * converts identically to what the fill transaction actually encodes.
+ */
+export function toPoolAtoms(humanAmount: number): bigint {
+  return BigInt(Math.round(humanAmount * Number(TOKEN_SCALE)));
+}
+
+/** The inverse of `toPoolAtoms`, for turning an atom-denominated limit back into a human USD number to display. */
+export function fromPoolAtoms(atoms: bigint): number {
+  return Number(atoms) / Number(TOKEN_SCALE);
+}
+
+/**
+ * Mirrors `calculate_bps_limit` in vsol/programs/vsol/src/math.rs exactly:
+ * `floor(amount * bps / 10_000)`, computed with a bigint intermediate (the
+ * program's `u128` `checked_mul`/`checked_div`) so the two can never disagree
+ * at a rounding boundary.
+ */
+export function calculateBpsLimit(amount: bigint, bps: number): bigint {
+  if (amount < 0n) throw new RangeError("amount must be non-negative");
+  if (!Number.isInteger(bps) || bps < 0) throw new RangeError("bps must be a non-negative integer");
+  return (amount * BigInt(bps)) / 10_000n;
+}
+
+export type VsolPoolDepthCheck =
+  | { ok: true; utilizationLimitAtoms: bigint; positionLimitAtoms: bigint }
+  | {
+      ok: false;
+      reason: "utilization" | "position" | "insufficient_writer_liquidity";
+      message: string;
+      /** The largest single-position payout (in atoms) that would clear every on-chain check right now -- 0n if the pool cannot currently underwrite any position at all. */
+      maxFittingPayoutAtoms: bigint;
+      utilizationLimitAtoms: bigint;
+      positionLimitAtoms: bigint;
+    };
+
+/**
+ * Pre-checks a candidate `maxPayoutAtoms` against the SAME utilization,
+ * per-position, and available-liquidity limits `fill_pool_quote` enforces on
+ * chain (vsol/programs/vsol/src/lib.rs lines computing `total_collateral`,
+ * `utilization_limit`, `position_limit`, `locked_after`), in the SAME order:
+ * utilization first, then per-position, then available writer liquidity.
+ */
+export function checkVsolPoolDepth(
+  pool: {
+    poolAssetsAtoms: bigint;
+    lockedCollateralAtoms: bigint;
+    maxUtilizationBps: number;
+    maxPositionBps: number;
+  },
+  maxPayoutAtoms: bigint,
+): VsolPoolDepthCheck {
+  const totalCollateral = pool.poolAssetsAtoms + pool.lockedCollateralAtoms;
+  const utilizationLimitAtoms = calculateBpsLimit(totalCollateral, pool.maxUtilizationBps);
+  const positionLimitAtoms = calculateBpsLimit(totalCollateral, pool.maxPositionBps);
+
+  // The largest single position that would satisfy ALL THREE requires right
+  // now: the remaining utilization headroom, the flat per-position cap, and
+  // the pool's actual available (unlocked) collateral -- whichever binds
+  // tightest. Reported to the buyer as "the max stake that would fit"
+  // (app/api/quotes/route.ts converts atoms -> a suggested stake), mirroring
+  // Split's "declining to promise a payout it cannot fund; take a smaller
+  // size, or a lower multiple."
+  const utilizationHeadroomAtoms = pool.lockedCollateralAtoms >= utilizationLimitAtoms
+    ? 0n
+    : utilizationLimitAtoms - pool.lockedCollateralAtoms;
+  const maxFittingPayoutAtoms = [utilizationHeadroomAtoms, positionLimitAtoms, pool.poolAssetsAtoms]
+    .reduce((min, value) => (value < min ? value : min));
+
+  const lockedAfter = pool.lockedCollateralAtoms + maxPayoutAtoms;
+  if (lockedAfter > utilizationLimitAtoms) {
+    return {
+      ok: false,
+      reason: "utilization",
+      message: "This payout would push the pool's locked collateral past its utilization limit.",
+      maxFittingPayoutAtoms,
+      utilizationLimitAtoms,
+      positionLimitAtoms,
+    };
+  }
+  if (maxPayoutAtoms > positionLimitAtoms) {
+    return {
+      ok: false,
+      reason: "position",
+      message: "This payout exceeds the pool's per-position risk limit.",
+      maxFittingPayoutAtoms,
+      utilizationLimitAtoms,
+      positionLimitAtoms,
+    };
+  }
+  if (maxPayoutAtoms > pool.poolAssetsAtoms) {
+    return {
+      ok: false,
+      reason: "insufficient_writer_liquidity",
+      message: "The pool does not have enough available (unlocked) collateral to underwrite this payout.",
+      maxFittingPayoutAtoms,
+      utilizationLimitAtoms,
+      positionLimitAtoms,
+    };
+  }
+  return { ok: true, utilizationLimitAtoms, positionLimitAtoms };
+}
+
 export async function buildVsolQuoteTransaction(params: {
   buyer: PublicKey;
   series?: VsolSeries;
@@ -1239,6 +1357,13 @@ export async function buildVsolQuoteTransaction(params: {
   cap: number;
   premium: number;
   maxPayout: number;
+  /**
+   * A pool snapshot already fetched by a caller (e.g. app/api/quotes/route.ts's
+   * pool-depth pre-check via `getPoolCore`/`checkVsolPoolDepth`), reused here
+   * instead of fetching it again. Omit to have this function fetch it itself,
+   * as before.
+   */
+  poolCore?: PoolCore;
 }) {
   if (!VSOL_PYTH_UPGRADE_DEPLOYED) throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
@@ -1257,7 +1382,7 @@ export async function buildVsolQuoteTransaction(params: {
   await listVsolSeriesOnChain(series, connection);
 
   const [core, seriesState] = await Promise.all([
-    getPoolCore(connection),
+    params.poolCore ?? getPoolCore(connection),
     getVsolSeriesStateOrPlan(series, connection),
   ]);
   if (!seriesState.available) throw new Error(seriesState.availabilityReason);
@@ -1279,15 +1404,24 @@ export async function buildVsolQuoteTransaction(params: {
   const quoteExpiry = BigInt(Math.min(now + 30, seriesState.lastTradeAt, seriesState.expiry - 1));
   if (quoteExpiry <= BigInt(now + 5)) throw new Error("The current devnet series is too close to its trade cutoff");
 
-  const maxPayout = BigInt(Math.round(params.maxPayout * Number(TOKEN_SCALE)));
+  const maxPayout = toPoolAtoms(params.maxPayout);
   const premium = BigInt(Math.max(1, Math.ceil(params.premium * Number(TOKEN_SCALE))));
   if (buyerToken.amount < premium) throw new Error("The wallet does not have enough devnet tUSDC for this premium");
-  const totalCollateral = core.poolAssets + core.pool.lockedCollateral;
-  const utilizationLimit = totalCollateral * BigInt(core.pool.maxUtilizationBps) / 10_000n;
-  const positionLimit = totalCollateral * BigInt(core.pool.maxPositionBps) / 10_000n;
-  if (maxPayout > core.poolAssets) throw new Error("The V2 pool has insufficient available collateral");
-  if (maxPayout > positionLimit) throw new Error("The quote exceeds the V2 pool per-position risk limit");
-  if (core.pool.lockedCollateral + maxPayout > utilizationLimit) throw new Error("The quote exceeds the V2 pool utilization limit");
+  // Same check app/api/quotes/route.ts already ran before this function was
+  // even called (see checkVsolPoolDepth's doc comment) -- repeated here, not
+  // trusted from the caller, because `poolCore` can be a few milliseconds
+  // stale by the time this transaction is actually built, and this is the
+  // last chance to fail closed before signing anything.
+  const depthCheck = checkVsolPoolDepth(
+    {
+      poolAssetsAtoms: core.poolAssets,
+      lockedCollateralAtoms: core.pool.lockedCollateral,
+      maxUtilizationBps: core.pool.maxUtilizationBps,
+      maxPositionBps: core.pool.maxPositionBps,
+    },
+    maxPayout,
+  );
+  if (!depthCheck.ok) throw new Error(depthCheck.message);
 
   const quote: Quote = {
     nonce: randomNonce(),
