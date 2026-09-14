@@ -3,12 +3,12 @@
 import { Transaction, VersionedTransaction } from "@solana/web3.js";
 import type { SolanaWalletProvider } from "./vsol";
 
-// Wallet connection and signing now go through Privy (see
-// app/lib/wallet-bridge.tsx and app/providers.tsx) instead of the hand-rolled
-// injected-wallet detection this file used to own. What survives here is the
-// base64/transaction plumbing that both the bridge and the pre-Privy test
-// suite (tests/vsol-versioned-fill.test.mjs, tests/product.test.mjs) still
-// depend on.
+// Wallet connection and signing now go through the standard Solana
+// wallet-adapter stack (see app/lib/wallet-bridge.tsx and app/providers.tsx)
+// instead of the hand-rolled injected-wallet detection this file used to
+// own. What survives here is the base64/transaction plumbing that both the
+// bridge and the original test suite (tests/vsol-versioned-fill.test.mjs,
+// tests/product.test.mjs) still depend on.
 
 export function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
@@ -22,9 +22,9 @@ export function base64ToBytes(encoded: string): Uint8Array {
 
 /**
  * Deserializes base64 transaction bytes as either a legacy Transaction or a
- * v0 VersionedTransaction (every Solana wallet this app supports -- Privy's
- * embedded wallet and every external wallet its modal connects -- can sign
- * both). VersionedTransaction.deserialize understands both wire formats (it
+ * v0 VersionedTransaction (every Solana wallet this app supports -- every
+ * external wallet our picker modal connects -- can sign both).
+ * VersionedTransaction.deserialize understands both wire formats (it
  * reads the version prefix inside the message itself), so this is a cheap,
  * side-effect-free probe: try it first, and fall back to the plain legacy
  * parser only if that probe throws.
@@ -44,7 +44,8 @@ export function deserializeSolanaTransaction(bytes: Uint8Array): Transaction | V
  * returns the signed transaction, also base64-encoded. Kept for
  * tests/vsol-versioned-fill.test.mjs's direct legacy/v0 round-trip coverage;
  * app code signs through app/lib/wallet-bridge.tsx's signTransactionBase64
- * instead, which talks to Privy directly rather than this provider shape.
+ * instead, which talks to the wallet adapter directly rather than this
+ * provider shape.
  */
 export async function signSerializedSolanaTransaction(encoded: string, provider: SolanaWalletProvider) {
   if (!provider) throw new Error("Solana wallet unavailable");

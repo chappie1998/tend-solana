@@ -23,8 +23,8 @@ export async function fetchSessionWallet(): Promise<string | null> {
 }
 
 // The default when no signer is supplied: no wallet is available to sign, so
-// this degrades exactly the way the pre-Privy signSolanaMessage did when it
-// had no usable provider -- return null (unsupported), never throw. In
+// this degrades exactly the way the original signSolanaMessage helper did
+// when it had no usable provider -- return null (unsupported), never throw. In
 // practice every real call site (TendTerminal) always passes the wallet
 // bridge's signMessageBase64 explicitly; this default only keeps the
 // single-argument call shape working.

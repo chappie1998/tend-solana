@@ -1911,11 +1911,15 @@ export async function resolveSignedVsolFillTransaction(
   } catch {
     return null;
   }
-  if (versioned.message.version === "legacy") return null;
-  // Narrowed (not merely asserted): the check above already ruled out
-  // "legacy", so this is exactly the MessageV0 branch of the VersionedMessage
-  // union -- kept as a local so every access below resolves against the same
-  // narrowed type.
+  // A positive "is v0" check, not "is not legacy": web3.js 1.99 added
+  // MessageV1 to the VersionedMessage union, so ruling out "legacy" alone no
+  // longer narrows to MessageV0. Demanding version 0 keeps this fail-closed --
+  // v0 is the only versioned shape composeVsolFillTransaction ever produces --
+  // and rejects the v1 layout outright rather than verifying signatures
+  // against a message format this path has never been audited against.
+  if (versioned.message.version !== 0) return null;
+  // Narrowed (not merely asserted) by the check above, and kept as a local so
+  // every access below resolves against the same narrowed type.
   const message: MessageV0 = versioned.message;
   if (!verifyVersionedVsolSignatures(versioned)) return null;
 

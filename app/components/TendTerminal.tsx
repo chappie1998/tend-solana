@@ -559,11 +559,11 @@ function TradeView({
     : [];
   const defaultPool = authorizedPools.find((pool) => pool.quotable) ?? authorizedPools[0] ?? null;
   const activePool = authorizedPools.find((pool) => pool.address === selectedPool) ?? defaultPool;
-  // `bridge.ready` is false until Privy finishes initialising -- that's the
-  // same "not checked yet" state quoteReadiness expects. Once ready,
-  // `providerDetected` reflects whether wallet sign-in is configured at all
-  // (bridge.configured), not whether a specific wallet extension exists --
-  // Privy's modal offers email sign-in too.
+  // `bridge.ready` is false until the wallet adapter has mounted client-side
+  // -- that's the same "not checked yet" state quoteReadiness expects. Once
+  // ready, `providerDetected` reflects whether any wallet-standard Solana
+  // wallet was actually found in this browser (bridge.configured) -- there
+  // is no email fallback now, external wallets only.
   const providerDetected = !bridge.ready ? null : bridge.configured;
   const readiness = quoteReadiness({ providerDetected, walletAddress, walletBusy, sessionWallet, sessionNotice });
   const inputIssue = quoteInputIssue({
@@ -1173,10 +1173,10 @@ export function TendTerminal() {
   const onSessionExpired = useCallback(() => setSessionWallet(null), []);
 
   // The accountChanged-equivalent behaviour: bridge.address is a reactive
-  // value (Privy owns the connection), so this effect -- not a provider
-  // event listener -- is what now reacts to a fresh connect, a switched
-  // account, or a disconnect. Session state always resets and re-attempts
-  // silent SIWS (or ends the session for a disconnect); the devnet faucet
+  // value (the wallet adapter owns the connection), so this effect -- not a
+  // provider event listener -- is what now reacts to a fresh connect, a
+  // switched account, or a disconnect. Session state always resets and
+  // re-attempts silent SIWS (or ends the session for a disconnect); the devnet faucet
   // claim runs only on the "" -> address transition, i.e. an actual new
   // connection, exactly as connectWallet() used to trigger it once.
   const previousWalletAddressRef = useRef(walletAddress);
@@ -1204,9 +1204,10 @@ export function TendTerminal() {
     });
   }, [walletAddress, signInWithWallet]);
 
-  // Opening Privy's modal is all this does: the modal reports its own errors,
-  // and dismissing it is not a failure worth a banner. The app reacts to the
-  // outcome through bridge.address (the effect above) and bridge.connecting.
+  // Opening our own wallet picker modal is all this does: the picker (and
+  // the adapter it connects) report their own errors, and dismissing it is
+  // not a failure worth a banner. The app reacts to the outcome through
+  // bridge.address (the effect above) and bridge.connecting.
   const connectWallet = useCallback(async () => {
     setWalletError("");
     await bridge.connect();

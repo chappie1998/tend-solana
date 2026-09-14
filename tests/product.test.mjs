@@ -19,9 +19,9 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
-  // Wallet connection + signing go through the Privy-backed bridge (see
-  // app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper this
-  // used to call directly -- that helper is kept only for
+  // Wallet connection + signing go through the wallet-adapter-backed bridge
+  // (see app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper
+  // this used to call directly -- that helper is kept only for
   // tests/vsol-versioned-fill.test.mjs's legacy/v0 round-trip coverage.
   assert.match(terminal, /bridge\.signTransactionBase64/);
   assert.match(walletHelper, /signTransaction/);

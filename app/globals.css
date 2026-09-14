@@ -179,6 +179,18 @@ code, .tabular, .num {
 .wallet-error button { width: 26px; height: 26px; border: 0; border-radius: var(--r-control); display: inline-grid; place-items: center; color: var(--negative); background: transparent; cursor: pointer; }
 .wallet-error button:hover { background: color-mix(in srgb, var(--negative) 16%, transparent); }
 
+/* Wallet picker — our own "choose a wallet" modal, built on the same
+   .review-modal chrome as every other dialog in the app (see rule 3 at the
+   top of this file: the modal is the one shadowed surface). */
+.wallet-picker-list { margin-top: 12px; display: flex; flex-direction: column; gap: 4px; }
+.wallet-picker-option { min-height: 44px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-control); display: flex; align-items: center; gap: 10px; background: var(--surface-2); color: var(--ink); font-size: var(--t-sm); font-weight: 500; cursor: pointer; transition: border-color 120ms ease, background-color 120ms ease; }
+.wallet-picker-option:hover { border-color: var(--border-strong); background: var(--surface-3); }
+.wallet-picker-option img { width: 24px; height: 24px; border-radius: var(--r-panel); flex: 0 0 auto; }
+.wallet-picker-empty p { color: var(--ink-2); font-size: var(--t-xs); line-height: 1.55; }
+.wallet-picker-empty .wallet-picker-list { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+.wallet-picker-empty .wallet-picker-list a { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-control); display: inline-flex; align-items: center; color: var(--ink-2); font-size: var(--t-xs); font-weight: 500; }
+.wallet-picker-empty .wallet-picker-list a:hover { color: var(--ink); border-color: var(--border-strong); background: var(--surface-2); }
+
 /* ---------------------------------------------------------------------
    Trade layout — the chart column is the page. The ticket is a fixed
    narrow rail beside it, denser than the chart column by design.

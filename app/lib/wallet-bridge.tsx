@@ -1,17 +1,18 @@
 "use client";
 
 // The single interface every component in this app uses to connect a
-// Solana wallet and sign with it. Privy lives entirely behind this file: its
-// modal handles both external wallets (Phantom, Solflare, Backpack, ...) and
-// email login with an embedded Solana wallet, so a visitor with no wallet
-// extension can still trade the devnet demo.
+// Solana wallet and sign with it. The standard wallet-adapter stack
+// (@solana/wallet-adapter-react) lives entirely behind this file: our own
+// picker modal (app/components/WalletPicker.tsx) lists whatever
+// wallet-standard wallets the browser has (Phantom, Solflare, Backpack,
+// ...) and connects to the one the visitor chooses. External wallets only --
+// no email login, no embedded wallet.
 //
-// The Privy-calling implementation (PrivyWalletBridge below) is mounted only
-// inside <PrivyProvider> -- see app/providers.tsx, which renders it when
-// NEXT_PUBLIC_PRIVY_APP_ID is configured and omits it (and PrivyProvider)
-// entirely otherwise. useWalletBridge() itself only ever calls useContext,
-// which is safe with no provider above it, so a missing app id can never
-// crash the page -- it just reports `configured: false`.
+// The wallet-adapter-calling implementation (WalletAdapterBridge below) is
+// mounted only inside <WalletProvider> -- see app/providers.tsx.
+// useWalletBridge() itself only ever calls useContext, which is safe with no
+// provider above it, so a missing provider can never crash the page -- it
+// just reports `configured: false`.
 
 import {
   createContext,
@@ -19,26 +20,19 @@ import {
   useContext,
   useMemo,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { useLogin, usePrivy } from "@privy-io/react-auth";
-import {
-  useSignMessage,
-  useSignTransaction,
-  useWallets,
-  type ConnectedStandardSolanaWallet,
-} from "@privy-io/react-auth/solana";
-import { base64ToBytes, bytesToBase64 } from "./solana-wallet";
+import { useWallet } from "@solana/wallet-adapter-react";
+import { VersionedTransaction } from "@solana/web3.js";
+import { base64ToBytes, bytesToBase64, deserializeSolanaTransaction } from "./solana-wallet";
+import { WalletPicker } from "../components/WalletPicker";
 
 export type WalletBridge = {
-  /** Privy has finished initialising. */
   ready: boolean;
-  /** False when NEXT_PUBLIC_PRIVY_APP_ID is missing -- wallet sign-in is unavailable, not just disconnected. */
   configured: boolean;
-  /** The connected Solana wallet's base58 address, or "" when none is connected. */
   address: string;
   connecting: boolean;
-  /** Opens the Privy login modal (external wallet connect or email login). */
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   signTransactionBase64(encoded: string): Promise<string>;
@@ -60,145 +54,122 @@ const NOT_CONFIGURED_BRIDGE: WalletBridge = {
 
 const WalletBridgeContext = createContext<WalletBridge | null>(null);
 
-/**
- * True only for Privy's own embedded Solana wallet. Privy's SDK identifies it
- * the same way internally (see the `isPrivyWallet` getter on its exported
- * `PrivyStandardWallet` class, in @privy-io/react-auth/solana) -- the
- * structural `SolanaStandardWallet` type doesn't declare the field, so this
- * reads it defensively rather than asserting the concrete class.
- */
-function isEmbeddedWallet(wallet: ConnectedStandardSolanaWallet): boolean {
-  return (wallet.standardWallet as { isPrivyWallet?: boolean }).isPrivyWallet === true;
-}
-
-/** Whether this wallet's wallet-standard feature set includes signMessage at all. */
-function supportsSignMessage(wallet: ConnectedStandardSolanaWallet): boolean {
-  return Boolean((wallet.standardWallet.features as Record<string, unknown>)["solana:signMessage"]);
+// Stable across renders on purpose: useSyncExternalStore never needs to
+// re-subscribe when this identity doesn't change, and this store never
+// actually changes -- it exists only to tell "server/first paint" (false)
+// apart from "mounted client-side" (true), the same hydration-safe pattern
+// used elsewhere for anything that must not assume a wallet exists during
+// SSR.
+function subscribeNever() {
+  return () => {};
 }
 
 /**
- * Picks which connected wallet's address to expose: keep `preferred` if it's
- * still among `wallets`, otherwise prefer an external wallet over the
- * embedded one, otherwise whichever is first.
+ * Mounted only inside <WalletProvider> -- every hook below assumes a
+ * provider ancestor. app/providers.tsx is responsible for never rendering
+ * this without one.
  */
-function pickAddress(wallets: ConnectedStandardSolanaWallet[], preferred: string): string {
-  const stillConnected = wallets.find((wallet) => wallet.address === preferred);
-  if (stillConnected) return stillConnected.address;
-  const external = wallets.find((wallet) => !isEmbeddedWallet(wallet));
-  return (external ?? wallets[0])?.address ?? "";
-}
+function WalletAdapterBridge({ children }: { children: ReactNode }) {
+  const { wallets, publicKey, connecting, select, disconnect, signTransaction, signMessage } = useWallet();
 
-/**
- * Mounted only inside <PrivyProvider> -- every hook below assumes a provider
- * ancestor. app/providers.tsx is responsible for never rendering this
- * without one.
- */
-function PrivyWalletBridge({ children }: { children: ReactNode }) {
-  // `isModalOpen` is Privy's own view of whether its login modal is showing.
-  // `connecting` is derived from it rather than tracked locally on purpose:
-  // closing the modal without logging in fires no completion callback, so a
-  // locally-held flag (or a promise awaiting one) would stay stuck forever
-  // and leave the whole ticket showing "Waiting for wallet…". Reading
-  // Privy's flag makes the state self-heal the moment the modal closes.
-  const { ready, logout, isModalOpen } = usePrivy();
-  const { wallets } = useWallets();
-  const { signMessage } = useSignMessage();
-  const { signTransaction } = useSignTransaction();
-  const { login } = useLogin();
+  // Haven't checked for wallets yet (SSR / before hydration) vs. checked and
+  // ready -- see quoteReadiness's `providerDetected: boolean | null`, which
+  // treats `!bridge.ready` as "not checked yet."
+  const ready = useSyncExternalStore(subscribeNever, () => true, () => false);
 
-  // Prefer an external wallet (Phantom, Solflare, ...) over Privy's embedded
-  // one when both are connected, but once an address is chosen, keep using it
-  // across renders even if `wallets` reorders -- only a disconnect (the
-  // chosen address no longer appearing in `wallets`) re-runs the preference.
-  // Adjusted during render (not in an effect) when `wallets` changes identity
-  // -- the same "state derived from a changed input" pattern TendTerminal's
-  // TradeView already uses for its own wallet-switch reset (see
-  // `quotedWallet` there): a plain conditional setState call during render,
-  // which React explicitly supports for this exact case.
-  const [previousWallets, setPreviousWallets] = useState(wallets);
-  const [address, setAddress] = useState(() => pickAddress(wallets, ""));
-  if (previousWallets !== wallets) {
-    setPreviousWallets(wallets);
-    setAddress((current) => pickAddress(wallets, current));
-  }
+  // Our own wallet picker modal, not the stock wallet-adapter-react-ui one
+  // (see app/components/WalletPicker.tsx for why). `connect()` just opens
+  // it; the picker itself calls `select()` on the chosen adapter, which --
+  // with `autoConnect` on -- is what actually triggers the connection.
+  const [pickerOpen, setPickerOpen] = useState(false);
 
-  const activeWallet = useMemo(
-    () => wallets.find((wallet) => wallet.address === address),
-    [wallets, address],
-  );
-
-  // Opens the modal and resolves immediately: Privy owns the rest of the
-  // flow, and the app reacts to its outcome through `address` (a fresh
-  // connection) and `connecting` (the modal being open), never by awaiting
-  // this. Errors inside the flow are surfaced by Privy's own modal UI.
   const connect = useCallback(async () => {
-    login();
-  }, [login]);
+    setPickerOpen(true);
+  }, []);
 
-  // logout() alone only ends a Privy-authenticated session -- it never
-  // touches an externally-connected wallet-standard wallet (Phantom,
-  // Solflare, ...), which stays in `wallets` and keeps re-resolving the same
-  // `address`. The wallet's own disconnect() (a wrapper around the
-  // standard:disconnect feature) is what actually drops that connection;
-  // logout() still runs after for the embedded-wallet / Privy-session case.
-  const disconnect = useCallback(async () => {
-    if (activeWallet) await activeWallet.disconnect();
-    await logout();
-  }, [activeWallet, logout]);
+  const closePicker = useCallback(() => setPickerOpen(false), []);
+
+  const disconnectWallet = useCallback(async () => {
+    await disconnect();
+  }, [disconnect]);
 
   const signTransactionBase64 = useCallback(
     async (encoded: string) => {
-      if (!activeWallet) throw new Error("Connect a Solana wallet first.");
+      if (!signTransaction) throw new Error("Connect a Solana wallet first.");
       const bytes = base64ToBytes(encoded);
-      const { signedTransaction } = await signTransaction({ transaction: bytes, wallet: activeWallet });
-      return bytesToBase64(signedTransaction);
+      const transaction = deserializeSolanaTransaction(bytes);
+      const signed = await signTransaction(transaction);
+      // VersionedTransaction.serialize() takes no options and never
+      // verifies. Legacy Transaction.serialize() defaults to
+      // { requireAllSignatures: true, verifySignatures: true } and throws
+      // ("Signature verification failed") whenever a required signature
+      // (e.g. the pool's, added server-side after this comes back) is still
+      // missing. app/lib/vsol-server.ts:173 disables both checks for the
+      // same reason when it hands a partially-signed legacy tx to the
+      // client; the wire bytes are identical either way when every
+      // signature is present, and the server re-verifies with
+      // `verifySignatures()` once the signed tx comes back
+      // (app/lib/vsol-server.ts:1904), so nothing is weakened by skipping
+      // the client-side check here.
+      const serialized =
+        signed instanceof VersionedTransaction
+          ? signed.serialize()
+          : signed.serialize({ requireAllSignatures: false, verifySignatures: false });
+      return bytesToBase64(serialized);
     },
-    [activeWallet, signTransaction],
+    [signTransaction],
   );
 
-  // Mirrors the pre-Privy signSolanaMessage contract: null only when signing
-  // is genuinely unsupported (no connected wallet, or this wallet's standard
-  // feature set has no signMessage) -- a declined/failed signature still
-  // throws, exactly like app/lib/solana-wallet.ts's signSolanaMessage did.
+  // null only when signing is genuinely unsupported (no connected wallet, or
+  // this wallet doesn't implement signMessage) -- a declined/failed
+  // signature still throws, exactly like the pre-adapter signSolanaMessage
+  // contract app/lib/session-client.ts relies on.
   const signMessageBase64 = useCallback(
     async (message: string) => {
-      if (!activeWallet || !supportsSignMessage(activeWallet)) return null;
-      const { signature } = await signMessage({ message: new TextEncoder().encode(message), wallet: activeWallet });
+      if (!signMessage) return null;
+      const signature = await signMessage(new TextEncoder().encode(message));
       if (!(signature instanceof Uint8Array) || signature.length !== 64) {
         throw new Error("The wallet returned an invalid message signature.");
       }
       return bytesToBase64(signature);
     },
-    [activeWallet, signMessage],
+    [signMessage],
   );
+
+  const address = publicKey?.toBase58() ?? "";
 
   const bridge = useMemo<WalletBridge>(
     () => ({
       ready,
-      configured: true,
+      configured: wallets.length > 0,
       address,
-      connecting: isModalOpen,
+      connecting: connecting || pickerOpen,
       connect,
-      disconnect,
+      disconnect: disconnectWallet,
       signTransactionBase64,
       signMessageBase64,
     }),
-    [ready, address, isModalOpen, connect, disconnect, signTransactionBase64, signMessageBase64],
+    [ready, wallets.length, address, connecting, pickerOpen, connect, disconnectWallet, signTransactionBase64, signMessageBase64],
   );
 
-  return <WalletBridgeContext.Provider value={bridge}>{children}</WalletBridgeContext.Provider>;
+  return (
+    <WalletBridgeContext.Provider value={bridge}>
+      {children}
+      {pickerOpen && <WalletPicker wallets={wallets} onSelect={select} onClose={closePicker} />}
+    </WalletBridgeContext.Provider>
+  );
 }
 
-/** See app/providers.tsx: rendered inside <PrivyProvider> only when NEXT_PUBLIC_PRIVY_APP_ID is configured. */
+/** See app/providers.tsx: rendered inside <WalletProvider>. */
 export function WalletBridgeProvider({ children }: { children: ReactNode }) {
-  return <PrivyWalletBridge>{children}</PrivyWalletBridge>;
+  return <WalletAdapterBridge>{children}</WalletAdapterBridge>;
 }
 
 /**
  * The wallet connection + signing interface every component should use.
  * Falls back to a harmless "not configured" bridge when no
- * WalletBridgeProvider is mounted above it (i.e. NEXT_PUBLIC_PRIVY_APP_ID is
- * unset) -- this never throws and never crashes the page.
+ * WalletBridgeProvider is mounted above it -- this never throws and never
+ * crashes the page.
  */
 export function useWalletBridge(): WalletBridge {
   return useContext(WalletBridgeContext) ?? NOT_CONFIGURED_BRIDGE;

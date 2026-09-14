@@ -338,7 +338,7 @@ test("the close-position flow reuses the audited session-wallet-only, message-ha
   // to quote expiry before the user signs.
   assert.match(portfolio, /spread/i);
   assert.match(portfolio, /below fair value/i);
-  // Signing goes through the Privy-backed wallet bridge (see
+  // Signing goes through the wallet-adapter-backed wallet bridge (see
   // app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper.
   assert.match(portfolio, /bridge\.signTransactionBase64/);
   assert.match(portfolio, /close\/prepare/);
