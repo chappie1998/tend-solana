@@ -929,7 +929,16 @@ function TradeView({
               would state a multiple the buyer is not getting. */}
           <div className="economics">
             <div className={bestQuote ? undefined : "econ-row--empty"}><span>Signed premium</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
-            <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div>
+            {/* The payout is a RAMP, not a switch (definedRiskPayout): zero
+                on the wrong side of the strike, proportional between strike
+                and cap, and the full number only at the cap. Showing "Max
+                payout" alone implied a coin flip that pays the headline, so
+                the three anchors that actually define the outcome -- where it
+                caps, where the premium is repaid, and where it pays nothing --
+                are stated next to it. */}
+            <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>at ${bestQuote.cap.toFixed(2)}{direction === "up" ? "+" : " or lower"}</small>}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Breakeven</span><strong>{bestQuote ? `$${bestQuote.breakeven.toFixed(2)}` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>Pays nothing {direction === "up" ? "below" : "above"}</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${bestQuote.strike.toFixed(2)}` : "—"}</strong></div>
             <details className="econ-detail">
               <summary>Pricing detail</summary>
               <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
@@ -938,7 +947,7 @@ function TradeView({
                   actually priced into the premium above (can run hotter than
                   "Realized volatility" when the reference is stale and the
                   gap-risk bump kicks in). */}
-              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Win probability</span><strong>{bestQuote ? `${(bestQuote.probabilityItm * 100).toFixed(1)}%` : "—"}</strong></div>
+              <div className={bestQuote ? undefined : "econ-row--empty"}><span>Chance of any payout</span><strong>{bestQuote ? `${(bestQuote.probabilityItm * 100).toFixed(1)}%` : "—"}</strong></div>
               <div className={bestQuote ? undefined : "econ-row--empty"}><span>Realized volatility</span><strong>{bestQuote ? `${bestQuote.pricingVolatility.toFixed(1)}%` : "—"}</strong></div>
               <div className={bestQuote ? undefined : "econ-row--empty"}><span>Implied volatility</span><strong>{bestQuote ? `${bestQuote.impliedVolatility.toFixed(1)}%` : "—"}</strong></div>
             </details>
