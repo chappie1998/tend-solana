@@ -130,8 +130,8 @@ function toAsset(market: (typeof markets)[number]) {
 // sourced from marketsByCategory the same way the old combined groups were.
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
-  { id: "crypto", label: "Crypto", icon: Activity },
   { id: "stocks", label: "Stocks", icon: LineChart },
+  { id: "crypto", label: "Crypto", icon: Activity },
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
   { id: "earn", label: "Write & earn", icon: TrendingUp },
   { id: "launch", label: "Launch", icon: Rocket },
@@ -1116,7 +1116,7 @@ function TradeView({
 export function TendTerminal() {
   const bridge = useWalletBridge();
   const walletAddress = bridge.address;
-  const [activeTab, setActiveTab] = useState<Tab>("crypto");
+  const [activeTab, setActiveTab] = useState<Tab>("stocks");
   const [menuOpen, setMenuOpen] = useState(false);
   const [walletMenuOpen, setWalletMenuOpen] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
@@ -1335,7 +1335,7 @@ export function TendTerminal() {
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "crypto" || activeTab === "stocks" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("crypto")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "crypto" || activeTab === "stocks" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("stocks")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );

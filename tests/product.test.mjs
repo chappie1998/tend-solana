@@ -449,8 +449,12 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
 
   // Grouping is config-driven: the view renders marketsByCategory, and never
   // re-derives the groups (or worse, uses a category as a tradability test).
-  assert.deepEqual(markets.marketsByCategory.map((group) => group.category), ["crypto", "stocks"]);
-  assert.deepEqual(markets.marketsByCategory.map((group) => group.label), ["Crypto", "Stocks"]);
+  // Stocks lead deliberately (CATEGORY_LABELS in markets.ts is the single
+  // place that decides) -- pinned so the order stays an explicit config
+  // decision rather than something a refactor can silently flip. Order is
+  // presentation only: nothing reads it as a tradability signal.
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.category), ["stocks", "crypto"]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.label), ["Stocks", "Crypto"]);
   assert.deepEqual(markets.marketsByCategory.map((group) => group.markets.length), [3, 3]);
   assert.match(terminal, /marketsByCategory/);
   assert.match(terminal, /asset-group-head/);

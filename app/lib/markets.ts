@@ -486,11 +486,16 @@ export type MarketGroup = {
 
 /**
  * The display order of the categories, and the only place that order is
- * decided. Crypto leads because it is the shelf that actually trades.
+ * decided. Stocks lead: they are what this deployment is demonstrating.
+ *
+ * This used to read "Crypto leads because it is the shelf that actually
+ * trades" -- true when stocks were all coming-soon, and false since NVDA,
+ * GOOGL and SPACEX went live. Order is presentation only; nothing derives
+ * tradability from it (that is `status`, always).
  */
 const CATEGORY_LABELS: ReadonlyArray<{ category: MarketCategory; label: string }> = [
-  { category: "crypto", label: "Crypto" },
   { category: "stocks", label: "Stocks" },
+  { category: "crypto", label: "Crypto" },
 ];
 
 /**
