@@ -233,7 +233,11 @@ function QuotePanel({
     return (
       <div className="quote-empty">
         <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
-        <div><strong>Wallet sign-in isn’t configured</strong><p>Quotes are signed for your wallet address, but this deployment has no wallet sign-in configured yet. If you already have a Solana wallet, you can still get one below.</p></div>
+        {/* `configured` now means "this browser has a wallet-standard Solana
+            wallet", not "this deployment set up a sign-in provider" -- the
+            meaning changed when Privy was removed. Blaming the deployment
+            here sent visitors looking for a fault that is on their side. */}
+        <div><strong>No Solana wallet detected</strong><p>Quotes are signed for your wallet address, so trading needs a Solana wallet in this browser. Install one — Phantom, Solflare or Backpack — then reload this page.</p></div>
         <a className="button primary" href="https://solana.com/wallets" target="_blank" rel="noreferrer"><Wallet size={16} aria-hidden="true" /> Get a Solana wallet</a>
       </div>
     );
@@ -349,10 +353,18 @@ function VsolStatus() {
     };
   }, []);
 
-  const explorer = status?.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
+  // Silent while healthy. A permanent "everything is verified" banner is noise
+  // on a trading surface -- it occupies the top of the page saying nothing
+  // actionable 99% of the time. What matters is the exception, so this renders
+  // only once execution is actually degraded (paused, deployment pending, or
+  // the status probe failing). The same liquidity it used to advertise still
+  // reaches the trader where it changes a decision: on the quote itself.
+  if (status === null || status.ok) return null;
+
+  const explorer = status.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
   return (
-    <div className={status?.ok ? "protocol-strip verified" : "protocol-strip"}>
-      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL V2 pool + Pyth series verified" : status.deploymentReady === false ? "Pyth deployment pending" : "Execution unavailable"}</strong><small>{status?.ok ? `${status.poolLiquidity ?? "0"} tUSDC available · ${status.seriesCount ?? 0} verified series` : status?.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
+    <div className="protocol-strip">
+      <div><span className="protocol-pulse" /><span><strong>{status.deploymentReady === false ? "Pyth deployment pending" : "Execution unavailable"}</strong><small>{status.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
@@ -860,7 +872,6 @@ function TradeView({
   return (
     <main className="trade-layout">
       <section className="market-column">
-        <div className="product-intro"><span className="eyebrow">VSOL · Solana-native defined risk</span><h1>Options, without the trapdoors.</h1><p>Choose up or down. Your loss is capped at the premium, and Solana escrows the writer’s full payout before the trade opens.</p></div>
         <VsolStatus />
         <div className="market-header">
           <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2>{/* Both strings come from app/lib/markets.ts. SOL was hardcoded as "Stock Token" here, which is simply untrue — the config carries what each instrument actually is so no view can invent it. */}<span>{asset.assetClass}</span></div><p>{asset.blurb}</p></div></div>

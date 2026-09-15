@@ -15,7 +15,14 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
     readFile(new URL("app/layout.tsx", root), "utf8"),
   ]);
 
-  assert.match(terminal, /VSOL V2 pool \+ Pyth series verified/);
+  // The always-on "everything is verified" banner is gone: it sat at the top of
+  // the trading surface restating a healthy state that needs no action. What
+  // has to survive is the EXCEPTION -- VsolStatus now renders only once
+  // execution is degraded -- so pin those labels, and assert the healthy
+  // banner stays gone so a revert cannot quietly reinstate the noise.
+  assert.match(terminal, /Execution unavailable/);
+  assert.match(terminal, /Pyth deployment pending/);
+  assert.doesNotMatch(terminal, /VSOL V2 pool \+ Pyth series verified/);
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
   assert.match(terminal, /fully verified Pyth update/);
