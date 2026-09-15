@@ -6,6 +6,7 @@ import { formatAtoms } from "../lib/format";
 import { useWalletBridge } from "../lib/wallet-bridge";
 import { solanaExplorerUrl } from "../lib/vsol";
 import type { ExpiryCode } from "../lib/expiries";
+import { useChainPositions, type ChainPositionRow } from "../lib/use-chain-positions";
 
 export type SavedPosition = {
   id: string;
@@ -40,35 +41,6 @@ export function isVerifiedPosition(position: SavedPosition) {
     && Boolean(position.simulationLogsHash);
 }
 
-type ChainPositionRow = {
-  address: string;
-  pool: string;
-  market: string;
-  direction: "up" | "down";
-  status: "open" | "unknown";
-  strike: string;
-  cap: string;
-  premium: string;
-  maxPayout: string;
-  premiumAtoms: string;
-  maxPayoutAtoms: string;
-  openedAt: number;
-  symbol: string | null;
-  seriesCode: string | null;
-  marketExpiry: number | null;
-  provenance: {
-    transactionSignature: string | null;
-    simulationId: string | null;
-    simulationLogsHash: string | null;
-  } | null;
-};
-
-type ChainState =
-  | { phase: "loading" }
-  | { phase: "signin-required"; message: string }
-  | { phase: "error"; message: string }
-  | { phase: "ready"; positions: ChainPositionRow[]; checkedAt: string };
-
 type CloseQuote = {
   intentId: string;
   transaction: string;
@@ -98,7 +70,10 @@ type CloseState =
   | { phase: "error"; message: string; quote: CloseQuote | null }
   | { phase: "done"; quote: CloseQuote; receipt: CloseReceipt };
 
-function MiniLogo({ ticker }: { ticker: string }) {
+// Exported so TradePositionsPanel (app/components/TradePositionsPanel.tsx) can
+// render the same identity mark for its own Market cells instead of keeping a
+// second copy.
+export function MiniLogo({ ticker }: { ticker: string }) {
   return <span className={`asset-logo asset-${ticker.toLowerCase()}`}>{ticker.slice(0, 1)}</span>;
 }
 
@@ -120,39 +95,10 @@ export function PortfolioView({
   onTrade: () => void;
 }) {
   const bridge = useWalletBridge();
-  const [chain, setChain] = useState<ChainState>({ phase: "loading" });
+  const { state: chain, reload: loadChain } = useChainPositions(walletAddress, sessionWallet);
   const [closeTarget, setCloseTarget] = useState<ChainPositionRow | null>(null);
   const [closeState, setCloseState] = useState<CloseState>({ phase: "idle" });
   const [nowMs, setNowMs] = useState(() => Date.now());
-
-  const loadChain = useCallback(async () => {
-    setChain({ phase: "loading" });
-    try {
-      const response = await fetch("/api/positions/chain", { cache: "no-store" });
-      const result = await response.json() as {
-        positions?: ChainPositionRow[];
-        checkedAt?: string;
-        error?: string;
-        code?: string;
-      };
-      if (response.status === 401 || result.code === "WALLET_SESSION_REQUIRED") {
-        setChain({ phase: "signin-required", message: result.error ?? "Sign in with your wallet signature to read chain positions." });
-        return;
-      }
-      if (!response.ok || !result.positions) {
-        setChain({ phase: "error", message: result.error ?? "Chain positions are unavailable." });
-        return;
-      }
-      setChain({ phase: "ready", positions: result.positions, checkedAt: result.checkedAt ?? new Date().toISOString() });
-    } catch {
-      setChain({ phase: "error", message: "Chain positions are unreachable. Check your connection and retry." });
-    }
-  }, []);
-
-  useEffect(() => {
-    const initial = window.setTimeout(() => void loadChain(), 0);
-    return () => window.clearTimeout(initial);
-  }, [loadChain, sessionWallet]);
 
   const loadCloseQuote = useCallback(async (position: ChainPositionRow) => {
     setCloseState({ phase: "loading" });

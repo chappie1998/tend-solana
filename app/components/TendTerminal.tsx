@@ -44,6 +44,7 @@ import {
 import { EarnView } from "./EarnView";
 import { LaunchView } from "./LaunchView";
 import { PortfolioView, type SavedPosition } from "./PortfolioView";
+import { TradePositionsPanel } from "./TradePositionsPanel";
 import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
 type Tab = "market" | "portfolio" | "earn" | "launch";
@@ -435,6 +436,7 @@ function TradeView({
   sessionNotice,
   onSignIn,
   onSessionExpired,
+  positions,
 }: {
   walletAddress: string;
   onConnect: () => void | Promise<void>;
@@ -445,6 +447,7 @@ function TradeView({
   sessionNotice: string;
   onSignIn: () => void | Promise<void>;
   onSessionExpired: () => void;
+  positions: SavedPosition[];
 }) {
   const [assetTicker, setAssetTicker] = useState(() => tradableAssets[0]?.ticker ?? "");
   const [direction, setDirection] = useState<Direction>("up");
@@ -1040,6 +1043,8 @@ function TradeView({
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
 
+      <TradePositionsPanel walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} onConnect={onConnect} />
+
       {complete && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setComplete(false)}>
           <div className="review-modal" role="dialog" aria-modal="true" aria-labelledby="review-title">
@@ -1286,7 +1291,7 @@ export function TendTerminal() {
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );

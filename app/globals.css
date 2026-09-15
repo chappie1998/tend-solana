@@ -545,6 +545,24 @@ code, .tabular, .num {
 .verification-error { color: var(--negative); background: color-mix(in srgb, var(--negative) 13%, transparent); }
 .positions-card > .quote-error, .positions-card > .empty-position { margin: 0; border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; }
 
+/* ---------------------------------------------------------------------
+   Trade page positions panel — a Hyperliquid-style tabbed strip (Positions /
+   Fill history), full-width under the chart + ticket. It is the panel
+   shell (grid-column span) and the tab strip that are new here; the rows
+   underneath reuse .position-table/.table-row/.table-head/.asset-cell
+   exactly as the Portfolio tab does. Only the column widths are their own
+   modifier, because Side and Strike are split into two cells here instead
+   of Portfolio's one combined "Position" column.
+   --------------------------------------------------------------------- */
+.trade-positions-panel { grid-column: 1 / -1; }
+.tab-strip { display: flex; gap: 2px; }
+.tab-btn { min-height: 32px; padding: 0 10px; border: 0; border-radius: var(--r-control); background: transparent; color: var(--ink-3); font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.01em; cursor: pointer; transition: background-color 120ms ease, color 120ms ease; }
+.tab-btn:hover { color: var(--ink-2); background: var(--surface-3); }
+.tab-btn.active { color: var(--ink); background: var(--surface-3); }
+.trade-positions-meta { display: flex; align-items: center; gap: 2px; }
+.trade-positions-row { grid-template-columns: 1.05fr .5fr .7fr .8fr .9fr .75fr 1.05fr .95fr; min-width: 940px; }
+.trade-history-row { grid-template-columns: 1.05fr .5fr .7fr .8fr .85fr 1.05fr .95fr; min-width: 820px; }
+
 footer { margin-top: auto; min-height: 44px; padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; color: var(--ink-3); font-size: var(--t-xs); flex-wrap: wrap; gap: 10px; }
 footer > div { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 footer .logo { color: var(--ink-2); font-size: var(--t-sm); }
