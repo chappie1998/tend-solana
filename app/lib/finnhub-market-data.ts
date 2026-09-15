@@ -77,8 +77,19 @@ export function parseFinnhubQuote(raw: unknown, symbol: string): ParsedQuote {
   return { price, high: validRange ? high : price, low: validRange ? low : price, publishTime: Math.floor(publishTime) };
 }
 
+/**
+ * The ticker an off-chain equity provider knows this market by. Falls back to
+ * `symbol` when they agree (NVDA, GOOGL). They are separate fields on purpose:
+ * `symbol` is permanent on-chain identity (hashed into the market PDA and the
+ * CustomPriceFeed seed), while this is just a vendor's spelling -- SPACEX
+ * trades as SPCX. See the `equityTicker` doc comment in app/lib/markets.ts.
+ */
+function tickerFor(market: Market): string {
+  return market.equityTicker || market.symbol;
+}
+
 export async function getFinnhubSnapshot(market: Market): Promise<MarketSnapshot> {
-  const symbol = market.symbol;
+  const symbol = tickerFor(market);
   const now = Date.now();
   const cached = snapshotCache.get(symbol);
   if (cached && cached.expiresAt > now) return cached.value;

@@ -358,19 +358,25 @@ test("getFinnhubSnapshot fails honestly for a symbol Finnhub has no quote for", 
 
 // --- market-data.ts: per-market routing -----------------------------------
 
-test("market-data.ts routes crypto to Coinbase and stocks to Finnhub -- never the other family, and SPACEX still fails honestly", async () => {
+test("market-data.ts routes crypto to Coinbase and stocks to Finnhub -- never the other family, and a stock's equityTicker overrides its on-chain symbol", async () => {
+  // SPACEX is now a live, publicly traded market (NASDAQ: SPCX -- see
+  // app/lib/markets.ts), so it no longer serves as an example of a stock
+  // that "fails honestly". What is still real and worth pinning: routing
+  // never crosses category families, and a stock whose `equityTicker`
+  // differs from its on-chain `symbol` (SPACEX -> SPCX) must resolve
+  // off-chain requests through the VENDOR ticker, not the permanent
+  // on-chain one -- see the dedicated ticker-mapping test below for the
+  // pure-function version of this same guarantee.
   const { marketData, markets } = await loadModules();
   const hostsHit = [];
+  let lastFinnhubSymbol;
   const restore = stubFetch((url) => {
     hostsHit.push(url.hostname);
     if (url.hostname === "api.exchange.coinbase.com") {
       return { ask: "101.42", bid: "101.38", price: "101.40", time: new Date().toISOString() };
     }
     if (url.hostname === "finnhub.io") {
-      const symbol = url.searchParams.get("symbol");
-      // SPACEX has no ticker on Finnhub either (private company) -- the real
-      // API answers with this same all-zero shape, not an error status.
-      if (symbol === "SPACEX") return { c: 0, h: 0, l: 0, o: 0, pc: 0, t: 0 };
+      lastFinnhubSymbol = url.searchParams.get("symbol");
       return { c: 212.11, h: 213.94, l: 211.63, o: 212.4875, pc: 210.96, t: Math.floor(Date.now() / 1_000) };
     }
     throw new Error(`unexpected host reached in this test: ${url.hostname}`);
@@ -383,14 +389,19 @@ test("market-data.ts routes crypto to Coinbase and stocks to Finnhub -- never th
     const nvdaSnapshot = await withEnv("FINNHUB_API_KEY", "test-key", () => marketData.getMarketSnapshot(markets.marketBySymbol("NVDA")));
     assert.deepEqual(hostsHit, ["finnhub.io"], "a stock market must never reach Coinbase");
     assert.equal(nvdaSnapshot.source, "Finnhub");
+    // NVDA's equityTicker is blank, so Finnhub is asked for its own symbol.
+    assert.equal(lastFinnhubSymbol, "NVDA");
 
+    // SPACEX carries symbol "SPACEX" (permanent on-chain identity, hashed
+    // into the market PDA and the CustomPriceFeed seed) but equityTicker
+    // "SPCX" (the vendor's own spelling -- it trades as SPCX on NASDAQ).
+    // The Finnhub request must go out for SPCX, never the raw on-chain
+    // symbol, and must still never touch Coinbase.
     hostsHit.length = 0;
-    await assert.rejects(
-      () => withEnv("FINNHUB_API_KEY", "test-key", () => marketData.getMarketSnapshot(markets.marketBySymbol("SPACEX"))),
-      /Finnhub has no quote for SPACEX/,
-      "SpaceX has no price source anywhere and must keep failing honestly, never invent a price",
-    );
-    assert.deepEqual(hostsHit, ["finnhub.io"], "SpaceX must still be attempted (not skipped), but never against Coinbase");
+    const spacexSnapshot = await withEnv("FINNHUB_API_KEY", "test-key", () => marketData.getMarketSnapshot(markets.marketBySymbol("SPACEX")));
+    assert.deepEqual(hostsHit, ["finnhub.io"], "a stock market must never reach Coinbase, SPACEX included");
+    assert.equal(lastFinnhubSymbol, "SPCX", "SPACEX must resolve through its equityTicker, not its on-chain symbol");
+    assert.equal(spacexSnapshot.source, "Finnhub");
   } finally {
     restore();
   }
@@ -413,5 +424,70 @@ test("market-data.ts routes stock chart bars to Twelve Data, never Coinbase or P
     assert.equal(result.source, "Twelve Data");
   } finally {
     restore();
+  }
+});
+
+// --- ticker mapping: equityTicker overrides symbol for off-chain vendors ---
+//
+// Pins app/lib/markets.ts's `equityTicker` contract so it cannot silently
+// regress: `symbol` is permanent on-chain identity (hashed into the market
+// PDA and the CustomPriceFeed seed), but Finnhub/Twelve Data know some
+// markets by a different spelling. Both getFinnhubSnapshot and
+// getTwelveDataMarketBars carry their own private `tickerFor(market)`
+// helper (`market.equityTicker || market.symbol`) -- this test exercises
+// the REAL functions with a stubbed fetch (never the network) so a change to
+// either helper's actual behavior fails here, not just a reimplementation of
+// it.
+
+test("a market's equityTicker overrides its on-chain symbol for every off-chain vendor request; a blank equityTicker falls back to symbol", async () => {
+  const { finnhub, twelveData, markets } = await loadModules();
+  const spacex = markets.marketBySymbol("SPACEX");
+  const nvda = markets.marketBySymbol("NVDA");
+  // The concrete mapping this whole test exists to pin: SPACEX -> SPCX,
+  // NVDA -> NVDA (no override needed). The end-to-end network-param proof for
+  // these exact two real markets already lives in the "market-data.ts routes
+  // crypto to Coinbase..." test above; asserting the config fields directly
+  // here (rather than re-issuing the same getFinnhubSnapshot calls) avoids
+  // colliding with that test's already-warm 5s snapshot cache for "SPCX"/
+  // "NVDA" while still pinning the exact real values.
+  assert.equal(spacex.equityTicker, "SPCX", "SPACEX must resolve to SPCX");
+  assert.equal(nvda.equityTicker, "", "NVDA needs no override -- it resolves to its own symbol");
+
+  // The general RULE (equityTicker || symbol), exercised end-to-end through
+  // both real vendor functions with fresh, uniquely-named fixtures so this
+  // test's own fetch calls can never be served from another test's cache.
+  const withOverride = { symbol: "TICKERMAP-ONCHAIN", equityTicker: "TICKERMAP-VENDOR" };
+  const withoutOverride = { symbol: "TICKERMAP-PLAIN", equityTicker: "" };
+
+  let finnhubSymbol;
+  const restoreFinnhub = stubFetch((url) => {
+    finnhubSymbol = url.searchParams.get("symbol");
+    return { c: 100, h: 101, l: 99, o: 100, pc: 100, t: Math.floor(Date.now() / 1_000) };
+  });
+  try {
+    await withEnv("FINNHUB_API_KEY", "test-key", () => finnhub.getFinnhubSnapshot(withOverride));
+    assert.equal(finnhubSymbol, "TICKERMAP-VENDOR", "a set equityTicker must resolve to IT, not the on-chain symbol");
+    await withEnv("FINNHUB_API_KEY", "test-key", () => finnhub.getFinnhubSnapshot(withoutOverride));
+    assert.equal(finnhubSymbol, "TICKERMAP-PLAIN", "a blank equityTicker must fall back to symbol");
+  } finally {
+    restoreFinnhub();
+  }
+
+  let twelveDataSymbol;
+  const restoreTwelveData = stubFetch((url) => {
+    twelveDataSymbol = url.searchParams.get("symbol");
+    return {
+      meta: { exchange_timezone: "America/New_York" },
+      status: "ok",
+      values: [{ datetime: "2026-09-15 09:31:00", open: "1", high: "1", low: "1", close: "1" }],
+    };
+  });
+  try {
+    await withEnv("TWELVE_DATA_API_KEY", "test-key", () => twelveData.getTwelveDataMarketBars(withOverride, "D"));
+    assert.equal(twelveDataSymbol, "TICKERMAP-VENDOR", "a set equityTicker must resolve to IT, not the on-chain symbol");
+    await withEnv("TWELVE_DATA_API_KEY", "test-key", () => twelveData.getTwelveDataMarketBars(withoutOverride, "D"));
+    assert.equal(twelveDataSymbol, "TICKERMAP-PLAIN", "a blank equityTicker must fall back to symbol");
+  } finally {
+    restoreTwelveData();
   }
 });

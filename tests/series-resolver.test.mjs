@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { buildMarketAccountBuffer, stubConnection } from "./helpers/vsol-market-fixture.mjs";
+import { withSyntheticComingSoonMarket } from "./helpers/synthetic-coming-soon-market.mjs";
 
 // Unit tests for app/lib/series-resolver.ts, the source of the rolling series
 // catalog.
@@ -18,14 +19,15 @@ import { buildMarketAccountBuffer, stubConnection } from "./helpers/vsol-market-
 const root = new URL("../", import.meta.url);
 
 async function loadModules() {
-  const [resolver, launchParams, vsol, sdk] = await Promise.all([
+  const [resolver, launchParams, vsol, sdk, markets] = await Promise.all([
     import(new URL("app/lib/series-resolver.ts", root)),
     import(new URL("app/lib/launch-params.ts", root)),
     import(new URL("app/lib/vsol.ts", root)),
     import(new URL("vsol/sdk/index.ts", root)),
+    import(new URL("app/lib/markets.ts", root)),
   ]);
   const accounts = await import(new URL("app/lib/vsol-market-accounts.ts", root));
-  return { resolver, launchParams, vsol, sdk, accounts };
+  return { resolver, launchParams, vsol, sdk, accounts, markets };
 }
 
 const STRIKE = 210_000_000n;
@@ -130,7 +132,7 @@ test("deriveVsolSeriesCandidate parity: the derived market matches an independen
 });
 
 test("a code with no viable on-chain market resolves to unavailable with a clear reason, never throws", async () => {
-  const { resolver } = await loadModules();
+  const { resolver, markets } = await loadModules();
   const now = Date.parse("2026-07-21T14:00:00Z");
 
   // TSLA is not a configured market at all (see app/lib/markets.ts), so every
@@ -147,16 +149,29 @@ test("a code with no viable on-chain market resolves to unavailable with a clear
   assert.equal(lowercase.available, false);
   assert.equal(lowercase.symbol, "TSLA");
 
-  // A CONFIGURED but coming-soon market (NVDA: its Pyth equity/tokenized-
-  // equity feeds need a paid entitlement this deployment does not have) is
-  // the case that matters most -- it is listed and visible, so the resolver
-  // is the last line stopping it from producing a tradable series. Every
-  // code, intraday and standard, must refuse it.
-  for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
-    const comingSoon = await resolver.resolveVsolSeries("NVDA", code, now);
-    assert.equal(comingSoon.available, false, `NVDA/${code} must never resolve to a tradable series`);
-    assert.match(comingSoon.reason, /coming soon/i);
-  }
+  // A CONFIGURED but coming-soon market is the case that matters most -- it
+  // is listed and visible, so the resolver is the last line stopping it from
+  // producing a tradable series. Every code, intraday and standard, must
+  // refuse it. SPACEX used to be this test's real-world example (a private
+  // company with no price on any provider); it is now `status: "live"` (see
+  // app/lib/markets.ts), so a synthetic coming-soon Market is pushed into
+  // the real catalog for this assertion instead -- see
+  // tests/helpers/synthetic-coming-soon-market.mjs for why that is the only
+  // available seam (resolveVsolSeries takes a SYMBOL and looks it up against
+  // the real catalog; there is no way to hand it a fixture Market directly).
+  //
+  // Note: SPACEX itself, despite being live, still cannot resolve to a
+  // series either -- it has no Pyth feed at all (pythFeedIdFor("SPACEX")
+  // throws; see tests/product.test.mjs), which is a genuine, separate gap
+  // this test does not exercise (see this task's final report).
+  const deps = { connection: stubConnection([]), fetchSpot: async () => 100 };
+  await withSyntheticComingSoonMarket(markets, async (soon) => {
+    for (const code of ["15M", "1H", "EOD", "7D", "30D"]) {
+      const comingSoon = await resolver.resolveVsolSeries(soon.symbol, code, now, deps);
+      assert.equal(comingSoon.available, false, `${soon.symbol}/${code} must never resolve to a tradable series`);
+      assert.match(comingSoon.reason, /coming soon/i);
+    }
+  });
 });
 
 test("resolveVsolSeriesCatalog and resolveAvailableVsolSeries never throw, and separate listed rungs from unlisted ones", async () => {
@@ -367,13 +382,26 @@ test("resolveOrPlanVsolSeriesCatalog costs one chain scan and at most one spot l
 
 test("resolveOrPlanVsolSeriesCatalog plans only UNLISTED slots — a grid-ruled-out slot keeps its own reason", async () => {
   const modules = await loadModules();
-  const { resolver } = modules;
+  const { resolver, markets } = modules;
   const now = Date.parse("2026-07-21T14:00:00Z");
   const deps = { connection: stubConnection([]), fetchSpot: async () => 210 };
 
-  // SPACEX is configured coming-soon: it has no Pyth feed at all, so the grid
-  // itself rules it out. Planning must NOT paper over that.
-  const catalog = await resolver.resolveOrPlanVsolSeriesCatalog(["SPACEX"], now, deps);
+  // A configured-but-coming-soon market is what this test guards against:
+  // the grid itself rules the slot out (before ever reaching discovery or
+  // planning), so `resolveOrPlanVsolSeriesCatalog` must report the grid's
+  // OWN reason rather than collapsing it into the generic "not listed yet"
+  // bucket and silently attempting to plan a listing for it. SPACEX used to
+  // be the real-world example (coming-soon, no Pyth feed at all); it is now
+  // `status: "live"` (see app/lib/markets.ts), so a synthetic coming-soon
+  // Market is pushed into the real catalog instead -- see
+  // tests/helpers/synthetic-coming-soon-market.mjs.
+  //
+  // Note: SPACEX itself, despite being live, actually still demonstrates a
+  // close cousin of the exact bug this test guards against -- see this
+  // task's final report. It is not used here because reproducing it depends
+  // on live devnet chain state (whether any already-listed market shares its
+  // config/settlementMint), which would make this assertion flaky.
+  const catalog = await withSyntheticComingSoonMarket(markets, (soon) => resolver.resolveOrPlanVsolSeriesCatalog([soon.symbol], now, deps));
   assert.equal(catalog.length, 5);
   assert.ok(catalog.every((entry) => !entry.available), "a coming-soon symbol must stay unavailable at every code");
   assert.ok(

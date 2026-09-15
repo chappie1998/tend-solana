@@ -263,12 +263,23 @@ const cache = new Map<string, { expiresAt: number; value: MarketDataBars }>();
 const inFlight = new Map<string, Promise<MarketDataBars>>();
 const failed = new Map<string, { expiresAt: number; error: Error }>();
 
+/**
+ * The ticker an off-chain equity provider knows this market by. Falls back to
+ * `symbol` when they agree (NVDA, GOOGL). They are separate fields on purpose:
+ * `symbol` is permanent on-chain identity (hashed into the market PDA and the
+ * CustomPriceFeed seed), while this is just a vendor's spelling -- SPACEX
+ * trades as SPCX. See the `equityTicker` doc comment in app/lib/markets.ts.
+ */
+function tickerFor(market: Market): string {
+  return market.equityTicker || market.symbol;
+}
+
 export async function getTwelveDataMarketBars(
   market: Market,
   resolution: ChartResolution,
   now = Date.now(),
 ): Promise<MarketDataBars> {
-  const symbol = market.symbol;
+  const symbol = tickerFor(market);
   const cacheKey = `${symbol}:${resolution}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.value;
@@ -336,7 +347,7 @@ const utcTradingDate = new Intl.DateTimeFormat("en-CA", {
 });
 
 export async function getTwelveDataRealizedVolatility(market: Market): Promise<RealizedVolatility> {
-  const symbol = market.symbol;
+  const symbol = tickerFor(market);
   const cached = volatilityCache.get(symbol);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 

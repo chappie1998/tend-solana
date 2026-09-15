@@ -20,10 +20,13 @@ export type MarketStatus = "live" | "coming-soon";
 /**
  * The shelf a market is listed on. Purely an organizing fact about the
  * underlying, deliberately independent of `status`: a category is not a
- * proxy for tradability and must never be used as one. It happens that every
- * crypto market is live today and every stock market is not, and reading
- * that coincidence as a rule is exactly the bug this comment exists to
- * prevent -- `status` is the only thing any gate may test.
+ * proxy for tradability and must never be used as one. Every crypto market
+ * is live, and the stocks group is now a MIX -- NVDA and GOOGL live, SpaceX
+ * coming-soon -- which is exactly why reading category as a tradability
+ * proxy was always the wrong shortcut: `status` is the only thing any gate
+ * may test. (`category` still legitimately selects a provider FAMILY --
+ * see app/lib/market-data.ts -- that is a data-routing decision, not a
+ * tradability one.)
  */
 export type MarketCategory = "crypto" | "stocks";
 
@@ -42,7 +45,13 @@ export type Market = {
    * it". Only SpaceX is in that state (a private company; see its entry).
    * A market with an empty feed can never be promoted to `"live"` by a
    * config edit alone, which is the whole point of distinguishing it from a
-   * market whose feed exists and is merely un-entitled.
+   * market whose feed exists but is merely un-entitled -- e.g. NVDA and
+   * GOOGL below, both `"live"` today via a different off-chain price source
+   * (Finnhub/Twelve Data; see `blurb`) despite carrying a real Pyth feed id
+   * this deployment's key still cannot read. This field is kept accurate
+   * regardless of `status` because it is settlement-identity metadata (it is
+   * hashed into the on-chain market id via `pythFeedIdFor`), not a
+   * tradability switch.
    */
   pythFeedId: string;
   /** Pyth's own symbol for `pythFeedId`. Empty exactly when that is. */
@@ -55,11 +64,25 @@ export type Market = {
    *
    * EMPTY STRING means the same thing it does for `pythFeedId`: not "unset",
    * but "no product exists for this market on Coinbase Exchange". Every
-   * coming-soon market carries an empty string here regardless of the reason
-   * its Pyth feed is blocked, because none of them (tokenized equities,
-   * SpaceX) trade on Coinbase's spot market at all.
+   * STOCK market carries an empty string here, live or coming-soon alike,
+   * because Coinbase lists no equities at all -- a live stock market's
+   * off-chain reference comes from Finnhub/Twelve Data instead (see
+   * app/lib/market-data.ts), never from this field.
    */
   coinbaseProductId: string;
+  /**
+   * The exchange ticker Finnhub/Twelve Data know this equity by, when it
+   * differs from `symbol`. Empty string means "they are the same" -- NVDA and
+   * GOOGL are their own tickers, so they leave this blank.
+   *
+   * These MUST be allowed to differ. `symbol` is hashed into the on-chain
+   * market PDA and seeds the market's `CustomPriceFeed`, so it is permanent
+   * on-chain identity: renaming SPACEX to SPCX to make the lookup "simpler"
+   * would repoint every derived address and orphan the feed and any open
+   * position. The vendor ticker is just how an off-chain HTTP provider spells
+   * it, and vendors rename tickers. Keep the two separate.
+   */
+  equityTicker: string;
   intradayEligible: boolean;
   status: MarketStatus;
   /**
@@ -84,8 +107,15 @@ export type Market = {
    */
   assetClass: string;
   /**
-   * One true sentence naming the underlying and the feed it settles on.
-   * Shown under the ticker; must stay accurate to `pythSymbol` above.
+   * One true sentence naming the underlying and the price source it displays
+   * on. For a crypto market this must stay accurate to `pythSymbol` above
+   * (settlement and display are the same feed there). For a STOCK market it
+   * must instead name Finnhub/Twelve Data (see app/lib/market-data.ts) --
+   * `pythSymbol` is kept on a stock entry only as settlement-identity
+   * metadata (see that field's own doc comment) and must never be quoted here
+   * as if it were the display source, because it is not: this deployment's
+   * Pyth key has no equity/tokenized-equity entitlement, so nothing here ever
+   * reads a Pyth price for a stock.
    */
   blurb: string;
   /**
@@ -94,12 +124,14 @@ export type Market = {
    * chip and returned verbatim by the expiry/quote gates, so the reason a
    * user sees is the same reason the server enforces.
    *
-   * The three coming-soon markets below are blocked for TWO different
-   * reasons and the copy must not blur them: NVDA and Google have real,
-   * working 24/7 feeds this deployment's Pyth key is not entitled to -- a
-   * billing state, one purchase away from live. SpaceX has no oracle at all,
+   * SpaceX is the one remaining coming-soon market: it has no oracle at all,
    * because it is a private company that does not trade; there is no
-   * settlement path for it even in principle, at any price tier.
+   * settlement path for it even in principle, at any price tier. NVDA and
+   * Google used to be blocked here too (a billing state: real, working 24/7
+   * Pyth feeds this deployment's key was not entitled to) -- that blocker no
+   * longer gates trading now that their off-chain reference comes from
+   * Finnhub/Twelve Data instead (see `blurb`), so both carry the same empty
+   * string every other live market does.
    */
   statusNote: string;
   /**
@@ -110,9 +142,11 @@ export type Market = {
    * than the tradable ones and inverted the panel's hierarchy. Empty string
    * for live markets.
    *
-   * Must preserve the kind-of-blocker distinction: a billing state that a
-   * purchase clears reads differently from an instrument that has no
-   * settlement source in principle.
+   * Must preserve the kind-of-blocker distinction if a second coming-soon
+   * market ever joins SpaceX below: a billing state that a purchase (or, as
+   * happened for NVDA/GOOGL, a different off-chain price source) clears
+   * reads differently from an instrument that has no settlement source in
+   * principle, which is SpaceX's own, permanent case.
    */
   statusTag: string;
   /**
@@ -164,6 +198,7 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.SOL/USD",
     // Verified live: GET /products/SOL-USD/ticker -> 200.
     coinbaseProductId: "SOL-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $2.50 at SOL ~$103.36 (measured 2026-09-05) is 2.4% -- mid-band.
@@ -186,6 +221,7 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.BTC/USD",
     // Verified live: GET /products/BTC-USD/ticker -> 200.
     coinbaseProductId: "BTC-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $2,000 at BTC ~$80,016 (measured 2026-09-05) is 2.50% -- mid-band, and
@@ -212,6 +248,7 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.ETH/USD",
     // Verified live: GET /products/ETH-USD/ticker -> 200.
     coinbaseProductId: "ETH-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $50 at ETH ~$2,473.52 (measured 2026-09-05) is 2.02% -- the bottom of
@@ -233,39 +270,41 @@ export const markets: Market[] = [
     tone: "#76b900",
     oracleStatus: "Pyth Core",
     // Crypto.NVDAX/USD -- tokenized NVDA (xStocks), the 24/7 feed this
-    // market settled on until 2026-08-26.
+    // market settled on until 2026-08-26, when Pyth made Hermes
+    // authentication mandatory and this deployment's API key turned out to
+    // be entitled to crypto spot feeds only (verified against
+    // hermes.pyth.network: Crypto.NVDAX/USD and Equity.US.NVDA/USD both
+    // 403 "Not entitled", where Crypto.SOL/BTC/ETH/USD all still 200).
     //
-    // NOT TRADABLE HERE, and the reason is external, not incomplete work:
-    // Pyth made Hermes authentication mandatory on 2026-08-26, and this
-    // deployment's API key is entitled to crypto spot feeds ONLY. Verified
-    // against hermes.pyth.network with the live key:
+    // That entitlement gap is UNCHANGED and is kept honest here -- the feed
+    // id/symbol below are settlement-identity metadata only, still not a
+    // price this deployment can read. What changed is the OFF-CHAIN
+    // reference this market displays and quotes off: NVDA now prices through
+    // Finnhub (spot) and Twelve Data (chart bars + realized volatility) --
+    // see app/lib/market-data.ts's per-category routing -- neither of which
+    // needs any Pyth entitlement at all. That is what makes `status: "live"`
+    // correct despite the Pyth blocker never having been lifted.
     //
-    //   Crypto.SOL/USD     -> 200 (entitled)
-    //   Crypto.BTC/USD     -> 200 (entitled)
-    //   Crypto.ETH/USD     -> 200 (entitled)
-    //   Crypto.NVDAX/USD   -> 403 "Not entitled: ... no grant accepts this feed"
-    //   Equity.US.NVDA/USD -> 403 "Not entitled"
-    //
-    // Equity and tokenized-equity feeds sit behind a paid Pyth tier this
-    // devnet deployment does not buy. With no price, NVDA cannot settle, so
-    // it must not be mintable or quotable -- a user must never be able to
-    // buy something that cannot settle. The feed id and symbol are kept
-    // accurate so that promoting this to `status: "live"` is the only edit
-    // required once the entitlement exists.
+    // The remaining real constraint this listing carries is that a US-equity
+    // spot price freezes outside its regular trading session (see
+    // app/lib/market-hours.ts); expiries.ts's `resolveExpiry` refuses any
+    // expiry for a stock-category market that would land outside that
+    // window, which is the actual gate keeping this safe to trade 24/7 like
+    // every other listing here even though NVDA itself is not a 24/7 asset.
     pythFeedId: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f",
     pythSymbol: "Crypto.NVDAX/USD",
-    // Tokenized NVDA does not trade on Coinbase's spot market either.
+    // Finnhub/Twelve Data, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
+    equityTicker: "",
     intradayEligible: true,
-    status: "coming-soon",
-    // Unused while this market is coming-soon (nothing lists a strike for
-    // it), but sized now so promoting it is a one-line `status` edit: $5.00
-    // at NVDA's ~$210 level is 2.4%.
+    status: "live",
+    // $5.00 at NVDA's ~$210 level is 2.4% -- mid-band, same sizing logic as
+    // every crypto listing above.
     strikeLadderStep: dollars(5),
-    assetClass: "Tokenized equity",
-    blurb: "Tokenized NVIDIA (xStocks), priced by the Pyth Crypto.NVDAX/USD feed.",
-    statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.NVDAX/USD needs a paid tier.",
-    statusTag: "Feed not entitled",
+    assetClass: "US equity",
+    blurb: "NVIDIA common stock, priced live off Finnhub (chart and realized volatility from Twelve Data).",
+    statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "GOOGL",
@@ -276,23 +315,27 @@ export const markets: Market[] = [
     oracleStatus: "Pyth Core",
     // Crypto.GOOGLX/USD -- tokenized GOOGL (xStocks), id read from Pyth's
     // own feed registry (hermes /v2/price_feeds?query=GOOGLX), not derived.
-    // Exactly the same blocker as NVDA above: the feed is real, published
-    // and 24/7, and this deployment's key returns 403 "Not entitled" for it
-    // and for Equity.US.GOOGL/USD alike. A billing state, not a missing
-    // oracle -- which is why this entry carries a real feed id and SpaceX
-    // below carries none.
+    // Exactly the same blocker as NVDA above, and the same resolution: this
+    // deployment's key still returns 403 "Not entitled" for it and for
+    // Equity.US.GOOGL/USD alike (a billing state, not a missing oracle --
+    // which is why this entry carries a real feed id and SpaceX below
+    // carries none), but that no longer matters for trading here because
+    // GOOGL's off-chain reference comes from Finnhub/Twelve Data instead
+    // (see the NVDA entry above for the fuller explanation, which applies
+    // identically). The feed id/symbol stay as settlement-identity metadata.
     pythFeedId: "b911b0329028cd0283e4259c33809d62942bd2716a58084e5f31d64c00b5424e",
     pythSymbol: "Crypto.GOOGLX/USD",
-    // Tokenized GOOGL does not trade on Coinbase's spot market either.
+    // Finnhub/Twelve Data, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
+    equityTicker: "",
     intradayEligible: true,
-    status: "coming-soon",
-    // Unused while coming-soon; ~2.4% at GOOGL's ~$210 level, same as NVDA.
+    status: "live",
+    // ~2.4% at GOOGL's ~$210 level, same sizing logic as NVDA.
     strikeLadderStep: dollars(5),
-    assetClass: "Tokenized equity",
-    blurb: "Tokenized Alphabet (xStocks), priced by the Pyth Crypto.GOOGLX/USD feed.",
-    statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.GOOGLX/USD needs a paid tier.",
-    statusTag: "Feed not entitled",
+    assetClass: "US equity",
+    blurb: "Alphabet (Google) common stock, priced live off Finnhub (chart and realized volatility from Twelve Data).",
+    statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "SPACEX",
@@ -301,32 +344,42 @@ export const markets: Market[] = [
     tokenAddress: deployment.underlyingMint,
     tone: "#c8cdd4",
     oracleStatus: "Pyth Core",
-    // NO FEED. This is a different kind of blocked from NVDA and Google, and
-    // the difference is not a detail: SpaceX is a private company, its stock
-    // does not trade on a public venue, and Pyth publishes nothing for it --
-    // a registry-wide query (hermes /v2/price_feeds?query=SpaceX, and
-    // ?query=SPACEX) returns zero feeds, not a feed we lack a grant for.
+    // SpaceX IPO'd on NASDAQ 2026-06-12 and trades as SPCX. This entry used
+    // to assert -- at length -- that it was a private company with no public
+    // price at any tier, which was true when written and is now simply false.
+    // Verified against both live providers before flipping it: Finnhub
+    // /stock/profile2 SPCX returns name "Space Exploration Technologies Corp",
+    // exchange NASDAQ, ipo 2026-06-12; Twelve Data /quote SPCX agrees. Do not
+    // reinstate the old copy from memory -- check the feed.
     //
-    // So there is no settlement price for a SpaceX contract to reference, at
-    // any Pyth tier, and no amount of paying for entitlements produces one.
-    // Listing it requires a price source that does not exist today. The
-    // empty strings below are the honest encoding of that, and they are load
-    // bearing: nothing can promote this market to "live" by flipping
-    // `status` alone, because there would still be no feed to settle on.
-    pythFeedId: "",
-    pythSymbol: "",
-    // No public market anywhere for SpaceX equity, Coinbase included.
+    // Pyth DOES publish SPCX, in three variants. This binds the 24/7 one
+    // deliberately: Equity.US.SPCX/USD is session-bound and would be dark
+    // outside RTH, the exact failure that made the equity NVDA feed useless
+    // here (dark ~81% of the week). Equity.Index.SPCX/USD is Pyth's own
+    // round-the-clock price for the same ticker.
+    //
+    // This id is NOT a price source for us -- this deployment's Pyth key has
+    // no equity entitlement, and stock prices come from Finnhub while
+    // settlement runs on the custom oracle. It is load-bearing as IDENTITY:
+    // `pythFeedIdFor` feeds `series-resolver.ts`'s market-PDA derivation, and
+    // an empty string there throws, so a market cannot be minted, quoted or
+    // settled without one. That is why this market could not simply be
+    // flipped live with the field left blank.
+    pythFeedId: "2dbfb1791e75725227a90dbd23c6bdd83b80cc9d13011973c948b6aeacdf17b9",
+    pythSymbol: "Equity.Index.SPCX/USD",
+    // Coinbase lists no equities, SpaceX included.
     coinbaseProductId: "",
-    intradayEligible: false,
-    status: "coming-soon",
-    // No feed means no spot, so no ladder can be sized. The value is inert
-    // (nothing lists a strike for a coming-soon market) and deliberately set
-    // to the default rather than to a number implying a real price level.
+    // The one market where the vendor ticker differs from `symbol` -- see that
+    // field's doc comment for why we do NOT rename the symbol to match.
+    equityTicker: "SPCX",
+    intradayEligible: true,
+    status: "live",
+    // ~2% of a ~$143 spot, matching how every other market's rung was sized.
     strikeLadderStep: dollars(2, 50),
-    assetClass: "Private company",
-    blurb: "SpaceX equity. No public market and no oracle — listed here as a target, not a tradable series.",
-    statusNote: "Coming soon — SpaceX is a private company: no public price and no Pyth feed exists for it at all, so there is no settlement source to trade against yet.",
-    statusTag: "No feed exists",
+    assetClass: "US equity",
+    blurb: "Space Exploration Technologies (SPCX) on NASDAQ, priced from Finnhub with chart history from Twelve Data.",
+    statusNote: "",
+    statusTag: "",
   },
 ];
 

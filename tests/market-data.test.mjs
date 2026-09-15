@@ -85,12 +85,13 @@ test("the default provider dispatches to the Coinbase implementation, not Pyth: 
 
 test("a stock market never reaches the Coinbase or Pyth code path, regardless of MARKET_DATA_PROVIDER", async () => {
   const { marketData, markets } = await loadModules();
-  // NVDA is coming-soon and carries no Coinbase product (see
-  // app/lib/markets.ts), so if this reached the Coinbase/Pyth path it would
-  // either throw the Coinbase-specific "has no Coinbase product configured"
-  // message or attempt a real Hermes fetch. Neither happens: category
-  // "stocks" is routed to Finnhub/Twelve Data before either crypto branch is
-  // ever consulted, so clearing the stock API keys must fail with a
+  // NVDA carries no Coinbase product (see app/lib/markets.ts) because
+  // Coinbase lists no equities at all -- true whether or not NVDA is
+  // tradable here. So if this reached the Coinbase/Pyth path it would either
+  // throw the Coinbase-specific "has no Coinbase product configured" message
+  // or attempt a real Hermes fetch. Neither happens: category "stocks" is
+  // routed to Finnhub/Twelve Data before either crypto branch is ever
+  // consulted, so clearing the stock API keys must fail with a
   // Finnhub/Twelve-Data-specific, not Coinbase-specific, reason -- and that
   // must hold no matter what MARKET_DATA_PROVIDER is set to, since a stock
   // market never reads it at all.
@@ -109,19 +110,42 @@ test("a stock market never reaches the Coinbase or Pyth code path, regardless of
 
 // --- markets.ts wiring ---------------------------------------------------
 
-test("every live market has a Coinbase product id; every coming-soon market has none", async () => {
+test("every live crypto market has a Coinbase product id; every stock market has none and every live stock resolves to a plain vendor ticker", async () => {
   const { markets } = await loadModules();
-  for (const market of markets.markets) {
-    if (market.status === "live") {
+  // The catalog carries zero coming-soon markets today (SPACEX flipped to
+  // live once it IPO'd -- see app/lib/markets.ts). The "no stock market
+  // carries a Coinbase product id" guarantee is still supposed to hold
+  // regardless of status -- Coinbase lists no equities at all, live or
+  // not -- so pin it with a synthetic coming-soon stock fixture too, rather
+  // than letting the guarantee go untested just because nothing real
+  // exercises the coming-soon half of it any more.
+  const syntheticComingSoonStock = { symbol: "SYNSTOCK", category: "stocks", status: "coming-soon", coinbaseProductId: "" };
+  for (const market of [...markets.markets, syntheticComingSoonStock]) {
+    if (market.status === "live" && market.category === "crypto") {
       assert.match(market.coinbaseProductId, /^[A-Z]+-USD$/, `${market.symbol} must carry a real Coinbase product id`);
     } else {
-      assert.equal(market.coinbaseProductId, "", `${market.symbol} is coming-soon and must carry no Coinbase product id`);
+      // Every stock market carries no Coinbase product id, live or
+      // coming-soon alike -- Coinbase lists no equities at all, so a live
+      // stock market's off-chain reference comes from Finnhub/Twelve Data
+      // instead (see the routing test above and app/lib/market-data.ts).
+      assert.equal(market.coinbaseProductId, "", `${market.symbol} must carry no Coinbase product id`);
     }
   }
   assert.deepEqual(
-    markets.liveMarkets.map((market) => market.coinbaseProductId).sort(),
+    markets.liveMarkets.filter((market) => market.category === "crypto").map((market) => market.coinbaseProductId).sort(),
     ["BTC-USD", "ETH-USD", "SOL-USD"],
   );
+  // Finnhub/Twelve Data key their request off `tickerFor(market)` --
+  // `market.equityTicker || market.symbol` (see the private `tickerFor`
+  // helper duplicated in getFinnhubSnapshot / getTwelveDataMarketBars) --
+  // NOT `market.symbol` directly any more: SPACEX's own symbol ("SPACEX")
+  // is permanent on-chain identity, but the vendor only knows it as "SPCX".
+  const liveStocks = markets.liveMarkets.filter((market) => market.category === "stocks");
+  assert.deepEqual(liveStocks.map((market) => market.symbol).sort(), ["GOOGL", "NVDA", "SPACEX"]);
+  for (const market of liveStocks) {
+    const vendorTicker = market.equityTicker || market.symbol;
+    assert.match(vendorTicker, /^[A-Z]+$/, `${market.symbol} must resolve to a plain ticker Finnhub/Twelve Data can resolve`);
+  }
 });
 
 // --- Coinbase ticker parsing ---------------------------------------------

@@ -6,11 +6,16 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
-// Reuses the app's already-built, already-tested Coinbase provider rather
-// than writing a second HTTP client here -- see CLAUDE.md's Coinbase
-// migration note for why this is the off-chain spot source on this
-// deployment.
-import { getCoinbaseSnapshot } from "../../app/lib/coinbase-market-data.ts";
+// Reuses the app's provider-neutral market-data entry point rather than
+// writing a second HTTP client here (or hardcoding one provider). Every live
+// market on this deployment routes through the SAME per-category dispatch
+// the app and the quote path use (see app/lib/market-data.ts's own header):
+// crypto reads Coinbase (or Pyth, via MARKET_DATA_PROVIDER), stocks always
+// read Finnhub. This pusher must never call a single provider directly --
+// it did that for a while (Coinbase only), which worked fine until NVDA/GOOGL
+// went live and every stock tick started asking Coinbase for a symbol
+// Coinbase has never listed, throwing every cycle.
+import { getMarketSnapshot } from "../../app/lib/market-data.ts";
 // The live market set, read from the one shared list (never hardcoded here)
 // so this pusher can never drift from what the app/keeper consider tradable.
 import { liveMarkets, type Market } from "../../app/lib/markets.ts";
@@ -19,8 +24,10 @@ import { deriveConfig, deriveCustomPriceFeed, PRICE_SCALE, VSOL_PROGRAM_ID } fro
 // The custom-oracle pusher is the off-chain half of the backup/demo
 // settlement path added alongside `CustomPriceFeed` in
 // vsol/programs/vsol/src/lib.rs: on a fixed cadence it fetches each live
-// symbol's Coinbase spot, scales it to `PRICE_SCALE` atoms, and calls
-// `update_custom_price_feed`. It is intentionally simple and centralized --
+// symbol's off-chain spot (via getMarketSnapshot's per-category routing --
+// Coinbase/Pyth for crypto, Finnhub for stocks), scales it to `PRICE_SCALE`
+// atoms, and calls `update_custom_price_feed`. It is intentionally simple
+// and centralized --
 // see that account's own doc comment for the honest trust-model disclosure
 // this script's signer check is the entirety of. This exists only so the
 // product can still settle expired markets while Pyth access is
@@ -82,11 +89,19 @@ async function pushOneSymbol(params: {
 }): Promise<void> {
   const { program, authority, config, market } = params;
   const feed = deriveCustomPriceFeed(market.symbol);
-  const snapshot = await getCoinbaseSnapshot(market);
+  const snapshot = await getMarketSnapshot(market);
   const price = toPriceScaleAtoms(snapshot.price);
+  // `confidence` is always a non-negative, human-scale dispersion proxy
+  // regardless of which provider produced the snapshot -- half the live
+  // bid/ask spread for Coinbase, half the day's high-low range for Finnhub
+  // (see MarketSnapshot's doc comment in app/lib/market-data-types.ts) --
+  // never a Pyth-style confidence interval, but always a real, roundable
+  // number. The `Math.max(0, ...)` stays defensive rather than provider-
+  // specific: neither provider's parser can hand back a negative value
+  // today, but nothing here should trust that invariant blindly either.
   const confidence = toPriceScaleAtoms(Math.max(0, snapshot.confidence));
   if (price <= 0n) {
-    throw new Error(`Coinbase returned a non-positive price for ${market.symbol} (${snapshot.price})`);
+    throw new Error(`${snapshot.source} returned a non-positive price for ${market.symbol} (${snapshot.price})`);
   }
 
   const signature = await program.methods
@@ -108,9 +123,11 @@ async function runOnePass(program: Program<Vsol>, authority: Keypair, config: Pu
     try {
       await pushOneSymbol({ program, authority, config, market });
     } catch (error) {
-      // Per-symbol isolation: a Coinbase outage, an un-initialized feed
-      // (init_custom_price_feed not yet called for this symbol), or a single
-      // failed RPC must cost only that symbol's tick, never the whole pass.
+      // Per-symbol isolation: an outage at whichever provider this symbol
+      // routes to (Coinbase/Pyth for crypto, Finnhub for stocks -- see
+      // app/lib/market-data.ts), an un-initialized feed (init_custom_price_feed
+      // not yet called for this symbol), or a single failed RPC must cost
+      // only that symbol's tick, never the whole pass.
       console.log(`skip: ${market.symbol} -- ${error instanceof Error ? error.message : String(error)}`);
     }
   }
