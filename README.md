@@ -61,6 +61,8 @@ VSOL_FAUCET_SECRET_KEY=<JSON byte array or base64-encoded JSON>
 VSOL_RPC_URL=<private Solana devnet RPC URL>
 PYTH_HERMES_URL=https://hermes.pyth.network
 PYTH_API_KEY=<server-only key>
+FINNHUB_API_KEY=<server-only key, stock market snapshots only>
+TWELVE_DATA_API_KEY=<server-only key, stock market chart bars only>
 ```
 
 Never use the program admin, upgrade authority, mainnet wallet, or personally funded key for these roles.

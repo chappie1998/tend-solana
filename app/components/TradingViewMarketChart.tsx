@@ -20,10 +20,10 @@ import {
 } from "../lib/market-bars";
 
 // Widened, not a single literal: the off-chain reference this app shows can
-// come from either provider (see app/lib/market-data.ts), and `source` must
-// always name whichever one actually produced this snapshot -- never a
-// hardcoded label independent of what the API returned.
-export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes";
+// come from any of this app's providers (see app/lib/market-data.ts), and
+// `source` must always name whichever one actually produced this snapshot --
+// never a hardcoded label independent of what the API returned.
+export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Finnhub";
 
 export type MarketSnapshot = {
   price: number;
@@ -43,7 +43,7 @@ type ChartState = "loading" | "success" | "error";
 type MarketBarsPayload = {
   symbol: string;
   resolution: ChartResolution;
-  source: "Coinbase Exchange" | "Pyth Benchmarks";
+  source: "Coinbase Exchange" | "Pyth Benchmarks" | "Twelve Data";
   freshness: "live" | "stale";
   bars: MarketBar[];
   asOf: number;
@@ -54,6 +54,8 @@ type MarketBarsPayload = {
 function shortSourceLabel(source: string | undefined): string {
   if (source === "Pyth Core Hermes" || source === "Pyth Benchmarks") return "Pyth";
   if (source === "Coinbase Exchange") return "Coinbase";
+  if (source === "Finnhub") return "Finnhub";
+  if (source === "Twelve Data") return "Twelve Data";
   return "Market";
 }
 

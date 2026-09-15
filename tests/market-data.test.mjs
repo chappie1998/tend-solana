@@ -63,21 +63,48 @@ test("marketDataSourceLabel names the provider that is actually selected, never 
   assert.equal(withEnv("MARKET_DATA_PROVIDER", "pyth", () => marketData.marketDataSourceLabel()), "Pyth Core Hermes");
 });
 
-test("the default provider dispatches to the Coinbase implementation, not Pyth: a market with no Coinbase product fails with the Coinbase-specific reason", async () => {
+test("the default provider dispatches to the Coinbase implementation, not Pyth: a crypto market with no Coinbase product fails with the Coinbase-specific reason", async () => {
+  const { marketData } = await loadModules();
+  // A synthetic CRYPTO market (no `category: "stocks"`) with no Coinbase
+  // product configured. If this reached the Pyth path instead it would
+  // attempt a real Hermes fetch and fail differently (or hang) -- this
+  // exact, synchronous, offline rejection is only reachable through the
+  // Coinbase code path. See the stock-routing test below for NVDA, and
+  // tests/stock-market-data.test.mjs for the rest of the stock provider
+  // coverage.
+  const syntheticCrypto = { name: "Synthetic", symbol: "SYN", category: "crypto", coinbaseProductId: "" };
+  await assert.rejects(
+    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketSnapshot(syntheticCrypto)),
+    /has no Coinbase product configured/,
+  );
+  await assert.rejects(
+    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketBars(syntheticCrypto, "D")),
+    /has no Coinbase product configured/,
+  );
+});
+
+test("a stock market never reaches the Coinbase or Pyth code path, regardless of MARKET_DATA_PROVIDER", async () => {
   const { marketData, markets } = await loadModules();
-  // NVDA is coming-soon: no Coinbase product configured (see app/lib/markets.ts).
-  // If this reached the Pyth path instead it would attempt a real Hermes
-  // fetch and fail differently (or hang) -- this exact, synchronous, offline
-  // rejection is only reachable through the Coinbase code path.
+  // NVDA is coming-soon and carries no Coinbase product (see
+  // app/lib/markets.ts), so if this reached the Coinbase/Pyth path it would
+  // either throw the Coinbase-specific "has no Coinbase product configured"
+  // message or attempt a real Hermes fetch. Neither happens: category
+  // "stocks" is routed to Finnhub/Twelve Data before either crypto branch is
+  // ever consulted, so clearing the stock API keys must fail with a
+  // Finnhub/Twelve-Data-specific, not Coinbase-specific, reason -- and that
+  // must hold no matter what MARKET_DATA_PROVIDER is set to, since a stock
+  // market never reads it at all.
   const nvda = markets.marketBySymbol("NVDA");
-  await assert.rejects(
-    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketSnapshot(nvda)),
-    /has no Coinbase product configured/,
-  );
-  await assert.rejects(
-    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketBars(nvda, "D")),
-    /has no Coinbase product configured/,
-  );
+  for (const provider of [undefined, "coinbase", "pyth"]) {
+    await assert.rejects(
+      () => withEnv("MARKET_DATA_PROVIDER", provider, () => withEnv("FINNHUB_API_KEY", undefined, () => marketData.getMarketSnapshot(nvda))),
+      /FINNHUB_API_KEY is not configured/,
+    );
+    await assert.rejects(
+      () => withEnv("MARKET_DATA_PROVIDER", provider, () => withEnv("TWELVE_DATA_API_KEY", undefined, () => marketData.getMarketBars(nvda, "D"))),
+      /TWELVE_DATA_API_KEY is not configured/,
+    );
+  }
 });
 
 // --- markets.ts wiring ---------------------------------------------------

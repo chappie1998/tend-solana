@@ -1,9 +1,14 @@
 // Provider-neutral shapes for off-chain market data: spot reference,
-// realized volatility, and chart bars. Two providers implement these --
+// realized volatility, and chart bars. Four providers implement these --
 // app/lib/coinbase-market-data.ts / coinbase-market-bars.ts (Coinbase
 // Exchange's public API, no key required) and app/lib/pyth-market-data.ts /
-// pyth-market-bars.ts (Pyth Core Hermes + History) -- and app/lib/market-data.ts
-// picks exactly one per call via MARKET_DATA_PROVIDER, defaulting to Coinbase.
+// pyth-market-bars.ts (Pyth Core Hermes + History) for CRYPTO markets, and
+// app/lib/finnhub-market-data.ts (spot) / app/lib/twelvedata-market-bars.ts
+// (bars + realized vol) for STOCK markets -- and app/lib/market-data.ts
+// resolves the right one per call: crypto picks Coinbase-vs-Pyth via
+// MARKET_DATA_PROVIDER (defaulting to Coinbase), stocks always go to
+// Finnhub/Twelve Data. See that file's header for the full routing and the
+// "no fallback between providers" contract.
 //
 // ONCHAIN SETTLEMENT IS UNAFFECTED BY THIS FILE. It always verifies a fresh
 // Pyth PriceUpdateV2 against the exact feed id hashed into the market
@@ -17,14 +22,17 @@
 
 import type { ChartResolution, MarketBar } from "./market-bars.ts";
 
-export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes";
+export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Finnhub";
 
 export type MarketSnapshot = {
   price: number;
   /**
    * Pyth: half the published confidence interval. Coinbase: half the live
-   * bid/ask spread, a standard liquidity-based proxy -- NOT a Pyth-style
-   * confidence interval. Every snapshot's `warning` field says which.
+   * bid/ask spread, a standard liquidity-based proxy. Finnhub: half the
+   * day's high-low range, a coarser dispersion proxy used only because the
+   * free `/quote` tier carries no bid/ask at all. None of the non-Pyth
+   * proxies is a Pyth-style confidence interval -- every snapshot's
+   * `warning` field says which kind it got.
    */
   confidence: number;
   confidenceBps: number;
@@ -46,7 +54,8 @@ export type MarketSnapshot = {
 
 export type RealizedVolatilitySource =
   | "Coinbase Exchange 20-session realized volatility"
-  | "Pyth Benchmarks 20-session realized volatility";
+  | "Pyth Benchmarks 20-session realized volatility"
+  | "Twelve Data 20-session realized volatility";
 
 export type RealizedVolatility = {
   value: number;
@@ -55,8 +64,8 @@ export type RealizedVolatility = {
   asOf: number;
 };
 
-/** Chart bars carry the same `source` vocabulary as MarketDataSource -- Pyth's own label for its history API is "Pyth Benchmarks", not "Pyth Core Hermes". */
-export type MarketDataBarsSource = "Coinbase Exchange" | "Pyth Benchmarks";
+/** Chart bars carry a related but distinct `source` vocabulary from MarketDataSource -- Pyth's own label for its history API is "Pyth Benchmarks", not "Pyth Core Hermes", and Twelve Data supplies bars for the same stock markets Finnhub snapshots. */
+export type MarketDataBarsSource = "Coinbase Exchange" | "Pyth Benchmarks" | "Twelve Data";
 
 export type MarketDataBars = {
   symbol: string;
