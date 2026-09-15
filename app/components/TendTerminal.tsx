@@ -11,6 +11,7 @@ import {
   ExternalLink,
   Info,
   LayoutDashboard,
+  LineChart,
   LoaderCircle,
   LockKeyhole,
   LogOut,
@@ -24,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { marketsByCategory, markets } from "../lib/markets";
+import { marketsByCategory, markets, type MarketCategory } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
 import { otherSidePremium, payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
@@ -47,7 +48,7 @@ import { PortfolioView, type SavedPosition } from "./PortfolioView";
 import { TradePositionsPanel } from "./TradePositionsPanel";
 import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
-type Tab = "market" | "portfolio" | "earn" | "launch";
+type Tab = "crypto" | "stocks" | "portfolio" | "earn" | "launch";
 type Direction = "up" | "down";
 // "expired" is a distinct value (not "error"): it's the neutral, no-fault
 // state after MAX_AUTO_REFRESHES silent re-quotes, versus a real fetch failure.
@@ -123,27 +124,14 @@ function toAsset(market: (typeof markets)[number]) {
   };
 }
 
-const assets = markets.map(toAsset);
-const tradableAssets = assets.filter((asset) => asset.tradable);
-// Grouped for display by app/lib/markets.ts's marketsByCategory -- the
-// grouping rule and the category order live there, not here, so adding a
-// market never means editing this component. The per-group `tradable` count
-// is derived from `status` (never from the category), because a category is
-// not a proxy for tradability: today every crypto market happens to be live
-// and every stock one is not, and hardcoding that coincidence is the bug
-// this comment exists to prevent.
-const assetGroups = marketsByCategory.map((group) => {
-  const groupAssets = group.markets.map(toAsset);
-  return {
-    category: group.category,
-    label: group.label,
-    assets: groupAssets,
-    tradableCount: groupAssets.filter((asset) => asset.tradable).length,
-  };
-});
+// Crypto and Stocks are now separate top-level destinations rather than two
+// rows of one combined strip, so there is no longer a single module-wide
+// asset list -- each is scoped to its own category inside TradeView (below),
+// sourced from marketsByCategory the same way the old combined groups were.
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
-  { id: "market", label: "Trade", icon: Activity },
+  { id: "crypto", label: "Crypto", icon: Activity },
+  { id: "stocks", label: "Stocks", icon: LineChart },
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
   { id: "earn", label: "Write & earn", icon: TrendingUp },
   { id: "launch", label: "Launch", icon: Rocket },
@@ -439,6 +427,7 @@ function payoffTierLabel(tier: number): string {
 }
 
 function TradeView({
+  category,
   walletAddress,
   onConnect,
   onPositionSaved,
@@ -450,6 +439,7 @@ function TradeView({
   onSessionExpired,
   positions,
 }: {
+  category: MarketCategory;
   walletAddress: string;
   onConnect: () => void | Promise<void>;
   onPositionSaved: (position: SavedPosition) => void;
@@ -461,7 +451,20 @@ function TradeView({
   onSessionExpired: () => void;
   positions: SavedPosition[];
 }) {
-  const [assetTicker, setAssetTicker] = useState(() => tradableAssets[0]?.ticker ?? "");
+  // This tab's markets ONLY, sourced from marketsByCategory (the single
+  // place grouping is decided -- see app/lib/markets.ts) rather than
+  // re-filtering `markets` by category here, so Crypto and Stocks never
+  // diverge on which symbols belong to which shelf. `tradable` still reads
+  // off each market's own `status`, never off `category` -- see toAsset's
+  // comment above for why that distinction is load-bearing.
+  const categoryGroup = marketsByCategory.find((group) => group.category === category);
+  const categoryLabel = categoryGroup?.label ?? category;
+  const categoryAssets = (categoryGroup?.markets ?? []).map(toAsset);
+  const tradableCategoryAssets = categoryAssets.filter((item) => item.tradable);
+  // First tradable market in this category; if none are tradable (Stocks,
+  // today), the first market in the category so the tab still has a default.
+  const defaultAssetTicker = tradableCategoryAssets[0]?.ticker ?? categoryAssets[0]?.ticker ?? "";
+  const [assetTicker, setAssetTicker] = useState(defaultAssetTicker);
   const [direction, setDirection] = useState<Direction>("up");
   const [expiry, setExpiry] = useState<ExpiryCode>("30D");
   const [payoff, setPayoff] = useState(5);
@@ -494,9 +497,11 @@ function TradeView({
   const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  // Only ever a tradable asset: the coming-soon chips are disabled, so
-  // `assetTicker` can never hold one, and the fallback stays on the live set.
-  const asset = tradableAssets.find((item) => item.ticker === assetTicker) ?? tradableAssets[0] ?? assets[0];
+  // Only ever a tradable asset when one exists in this category: the
+  // coming-soon chips are disabled, so `assetTicker` can never hold one while
+  // any tradable market is available, and the fallback stays on this
+  // category's own set (see toAsset's comment -- never the other shelf's).
+  const asset = tradableCategoryAssets.find((item) => item.ticker === assetTicker) ?? tradableCategoryAssets[0] ?? categoryAssets[0];
   // What the buyer typed is what they PAY. The payout it buys is solved
   // server-side and only known once a quote exists (see payoutForStake).
   const stake = Number(amount) || 0;
@@ -696,6 +701,30 @@ function TradeView({
     return () => window.clearInterval(timer);
   }, [quoteState, bestQuote, executionState, complete]);
 
+  // Reset to this category's default asset the moment `category` itself
+  // changes -- e.g. switching from Crypto to Stocks in the nav. Mirrors the
+  // wallet-switch reset just below: state repair during render (a plain
+  // conditional setState, not useEffect+setState, which
+  // react-hooks/set-state-in-effect forbids as an error). Inlines
+  // invalidateQuote's state resets rather than calling it directly, because
+  // that function also bumps requestSeqRef/autoRefreshCountRef -- ref writes
+  // the react-hooks/refs rule forbids during render; the ref bump for a
+  // category change is handled by the effect below instead, alongside the
+  // wallet one.
+  const [resolvedCategory, setResolvedCategory] = useState(category);
+  if (resolvedCategory !== category) {
+    setResolvedCategory(category);
+    setAssetTicker(defaultAssetTicker);
+    setMarketSnapshot(null);
+    setComplete(false);
+    setExecutionState("idle");
+    setExecutionError("");
+    setQuoteState("idle");
+    setQuotes([]);
+    setSelectedQuoteId("");
+    setVsolQuote(null);
+  }
+
   // Signed quotes bind the exact buyer, so switching wallets invalidates them mid-render.
   const [quotedWallet, setQuotedWallet] = useState(walletAddress);
   if (quotedWallet !== walletAddress) {
@@ -710,12 +739,12 @@ function TradeView({
   }
 
   // Refs are read/written outside render (event handlers, effects) only --
-  // this mirrors the wallet-switch reset above without mutating a ref
-  // during render.
+  // this mirrors the wallet-switch and category-switch resets above without
+  // mutating a ref during render.
   useEffect(() => {
     requestSeqRef.current += 1;
     autoRefreshCountRef.current = 0;
-  }, [walletAddress]);
+  }, [walletAddress, category]);
 
   // Clamps the stake into the new tier's bounds as the tier changes, so the
   // ticket is never left in a state that cannot be quoted.
@@ -880,37 +909,39 @@ function TradeView({
         </div>
 
         <div className="asset-strip" role="group" aria-label="Available markets">
-          {assetGroups.map((group) => (
-            <section key={group.category} className="asset-group" aria-label={group.label}>
-              <h3 className="asset-group-head">{group.label}<span>{group.tradableCount > 0 ? `${group.tradableCount} tradable` : "Coming soon"}</span></h3>
-              <div className="asset-group-row">
-                {group.assets.map((item) => (
-                  <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-                    <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : `${shortDataSourceLabel(dataSourceLabel)} pending`}</small></span>
-                    {/* The two coming-soon cases are different in kind (an un-entitled
-                        feed vs no feed at all) and a user cannot tell which is which
-                        from "Coming soon", so the distinction is rendered, not only
-                        tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
-                        full sentence. Three sentences inline made the UNTRADABLE
-                        markets taller than the tradable ones. The authoritative
-                        sentence is still one hover away (the button's `title`), and it
-                        is still the same string the server returns from resolveExpiry,
-                        so the reason shown is the reason enforced.
+          {/* Crypto and Stocks are now separate nav destinations, so this strip
+              lists ONE category's markets -- the two-group layout collapsed to
+              one section, still built from the same asset-group chrome (and the
+              same `marketsByCategory`-sourced data) the combined strip used. */}
+          <section className="asset-group" aria-label={categoryLabel}>
+            <h3 className="asset-group-head">{categoryLabel}<span>{tradableCategoryAssets.length > 0 ? `${tradableCategoryAssets.length} tradable` : "Coming soon"}</span></h3>
+            <div className="asset-group-row">
+              {categoryAssets.map((item) => (
+                <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
+                  <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : `${shortDataSourceLabel(dataSourceLabel)} pending`}</small></span>
+                  {/* The two coming-soon cases are different in kind (an un-entitled
+                      feed vs no feed at all) and a user cannot tell which is which
+                      from "Coming soon", so the distinction is rendered, not only
+                      tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
+                      full sentence. Three sentences inline made the UNTRADABLE
+                      markets taller than the tradable ones. The authoritative
+                      sentence is still one hover away (the button's `title`), and it
+                      is still the same string the server returns from resolveExpiry,
+                      so the reason shown is the reason enforced.
 
-                        A market that is tradable but not selected shows nothing here:
-                        it has a live price in the line above, and an em-dash beside a
-                        real price reads as missing data rather than as "not the
-                        market you are looking at". */}
-                    {item.tradable
-                      ? item.ticker === asset.ticker
-                        ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
-                        : null
-                      : <span className="asset-chip-note">{item.statusTag}</span>}
-                  </button>
-                ))}
-              </div>
-            </section>
-          ))}
+                      A market that is tradable but not selected shows nothing here:
+                      it has a live price in the line above, and an em-dash beside a
+                      real price reads as missing data rather than as "not the
+                      market you are looking at". */}
+                  {item.tradable
+                    ? item.ticker === asset.ticker
+                      ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
+                      : null
+                    : <span className="asset-chip-note">{item.statusTag}</span>}
+                </button>
+              ))}
+            </div>
+          </section>
         </div>
 
         <div className="market-card">
@@ -1083,7 +1114,7 @@ function TradeView({
 export function TendTerminal() {
   const bridge = useWalletBridge();
   const walletAddress = bridge.address;
-  const [activeTab, setActiveTab] = useState<Tab>("market");
+  const [activeTab, setActiveTab] = useState<Tab>("crypto");
   const [menuOpen, setMenuOpen] = useState(false);
   const [walletMenuOpen, setWalletMenuOpen] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
@@ -1096,7 +1127,7 @@ export function TendTerminal() {
   const [positions, setPositions] = useState<SavedPosition[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [positionsError, setPositionsError] = useState("");
-  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Trade", [activeTab]);
+  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Crypto", [activeTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1302,7 +1333,7 @@ export function TendTerminal() {
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "crypto" || activeTab === "stocks" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("crypto")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );
