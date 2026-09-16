@@ -310,7 +310,7 @@ test("SOL is live and tradable, and the coming-soon status gate still blocks a n
   assert.match(terminal, /disabled=\{!item\.tradable\}/);
 });
 
-test("the catalog is two categories: crypto is all live, and stocks are all live too (Finnhub-priced), across three symbols", async () => {
+test("the catalog is two categories: crypto is all live, and stocks are all live too (Hyperliquid-priced), across three symbols", async () => {
   const [markets, expiries, terminal] = await Promise.all([
     import(new URL("app/lib/markets.ts", root)),
     import(new URL("app/lib/expiries.ts", root)),
@@ -341,12 +341,12 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
   assert.deepEqual(markets.liveMarkets.filter((market) => market.category === "crypto").map((market) => market.symbol), crypto);
 
   // Stocks: NVDA, GOOGL and -- as of SPACEX's 2026-06-12 NASDAQ IPO -- SPACEX
-  // too are all tradable now, priced off Finnhub/Twelve Data instead of Pyth.
-  // NVDA/GOOGL's Pyth entitlement gap never closed (see their entries in
-  // markets.ts), it just stopped being the thing that gates trading here.
-  // The catalog carries zero coming-soon markets today -- see the previous
-  // test for how the coming-soon GATE itself is still exercised with a
-  // synthetic fixture.
+  // too are all tradable now, priced off Hyperliquid's "xyz" HIP-3 dex
+  // instead of Pyth. NVDA/GOOGL's Pyth entitlement gap never closed (see
+  // their entries in markets.ts), it just stopped being the thing that gates
+  // trading here. The catalog carries zero coming-soon markets today -- see
+  // the previous test for how the coming-soon GATE itself is still exercised
+  // with a synthetic fixture.
   const liveStockSymbols = ["NVDA", "GOOGL", "SPACEX"];
   for (const symbol of liveStockSymbols) {
     const market = bySymbol[symbol];
@@ -358,13 +358,13 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
     assert.equal(markets.tradableMarketBySymbol(symbol), market);
     assert.equal(market.coinbaseProductId, "", `${symbol} does not trade on Coinbase`);
     assert.doesNotMatch(market.blurb, /Pyth/, `${symbol}'s blurb must not claim a Pyth price it does not have`);
-    assert.match(market.blurb, /Finnhub/i, `${symbol}'s blurb must name its real price source`);
+    assert.match(market.blurb, /Hyperliquid/i, `${symbol}'s blurb must name its real price source`);
     assert.equal(market.assetClass, "US equity");
   }
   // EVERY live market carries a real Pyth feed id as settlement-identity
   // metadata (see the field's own doc comment), even though no stock BLURB
-  // claims a Pyth price this deployment cannot read -- Finnhub is the real
-  // source and settlement runs on the custom oracle.
+  // claims a Pyth price this deployment cannot read -- Hyperliquid's "xyz"
+  // dex is the real source and settlement runs on the custom oracle.
   //
   // SPACEX used to be the exception, blank because SpaceX was private. It
   // IPO'd on NASDAQ 2026-06-12 as SPCX and Pyth publishes it, so it is
@@ -407,8 +407,8 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
     assert.ok(pct >= 2 && pct <= 3, `${symbol}'s ladder step is ${pct.toFixed(2)}% of spot, outside the 2-3% band`);
   }
   // SPACEX is excluded from the 2-3% band check above: its own $2.50 step
-  // against the ~$143.49 spot Finnhub reports (see markets.ts's SPACEX entry
-  // and CLAUDE.md) is ~1.74%, not the "~2%" the entry's own comment claims --
+  // against the ~$143.49 spot markets.ts's SPACEX entry cites (see that
+  // entry and CLAUDE.md) is ~1.74%, not the "~2%" the entry's own comment claims --
   // just under the band every other listing here was sized to. Pinned as the
   // real, current value rather than fudging the band to cover it; worth
   // reconciling in markets.ts (a wider step, e.g. $3.00-3.25, would land back
@@ -418,32 +418,18 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
   assert.ok(spacexPct > 1.5 && spacexPct < 2, `SPACEX's ladder step is ${spacexPct.toFixed(2)}% of spot -- update this pin if markets.ts's step or blurb spot changes`);
 
   // Every live market is tradable at every code the grid itself allows --
-  // status is the only gate consulted here, never category.
+  // status is the only gate consulted here, never category. NVDA/GOOGL/
+  // SPACEX used to be the exception (a stock's tradability was also
+  // clock-gated to regular trading hours -- see tests/expiries.test.mjs's
+  // header for why that gate is gone), so this now holds identically for
+  // stocks and crypto: 24/7, with no trading-hours language anywhere in the
+  // reason a code IS available.
   const now = Date.parse("2026-07-17T14:00:00Z");
   for (const code of expiries.expiryCodes) {
-    for (const symbol of crypto) {
-      assert.equal(expiries.resolveExpiry(code, symbol, now).available, true, `${symbol}/${code} must be tradable`);
-    }
-  }
-
-  // NVDA/GOOGL/SPACEX are LIVE, but a stock's tradability is now also
-  // clock-gated: a US-equity price freezes outside regular trading hours, so
-  // an expiry landing outside that window must refuse with a named,
-  // actionable reason instead of either throwing or (worse) silently
-  // offering a binary that would settle against a known, frozen price. `now`
-  // above (2026-07-17, Friday 10:00 ET) puts 15M/1H inside the trading
-  // session and EOD/7D/30D outside it (they land at the next UTC midnight,
-  // 8pm ET) -- pinned here as a regression check; the exhaustive RTH-gating
-  // coverage (weekends, DST, exact boundary) lives in tests/expiries.test.mjs.
-  const expectedStockAvailability = { "15M": true, "1H": true, EOD: false, "7D": false, "30D": false };
-  for (const symbol of liveStockSymbols) {
-    for (const code of expiries.expiryCodes) {
+    for (const symbol of [...crypto, ...liveStockSymbols]) {
       const definition = expiries.resolveExpiry(code, symbol, now);
-      assert.equal(definition.available, expectedStockAvailability[code], `${symbol}/${code} availability regression`);
-      if (!definition.available) {
-        assert.match(definition.availabilityReason, /frozen outside regular trading hours/i);
-        assert.match(definition.availabilityReason, new RegExp(bySymbol[symbol].name));
-      }
+      assert.equal(definition.available, true, `${symbol}/${code} must be tradable`);
+      assert.doesNotMatch(definition.availabilityReason, /trading hours|frozen|session|holiday|weekend/i);
     }
   }
 

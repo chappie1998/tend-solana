@@ -11,7 +11,7 @@ import type { Vsol } from "../target/types/vsol.ts";
 // market on this deployment routes through the SAME per-category dispatch
 // the app and the quote path use (see app/lib/market-data.ts's own header):
 // crypto reads Coinbase (or Pyth, via MARKET_DATA_PROVIDER), stocks always
-// read Finnhub. This pusher must never call a single provider directly --
+// read Hyperliquid's "xyz" dex. This pusher must never call a single provider directly --
 // it did that for a while (Coinbase only), which worked fine until NVDA/GOOGL
 // went live and every stock tick started asking Coinbase for a symbol
 // Coinbase has never listed, throwing every cycle.
@@ -25,7 +25,7 @@ import { deriveConfig, deriveCustomPriceFeed, PRICE_SCALE, VSOL_PROGRAM_ID } fro
 // settlement path added alongside `CustomPriceFeed` in
 // vsol/programs/vsol/src/lib.rs: on a fixed cadence it fetches each live
 // symbol's off-chain spot (via getMarketSnapshot's per-category routing --
-// Coinbase/Pyth for crypto, Finnhub for stocks), scales it to `PRICE_SCALE`
+// Coinbase/Pyth for crypto, Hyperliquid for stocks), scales it to `PRICE_SCALE`
 // atoms, and calls `update_custom_price_feed`. It is intentionally simple
 // and centralized --
 // see that account's own doc comment for the honest trust-model disclosure
@@ -93,7 +93,7 @@ async function pushOneSymbol(params: {
   const price = toPriceScaleAtoms(snapshot.price);
   // `confidence` is always a non-negative, human-scale dispersion proxy
   // regardless of which provider produced the snapshot -- half the live
-  // bid/ask spread for Coinbase, half the day's high-low range for Finnhub
+  // bid/ask spread for Coinbase, |mark - oracle| for Hyperliquid
   // (see MarketSnapshot's doc comment in app/lib/market-data-types.ts) --
   // never a Pyth-style confidence interval, but always a real, roundable
   // number. The `Math.max(0, ...)` stays defensive rather than provider-
@@ -124,7 +124,7 @@ async function runOnePass(program: Program<Vsol>, authority: Keypair, config: Pu
       await pushOneSymbol({ program, authority, config, market });
     } catch (error) {
       // Per-symbol isolation: an outage at whichever provider this symbol
-      // routes to (Coinbase/Pyth for crypto, Finnhub for stocks -- see
+      // routes to (Coinbase/Pyth for crypto, Hyperliquid for stocks -- see
       // app/lib/market-data.ts), an un-initialized feed (init_custom_price_feed
       // not yet called for this symbol), or a single failed RPC must cost
       // only that symbol's tick, never the whole pass.

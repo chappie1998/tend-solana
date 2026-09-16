@@ -406,8 +406,7 @@ function expiryChipTitle(item: Pick<ExpiryDefinition, "available" | "label" | "d
 function shortDataSourceLabel(source: string | null | undefined): string {
   if (source === "Pyth Core Hermes") return "Pyth";
   if (source === "Coinbase Exchange") return "Coinbase";
-  if (source === "Finnhub") return "Finnhub";
-  if (source === "Twelve Data") return "Twelve Data";
+  if (source === "Hyperliquid") return "Hyperliquid";
   return "Market";
 }
 

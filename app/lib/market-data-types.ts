@@ -1,14 +1,14 @@
 // Provider-neutral shapes for off-chain market data: spot reference,
-// realized volatility, and chart bars. Four providers implement these --
+// realized volatility, and chart bars. Three providers implement these --
 // app/lib/coinbase-market-data.ts / coinbase-market-bars.ts (Coinbase
 // Exchange's public API, no key required) and app/lib/pyth-market-data.ts /
 // pyth-market-bars.ts (Pyth Core Hermes + History) for CRYPTO markets, and
-// app/lib/finnhub-market-data.ts (spot) / app/lib/twelvedata-market-bars.ts
-// (bars + realized vol) for STOCK markets -- and app/lib/market-data.ts
-// resolves the right one per call: crypto picks Coinbase-vs-Pyth via
-// MARKET_DATA_PROVIDER (defaulting to Coinbase), stocks always go to
-// Finnhub/Twelve Data. See that file's header for the full routing and the
-// "no fallback between providers" contract.
+// app/lib/hyperliquid-market-data.ts (spot, bars, and realized vol, all from
+// one module) for STOCK markets -- and app/lib/market-data.ts resolves the
+// right one per call: crypto picks Coinbase-vs-Pyth via MARKET_DATA_PROVIDER
+// (defaulting to Coinbase), stocks always go to Hyperliquid's public "xyz"
+// HIP-3 dex, no key required either. See that file's header for the full
+// routing and the "no fallback between providers" contract.
 //
 // ONCHAIN SETTLEMENT IS UNAFFECTED BY THIS FILE. It always verifies a fresh
 // Pyth PriceUpdateV2 against the exact feed id hashed into the market
@@ -22,16 +22,18 @@
 
 import type { ChartResolution, MarketBar } from "./market-bars.ts";
 
-export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Finnhub";
+export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Hyperliquid";
 
 export type MarketSnapshot = {
   price: number;
   /**
    * Pyth: half the published confidence interval. Coinbase: half the live
-   * bid/ask spread, a standard liquidity-based proxy. Finnhub: half the
-   * day's high-low range, a coarser dispersion proxy used only because the
-   * free `/quote` tier carries no bid/ask at all. None of the non-Pyth
-   * proxies is a Pyth-style confidence interval -- every snapshot's
+   * bid/ask spread, a standard liquidity-based proxy. Hyperliquid: the
+   * absolute difference between its own traded mark price and its external
+   * oracle price -- two independently-derived numbers for the same asset,
+   * which can legitimately read near zero when they agree closely (a
+   * tighter measure than a high-low proxy, not a broken one). None of the
+   * non-Pyth proxies is a Pyth-style confidence interval -- every snapshot's
    * `warning` field says which kind it got.
    */
   confidence: number;
@@ -55,7 +57,7 @@ export type MarketSnapshot = {
 export type RealizedVolatilitySource =
   | "Coinbase Exchange 20-session realized volatility"
   | "Pyth Benchmarks 20-session realized volatility"
-  | "Twelve Data 20-session realized volatility";
+  | "Hyperliquid 20-session realized volatility";
 
 export type RealizedVolatility = {
   value: number;
@@ -64,16 +66,17 @@ export type RealizedVolatility = {
   asOf: number;
 };
 
-/** Chart bars carry a related but distinct `source` vocabulary from MarketDataSource -- Pyth's own label for its history API is "Pyth Benchmarks", not "Pyth Core Hermes", and Twelve Data supplies bars for the same stock markets Finnhub snapshots. */
-export type MarketDataBarsSource = "Coinbase Exchange" | "Pyth Benchmarks" | "Twelve Data";
+/** Chart bars carry a related but distinct `source` vocabulary from MarketDataSource -- Pyth's own label for its history API is "Pyth Benchmarks", not "Pyth Core Hermes"; Hyperliquid uses one label ("Hyperliquid") for both its snapshot and its bars. */
+export type MarketDataBarsSource = "Coinbase Exchange" | "Pyth Benchmarks" | "Hyperliquid";
 
 export type MarketDataBars = {
   symbol: string;
   resolution: ChartResolution;
   source: MarketDataBarsSource;
   // Whether the most recent bar is inside the normal publish cadence for this
-  // resolution. There is no "market closed" state -- Tend quotes 24/7 -- this
-  // just tells the chart whether to poll fast or slow.
+  // resolution. There is no "market closed" state -- Tend quotes every
+  // market, crypto and stocks alike, 24/7 -- this just tells the chart
+  // whether to poll fast or slow.
   freshness: "live" | "stale";
   bars: MarketBar[];
   from: number;

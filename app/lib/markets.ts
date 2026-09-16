@@ -47,8 +47,8 @@ export type Market = {
    * config edit alone, which is the whole point of distinguishing it from a
    * market whose feed exists but is merely un-entitled -- e.g. NVDA and
    * GOOGL below, both `"live"` today via a different off-chain price source
-   * (Finnhub/Twelve Data; see `blurb`) despite carrying a real Pyth feed id
-   * this deployment's key still cannot read. This field is kept accurate
+   * (Hyperliquid's "xyz" dex; see `blurb`) despite carrying a real Pyth feed
+   * id this deployment's key still cannot read. This field is kept accurate
    * regardless of `status` because it is settlement-identity metadata (it is
    * hashed into the on-chain market id via `pythFeedIdFor`), not a
    * tradability switch.
@@ -66,14 +66,16 @@ export type Market = {
    * but "no product exists for this market on Coinbase Exchange". Every
    * STOCK market carries an empty string here, live or coming-soon alike,
    * because Coinbase lists no equities at all -- a live stock market's
-   * off-chain reference comes from Finnhub/Twelve Data instead (see
+   * off-chain reference comes from Hyperliquid's "xyz" HIP-3 dex instead (see
    * app/lib/market-data.ts), never from this field.
    */
   coinbaseProductId: string;
   /**
-   * The exchange ticker Finnhub/Twelve Data know this equity by, when it
-   * differs from `symbol`. Empty string means "they are the same" -- NVDA and
-   * GOOGL are their own tickers, so they leave this blank.
+   * The exchange ticker an off-chain equity vendor knows this equity by, when
+   * it differs from `symbol` -- today that vendor is Hyperliquid's "xyz" dex
+   * (see app/lib/hyperliquid-market-data.ts), which namespaces every coin as
+   * `xyz:${equityTicker || symbol}`. Empty string means "they are the same"
+   * -- NVDA and GOOGL are their own tickers, so they leave this blank.
    *
    * These MUST be allowed to differ. `symbol` is hashed into the on-chain
    * market PDA and seeds the market's `CustomPriceFeed`, so it is permanent
@@ -110,7 +112,7 @@ export type Market = {
    * One true sentence naming the underlying and the price source it displays
    * on. For a crypto market this must stay accurate to `pythSymbol` above
    * (settlement and display are the same feed there). For a STOCK market it
-   * must instead name Finnhub/Twelve Data (see app/lib/market-data.ts) --
+   * must instead name Hyperliquid's "xyz" dex (see app/lib/market-data.ts) --
    * `pythSymbol` is kept on a stock entry only as settlement-identity
    * metadata (see that field's own doc comment) and must never be quoted here
    * as if it were the display source, because it is not: this deployment's
@@ -130,8 +132,8 @@ export type Market = {
    * Google used to be blocked here too (a billing state: real, working 24/7
    * Pyth feeds this deployment's key was not entitled to) -- that blocker no
    * longer gates trading now that their off-chain reference comes from
-   * Finnhub/Twelve Data instead (see `blurb`), so both carry the same empty
-   * string every other live market does.
+   * Hyperliquid's "xyz" dex instead (see `blurb`), so both carry the same
+   * empty string every other live market does.
    */
   statusNote: string;
   /**
@@ -280,20 +282,20 @@ export const markets: Market[] = [
     // id/symbol below are settlement-identity metadata only, still not a
     // price this deployment can read. What changed is the OFF-CHAIN
     // reference this market displays and quotes off: NVDA now prices through
-    // Finnhub (spot) and Twelve Data (chart bars + realized volatility) --
-    // see app/lib/market-data.ts's per-category routing -- neither of which
-    // needs any Pyth entitlement at all. That is what makes `status: "live"`
-    // correct despite the Pyth blocker never having been lifted.
-    //
-    // The remaining real constraint this listing carries is that a US-equity
-    // spot price freezes outside its regular trading session (see
-    // app/lib/market-hours.ts); expiries.ts's `resolveExpiry` refuses any
-    // expiry for a stock-category market that would land outside that
-    // window, which is the actual gate keeping this safe to trade 24/7 like
-    // every other listing here even though NVDA itself is not a 24/7 asset.
+    // Hyperliquid's "xyz" HIP-3 dex -- a tokenized-equity PERP that genuinely
+    // trades 24/7 (see app/lib/hyperliquid-market-data.ts for the live
+    // verification evidence), for spot, chart bars, AND realized volatility
+    // alike -- see app/lib/market-data.ts's per-category routing -- none of
+    // which needs any Pyth entitlement at all. That is what makes
+    // `status: "live"` correct despite the Pyth blocker never having been
+    // lifted, and it's also what makes trading this 24/7 HONEST rather than
+    // a loophole: unlike the real Finnhub/Twelve Data quotes this used to
+    // price off (which froze outside 09:30-16:00 America/New_York and forced
+    // a matching RTH gate in expiries.ts), Hyperliquid's price keeps moving
+    // around the clock, so there is no frozen-price window left to gate.
     pythFeedId: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f",
     pythSymbol: "Crypto.NVDAX/USD",
-    // Finnhub/Twelve Data, not Coinbase -- Coinbase lists no equities at all.
+    // Hyperliquid's "xyz" dex, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
     equityTicker: "",
     intradayEligible: true,
@@ -302,7 +304,7 @@ export const markets: Market[] = [
     // every crypto listing above.
     strikeLadderStep: dollars(5),
     assetClass: "US equity",
-    blurb: "NVIDIA common stock, priced live off Finnhub (chart and realized volatility from Twelve Data).",
+    blurb: "NVIDIA common stock, priced live off Hyperliquid's xyz:NVDA 24/7 equity feed.",
     statusNote: "",
     statusTag: "",
   },
@@ -320,12 +322,13 @@ export const markets: Market[] = [
     // Equity.US.GOOGL/USD alike (a billing state, not a missing oracle --
     // which is why this entry carries a real feed id and SpaceX below
     // carries none), but that no longer matters for trading here because
-    // GOOGL's off-chain reference comes from Finnhub/Twelve Data instead
+    // GOOGL's off-chain reference comes from Hyperliquid's "xyz" dex instead
     // (see the NVDA entry above for the fuller explanation, which applies
-    // identically). The feed id/symbol stay as settlement-identity metadata.
+    // identically, including why this is now honestly 24/7 with no RTH gate).
+    // The feed id/symbol stay as settlement-identity metadata.
     pythFeedId: "b911b0329028cd0283e4259c33809d62942bd2716a58084e5f31d64c00b5424e",
     pythSymbol: "Crypto.GOOGLX/USD",
-    // Finnhub/Twelve Data, not Coinbase -- Coinbase lists no equities at all.
+    // Hyperliquid's "xyz" dex, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
     equityTicker: "",
     intradayEligible: true,
@@ -333,7 +336,7 @@ export const markets: Market[] = [
     // ~2.4% at GOOGL's ~$210 level, same sizing logic as NVDA.
     strikeLadderStep: dollars(5),
     assetClass: "US equity",
-    blurb: "Alphabet (Google) common stock, priced live off Finnhub (chart and realized volatility from Twelve Data).",
+    blurb: "Alphabet (Google) common stock, priced live off Hyperliquid's xyz:GOOGL 24/7 equity feed.",
     statusNote: "",
     statusTag: "",
   },
@@ -349,7 +352,9 @@ export const markets: Market[] = [
     // price at any tier, which was true when written and is now simply false.
     // Verified against both live providers before flipping it: Finnhub
     // /stock/profile2 SPCX returns name "Space Exploration Technologies Corp",
-    // exchange NASDAQ, ipo 2026-06-12; Twelve Data /quote SPCX agrees. Do not
+    // exchange NASDAQ, ipo 2026-06-12; Twelve Data /quote SPCX agrees, and
+    // Hyperliquid's "xyz" dex lists it as xyz:SPCX (see `equityTicker`
+    // below), the price source this market actually reads from now. Do not
     // reinstate the old copy from memory -- check the feed.
     //
     // Pyth DOES publish SPCX, in three variants. This binds the 24/7 one
@@ -359,25 +364,26 @@ export const markets: Market[] = [
     // round-the-clock price for the same ticker.
     //
     // This id is NOT a price source for us -- this deployment's Pyth key has
-    // no equity entitlement, and stock prices come from Finnhub while
-    // settlement runs on the custom oracle. It is load-bearing as IDENTITY:
-    // `pythFeedIdFor` feeds `series-resolver.ts`'s market-PDA derivation, and
-    // an empty string there throws, so a market cannot be minted, quoted or
-    // settled without one. That is why this market could not simply be
-    // flipped live with the field left blank.
+    // no equity entitlement, and stock prices come from Hyperliquid's "xyz"
+    // dex while settlement runs on the custom oracle. It is load-bearing as
+    // IDENTITY: `pythFeedIdFor` feeds `series-resolver.ts`'s market-PDA
+    // derivation, and an empty string there throws, so a market cannot be
+    // minted, quoted or settled without one. That is why this market could
+    // not simply be flipped live with the field left blank.
     pythFeedId: "2dbfb1791e75725227a90dbd23c6bdd83b80cc9d13011973c948b6aeacdf17b9",
     pythSymbol: "Equity.Index.SPCX/USD",
     // Coinbase lists no equities, SpaceX included.
     coinbaseProductId: "",
     // The one market where the vendor ticker differs from `symbol` -- see that
     // field's doc comment for why we do NOT rename the symbol to match.
+    // Hyperliquid's "xyz" dex resolves this to the coin `xyz:SPCX`.
     equityTicker: "SPCX",
     intradayEligible: true,
     status: "live",
     // ~2% of a ~$143 spot, matching how every other market's rung was sized.
     strikeLadderStep: dollars(2, 50),
     assetClass: "US equity",
-    blurb: "Space Exploration Technologies (SPCX) on NASDAQ, priced from Finnhub with chart history from Twelve Data.",
+    blurb: "Space Exploration Technologies (SPCX) on NASDAQ, priced live off Hyperliquid's xyz:SPCX 24/7 equity feed.",
     statusNote: "",
     statusTag: "",
   },

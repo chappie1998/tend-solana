@@ -23,7 +23,7 @@ import {
 // come from any of this app's providers (see app/lib/market-data.ts), and
 // `source` must always name whichever one actually produced this snapshot --
 // never a hardcoded label independent of what the API returned.
-export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Finnhub";
+export type MarketDataSource = "Coinbase Exchange" | "Pyth Core Hermes" | "Hyperliquid";
 
 export type MarketSnapshot = {
   price: number;
@@ -43,7 +43,7 @@ type ChartState = "loading" | "success" | "error";
 type MarketBarsPayload = {
   symbol: string;
   resolution: ChartResolution;
-  source: "Coinbase Exchange" | "Pyth Benchmarks" | "Twelve Data";
+  source: "Coinbase Exchange" | "Pyth Benchmarks" | "Hyperliquid";
   freshness: "live" | "stale";
   bars: MarketBar[];
   asOf: number;
@@ -54,8 +54,7 @@ type MarketBarsPayload = {
 function shortSourceLabel(source: string | undefined): string {
   if (source === "Pyth Core Hermes" || source === "Pyth Benchmarks") return "Pyth";
   if (source === "Coinbase Exchange") return "Coinbase";
-  if (source === "Finnhub") return "Finnhub";
-  if (source === "Twelve Data") return "Twelve Data";
+  if (source === "Hyperliquid") return "Hyperliquid";
   return "Market";
 }
 

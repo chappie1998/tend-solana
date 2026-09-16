@@ -70,7 +70,7 @@ test("the default provider dispatches to the Coinbase implementation, not Pyth: 
   // attempt a real Hermes fetch and fail differently (or hang) -- this
   // exact, synchronous, offline rejection is only reachable through the
   // Coinbase code path. See the stock-routing test below for NVDA, and
-  // tests/stock-market-data.test.mjs for the rest of the stock provider
+  // tests/hyperliquid-market-data.test.mjs for the rest of the stock provider
   // coverage.
   const syntheticCrypto = { name: "Synthetic", symbol: "SYN", category: "crypto", coinbaseProductId: "" };
   await assert.rejects(
@@ -90,21 +90,37 @@ test("a stock market never reaches the Coinbase or Pyth code path, regardless of
   // tradable here. So if this reached the Coinbase/Pyth path it would either
   // throw the Coinbase-specific "has no Coinbase product configured" message
   // or attempt a real Hermes fetch. Neither happens: category "stocks" is
-  // routed to Finnhub/Twelve Data before either crypto branch is ever
-  // consulted, so clearing the stock API keys must fail with a
-  // Finnhub/Twelve-Data-specific, not Coinbase-specific, reason -- and that
-  // must hold no matter what MARKET_DATA_PROVIDER is set to, since a stock
-  // market never reads it at all.
+  // routed to Hyperliquid's "xyz" dex before either crypto branch is ever
+  // consulted -- proven here by stubbing fetch and asserting only
+  // api.hyperliquid.xyz is ever reached, no matter what
+  // MARKET_DATA_PROVIDER is set to, since a stock market never reads it at
+  // all. See tests/hyperliquid-market-data.test.mjs for the rest of the
+  // stock provider coverage.
   const nvda = markets.marketBySymbol("NVDA");
-  for (const provider of [undefined, "coinbase", "pyth"]) {
-    await assert.rejects(
-      () => withEnv("MARKET_DATA_PROVIDER", provider, () => withEnv("FINNHUB_API_KEY", undefined, () => marketData.getMarketSnapshot(nvda))),
-      /FINNHUB_API_KEY is not configured/,
+  // ONE stub shared across all three provider values, not reset per
+  // iteration: hyperliquid-market-data.ts caches its universe fetch under a
+  // single shared key (see that file's header), so a second/third call
+  // milliseconds later may legitimately hit the warm cache rather than
+  // firing a new request. Asserting every host that WAS reached is
+  // Hyperliquid (never Coinbase/Pyth) is the robust form of this guarantee
+  // -- it holds whether or not a given iteration re-fetches.
+  const hostsHit = [];
+  const restore = stubFetch((url) => {
+    hostsHit.push(url.hostname);
+    return [{ universe: [{ name: "xyz:NVDA" }] }, [{ markPx: "212.15", oraclePx: "212.10" }]];
+  });
+  try {
+    for (const provider of [undefined, "coinbase", "pyth"]) {
+      const snapshot = await withEnv("MARKET_DATA_PROVIDER", provider, () => marketData.getMarketSnapshot(nvda));
+      assert.equal(snapshot.source, "Hyperliquid", `provider=${provider}: a stock market must resolve through Hyperliquid`);
+    }
+    assert.ok(hostsHit.length >= 1, "at least one call must have actually reached the network");
+    assert.ok(
+      hostsHit.every((host) => host === "api.hyperliquid.xyz"),
+      `a stock market must never reach Coinbase or Pyth, got: ${hostsHit.join(", ")}`,
     );
-    await assert.rejects(
-      () => withEnv("MARKET_DATA_PROVIDER", provider, () => withEnv("TWELVE_DATA_API_KEY", undefined, () => marketData.getMarketBars(nvda, "D"))),
-      /TWELVE_DATA_API_KEY is not configured/,
-    );
+  } finally {
+    restore();
   }
 });
 
@@ -126,8 +142,8 @@ test("every live crypto market has a Coinbase product id; every stock market has
     } else {
       // Every stock market carries no Coinbase product id, live or
       // coming-soon alike -- Coinbase lists no equities at all, so a live
-      // stock market's off-chain reference comes from Finnhub/Twelve Data
-      // instead (see the routing test above and app/lib/market-data.ts).
+      // stock market's off-chain reference comes from Hyperliquid's "xyz"
+      // dex instead (see the routing test above and app/lib/market-data.ts).
       assert.equal(market.coinbaseProductId, "", `${market.symbol} must carry no Coinbase product id`);
     }
   }
@@ -135,16 +151,15 @@ test("every live crypto market has a Coinbase product id; every stock market has
     markets.liveMarkets.filter((market) => market.category === "crypto").map((market) => market.coinbaseProductId).sort(),
     ["BTC-USD", "ETH-USD", "SOL-USD"],
   );
-  // Finnhub/Twelve Data key their request off `tickerFor(market)` --
-  // `market.equityTicker || market.symbol` (see the private `tickerFor`
-  // helper duplicated in getFinnhubSnapshot / getTwelveDataMarketBars) --
-  // NOT `market.symbol` directly any more: SPACEX's own symbol ("SPACEX")
-  // is permanent on-chain identity, but the vendor only knows it as "SPCX".
+  // Hyperliquid's "xyz" dex keys its coin name off `equityTicker || symbol`
+  // (see hyperliquidCoinFor in app/lib/hyperliquid-market-data.ts) -- NOT
+  // `market.symbol` directly: SPACEX's own symbol ("SPACEX") is permanent
+  // on-chain identity, but the vendor only knows it as "SPCX".
   const liveStocks = markets.liveMarkets.filter((market) => market.category === "stocks");
   assert.deepEqual(liveStocks.map((market) => market.symbol).sort(), ["GOOGL", "NVDA", "SPACEX"]);
   for (const market of liveStocks) {
     const vendorTicker = market.equityTicker || market.symbol;
-    assert.match(vendorTicker, /^[A-Z]+$/, `${market.symbol} must resolve to a plain ticker Finnhub/Twelve Data can resolve`);
+    assert.match(vendorTicker, /^[A-Z]+$/, `${market.symbol} must resolve to a plain ticker Hyperliquid can resolve`);
   }
 });
 

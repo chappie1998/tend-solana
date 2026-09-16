@@ -1,19 +1,21 @@
-// Tend is a 24/7 protocol for CRYPTO: expiries are pure clock arithmetic in
-// UTC, with no market calendar, no session, and no holiday — the only real
-// constraint is whether a fresh Pyth print exists for a symbol (see
-// `intradayEligible`), which is a feed-availability fact, not an
-// hours-of-operation rule. This is a hard rule (CLAUDE.md, "24/7 product")
-// and this file must never gate a crypto-category market on the clock.
+// Tend is a 24/7 protocol for EVERY market it lists, crypto and stocks
+// alike: expiries are pure clock arithmetic in UTC, with no market calendar,
+// no session, and no holiday — the only real constraint is whether a fresh
+// price feed exists for a symbol (see `intradayEligible`), which is a
+// feed-availability fact, not an hours-of-operation rule. This is a hard
+// rule (CLAUDE.md, "24/7 product") and this file must never gate any
+// market's expiry on the clock.
 //
-// STOCKS carry one deliberate, scoped exception to that rule: a US-equity
-// spot price freezes outside its regular trading session (see
-// app/lib/market-hours.ts for the empirical proof and the reasoning), so a
-// binary expiring while its underlying is frozen is not a bet, it is a known
-// outcome. `resolveExpiry` refuses a stock-category expiry that would land
-// outside 09:30-16:00 America/New_York, Mon-Fri, via the SAME
-// available/availabilityReason mechanism every other unavailable case already
-// uses below — never a second gate, and never anywhere outside this function
-// (not the quote path, not settlement).
+// Stocks used to carry a scoped exception here (2026-09-16): NVDA/GOOGL were
+// priced off real Finnhub/Twelve Data equity quotes, which genuinely freeze
+// outside 09:30-16:00 America/New_York, so a binary expiring while its
+// underlying was frozen would have settled against a known outcome rather
+// than a real bet. That exception is gone now that stocks price off
+// Hyperliquid's "xyz" HIP-3 dex (see app/lib/hyperliquid-market-data.ts),
+// whose tokenized-equity perps genuinely trade around the clock — the same
+// 24/7 guarantee every crypto listing already had. See CLAUDE.md for the
+// residual risk this switch carries instead (thinner overnight liquidity on
+// that dex).
 //
 // Both feed-availability and category facts come from the market config in
 // ./markets.ts, never from a symbol comparison in here. A hardcoded
@@ -24,7 +26,6 @@
 
 // The explicit .ts extension keeps this module importable by the node:test
 // suite (type stripping) as well as the bundler, matching ./launch-params.ts.
-import { isWithinRegularTradingHours, REGULAR_TRADING_HOURS_DESCRIPTION } from "./market-hours.ts";
 import { marketBySymbol } from "./markets.ts";
 
 export type ExpiryCode = "15M" | "1H" | "EOD" | "7D" | "30D";
@@ -146,14 +147,8 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
   const market = marketBySymbol(symbol);
   const tradable = market?.status === "live";
   const intradayEligible = tradable && market.intradayEligible;
-  // Scoped 24/7 exception: only a TRADABLE STOCK market is ever checked
-  // against the clock at all -- a crypto market's `withinTradingHours` is
-  // always true by construction, and an unknown or coming-soon symbol is
-  // already refused above by `tradable` before this is even consulted.
-  const isStockMarket = tradable && market.category === "stocks";
   const grid = computeExpiryGrid(now);
   const expiryAt = grid[code];
-  const withinTradingHours = !isStockMarket || isWithinRegularTradingHours(expiryAt);
   let expiryDays = 0;
   let observationWindowSeconds = 60;
   let tradeLockSeconds = 60;
@@ -177,8 +172,7 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
   const durationMinutes = Math.max(1, Math.ceil((expiryAt - now) / MINUTE));
   const available = tradable
     && (!INTRADAY_CODES.has(code) || intradayEligible)
-    && expiryAt - now > tradeLockSeconds * 1_000
-    && withinTradingHours;
+    && expiryAt - now > tradeLockSeconds * 1_000;
   let availabilityReason = "A matching deployed onchain series is required.";
   if (!tradable) {
     // The market's own configured explanation, so the sentence a user reads
@@ -186,12 +180,6 @@ export function resolveExpiry(code: ExpiryCode, symbol: string, now = Date.now()
     availabilityReason = market?.statusNote || "This symbol is not a configured Tend market.";
   } else if (INTRADAY_CODES.has(code) && !intradayEligible) {
     availabilityReason = "This symbol has no verified intraday Pyth feed.";
-  } else if (isStockMarket && !withinTradingHours) {
-    // Actionable, not just a refusal: names the window so a trader knows
-    // when to come back, same voice as the other reasons in this function.
-    availabilityReason =
-      `${market.name}'s price is frozen outside regular trading hours (${REGULAR_TRADING_HOURS_DESCRIPTION}); ` +
-      "this series would expire while the market is closed. Pick a series that lands inside the trading session.";
   } else if (!available) {
     availabilityReason = "This series is too close to its trade cutoff. A new series must roll first.";
   }
