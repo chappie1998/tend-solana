@@ -233,7 +233,7 @@ export function PortfolioView({
           <div className="quote-error" role="alert"><div><strong>Couldn’t read chain positions</strong><p>{chain.message}</p></div><button type="button" className="button secondary" onClick={() => void loadChain()}><RefreshCw size={15} /> Retry</button></div>
         ) : chainPositions.length ? (
           <div className="position-table" role="table" aria-label="Open chain positions">
-            <div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Max payout</span><span>Status</span><span>Links</span></div>
+            <div className="table-row table-head" role="row"><span>Market</span><span>Position</span><span>Premium</span><span>Max winning</span><span>Status</span><span>Links</span></div>
             {chainPositions.map((position) => (
               <div className="table-row" role="row" key={position.address}>
                 <span className="asset-cell"><MiniLogo ticker={position.symbol ?? "?"} /><strong>{position.symbol ?? "Unknown"}</strong>{position.seriesCode ? <small> {position.seriesCode}</small> : null}</span>
@@ -314,7 +314,7 @@ export function PortfolioView({
                 <div><span>Buyback proceeds</span><strong>${closePricing.buyback.toFixed(2)}</strong></div>
                 <div><span>Fair value</span><strong>${closePricing.fairValue.toFixed(2)}</strong></div>
                 <div><span>Spread below fair value</span><strong>{(activeQuote.spreadBps / 100).toFixed(2)}%</strong></div>
-                <div><span>Max payout</span><strong>${closePricing.maxPayout.toFixed(2)}</strong></div>
+                <div><span>Max winning</span><strong>${closePricing.maxPayout.toFixed(2)}</strong></div>
                 <div><span>Premium paid</span><strong>${closePricing.premium.toFixed(2)}</strong></div>
                 <div><span>P/L vs premium</span><strong className={closePricing.pnl >= 0 ? "positive" : "negative"}>{closePricing.pnl >= 0 ? "+" : "-"}${Math.abs(closePricing.pnl).toFixed(2)}</strong></div>
               </div>

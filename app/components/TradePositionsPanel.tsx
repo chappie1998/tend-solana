@@ -107,7 +107,7 @@ export function TradePositionsPanel({
   } else if (chainPositions.length) {
     positionsContent = (
       <div className="position-table" role="table" aria-label="Open chain positions">
-        <div className="table-row table-head trade-positions-row" role="row"><span>Market</span><span>Side</span><span>Strike</span><span>Premium</span><span>Max payout</span><span>Expires</span><span>Status</span><span>Links</span></div>
+        <div className="table-row table-head trade-positions-row" role="row"><span>Market</span><span>Side</span><span>Strike</span><span>Premium</span><span>Max winning</span><span>Expires</span><span>Status</span><span>Links</span></div>
         {chainPositions.map((position: ChainPositionRow) => (
           <div className="table-row trade-positions-row" role="row" key={position.address}>
             <span className="asset-cell"><MiniLogo ticker={position.symbol ?? "?"} /><strong>{position.symbol ?? "Unknown"}</strong>{position.seriesCode ? <small> {position.seriesCode}</small> : null}</span>

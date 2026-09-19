@@ -152,6 +152,26 @@ export function digitalFairValue(params: {
 // ---------------------------------------------------------------------------
 export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
 
+/**
+ * The protocol's cut of a WINNING payout, in basis points -- mirrors
+ * `config.fee_bps` on chain (set to 500 on 2026-09-19).
+ *
+ * `settle_pool_position` charges this against the payout and takes it from the
+ * buyer's side, so a LOSING position pays nothing at all and a winner receives
+ * `payout - fee`. It is duplicated here (rather than read from chain) purely so
+ * the ticket can show the net before a quote exists; the authoritative value is
+ * always the `fee_bps` snapshotted on the position itself, which is what
+ * settlement actually uses. A filled quote therefore cannot be re-priced by a
+ * later governance change.
+ */
+export const PROTOCOL_WIN_FEE_BPS = 500;
+
+/** What a winner actually receives after the protocol's cut of the payout. */
+export function netWinning(maxPayout: number, feeBps: number = PROTOCOL_WIN_FEE_BPS): number {
+  if (!Number.isFinite(maxPayout) || maxPayout <= 0) return 0;
+  return maxPayout * (1 - feeBps / 10_000);
+}
+
 export function applyMakerEdge(fair: number, edgeBps: number = MAKER_EDGE_BPS): number {
   return fair * (1 + edgeBps / 10_000);
 }

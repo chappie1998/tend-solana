@@ -687,3 +687,20 @@ test("stakeBoundsForPayoff keeps the implied payout inside the pool's limits", a
   }
   assert.deepEqual(stakeBoundsForPayoff(5), { min: 20, max: 1_000 });
 });
+
+test("the win fee is a cut of the PAYOUT, mirrors config.fee_bps on chain, and never touches a loss", async () => {
+  const { PROTOCOL_WIN_FEE_BPS, netWinning } = await loadOptions();
+  // Mirrors `config.fee_bps`, set to 500 on chain 2026-09-19. If these ever
+  // diverge the ticket quotes a net the settlement will not actually pay.
+  assert.equal(PROTOCOL_WIN_FEE_BPS, 500);
+  assert.equal(netWinning(500), 475);
+  assert.equal(netWinning(1_000), 950);
+  // A loss has no payout, so there is nothing to take a cut of.
+  assert.equal(netWinning(0), 0);
+  assert.equal(netWinning(-5), 0);
+  // The helper takes an explicit rate so an OLDER position -- which settles on
+  // the fee_bps snapshotted at fill, not today's config -- can be shown
+  // correctly rather than assuming everyone pays 5%.
+  assert.equal(netWinning(1_000, 25), 997.5);
+  assert.equal(netWinning(1_000, 0), 1_000);
+});

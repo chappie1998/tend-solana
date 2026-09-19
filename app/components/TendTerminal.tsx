@@ -27,7 +27,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marketsByCategory, markets, type MarketCategory } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
-import { otherSidePremium, payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
+import { netWinning, otherSidePremium, payoffTiersFor, PROTOCOL_WIN_FEE_BPS, stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { useWalletBridge, type WalletBridge } from "../lib/wallet-bridge";
 import {
@@ -1021,7 +1021,7 @@ function TradeView({
               can come back. Everything else is pricing evidence, and it now
               sits behind "Pricing detail" instead of ahead of the answer.
 
-              "Max payout" deliberately restates the position size: the payoff
+              "Max winning" deliberately restates the position size: the payoff
               dial does NOT move it -- it moves the PREMIUM. That reads as a
               frozen number unless the ratio is on screen, so the multiple the
               quote actually achieved is shown beside it. It is the quote's own
@@ -1055,7 +1055,7 @@ function TradeView({
                 no partial payout in between, so both outcomes are stated as
                 their own unambiguous headline rows rather than a single
                 number that could read as a coin flip. */}
-            <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>{direction === "up" ? "at or above" : "at or below"} ${bestQuote.strike.toFixed(2)}</small>}</strong></div>
+            <div className="economics-total"><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>{direction === "up" ? "at or above" : "at or below"} ${bestQuote.strike.toFixed(2)} · nets ${netWinning(bestQuote.maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })} after the {PROTOCOL_WIN_FEE_BPS / 100}% fee</small>}</strong></div>
             {/* The price the buyer needs to hit for the FULL payout, stated
                 as its own headline number rather than only the small
                 annotation above -- direction-aware. For a binary, this IS
@@ -1097,14 +1097,14 @@ function TradeView({
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div><div><span>You net if you win</span><strong>{maxPayout === null ? "—" : `$${netWinning(maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}<small>after the {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee</small></strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
+            <p className="preview-disclaimer">A winning position pays a {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee out of its payout; a losing one pays no fee. Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>
