@@ -3,6 +3,7 @@ import "./globals.css";
 import { Providers } from "./providers";
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://solana.usetend.xyz"),
   title: {
     default: "VSOL by Tend — Defined-risk markets on Solana",
     template: "%s · VSOL",

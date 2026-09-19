@@ -15,6 +15,17 @@ export type FetchJsonCappedOptions = {
   maxBytes: number;
   /** Named in every error this throws, e.g. "Coinbase Exchange". */
   label: string;
+  /**
+   * Defaults to "GET" (every existing caller until hyperliquid-market-data.ts
+   * -- Coinbase and Pyth both read plain query-string GETs). Hyperliquid's
+   * `/info` endpoint is POST-only: every request, spot and
+   * chart alike, carries a JSON body naming the query (e.g.
+   * `{"type":"metaAndAssetCtxs","dex":"xyz"}`), so this needed a real method
+   * override rather than a second fetch helper.
+   */
+  method?: "GET" | "POST";
+  /** Only meaningful with `method: "POST"`. A pre-serialized JSON string, not an object -- callers own their own encoding, same as every other option here. */
+  body?: string;
 };
 
 export async function fetchJsonCapped(url: URL, options: FetchJsonCappedOptions): Promise<unknown> {
@@ -22,6 +33,8 @@ export async function fetchJsonCapped(url: URL, options: FetchJsonCappedOptions)
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
   try {
     const response = await fetch(url, {
+      method: options.method ?? "GET",
+      body: options.body,
       headers: options.headers,
       cache: "no-store",
       redirect: "manual",

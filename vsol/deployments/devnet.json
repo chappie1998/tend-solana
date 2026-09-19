@@ -52,7 +52,7 @@
     3,
     171
   ],
-  "domainVersion": 1,
+  "domainVersion": 3,
   "uiMarket": "2GhbbygZp8THBPQLECM95mjrzSRpTxmpKybevN631AGi",
   "uiOracle": "5scRpMJaWPWqukZBxjUa4PjtKNJUscZxJhL5QQcF5NbE",
   "uiExpiry": 1791244800,
@@ -325,5 +325,30 @@
     "closeEarlyConservationVerified": true
   },
   "generatedAt": "2026-09-05T17:35:24.555Z",
-  "addressLookupTable": "7n98WJ7kpmK6GF5VS6qZtZ8Gmey1R5xi4WCemZ3MYd4X"
+  "addressLookupTable": "7n98WJ7kpmK6GF5VS6qZtZ8Gmey1R5xi4WCemZ3MYd4X",
+  "customSettlementDeployed": true,
+  "customSettlementUpgrade": {
+    "ok": true,
+    "programId": "2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v",
+    "programData": "7Zt5ALsY2GFZ9phVteAmxfHGmpZDNMrwHx1UKwTpfmkA",
+    "slot": 500391577,
+    "sha256": "7d1f6a3b75f8cb9b8f87647d3028e5fa5cd756085c248061f5868af292407f9d",
+    "binaryBytes": 1190744,
+    "verifiedAt": "2026-09-18T15:01:53.617Z",
+    "cluster": "devnet",
+    "signature": "3M9Yev8u9vpZFGbGqtEs4X86os8bfGs5kUHnPvqEa9z3oUQSoCcibMBRDLyhEWxbF7cUWMsHBkr65LyaY4nYxVrG"
+  },
+  "customSettlementUpgradeHistory": [
+    {
+      "ok": true,
+      "programId": "2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v",
+      "programData": "7Zt5ALsY2GFZ9phVteAmxfHGmpZDNMrwHx1UKwTpfmkA",
+      "slot": 500387568,
+      "sha256": "9281fb81203ea0f2ae55fb302b3a905c119f613bfda3776757c625964807b73e",
+      "binaryBytes": 1191560,
+      "verifiedAt": "2026-09-18T14:50:38.368Z",
+      "cluster": "devnet",
+      "signature": "4eCMLJAcEBvw2jNjui1Cz9sBLNaZSrPHzNwRUy3vDJqRKwMYtB33B6KDzr2DFA7BXVwVcowAvZnJ8EsX2Dr723mV"
+    }
+  ]
 }

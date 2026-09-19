@@ -26,7 +26,7 @@ use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
 use vsol::{
     COMPLETE_SET_TOKEN_SEED, COMPLETE_SET_VAULT_SEED, DOWN_MINT_SEED, ELIGIBILITY_SEED,
-    MARKET_SEED, NONCE_SEED, ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED, POOL_POSITION_SEED,
+    CUSTOM_FEED_SEED, CUSTOM_SETTLEMENT_OBSERVATION_SEED, MARKET_SEED, NONCE_SEED, ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED, POOL_POSITION_SEED,
     POOL_POSITION_VAULT_SEED, POOL_SEED, POOL_TOKEN_SEED, POSITION_SEED, POSITION_VAULT_SEED,
     PROVIDER_SEED, UP_MINT_SEED, WRITER_SEED, WRITER_TOKEN_SEED,
 };
@@ -295,6 +295,14 @@ pub fn market_pda(config: &Pubkey, market_id: &[u8; 32]) -> Pubkey {
 
 pub fn oracle_pda(market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[ORACLE_SEED, market.as_ref()], &vsol::ID).0
+}
+
+pub fn custom_feed_pda(symbol: &[u8; 16]) -> Pubkey {
+    Pubkey::find_program_address(&[CUSTOM_FEED_SEED, symbol], &vsol::ID).0
+}
+
+pub fn custom_observation_pda(symbol: &[u8; 16], expiry: i64) -> Pubkey {
+    Pubkey::find_program_address(&[CUSTOM_SETTLEMENT_OBSERVATION_SEED, symbol, &expiry.to_le_bytes()], &vsol::ID).0
 }
 
 pub fn writer_vault_pda(config: &Pubkey, maker: &Pubkey, settlement_mint: &Pubkey) -> Pubkey {

@@ -30,5 +30,10 @@ artifacts
 cache
 .wrangler
 examples
+video
 *.so
 *.rlib
+.env
+.env.*
+**/.env
+**/.env.*

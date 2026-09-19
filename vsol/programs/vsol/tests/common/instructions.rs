@@ -134,6 +134,22 @@ pub fn set_market_enabled_ix(admin: &Pubkey, config: &Pubkey, market: &Pubkey, e
     }
 }
 
+pub fn init_custom_price_feed_ix(admin: &Pubkey, config: &Pubkey, feed: &Pubkey, symbol: [u8; 16], price_scale: u64) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new(*admin, true), AccountMeta::new_readonly(*config, false), AccountMeta::new(*feed, false), AccountMeta::new_readonly(system_program_id(), false)], data: vsol::instruction::InitCustomPriceFeed { symbol, price_scale }.data() }
+}
+
+pub fn update_custom_price_feed_ix(authority: &Pubkey, config: &Pubkey, feed: &Pubkey, price: u64, confidence: u64, observed_at: i64) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new_readonly(*config, false), AccountMeta::new(*feed, false)], data: vsol::instruction::UpdateCustomPriceFeed { price, confidence, observed_at }.data() }
+}
+
+pub fn capture_custom_observation_ix(authority: &Pubkey, config: &Pubkey, market: &Pubkey, feed: &Pubkey, observation: &Pubkey) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new(*authority, true), AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new_readonly(*feed, false), AccountMeta::new(*observation, false), AccountMeta::new_readonly(system_program_id(), false)], data: vsol::instruction::CaptureCustomSettlementObservation.data() }
+}
+
+pub fn publish_custom_settlement_ix(config: &Pubkey, market: &Pubkey, oracle: &Pubkey, observation: &Pubkey) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new(*oracle, false), AccountMeta::new_readonly(*observation, false)], data: vsol::instruction::PublishCustomSettlement.data() }
+}
+
 /// `publish_pyth_settlement` takes no signer at all (it's a permissionless
 /// crank): `config`/`market` are read-only, `oracle` is the only mutable
 /// account, and `price_update` is an `UncheckedAccount` whose entire

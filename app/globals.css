@@ -169,10 +169,27 @@ code, .tabular, .num {
 .wallet-button:hover, .icon-button:hover { border-color: var(--border-strong); background: var(--surface-2); }
 .wallet-button.connected { color: var(--positive); border-color: color-mix(in srgb, var(--positive) 34%, var(--border)); }
 .icon-button { width: 32px; padding: 0; }
+.wallet-control { position: relative; }
+.wallet-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; min-width: 180px; padding: 4px; display: flex; flex-direction: column; gap: 2px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-control); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28); }
+.wallet-menu button, .wallet-menu a { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 10px; border: 0; border-radius: calc(var(--r-control) - 2px); background: transparent; color: var(--ink); font-size: var(--t-sm); font-family: inherit; text-decoration: none; cursor: pointer; }
+.wallet-menu button:hover, .wallet-menu a:hover { background: var(--surface-2); }
+.wallet-menu-disconnect { color: var(--negative); }
 .mobile-menu, .mobile-nav { display: none; }
 .wallet-error { min-height: 32px; padding: 6px 12px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--negative); background: color-mix(in srgb, var(--negative) 12%, var(--surface)); border-bottom: 1px solid color-mix(in srgb, var(--negative) 30%, var(--border)); font-size: var(--t-sm); }
 .wallet-error button { width: 26px; height: 26px; border: 0; border-radius: var(--r-control); display: inline-grid; place-items: center; color: var(--negative); background: transparent; cursor: pointer; }
 .wallet-error button:hover { background: color-mix(in srgb, var(--negative) 16%, transparent); }
+
+/* Wallet picker — our own "choose a wallet" modal, built on the same
+   .review-modal chrome as every other dialog in the app (see rule 3 at the
+   top of this file: the modal is the one shadowed surface). */
+.wallet-picker-list { margin-top: 12px; display: flex; flex-direction: column; gap: 4px; }
+.wallet-picker-option { min-height: 44px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-control); display: flex; align-items: center; gap: 10px; background: var(--surface-2); color: var(--ink); font-size: var(--t-sm); font-weight: 500; cursor: pointer; transition: border-color 120ms ease, background-color 120ms ease; }
+.wallet-picker-option:hover { border-color: var(--border-strong); background: var(--surface-3); }
+.wallet-picker-option img { width: 24px; height: 24px; border-radius: var(--r-panel); flex: 0 0 auto; }
+.wallet-picker-empty p { color: var(--ink-2); font-size: var(--t-xs); line-height: 1.55; }
+.wallet-picker-empty .wallet-picker-list { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+.wallet-picker-empty .wallet-picker-list a { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-control); display: inline-flex; align-items: center; color: var(--ink-2); font-size: var(--t-xs); font-weight: 500; }
+.wallet-picker-empty .wallet-picker-list a:hover { color: var(--ink); border-color: var(--border-strong); background: var(--surface-2); }
 
 /* ---------------------------------------------------------------------
    Trade layout — the chart column is the page. The ticket is a fixed
@@ -311,8 +328,6 @@ code, .tabular, .num {
 .data-mode.live { color: var(--positive); background: color-mix(in srgb, var(--positive) 15%, transparent); }
 .data-mode.stale { color: var(--negative); background: color-mix(in srgb, var(--negative) 15%, transparent); }
 .data-mode.loading { color: var(--ink-3); background: var(--surface-3); }
-.market-footer { min-height: 30px; padding: 5px 12px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 16px; color: var(--ink-3); font-size: var(--t-micro); flex-wrap: wrap; }
-.market-footer span { display: flex; align-items: center; gap: 5px; }
 
 /* Pricing disclosure — a ruled region of the market panel, not a card
    parked underneath it. */
@@ -528,6 +543,24 @@ code, .tabular, .num {
 .verification-error { color: var(--negative); background: color-mix(in srgb, var(--negative) 13%, transparent); }
 .positions-card > .quote-error, .positions-card > .empty-position { margin: 0; border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; }
 
+/* ---------------------------------------------------------------------
+   Trade page positions panel — a Hyperliquid-style tabbed strip (Positions /
+   Fill history), full-width under the chart + ticket. It is the panel
+   shell (grid-column span) and the tab strip that are new here; the rows
+   underneath reuse .position-table/.table-row/.table-head/.asset-cell
+   exactly as the Portfolio tab does. Only the column widths are their own
+   modifier, because Side and Strike are split into two cells here instead
+   of Portfolio's one combined "Position" column.
+   --------------------------------------------------------------------- */
+.trade-positions-panel { grid-column: 1 / -1; }
+.tab-strip { display: flex; gap: 2px; }
+.tab-btn { min-height: 32px; padding: 0 10px; border: 0; border-radius: var(--r-control); background: transparent; color: var(--ink-3); font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.01em; cursor: pointer; transition: background-color 120ms ease, color 120ms ease; }
+.tab-btn:hover { color: var(--ink-2); background: var(--surface-3); }
+.tab-btn.active { color: var(--ink); background: var(--surface-3); }
+.trade-positions-meta { display: flex; align-items: center; gap: 2px; }
+.trade-positions-row { grid-template-columns: 1.05fr .5fr .7fr .8fr .9fr .75fr 1.05fr .95fr; min-width: 940px; }
+.trade-history-row { grid-template-columns: 1.05fr .5fr .7fr .8fr .85fr 1.05fr .95fr; min-width: 820px; }
+
 footer { margin-top: auto; min-height: 44px; padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; color: var(--ink-3); font-size: var(--t-xs); flex-wrap: wrap; gap: 10px; }
 footer > div { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 footer .logo { color: var(--ink-2); font-size: var(--t-sm); }
@@ -639,7 +672,6 @@ footer a:hover { color: var(--ink); }
   .resolution-picker button { flex: 1; min-width: 0; min-height: 32px; }
   .chart-source { align-items: flex-start; flex-wrap: wrap; gap: 4px 10px; }
   .chart-source > span:nth-child(3) { order: 4; flex-basis: 100%; white-space: normal; }
-  .market-footer { gap: 6px 14px; }
   .transparency-card { align-items: flex-start; }
   .view-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
   .metric-grid { grid-template-columns: 1fr 1fr; }

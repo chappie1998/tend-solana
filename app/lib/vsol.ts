@@ -81,6 +81,7 @@ export const VSOL_CLUSTER = "devnet" as const;
 export const VSOL_RPC_URL = deployment.rpcUrl;
 export const VSOL_PROGRAM_ID = new PublicKey(deployment.programId);
 export const VSOL_PYTH_UPGRADE_DEPLOYED = deployment.pythUpgradeDeployed;
+export const VSOL_CUSTOM_SETTLEMENT_DEPLOYED = Boolean((deployed as unknown as { customSettlementDeployed?: boolean }).customSettlementDeployed);
 // The `close_pool_position` instruction landed in the program source and IDL
 // (vsol/programs/vsol/src/lib.rs, vsol/target/idl/vsol.json) but the last
 // devnet program upgrade predates it. Until the manifest publishes this flag

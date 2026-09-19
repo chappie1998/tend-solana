@@ -63,38 +63,104 @@ test("marketDataSourceLabel names the provider that is actually selected, never 
   assert.equal(withEnv("MARKET_DATA_PROVIDER", "pyth", () => marketData.marketDataSourceLabel()), "Pyth Core Hermes");
 });
 
-test("the default provider dispatches to the Coinbase implementation, not Pyth: a market with no Coinbase product fails with the Coinbase-specific reason", async () => {
-  const { marketData, markets } = await loadModules();
-  // NVDA is coming-soon: no Coinbase product configured (see app/lib/markets.ts).
-  // If this reached the Pyth path instead it would attempt a real Hermes
-  // fetch and fail differently (or hang) -- this exact, synchronous, offline
-  // rejection is only reachable through the Coinbase code path.
-  const nvda = markets.marketBySymbol("NVDA");
+test("the default provider dispatches to the Coinbase implementation, not Pyth: a crypto market with no Coinbase product fails with the Coinbase-specific reason", async () => {
+  const { marketData } = await loadModules();
+  // A synthetic CRYPTO market (no `category: "stocks"`) with no Coinbase
+  // product configured. If this reached the Pyth path instead it would
+  // attempt a real Hermes fetch and fail differently (or hang) -- this
+  // exact, synchronous, offline rejection is only reachable through the
+  // Coinbase code path. See the stock-routing test below for NVDA, and
+  // tests/hyperliquid-market-data.test.mjs for the rest of the stock provider
+  // coverage.
+  const syntheticCrypto = { name: "Synthetic", symbol: "SYN", category: "crypto", coinbaseProductId: "" };
   await assert.rejects(
-    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketSnapshot(nvda)),
+    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketSnapshot(syntheticCrypto)),
     /has no Coinbase product configured/,
   );
   await assert.rejects(
-    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketBars(nvda, "D")),
+    () => withEnv("MARKET_DATA_PROVIDER", undefined, () => marketData.getMarketBars(syntheticCrypto, "D")),
     /has no Coinbase product configured/,
   );
 });
 
+test("a stock market never reaches the Coinbase or Pyth code path, regardless of MARKET_DATA_PROVIDER", async () => {
+  const { marketData, markets } = await loadModules();
+  // NVDA carries no Coinbase product (see app/lib/markets.ts) because
+  // Coinbase lists no equities at all -- true whether or not NVDA is
+  // tradable here. So if this reached the Coinbase/Pyth path it would either
+  // throw the Coinbase-specific "has no Coinbase product configured" message
+  // or attempt a real Hermes fetch. Neither happens: category "stocks" is
+  // routed to Hyperliquid's "xyz" dex before either crypto branch is ever
+  // consulted -- proven here by stubbing fetch and asserting only
+  // api.hyperliquid.xyz is ever reached, no matter what
+  // MARKET_DATA_PROVIDER is set to, since a stock market never reads it at
+  // all. See tests/hyperliquid-market-data.test.mjs for the rest of the
+  // stock provider coverage.
+  const nvda = markets.marketBySymbol("NVDA");
+  // ONE stub shared across all three provider values, not reset per
+  // iteration: hyperliquid-market-data.ts caches its universe fetch under a
+  // single shared key (see that file's header), so a second/third call
+  // milliseconds later may legitimately hit the warm cache rather than
+  // firing a new request. Asserting every host that WAS reached is
+  // Hyperliquid (never Coinbase/Pyth) is the robust form of this guarantee
+  // -- it holds whether or not a given iteration re-fetches.
+  const hostsHit = [];
+  const restore = stubFetch((url) => {
+    hostsHit.push(url.hostname);
+    return [{ universe: [{ name: "xyz:NVDA" }] }, [{ markPx: "212.15", oraclePx: "212.10" }]];
+  });
+  try {
+    for (const provider of [undefined, "coinbase", "pyth"]) {
+      const snapshot = await withEnv("MARKET_DATA_PROVIDER", provider, () => marketData.getMarketSnapshot(nvda));
+      assert.equal(snapshot.source, "Hyperliquid", `provider=${provider}: a stock market must resolve through Hyperliquid`);
+    }
+    assert.ok(hostsHit.length >= 1, "at least one call must have actually reached the network");
+    assert.ok(
+      hostsHit.every((host) => host === "api.hyperliquid.xyz"),
+      `a stock market must never reach Coinbase or Pyth, got: ${hostsHit.join(", ")}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
 // --- markets.ts wiring ---------------------------------------------------
 
-test("every live market has a Coinbase product id; every coming-soon market has none", async () => {
+test("every live crypto market has a Coinbase product id; every stock market has none and every live stock resolves to a plain vendor ticker", async () => {
   const { markets } = await loadModules();
-  for (const market of markets.markets) {
-    if (market.status === "live") {
+  // The catalog carries zero coming-soon markets today (SPACEX flipped to
+  // live once it IPO'd -- see app/lib/markets.ts). The "no stock market
+  // carries a Coinbase product id" guarantee is still supposed to hold
+  // regardless of status -- Coinbase lists no equities at all, live or
+  // not -- so pin it with a synthetic coming-soon stock fixture too, rather
+  // than letting the guarantee go untested just because nothing real
+  // exercises the coming-soon half of it any more.
+  const syntheticComingSoonStock = { symbol: "SYNSTOCK", category: "stocks", status: "coming-soon", coinbaseProductId: "" };
+  for (const market of [...markets.markets, syntheticComingSoonStock]) {
+    if (market.status === "live" && market.category === "crypto") {
       assert.match(market.coinbaseProductId, /^[A-Z]+-USD$/, `${market.symbol} must carry a real Coinbase product id`);
     } else {
-      assert.equal(market.coinbaseProductId, "", `${market.symbol} is coming-soon and must carry no Coinbase product id`);
+      // Every stock market carries no Coinbase product id, live or
+      // coming-soon alike -- Coinbase lists no equities at all, so a live
+      // stock market's off-chain reference comes from Hyperliquid's "xyz"
+      // dex instead (see the routing test above and app/lib/market-data.ts).
+      assert.equal(market.coinbaseProductId, "", `${market.symbol} must carry no Coinbase product id`);
     }
   }
   assert.deepEqual(
-    markets.liveMarkets.map((market) => market.coinbaseProductId).sort(),
+    markets.liveMarkets.filter((market) => market.category === "crypto").map((market) => market.coinbaseProductId).sort(),
     ["BTC-USD", "ETH-USD", "SOL-USD"],
   );
+  // Hyperliquid's "xyz" dex keys its coin name off `equityTicker || symbol`
+  // (see hyperliquidCoinFor in app/lib/hyperliquid-market-data.ts) -- NOT
+  // `market.symbol` directly: SPACEX's own symbol ("SPACEX") is permanent
+  // on-chain identity, but the vendor only knows it as "SPCX".
+  const liveStocks = markets.liveMarkets.filter((market) => market.category === "stocks");
+  assert.deepEqual(liveStocks.map((market) => market.symbol).sort(), ["GOOGL", "NVDA", "SPACEX"]);
+  for (const market of liveStocks) {
+    const vendorTicker = market.equityTicker || market.symbol;
+    assert.match(vendorTicker, /^[A-Z]+$/, `${market.symbol} must resolve to a plain ticker Hyperliquid can resolve`);
+  }
 });
 
 // --- Coinbase ticker parsing ---------------------------------------------

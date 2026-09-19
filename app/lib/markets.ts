@@ -5,6 +5,9 @@ import deployment from "../../vsol/deployments/devnet.json" with { type: "json" 
 // The explicit .ts extension keeps this module importable by the node:test
 // suite (type stripping) and by vsol/scripts/*.ts as well as the bundler.
 import { PRICE_SCALE } from "../../vsol/sdk/index.ts";
+// Used only by preIpoMintFor below, to decode a pre-IPO market's `pythFeedId`
+// back into the SPL mint it encodes -- see that function's own doc comment.
+import { PublicKey } from "@solana/web3.js";
 
 /**
  * Whether a listed market can actually be traded here.
@@ -20,12 +23,21 @@ export type MarketStatus = "live" | "coming-soon";
 /**
  * The shelf a market is listed on. Purely an organizing fact about the
  * underlying, deliberately independent of `status`: a category is not a
- * proxy for tradability and must never be used as one. It happens that every
- * crypto market is live today and every stock market is not, and reading
- * that coincidence as a rule is exactly the bug this comment exists to
- * prevent -- `status` is the only thing any gate may test.
+ * proxy for tradability and must never be used as one. Every crypto market
+ * is live, and the stocks group is now a MIX -- NVDA and GOOGL live, SpaceX
+ * coming-soon -- which is exactly why reading category as a tradability
+ * proxy was always the wrong shortcut: `status` is the only thing any gate
+ * may test. (`category` still legitimately selects a provider FAMILY --
+ * see app/lib/market-data.ts -- that is a data-routing decision, not a
+ * tradability one.)
+ *
+ * "pre-ipo": tokenized pre-IPO equity trading live on Solana DEXes (Tessera
+ * and PreStocks issue these tokens; app/lib/preipo-market-data.ts prices
+ * them off DexScreener/GeckoTerminal, never off either issuer's own static
+ * valuation mark -- see that file's header and each pre-IPO market's `blurb`
+ * below).
  */
-export type MarketCategory = "crypto" | "stocks";
+export type MarketCategory = "crypto" | "stocks" | "pre-ipo";
 
 export type Market = {
   symbol: string;
@@ -33,7 +45,7 @@ export type Market = {
   category: MarketCategory;
   tokenAddress: string;
   tone: string;
-  oracleStatus: "Pyth Core";
+  oracleStatus: "Custom oracle";
   /**
    * The Pyth feed this market settles and displays on, as a 32-byte hex id.
    *
@@ -42,10 +54,38 @@ export type Market = {
    * it". Only SpaceX is in that state (a private company; see its entry).
    * A market with an empty feed can never be promoted to `"live"` by a
    * config edit alone, which is the whole point of distinguishing it from a
-   * market whose feed exists and is merely un-entitled.
+   * market whose feed exists but is merely un-entitled -- e.g. NVDA and
+   * GOOGL below, both `"live"` today via a different off-chain price source
+   * (Hyperliquid's "xyz" dex; see `blurb`) despite carrying a real Pyth feed
+   * id this deployment's key still cannot read. This field is kept accurate
+   * regardless of `status` because it is settlement-identity metadata (it is
+   * hashed into the on-chain market id via `pythFeedIdFor`), not a
+   * tradability switch.
+   *
+   * EXCEPTION -- every `category: "pre-ipo"` market: Pyth publishes nothing
+   * at all for these tokens (checked directly), yet `pythFeedIdFor` still
+   * THROWS on an empty string, and that throw would otherwise make a
+   * pre-IPO market look live while being structurally unmintable (see
+   * series-resolver.ts's market-PDA derivation). Rather than leave it blank,
+   * these entries carry their own SPL token mint here instead, hex-encoded
+   * (`new PublicKey(mint).toBuffer().toString("hex")` -- a Solana pubkey is
+   * exactly 32 bytes, the same width a real feed id needs). This is NOT a
+   * Pyth feed and is never read as one: it is deterministic, meaningful
+   * on-chain identity, decoded back to the mint by `preIpoMintFor` below for
+   * the DexScreener/GeckoTerminal calls in app/lib/preipo-market-data.ts.
+   * Settlement for these markets runs on the custom oracle
+   * (`CustomPriceFeed`/`publish_custom_settlement`; see CLAUDE.md), never on
+   * a Pyth PriceUpdateV2.
    */
   pythFeedId: string;
-  /** Pyth's own symbol for `pythFeedId`. Empty exactly when that is. */
+  /**
+   * Pyth's own symbol for `pythFeedId`. Empty exactly when that is --
+   * EXCEPT every pre-IPO market, where `pythFeedId` is deliberately
+   * non-empty (see that field's doc comment) but there is still no real
+   * Pyth symbol to report, so this stays empty rather than holding an
+   * invented "Equity.*"-shaped string that would misleadingly imply a real
+   * Pyth listing.
+   */
   pythSymbol: string;
   /**
    * The Coinbase Exchange product this market's off-chain spot/volatility/
@@ -55,11 +95,27 @@ export type Market = {
    *
    * EMPTY STRING means the same thing it does for `pythFeedId`: not "unset",
    * but "no product exists for this market on Coinbase Exchange". Every
-   * coming-soon market carries an empty string here regardless of the reason
-   * its Pyth feed is blocked, because none of them (tokenized equities,
-   * SpaceX) trade on Coinbase's spot market at all.
+   * STOCK market carries an empty string here, live or coming-soon alike,
+   * because Coinbase lists no equities at all -- a live stock market's
+   * off-chain reference comes from Hyperliquid's "xyz" HIP-3 dex instead (see
+   * app/lib/market-data.ts), never from this field.
    */
   coinbaseProductId: string;
+  /**
+   * The exchange ticker an off-chain equity vendor knows this equity by, when
+   * it differs from `symbol` -- today that vendor is Hyperliquid's "xyz" dex
+   * (see app/lib/hyperliquid-market-data.ts), which namespaces every coin as
+   * `xyz:${equityTicker || symbol}`. Empty string means "they are the same"
+   * -- NVDA and GOOGL are their own tickers, so they leave this blank.
+   *
+   * These MUST be allowed to differ. `symbol` is hashed into the on-chain
+   * market PDA and seeds the market's `CustomPriceFeed`, so it is permanent
+   * on-chain identity: renaming SPACEX to SPCX to make the lookup "simpler"
+   * would repoint every derived address and orphan the feed and any open
+   * position. The vendor ticker is just how an off-chain HTTP provider spells
+   * it, and vendors rename tickers. Keep the two separate.
+   */
+  equityTicker: string;
   intradayEligible: boolean;
   status: MarketStatus;
   /**
@@ -84,8 +140,15 @@ export type Market = {
    */
   assetClass: string;
   /**
-   * One true sentence naming the underlying and the feed it settles on.
-   * Shown under the ticker; must stay accurate to `pythSymbol` above.
+   * One true sentence naming the underlying and the price source it displays
+   * on. For a crypto market this must stay accurate to `pythSymbol` above
+   * (settlement and display are the same feed there). For a STOCK market it
+   * must instead name Hyperliquid's "xyz" dex (see app/lib/market-data.ts) --
+   * `pythSymbol` is kept on a stock entry only as settlement-identity
+   * metadata (see that field's own doc comment) and must never be quoted here
+   * as if it were the display source, because it is not: this deployment's
+   * Pyth key has no equity/tokenized-equity entitlement, so nothing here ever
+   * reads a Pyth price for a stock.
    */
   blurb: string;
   /**
@@ -94,12 +157,14 @@ export type Market = {
    * chip and returned verbatim by the expiry/quote gates, so the reason a
    * user sees is the same reason the server enforces.
    *
-   * The three coming-soon markets below are blocked for TWO different
-   * reasons and the copy must not blur them: NVDA and Google have real,
-   * working 24/7 feeds this deployment's Pyth key is not entitled to -- a
-   * billing state, one purchase away from live. SpaceX has no oracle at all,
+   * SpaceX is the one remaining coming-soon market: it has no oracle at all,
    * because it is a private company that does not trade; there is no
-   * settlement path for it even in principle, at any price tier.
+   * settlement path for it even in principle, at any price tier. NVDA and
+   * Google used to be blocked here too (a billing state: real, working 24/7
+   * Pyth feeds this deployment's key was not entitled to) -- that blocker no
+   * longer gates trading now that their off-chain reference comes from
+   * Hyperliquid's "xyz" dex instead (see `blurb`), so both carry the same
+   * empty string every other live market does.
    */
   statusNote: string;
   /**
@@ -110,9 +175,11 @@ export type Market = {
    * than the tradable ones and inverted the panel's hierarchy. Empty string
    * for live markets.
    *
-   * Must preserve the kind-of-blocker distinction: a billing state that a
-   * purchase clears reads differently from an instrument that has no
-   * settlement source in principle.
+   * Must preserve the kind-of-blocker distinction if a second coming-soon
+   * market ever joins SpaceX below: a billing state that a purchase (or, as
+   * happened for NVDA/GOOGL, a different off-chain price source) clears
+   * reads differently from an instrument that has no settlement source in
+   * principle, which is SpaceX's own, permanent case.
    */
   statusTag: string;
   /**
@@ -152,7 +219,7 @@ export const markets: Market[] = [
     category: "crypto",
     tokenAddress: deployment.underlyingMint,
     tone: "#83e0ba",
-    oracleStatus: "Pyth Core",
+    oracleStatus: "Custom oracle",
     // Settlement and display are deliberately the SAME feed. Showing one
     // price while settling on another would mean users see one number and
     // get settled on a different one.
@@ -164,12 +231,13 @@ export const markets: Market[] = [
     pythSymbol: "Crypto.SOL/USD",
     // Verified live: GET /products/SOL-USD/ticker -> 200.
     coinbaseProductId: "SOL-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $2.50 at SOL ~$103.36 (measured 2026-09-05) is 2.4% -- mid-band.
     strikeLadderStep: dollars(2, 50),
     assetClass: "Native asset",
-    blurb: "Solana's native asset, settled against the Pyth Crypto.SOL/USD feed.",
+    blurb: "Solana's native asset, settled from the centrally signed Coinbase Exchange SOL-USD reference.",
     statusNote: "",
     statusTag: "",
   },
@@ -179,13 +247,14 @@ export const markets: Market[] = [
     category: "crypto",
     tokenAddress: deployment.underlyingMint,
     tone: "#f7931a",
-    oracleStatus: "Pyth Core",
+    oracleStatus: "Custom oracle",
     // Crypto.BTC/USD -- entitled on this deployment's Pyth key (verified
     // live: 200), and 24/7 like every crypto spot feed.
     pythFeedId: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
     pythSymbol: "Crypto.BTC/USD",
     // Verified live: GET /products/BTC-USD/ticker -> 200.
     coinbaseProductId: "BTC-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $2,000 at BTC ~$80,016 (measured 2026-09-05) is 2.50% -- mid-band, and
@@ -195,7 +264,7 @@ export const markets: Market[] = [
     // strikes. This is the entry that makes a global step indefensible.
     strikeLadderStep: dollars(2_000),
     assetClass: "Native asset",
-    blurb: "Bitcoin, settled against the Pyth Crypto.BTC/USD feed.",
+    blurb: "Bitcoin, settled from the centrally signed Coinbase Exchange BTC-USD reference.",
     statusNote: "",
     statusTag: "",
   },
@@ -205,13 +274,14 @@ export const markets: Market[] = [
     category: "crypto",
     tokenAddress: deployment.underlyingMint,
     tone: "#8a92b2",
-    oracleStatus: "Pyth Core",
+    oracleStatus: "Custom oracle",
     // Crypto.ETH/USD -- entitled on this deployment's Pyth key (verified
     // live: 200), and 24/7 like every crypto spot feed.
     pythFeedId: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     pythSymbol: "Crypto.ETH/USD",
     // Verified live: GET /products/ETH-USD/ticker -> 200.
     coinbaseProductId: "ETH-USD",
+    equityTicker: "",
     intradayEligible: true,
     status: "live",
     // $50 at ETH ~$2,473.52 (measured 2026-09-05) is 2.02% -- the bottom of
@@ -221,7 +291,7 @@ export const markets: Market[] = [
     // ~$2,500, where $50 drops under 2%.
     strikeLadderStep: dollars(50),
     assetClass: "Native asset",
-    blurb: "Ether, settled against the Pyth Crypto.ETH/USD feed.",
+    blurb: "Ether, settled from the centrally signed Coinbase Exchange ETH-USD reference.",
     statusNote: "",
     statusTag: "",
   },
@@ -231,41 +301,43 @@ export const markets: Market[] = [
     category: "stocks",
     tokenAddress: deployment.underlyingMint,
     tone: "#76b900",
-    oracleStatus: "Pyth Core",
+    oracleStatus: "Custom oracle",
     // Crypto.NVDAX/USD -- tokenized NVDA (xStocks), the 24/7 feed this
-    // market settled on until 2026-08-26.
+    // market settled on until 2026-08-26, when Pyth made Hermes
+    // authentication mandatory and this deployment's API key turned out to
+    // be entitled to crypto spot feeds only (verified against
+    // hermes.pyth.network: Crypto.NVDAX/USD and Equity.US.NVDA/USD both
+    // 403 "Not entitled", where Crypto.SOL/BTC/ETH/USD all still 200).
     //
-    // NOT TRADABLE HERE, and the reason is external, not incomplete work:
-    // Pyth made Hermes authentication mandatory on 2026-08-26, and this
-    // deployment's API key is entitled to crypto spot feeds ONLY. Verified
-    // against hermes.pyth.network with the live key:
-    //
-    //   Crypto.SOL/USD     -> 200 (entitled)
-    //   Crypto.BTC/USD     -> 200 (entitled)
-    //   Crypto.ETH/USD     -> 200 (entitled)
-    //   Crypto.NVDAX/USD   -> 403 "Not entitled: ... no grant accepts this feed"
-    //   Equity.US.NVDA/USD -> 403 "Not entitled"
-    //
-    // Equity and tokenized-equity feeds sit behind a paid Pyth tier this
-    // devnet deployment does not buy. With no price, NVDA cannot settle, so
-    // it must not be mintable or quotable -- a user must never be able to
-    // buy something that cannot settle. The feed id and symbol are kept
-    // accurate so that promoting this to `status: "live"` is the only edit
-    // required once the entitlement exists.
+    // That entitlement gap is UNCHANGED and is kept honest here -- the feed
+    // id/symbol below are settlement-identity metadata only, still not a
+    // price this deployment can read. What changed is the OFF-CHAIN
+    // reference this market displays and quotes off: NVDA now prices through
+    // Hyperliquid's "xyz" HIP-3 dex -- a tokenized-equity PERP that genuinely
+    // trades 24/7 (see app/lib/hyperliquid-market-data.ts for the live
+    // verification evidence), for spot, chart bars, AND realized volatility
+    // alike -- see app/lib/market-data.ts's per-category routing -- none of
+    // which needs any Pyth entitlement at all. That is what makes
+    // `status: "live"` correct despite the Pyth blocker never having been
+    // lifted, and it's also what makes trading this 24/7 HONEST rather than
+    // a loophole: unlike the real Finnhub/Twelve Data quotes this used to
+    // price off (which froze outside 09:30-16:00 America/New_York and forced
+    // a matching RTH gate in expiries.ts), Hyperliquid's price keeps moving
+    // around the clock, so there is no frozen-price window left to gate.
     pythFeedId: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f",
     pythSymbol: "Crypto.NVDAX/USD",
-    // Tokenized NVDA does not trade on Coinbase's spot market either.
+    // Hyperliquid's "xyz" dex, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
+    equityTicker: "",
     intradayEligible: true,
-    status: "coming-soon",
-    // Unused while this market is coming-soon (nothing lists a strike for
-    // it), but sized now so promoting it is a one-line `status` edit: $5.00
-    // at NVDA's ~$210 level is 2.4%.
+    status: "live",
+    // $5.00 at NVDA's ~$210 level is 2.4% -- mid-band, same sizing logic as
+    // every crypto listing above.
     strikeLadderStep: dollars(5),
-    assetClass: "Tokenized equity",
-    blurb: "Tokenized NVIDIA (xStocks), priced by the Pyth Crypto.NVDAX/USD feed.",
-    statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.NVDAX/USD needs a paid tier.",
-    statusTag: "Feed not entitled",
+    assetClass: "US equity",
+    blurb: "NVIDIA common stock, priced live off Hyperliquid's xyz:NVDA 24/7 equity feed.",
+    statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "GOOGL",
@@ -273,26 +345,31 @@ export const markets: Market[] = [
     category: "stocks",
     tokenAddress: deployment.underlyingMint,
     tone: "#4285f4",
-    oracleStatus: "Pyth Core",
+    oracleStatus: "Custom oracle",
     // Crypto.GOOGLX/USD -- tokenized GOOGL (xStocks), id read from Pyth's
     // own feed registry (hermes /v2/price_feeds?query=GOOGLX), not derived.
-    // Exactly the same blocker as NVDA above: the feed is real, published
-    // and 24/7, and this deployment's key returns 403 "Not entitled" for it
-    // and for Equity.US.GOOGL/USD alike. A billing state, not a missing
-    // oracle -- which is why this entry carries a real feed id and SpaceX
-    // below carries none.
+    // Exactly the same blocker as NVDA above, and the same resolution: this
+    // deployment's key still returns 403 "Not entitled" for it and for
+    // Equity.US.GOOGL/USD alike (a billing state, not a missing oracle --
+    // which is why this entry carries a real feed id and SpaceX below
+    // carries none), but that no longer matters for trading here because
+    // GOOGL's off-chain reference comes from Hyperliquid's "xyz" dex instead
+    // (see the NVDA entry above for the fuller explanation, which applies
+    // identically, including why this is now honestly 24/7 with no RTH gate).
+    // The feed id/symbol stay as settlement-identity metadata.
     pythFeedId: "b911b0329028cd0283e4259c33809d62942bd2716a58084e5f31d64c00b5424e",
     pythSymbol: "Crypto.GOOGLX/USD",
-    // Tokenized GOOGL does not trade on Coinbase's spot market either.
+    // Hyperliquid's "xyz" dex, not Coinbase -- Coinbase lists no equities at all.
     coinbaseProductId: "",
+    equityTicker: "",
     intradayEligible: true,
-    status: "coming-soon",
-    // Unused while coming-soon; ~2.4% at GOOGL's ~$210 level, same as NVDA.
+    status: "live",
+    // ~2.4% at GOOGL's ~$210 level, same sizing logic as NVDA.
     strikeLadderStep: dollars(5),
-    assetClass: "Tokenized equity",
-    blurb: "Tokenized Alphabet (xStocks), priced by the Pyth Crypto.GOOGLX/USD feed.",
-    statusNote: "Coming soon — the feed exists and runs 24/7, but this deployment's Pyth key is entitled to crypto feeds only; Crypto.GOOGLX/USD needs a paid tier.",
-    statusTag: "Feed not entitled",
+    assetClass: "US equity",
+    blurb: "Alphabet (Google) common stock, priced live off Hyperliquid's xyz:GOOGL 24/7 equity feed.",
+    statusNote: "",
+    statusTag: "",
   },
   {
     symbol: "SPACEX",
@@ -300,33 +377,263 @@ export const markets: Market[] = [
     category: "stocks",
     tokenAddress: deployment.underlyingMint,
     tone: "#c8cdd4",
-    oracleStatus: "Pyth Core",
-    // NO FEED. This is a different kind of blocked from NVDA and Google, and
-    // the difference is not a detail: SpaceX is a private company, its stock
-    // does not trade on a public venue, and Pyth publishes nothing for it --
-    // a registry-wide query (hermes /v2/price_feeds?query=SpaceX, and
-    // ?query=SPACEX) returns zero feeds, not a feed we lack a grant for.
+    oracleStatus: "Custom oracle",
+    // SpaceX IPO'd on NASDAQ 2026-06-12 and trades as SPCX. This entry used
+    // to assert -- at length -- that it was a private company with no public
+    // price at any tier, which was true when written and is now simply false.
+    // Verified against both live providers before flipping it: Finnhub
+    // /stock/profile2 SPCX returns name "Space Exploration Technologies Corp",
+    // exchange NASDAQ, ipo 2026-06-12; Twelve Data /quote SPCX agrees, and
+    // Hyperliquid's "xyz" dex lists it as xyz:SPCX (see `equityTicker`
+    // below), the price source this market actually reads from now. Do not
+    // reinstate the old copy from memory -- check the feed.
     //
-    // So there is no settlement price for a SpaceX contract to reference, at
-    // any Pyth tier, and no amount of paying for entitlements produces one.
-    // Listing it requires a price source that does not exist today. The
-    // empty strings below are the honest encoding of that, and they are load
-    // bearing: nothing can promote this market to "live" by flipping
-    // `status` alone, because there would still be no feed to settle on.
-    pythFeedId: "",
-    pythSymbol: "",
-    // No public market anywhere for SpaceX equity, Coinbase included.
+    // Pyth DOES publish SPCX, in three variants. This binds the 24/7 one
+    // deliberately: Equity.US.SPCX/USD is session-bound and would be dark
+    // outside RTH, the exact failure that made the equity NVDA feed useless
+    // here (dark ~81% of the week). Equity.Index.SPCX/USD is Pyth's own
+    // round-the-clock price for the same ticker.
+    //
+    // This id is NOT a price source for us -- this deployment's Pyth key has
+    // no equity entitlement, and stock prices come from Hyperliquid's "xyz"
+    // dex while settlement runs on the custom oracle. It is load-bearing as
+    // IDENTITY: `pythFeedIdFor` feeds `series-resolver.ts`'s market-PDA
+    // derivation, and an empty string there throws, so a market cannot be
+    // minted, quoted or settled without one. That is why this market could
+    // not simply be flipped live with the field left blank.
+    pythFeedId: "2dbfb1791e75725227a90dbd23c6bdd83b80cc9d13011973c948b6aeacdf17b9",
+    pythSymbol: "Equity.Index.SPCX/USD",
+    // Coinbase lists no equities, SpaceX included.
     coinbaseProductId: "",
-    intradayEligible: false,
-    status: "coming-soon",
-    // No feed means no spot, so no ladder can be sized. The value is inert
-    // (nothing lists a strike for a coming-soon market) and deliberately set
-    // to the default rather than to a number implying a real price level.
+    // The one market where the vendor ticker differs from `symbol` -- see that
+    // field's doc comment for why we do NOT rename the symbol to match.
+    // Hyperliquid's "xyz" dex resolves this to the coin `xyz:SPCX`.
+    equityTicker: "SPCX",
+    intradayEligible: true,
+    status: "live",
+    // ~2% of a ~$143 spot, matching how every other market's rung was sized.
     strikeLadderStep: dollars(2, 50),
-    assetClass: "Private company",
-    blurb: "SpaceX equity. No public market and no oracle — listed here as a target, not a tradable series.",
-    statusNote: "Coming soon — SpaceX is a private company: no public price and no Pyth feed exists for it at all, so there is no settlement source to trade against yet.",
-    statusTag: "No feed exists",
+    assetClass: "US equity",
+    blurb: "Space Exploration Technologies (SPCX) on NASDAQ, priced live off Hyperliquid's xyz:SPCX 24/7 equity feed.",
+    statusNote: "",
+    statusTag: "",
+  },
+  // --- Pre-IPO tokenized equity (category "pre-ipo") -------------------
+  //
+  // Seven markets across two issuers, both permissionless SPL tokens trading
+  // on real Solana DEXes -- Tessera ("T-" tokens, e.g. tOpenAI) and PreStocks
+  // (plain tokens, e.g. OPENAI). Priced by app/lib/preipo-market-data.ts off
+  // DexScreener (spot + pair discovery) and GeckoTerminal (chart bars for
+  // that same pool) -- NEVER off either issuer's own `/token-details` or
+  // `/api/prestocks` `markPrice`, which is a static issuer valuation mark,
+  // not a traded price (measured: it diverges from the live DEX price by up
+  // to 74% and can sit unchanged for hours -- see CLAUDE.md). Settling a
+  // binary against a frozen mark is the exact failure this repo already
+  // documents for frozen equity feeds.
+  //
+  // Every mint below was re-verified live against https://prestocks.com/api/prestocks
+  // and https://rest-api.tessera.pe/v1/public/token-details on 2026-09-19,
+  // not copied from an earlier, partly-wrong draft that had duplicated one
+  // PreStocks mint across two symbols.
+  //
+  // `pythFeedId` on every entry here is that market's own SPL mint,
+  // hex-encoded (see that field's doc comment above for why); `pythSymbol`
+  // stays empty (see its own doc comment) -- neither is a Pyth feed.
+  // `equityTicker` stays empty on all seven: app/lib/preipo-market-data.ts
+  // looks a market up by MINT (via `preIpoMintFor`), never by a vendor
+  // ticker string, so the field this app uses for "the ticker an off-chain
+  // provider knows this by" has nothing to carry here.
+  //
+  // `intradayEligible: false` on every entry here, deliberately: listed
+  // liquidity across these seven ranges $71k-$656k, far thinner than any
+  // crypto or equity venue this app otherwise reads from. CLAUDE.md already
+  // documents that settlement publication is PERMISSIONLESS with no
+  // on-chain width floor -- what an unprivileged settler can capture from a
+  // few seconds of in-window noise scales as roughly 1/width. A 15-minute or
+  // 1-hour binary settles off a snapshot near the very end of its own short
+  // window, so it is cheap to nudge with a single trade against a thin
+  // book at exactly that instant; holding a manipulated price across a whole
+  // 7D or 30D window, by contrast, costs real, sustained capital and time.
+  // So these seven offer only the standard EOD/7D/30D tenors, never 15M/1H.
+  {
+    symbol: "TOPENAI",
+    name: "OpenAI (Tessera)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#10a37f",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 (Tessera token-details: code "tOpenAI").
+    // Highest-liquidity qualifying pair: tOpenAI/USDC, pool
+    // 2ZWxT3niYjyudmDMDVar9ajNE42RkwYdzZBh6TiMuKQY, $585.5k liquidity,
+    // priceUsd $968.72 -- the same pool GeckoTerminal's OHLCV endpoint was
+    // verified against (10 hourly bars, see app/lib/preipo-market-data.ts).
+    pythFeedId: "0be1c8305cf2eb2734a9e9ccc5b0621bcfa228e44356d1d1e9fcfaf9c45c0934",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    // See the "Pre-IPO tokenized equity" block comment above this entry.
+    intradayEligible: false,
+    status: "live",
+    // $25 at ~$968.72 (measured 2026-09-19, DexScreener tOpenAI/USDC) is 2.58%.
+    strikeLadderStep: dollars(25),
+    assetClass: "Pre-IPO equity token",
+    blurb: "OpenAI, via Tessera's tokenized pre-IPO equity (tOpenAI), priced live off Solana DEX trading -- never Tessera's own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "TKALSHI",
+    name: "Kalshi (Tessera)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#00b894",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 (Tessera token-details: code "tKalshi").
+    // Highest-liquidity qualifying pair: tKalshi/USDC, pool
+    // CGYxcqLiJEoYapZrU7uVGBGfEE15pXDV4mB9AQ8Fsuff, $655.6k liquidity,
+    // priceUsd $447.22.
+    pythFeedId: "06bdd52ef8d479a5adf38582017ad35b07c2c21ba34c3da7ae08a9fdc0d105aa",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $10 at ~$447.22 (measured 2026-09-19, DexScreener tKalshi/USDC) is 2.24%.
+    strikeLadderStep: dollars(10),
+    assetClass: "Pre-IPO equity token",
+    blurb: "Kalshi, via Tessera's tokenized pre-IPO equity (tKalshi), priced live off Solana DEX trading -- never Tessera's own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "TSPACEX",
+    name: "SpaceX (Tessera)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#94a3b8",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 (Tessera token-details: code "tSpaceX").
+    // Only qualifying pair: tSpaceX/USDC, pool
+    // 8obGpjiUu7QTJHK58YHCoz5HxobmrVP2x5zpMZu3c4BT, $571.1k liquidity,
+    // priceUsd $557.78.
+    pythFeedId: "06c5cecc1c6194b851694e5b124a98fdb9a7ca5f37f59238690540ad74f3f785",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $12.50 at ~$557.78 (measured 2026-09-19, DexScreener tSpaceX/USDC) is 2.24%.
+    strikeLadderStep: dollars(12, 50),
+    assetClass: "Pre-IPO equity token",
+    blurb: "SpaceX, via Tessera's tokenized pre-IPO equity (tSpaceX), priced live off Solana DEX trading -- never Tessera's own static valuation mark. Distinct from Hyperliquid-priced NASDAQ-listed SPCX above.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "POPENAI",
+    name: "OpenAI (PreStocks)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#1a7f64",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 against /api/prestocks (symbol "OPENAI").
+    // Highest-liquidity qualifying pair: OPENAI/USDC, pool
+    // 4HTy7aTjPm5PTSEws2yWRDPX6gjWM6sC2dV5mv9u8JsH, $167.7k liquidity,
+    // priceUsd $1,675.51 -- a DIFFERENT mint and pool from TOPENAI above:
+    // Tessera and PreStocks each issue their own, unrelated OpenAI token.
+    pythFeedId: "05daec0529e52bbf67f6ff1e146a9eb6ace7fc4ea31ca4bc9f15e10fe3719728",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $40 at ~$1,675.51 (measured 2026-09-19, DexScreener OPENAI/USDC) is 2.39%.
+    strikeLadderStep: dollars(40),
+    assetClass: "Pre-IPO equity token",
+    blurb: "OpenAI, via PreStocks' tokenized pre-IPO equity, priced live off Solana DEX trading -- never PreStocks' own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "PANTHROPIC",
+    name: "Anthropic (PreStocks)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#d97757",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 against /api/prestocks (symbol "ANTHROPIC").
+    // Highest-liquidity qualifying pair: ANTHROPIC/SOL, pool
+    // EZyszDEx1LZDt7TsSFV8xdPi49sDKC3mdfv2MVMEQLtU, $176.1k liquidity,
+    // priceUsd $985.07. This mint also has a much-higher-liquidity
+    // BUTTHOLE/ANTHROPIC pair ($282.6k) where ANTHROPIC is the QUOTE, not
+    // the base -- excluded by the base-token filter (see
+    // app/lib/preipo-market-data.ts); its priceUsd (~$0.0019) is BUTTHOLE's
+    // price, not this token's.
+    pythFeedId: "05daeb30d7e25e800c73fcec5dd967be486c460a83aa9de087f2b13d72474f5a",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $25 at ~$985.07 (measured 2026-09-19, DexScreener ANTHROPIC/SOL) is 2.54%.
+    strikeLadderStep: dollars(25),
+    assetClass: "Pre-IPO equity token",
+    blurb: "Anthropic, via PreStocks' tokenized pre-IPO equity, priced live off Solana DEX trading -- never PreStocks' own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "PNEURALINK",
+    name: "Neuralink (PreStocks)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#8b5cf6",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 against /api/prestocks (symbol
+    // "NEURALINK") -- NOT the FIGUREAI mint an earlier draft of this table
+    // mistakenly duplicated onto NEURALINK; re-fetched and confirmed the two
+    // are distinct SPL tokens with distinct pools.
+    // Highest-liquidity qualifying pair: NEURALINK/USDC, pool
+    // GhznDwSWioFirbyAJY5GWpwcfN4NNR2KPY9Q9XPHT8Ry, $71.5k liquidity,
+    // priceUsd $392.13.
+    pythFeedId: "05daeb170bd7934f6e77bd0ac1df8cce6f23063bad0ca33242380592f713eb21",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $10 at ~$392.13 (measured 2026-09-19, DexScreener NEURALINK/USDC) is 2.55%.
+    strikeLadderStep: dollars(10),
+    assetClass: "Pre-IPO equity token",
+    blurb: "Neuralink, via PreStocks' tokenized pre-IPO equity, priced live off Solana DEX trading -- never PreStocks' own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
+  },
+  {
+    symbol: "PFIGUREAI",
+    name: "Figure AI (PreStocks)",
+    category: "pre-ipo",
+    tokenAddress: deployment.underlyingMint,
+    tone: "#f59e0b",
+    oracleStatus: "Custom oracle",
+    // Mint verified live 2026-09-19 against /api/prestocks (symbol
+    // "FIGUREAI"). Highest-liquidity qualifying pair: FIGUREAI/SOL, pool
+    // AG8Sui3oZ9eEsNwdQfxQkQfiniHHJNFCxXgdR1Wsa8Ji, $78.0k liquidity,
+    // priceUsd $181.21 -- this app's smallest-liquidity pre-IPO listing,
+    // which is exactly why `intradayEligible` is false across this whole
+    // category (see the block comment above).
+    pythFeedId: "05daea1f26ea4ae09ee1cfc4ca671a266b807afeafdaba4708d3fd1d63f1c86a",
+    pythSymbol: "",
+    coinbaseProductId: "",
+    equityTicker: "",
+    intradayEligible: false,
+    status: "live",
+    // $4.50 at ~$181.21 (measured 2026-09-19, DexScreener FIGUREAI/SOL) is 2.48%.
+    strikeLadderStep: dollars(4, 50),
+    assetClass: "Pre-IPO equity token",
+    blurb: "Figure AI, via PreStocks' tokenized pre-IPO equity, priced live off Solana DEX trading -- never PreStocks' own static valuation mark.",
+    statusNote: "",
+    statusTag: "",
   },
 ];
 
@@ -374,6 +681,32 @@ export function pythFeedIdFor(symbol: string): string {
   if (!market) throw new Error(`No market metadata is configured for ${symbol}`);
   if (!market.pythFeedId) throw new Error(`${market.name} has no Pyth feed, so no series can bind to one.`);
   return market.pythFeedId;
+}
+
+/**
+ * The SPL mint a pre-IPO market's `pythFeedId` encodes, decoded back from
+ * hex to base58 -- see that field's own doc comment for why a pre-IPO market
+ * carries its mint there in the first place (Pyth publishes nothing for
+ * these tokens, and `pythFeedIdFor` throws on an empty string). This is what
+ * app/lib/preipo-market-data.ts actually calls DexScreener and GeckoTerminal
+ * with; nothing else in the app needs a pre-IPO market's raw mint address.
+ *
+ * Deliberately refuses anything that is not itself a pre-IPO market's real
+ * `pythFeedId`: calling this on a crypto or stock market would silently
+ * "decode" its genuine Pyth feed id into a nonsense base58 string that
+ * happens to parse as a Solana pubkey, and calling it with a malformed
+ * (non-64-hex-char) id would do the same from garbage input. Both throw,
+ * naming the symbol, rather than returning a wrong-but-plausible-looking
+ * mint.
+ */
+export function preIpoMintFor(market: Pick<Market, "symbol" | "category" | "pythFeedId">): string {
+  if (market.category !== "pre-ipo") {
+    throw new Error(`${market.symbol} is not a pre-IPO market; its pythFeedId is a real Pyth feed id, not an encoded mint.`);
+  }
+  if (!/^[0-9a-f]{64}$/i.test(market.pythFeedId)) {
+    throw new Error(`${market.symbol}'s pythFeedId is not a valid 64-hex-character mint encoding`);
+  }
+  return new PublicKey(Buffer.from(market.pythFeedId, "hex")).toBase58();
 }
 
 /**
@@ -433,11 +766,20 @@ export type MarketGroup = {
 
 /**
  * The display order of the categories, and the only place that order is
- * decided. Crypto leads because it is the shelf that actually trades.
+ * decided. Pre-IPO leads now: it is this deployment's hackathon centrepiece
+ * (Tessera and PreStocks tokenized equity, priced live off Solana DEX
+ * trading -- see the "Pre-IPO tokenized equity" block comment in `markets`
+ * above). Stocks and Crypto follow in their previous order.
+ *
+ * This used to read "Stocks lead: they are what this deployment is
+ * demonstrating" -- true before this category existed. Order is
+ * presentation only; nothing derives tradability from it (that is `status`,
+ * always).
  */
 const CATEGORY_LABELS: ReadonlyArray<{ category: MarketCategory; label: string }> = [
-  { category: "crypto", label: "Crypto" },
+  { category: "pre-ipo", label: "Pre-IPO" },
   { category: "stocks", label: "Stocks" },
+  { category: "crypto", label: "Crypto" },
 ];
 
 /**

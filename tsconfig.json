@@ -32,5 +32,5 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules", "vsol/scripts", "vsol/tests"]
+  "exclude": ["node_modules", "vsol/scripts", "vsol/tests", "video"]
 }

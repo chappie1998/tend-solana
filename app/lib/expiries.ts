@@ -1,13 +1,28 @@
-// Tend is a 24/7 protocol: expiries are pure clock arithmetic in UTC. There is
-// no market calendar, no session, and no holiday — the only real constraint is
-// whether a fresh Pyth print exists for a symbol (see `intradayEligible`),
-// which is a feed-availability fact, not an hours-of-operation rule.
+// Tend is a 24/7 protocol for EVERY market it lists, crypto and stocks
+// alike: expiries are pure clock arithmetic in UTC, with no market calendar,
+// no session, and no holiday — the only real constraint is whether a fresh
+// price feed exists for a symbol (see `intradayEligible`), which is a
+// feed-availability fact, not an hours-of-operation rule. This is a hard
+// rule (CLAUDE.md, "24/7 product") and this file must never gate any
+// market's expiry on the clock.
 //
-// Both feed-availability facts come from the market config in ./markets.ts,
-// never from a symbol comparison in here. A hardcoded `symbol === "NVDA"`
-// used to stand in for `intradayEligible`, which silently made every
-// intraday code unavailable for any other symbol the moment a second market
-// was listed — the catalog would look broken with nothing to point at.
+// Stocks used to carry a scoped exception here (2026-09-16): NVDA/GOOGL were
+// priced off real Finnhub/Twelve Data equity quotes, which genuinely freeze
+// outside 09:30-16:00 America/New_York, so a binary expiring while its
+// underlying was frozen would have settled against a known outcome rather
+// than a real bet. That exception is gone now that stocks price off
+// Hyperliquid's "xyz" HIP-3 dex (see app/lib/hyperliquid-market-data.ts),
+// whose tokenized-equity perps genuinely trade around the clock — the same
+// 24/7 guarantee every crypto listing already had. See CLAUDE.md for the
+// residual risk this switch carries instead (thinner overnight liquidity on
+// that dex).
+//
+// Both feed-availability and category facts come from the market config in
+// ./markets.ts, never from a symbol comparison in here. A hardcoded
+// `symbol === "NVDA"` used to stand in for `intradayEligible`, which silently
+// made every intraday code unavailable for any other symbol the moment a
+// second market was listed — the catalog would look broken with nothing to
+// point at.
 
 // The explicit .ts extension keeps this module importable by the node:test
 // suite (type stripping) as well as the bundler, matching ./launch-params.ts.

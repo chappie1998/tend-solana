@@ -36,11 +36,14 @@ struct ConfigFixture {
 }
 
 fn setup_config(harness: &mut Harness) -> ConfigFixture {
+    setup_config_with_treasury(harness, Pubkey::new_unique())
+}
+
+fn setup_config_with_treasury(harness: &mut Harness, treasury_owner: Pubkey) -> ConfigFixture {
     let admin = harness.funded_keypair();
     let pause_authority = harness.funded_keypair();
     let oracle_authority = harness.funded_keypair();
     let eligibility_authority = harness.funded_keypair();
-    let treasury_owner = Pubkey::new_unique();
     let domain_separator = [0x42u8; 32];
 
     let config = config_pda();
@@ -1865,7 +1868,8 @@ fn set_liquidity_pool_market_all_transitions_succeed_while_pool_idle() {
 #[test]
 fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
     let mut harness = Harness::new();
-    let fixture = setup_config(&mut harness);
+    let buyer = harness.funded_keypair();
+    let fixture = setup_config_with_treasury(&mut harness, buyer.pubkey());
     let pool = setup_pool(&mut harness, &fixture);
     let market = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
 
@@ -1908,7 +1912,6 @@ fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
         &[],
     );
 
-    let buyer = harness.funded_keypair();
     let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
     harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
     let quote = default_pool_quote(1, harness.now() + 30);
@@ -1942,8 +1945,8 @@ fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
     finalize_oracle(&mut harness, &market, 200 * ONE_TOKEN);
 
     let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
-    let treasury_destination =
-        harness.create_token_account(&pool.manager, &market.settlement_mint, &fixture.treasury_owner);
+    let wrong_treasury_destination =
+        harness.create_token_account(&pool.manager, &market.settlement_mint, &pool.manager.pubkey());
     let settle_accounts = SettlePoolPositionAccounts {
         cranker: buyer.pubkey(),
         config: fixture.config,
@@ -1956,15 +1959,31 @@ fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
         settlement_mint: market.settlement_mint,
         buyer_destination,
         pool_token: pool.pool_token,
-        treasury_destination,
+        treasury_destination: wrong_treasury_destination,
         rent_recipient: buyer.pubkey(),
+    };
+    let failed = harness.send_err(&buyer, &[settle_pool_position_ix(&settle_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidDestination);
+    let pool_after_rejection: vsol::LiquidityPool = harness.read_account(&pool.pool);
+    assert_eq!(pool_after_rejection.open_positions, 1);
+    assert_eq!(pool_after_rejection.locked_collateral, quote.max_payout);
+
+    // The buyer also owns the configured treasury, so payout and fee share
+    // one token account. `dup` permits this legitimate alias while the owner
+    // and mint constraints above still reject arbitrary destinations.
+    let settle_accounts = SettlePoolPositionAccounts {
+        treasury_destination: buyer_destination,
+        ..settle_accounts
     };
     harness.send_ok(&buyer, &[settle_pool_position_ix(&settle_accounts)], &[]);
 
     let pool_after_settle: vsol::LiquidityPool = harness.read_account(&pool.pool);
     assert_eq!(pool_after_settle.open_positions, 0);
     assert_eq!(pool_after_settle.locked_collateral, 0);
-    assert_eq!(harness.token_balance(&buyer_destination), quote.max_payout);
+    let expected_fee = quote.premium * 50 / 10_000;
+    assert_eq!(harness.token_balance(&buyer_destination), quote.max_payout + expected_fee);
+    assert!(harness.svm.get_account(&pool_position).is_none());
+    assert!(harness.svm.get_account(&pool_position_vault).is_none());
 
     // Round out the lifecycle: with the pool back to zero exposure, the sole
     // provider can withdraw all their shares for the pool's entire remaining
@@ -4812,6 +4831,94 @@ fn create_market_rejects_zero_strike() {
         &[],
     );
     assert_vsol_error(&failed, vsol::VsolError::InvalidStrike);
+}
+
+#[test]
+fn custom_observation_is_authorized_immutable_and_supports_delayed_relay() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let impostor = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let symbol = symbol_bytes("NVDA");
+    let feed = custom_feed_pda(&symbol);
+    let observation = custom_observation_pda(&symbol, market.expiry);
+    harness.send_ok(&fixture.admin, &[init_custom_price_feed_ix(&fixture.admin.pubkey(), &fixture.config, &feed, symbol, ONE_TOKEN)], &[]);
+
+    let unauthorized = harness.send_err(&impostor, &[update_custom_price_feed_ix(&impostor.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, harness.now())], &[]);
+    assert_vsol_error(&unauthorized, vsol::VsolError::Unauthorized);
+    let future = harness.send_err(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, harness.now() + 1)], &[]);
+    assert_vsol_error(&future, vsol::VsolError::CustomFeedFromFuture);
+    let stale = harness.send_err(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, harness.now() - vsol::CUSTOM_ORACLE_MAX_STALENESS_SECONDS - 1)], &[]);
+    assert_vsol_error(&stale, vsol::VsolError::CustomFeedStale);
+
+    harness.warp_to_timestamp(market.expiry);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 2 * ONE_TOKEN, market.expiry)], &[]);
+    let poisoned = harness.send_err(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+    assert_vsol_error(&poisoned, vsol::VsolError::OracleConfidenceTooWide);
+    harness.warp_to_timestamp(market.expiry + 1);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 7, market.expiry + 1)], &[]);
+    let retrograde = harness.send_err(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 102 * ONE_TOKEN, 8, market.expiry + 1)], &[]);
+    assert_vsol_error(&retrograde, vsol::VsolError::CustomFeedTimestampNotIncreasing);
+    let unauthorized_capture = harness.send_err(&impostor, &[capture_custom_observation_ix(&impostor.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+    assert_vsol_error(&unauthorized_capture, vsol::VsolError::Unauthorized);
+    harness.send_ok(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+    let captured: vsol::CustomSettlementObservation = harness.read_account(&observation);
+    assert_eq!(captured.price, 101 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry + 2);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 250 * ONE_TOKEN, 9, market.expiry + 2)], &[]);
+    let duplicate = harness.send_err(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+    assert!(format!("{duplicate:?}").contains("already in use"));
+    assert_eq!(harness.read_account::<vsol::CustomSettlementObservation>(&observation).price, 101 * ONE_TOKEN);
+
+    harness.warp_to_timestamp(market.expiry + i64::from(market.observation_window_seconds) + i64::from(market.settlement_grace_seconds));
+    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &market.market, &market.oracle, &observation)], &[]);
+    let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
+    assert!(oracle.finalized);
+    assert_eq!(oracle.price, 101 * ONE_TOKEN);
+    assert_eq!(oracle.observed_at, market.expiry + 1);
+}
+
+#[test]
+fn custom_observation_cannot_be_captured_after_window() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let symbol = symbol_bytes("NVDA");
+    let feed = custom_feed_pda(&symbol);
+    let observation = custom_observation_pda(&symbol, market.expiry);
+    harness.send_ok(&fixture.admin, &[init_custom_price_feed_ix(&fixture.admin.pubkey(), &fixture.config, &feed, symbol, ONE_TOKEN)], &[]);
+    harness.warp_to_timestamp(market.expiry + i64::from(market.observation_window_seconds) + 1);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, harness.now())], &[]);
+    let failed = harness.send_err(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::InvalidObservationTime);
+}
+
+#[test]
+fn shared_expiry_observation_respects_each_markets_capture_window() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let short = setup_market_with_terms(&mut harness, &fixture, &creator, settlement_mint, 0x71, 5, SETTLEMENT_GRACE, MAX_SETTLEMENT_STALENESS);
+    let long = setup_market_with_terms(&mut harness, &fixture, &creator, settlement_mint, 0x72, 30, SETTLEMENT_GRACE, MAX_SETTLEMENT_STALENESS);
+    assert_eq!(short.expiry, long.expiry);
+    let symbol = symbol_bytes("NVDA");
+    let feed = custom_feed_pda(&symbol);
+    let observation = custom_observation_pda(&symbol, long.expiry);
+    harness.send_ok(&fixture.admin, &[init_custom_price_feed_ix(&fixture.admin.pubkey(), &fixture.config, &feed, symbol, ONE_TOKEN)], &[]);
+    harness.warp_to_timestamp(long.expiry + 10);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, long.expiry + 1)], &[]);
+    harness.send_ok(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &long.market, &feed, &observation)], &[]);
+
+    let short_failed = harness.send_err(&creator, &[publish_custom_settlement_ix(&fixture.config, &short.market, &short.oracle, &observation)], &[]);
+    assert_vsol_error(&short_failed, vsol::VsolError::InvalidObservationTime);
+    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &long.market, &long.oracle, &observation)], &[]);
+    assert_eq!(harness.read_account::<vsol::SettlementOracle>(&long.oracle).price, 101 * ONE_TOKEN);
 }
 
 /// Decision record for "the oracle never finalizes" (see this task's

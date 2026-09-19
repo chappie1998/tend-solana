@@ -152,6 +152,26 @@ export function digitalFairValue(params: {
 // ---------------------------------------------------------------------------
 export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
 
+/**
+ * The protocol's cut of a WINNING payout, in basis points -- mirrors
+ * `config.fee_bps` on chain (set to 500 on 2026-09-19).
+ *
+ * `settle_pool_position` charges this against the payout and takes it from the
+ * buyer's side, so a LOSING position pays nothing at all and a winner receives
+ * `payout - fee`. It is duplicated here (rather than read from chain) purely so
+ * the ticket can show the net before a quote exists; the authoritative value is
+ * always the `fee_bps` snapshotted on the position itself, which is what
+ * settlement actually uses. A filled quote therefore cannot be re-priced by a
+ * later governance change.
+ */
+export const PROTOCOL_WIN_FEE_BPS = 500;
+
+/** What a winner actually receives after the protocol's cut of the payout. */
+export function netWinning(maxPayout: number, feeBps: number = PROTOCOL_WIN_FEE_BPS): number {
+  if (!Number.isFinite(maxPayout) || maxPayout <= 0) return 0;
+  return maxPayout * (1 - feeBps / 10_000);
+}
+
 export function applyMakerEdge(fair: number, edgeBps: number = MAKER_EDGE_BPS): number {
   return fair * (1 + edgeBps / 10_000);
 }
@@ -374,14 +394,23 @@ const GAP_RISK_MAX_VOL_MULTIPLIER = 1.75;
 // isolation) are not forced through the product's own sales restrictions.
 // ---------------------------------------------------------------------------
 export const INTRADAY_TIER_MAX_MINUTES = 60; // 15M and 1H.
-// Intraday starts AT the money, not below it. A 1.5x binary needs P(win) ~58%,
-// which puts its target BELOW spot -- you win if the price merely holds. That
-// is a real product, but it is not a directional bet, and the whole point of a
-// binary here is "win big, lose big". 2x sits essentially at the entry price,
-// 3x and 6x are genuine moves.
-export const PAYOFF_TIERS_INTRADAY: readonly number[] = [2, 3, 6];
+// Intraday is a 1.5x / 2x / 3x menu, deliberately reversing the earlier
+// "start at the money" rule (which set 2x/3x/6x). A 1.5x binary needs
+// P(win) ~58%, which puts its target slightly BELOW spot -- you win if the
+// price merely holds. That was previously rejected as "not a directional
+// bet", but it is the right shape for this product now that a protocol fee
+// is taken from winning payouts: a high-hit-rate ticket is what makes a
+// win-side fee meaningful, and a trader who wants a genuine directional
+// move still has 3x here and 5x/10x on the standard tenors.
+//
+// These are distinct contracts, not three labels on one: the traded strike
+// is the value the pricing engine SOLVES (minted on demand, see
+// listVsolSeriesOnChain), not a coarse ladder rung -- at spot $100/vol 60
+// the 15M targets land at $99.94 / $100.05 / $100.18. `ladderStrike` only
+// picks the default at-the-money rung when PLANNING a listing.
+export const PAYOFF_TIERS_INTRADAY: readonly number[] = [1.5, 2, 3];
 export const PAYOFF_TIERS_STANDARD: readonly number[] = [2, 5, 10];
-export const PAYOFF_TIERS_ALL: readonly number[] = [2, 3, 5, 6, 10];
+export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3, 5, 6, 10];
 
 export function payoffTiersFor(durationMinutes: number): number[] {
   return durationMinutes <= INTRADAY_TIER_MAX_MINUTES

@@ -4,13 +4,17 @@ import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
-  BadgeCheck,
   BookOpen,
   Clock3,
+  Copy,
+  ExternalLink,
   Info,
+  Landmark,
   LayoutDashboard,
+  LineChart,
   LoaderCircle,
   LockKeyhole,
+  LogOut,
   Menu,
   RefreshCw,
   Rocket,
@@ -21,9 +25,9 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { marketsByCategory, markets } from "../lib/markets";
+import { marketsByCategory, markets, type MarketCategory } from "../lib/markets";
 import { expiryCodes, formatExpiryDetail, resolveExpiry, type ExpiryCode, type ExpiryDefinition } from "../lib/expiries";
-import { otherSidePremium, payoffTiersFor, stakeBoundsForPayoff } from "../lib/options";
+import { netWinning, otherSidePremium, payoffTiersFor, PROTOCOL_WIN_FEE_BPS, stakeBoundsForPayoff } from "../lib/options";
 import { endWalletSession, establishWalletSession, fetchSessionWallet } from "../lib/session-client";
 import { useWalletBridge, type WalletBridge } from "../lib/wallet-bridge";
 import {
@@ -41,9 +45,10 @@ import {
 import { EarnView } from "./EarnView";
 import { LaunchView } from "./LaunchView";
 import { PortfolioView, type SavedPosition } from "./PortfolioView";
+import { TradePositionsPanel } from "./TradePositionsPanel";
 import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
-type Tab = "market" | "portfolio" | "earn" | "launch";
+type Tab = "pre-ipo" | "crypto" | "stocks" | "portfolio" | "earn" | "launch";
 type Direction = "up" | "down";
 // "expired" is a distinct value (not "error"): it's the neutral, no-fault
 // state after MAX_AUTO_REFRESHES silent re-quotes, versus a real fetch failure.
@@ -119,27 +124,15 @@ function toAsset(market: (typeof markets)[number]) {
   };
 }
 
-const assets = markets.map(toAsset);
-const tradableAssets = assets.filter((asset) => asset.tradable);
-// Grouped for display by app/lib/markets.ts's marketsByCategory -- the
-// grouping rule and the category order live there, not here, so adding a
-// market never means editing this component. The per-group `tradable` count
-// is derived from `status` (never from the category), because a category is
-// not a proxy for tradability: today every crypto market happens to be live
-// and every stock one is not, and hardcoding that coincidence is the bug
-// this comment exists to prevent.
-const assetGroups = marketsByCategory.map((group) => {
-  const groupAssets = group.markets.map(toAsset);
-  return {
-    category: group.category,
-    label: group.label,
-    assets: groupAssets,
-    tradableCount: groupAssets.filter((asset) => asset.tradable).length,
-  };
-});
+// Crypto and Stocks are now separate top-level destinations rather than two
+// rows of one combined strip, so there is no longer a single module-wide
+// asset list -- each is scoped to its own category inside TradeView (below),
+// sourced from marketsByCategory the same way the old combined groups were.
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
-  { id: "market", label: "Trade", icon: Activity },
+  { id: "pre-ipo", label: "Pre-IPO", icon: Landmark },
+  { id: "stocks", label: "Stocks", icon: LineChart },
+  { id: "crypto", label: "Crypto", icon: Activity },
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
   { id: "earn", label: "Write & earn", icon: TrendingUp },
   { id: "launch", label: "Launch", icon: Rocket },
@@ -229,7 +222,11 @@ function QuotePanel({
     return (
       <div className="quote-empty">
         <div className="empty-icon"><Wallet size={20} aria-hidden="true" /></div>
-        <div><strong>Wallet sign-in isn’t configured</strong><p>Quotes are signed for your wallet address, but this deployment has no wallet sign-in configured yet. If you already have a Solana wallet, you can still get one below.</p></div>
+        {/* `configured` now means "this browser has a wallet-standard Solana
+            wallet", not "this deployment set up a sign-in provider" -- the
+            meaning changed when Privy was removed. Blaming the deployment
+            here sent visitors looking for a fault that is on their side. */}
+        <div><strong>No Solana wallet detected</strong><p>Quotes are signed for your wallet address, so trading needs a Solana wallet in this browser. Install one — Phantom, Solflare or Backpack — then reload this page.</p></div>
         <a className="button primary" href="https://solana.com/wallets" target="_blank" rel="noreferrer"><Wallet size={16} aria-hidden="true" /> Get a Solana wallet</a>
       </div>
     );
@@ -345,10 +342,18 @@ function VsolStatus() {
     };
   }, []);
 
-  const explorer = status?.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
+  // Silent while healthy. A permanent "everything is verified" banner is noise
+  // on a trading surface -- it occupies the top of the page saying nothing
+  // actionable 99% of the time. What matters is the exception, so this renders
+  // only once execution is actually degraded (paused, deployment pending, or
+  // the status probe failing). The same liquidity it used to advertise still
+  // reaches the trader where it changes a decision: on the quote itself.
+  if (status === null || status.ok) return null;
+
+  const explorer = status.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
   return (
-    <div className={status?.ok ? "protocol-strip verified" : "protocol-strip"}>
-      <div><span className="protocol-pulse" /><span><strong>{status === null ? "Checking VSOL devnet…" : status.ok ? "VSOL V2 pool + Pyth series verified" : status.deploymentReady === false ? "Pyth deployment pending" : "Execution unavailable"}</strong><small>{status?.ok ? `${status.poolLiquidity ?? "0"} tUSDC available · ${status.seriesCount ?? 0} verified series` : status?.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
+    <div className="protocol-strip">
+      <div><span className="protocol-pulse" /><span><strong>{status.deploymentReady === false ? "Settlement upgrade pending" : "Execution unavailable"}</strong><small>{status.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
@@ -402,6 +407,8 @@ function expiryChipTitle(item: Pick<ExpiryDefinition, "available" | "label" | "d
 function shortDataSourceLabel(source: string | null | undefined): string {
   if (source === "Pyth Core Hermes") return "Pyth";
   if (source === "Coinbase Exchange") return "Coinbase";
+  if (source === "Hyperliquid") return "Hyperliquid";
+  if (source === "DEX (Solana)") return "DEX";
   return "Market";
 }
 
@@ -413,8 +420,17 @@ function clampedAmountForPayoff(nextPayoff: number, currentAmount: string): stri
   return clamped !== current ? String(clamped) : currentAmount;
 }
 
-/** Short marketing label for a payoff tier button -- covers every value across both the intraday and standard ladders (see payoffTiersFor). */
+/**
+ * Short marketing label for a payoff tier button -- covers every value across
+ * both the intraday and standard ladders (see payoffTiersFor).
+ *
+ * Ordered by how likely the tier is to WIN, not by size of payout: 1.5x lands
+ * around a 58% hit rate, 2x ~43%, 3x ~29%, 10x ~9%. 1.5x previously fell
+ * through to the "Aggressive" default, which labelled the single likeliest
+ * ticket on the board as the riskiest one.
+ */
 function payoffTierLabel(tier: number): string {
+  if (tier === 1.5) return "Likeliest";
   if (tier === 2) return "Even odds";
   if (tier === 3) return "Bold";
   if (tier === 5) return "Popular";
@@ -423,6 +439,7 @@ function payoffTierLabel(tier: number): string {
 }
 
 function TradeView({
+  category,
   walletAddress,
   onConnect,
   onPositionSaved,
@@ -432,7 +449,9 @@ function TradeView({
   sessionNotice,
   onSignIn,
   onSessionExpired,
+  positions,
 }: {
+  category: MarketCategory;
   walletAddress: string;
   onConnect: () => void | Promise<void>;
   onPositionSaved: (position: SavedPosition) => void;
@@ -442,8 +461,22 @@ function TradeView({
   sessionNotice: string;
   onSignIn: () => void | Promise<void>;
   onSessionExpired: () => void;
+  positions: SavedPosition[];
 }) {
-  const [assetTicker, setAssetTicker] = useState(() => tradableAssets[0]?.ticker ?? "");
+  // This tab's markets ONLY, sourced from marketsByCategory (the single
+  // place grouping is decided -- see app/lib/markets.ts) rather than
+  // re-filtering `markets` by category here, so Crypto and Stocks never
+  // diverge on which symbols belong to which shelf. `tradable` still reads
+  // off each market's own `status`, never off `category` -- see toAsset's
+  // comment above for why that distinction is load-bearing.
+  const categoryGroup = marketsByCategory.find((group) => group.category === category);
+  const categoryLabel = categoryGroup?.label ?? category;
+  const categoryAssets = (categoryGroup?.markets ?? []).map(toAsset);
+  const tradableCategoryAssets = categoryAssets.filter((item) => item.tradable);
+  // First tradable market in this category; if none are tradable (Stocks,
+  // today), the first market in the category so the tab still has a default.
+  const defaultAssetTicker = tradableCategoryAssets[0]?.ticker ?? categoryAssets[0]?.ticker ?? "";
+  const [assetTicker, setAssetTicker] = useState(defaultAssetTicker);
   const [direction, setDirection] = useState<Direction>("up");
   const [expiry, setExpiry] = useState<ExpiryCode>("30D");
   const [payoff, setPayoff] = useState(5);
@@ -476,9 +509,11 @@ function TradeView({
   const [selectedPool, setSelectedPool] = useState("");
   const [vsolQuote, setVsolQuote] = useState<VsolQuotePayload | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  // Only ever a tradable asset: the coming-soon chips are disabled, so
-  // `assetTicker` can never hold one, and the fallback stays on the live set.
-  const asset = tradableAssets.find((item) => item.ticker === assetTicker) ?? tradableAssets[0] ?? assets[0];
+  // Only ever a tradable asset when one exists in this category: the
+  // coming-soon chips are disabled, so `assetTicker` can never hold one while
+  // any tradable market is available, and the fallback stays on this
+  // category's own set (see toAsset's comment -- never the other shelf's).
+  const asset = tradableCategoryAssets.find((item) => item.ticker === assetTicker) ?? tradableCategoryAssets[0] ?? categoryAssets[0];
   // What the buyer typed is what they PAY. The payout it buys is solved
   // server-side and only known once a quote exists (see payoutForStake).
   const stake = Number(amount) || 0;
@@ -556,11 +591,11 @@ function TradeView({
     : [];
   const defaultPool = authorizedPools.find((pool) => pool.quotable) ?? authorizedPools[0] ?? null;
   const activePool = authorizedPools.find((pool) => pool.address === selectedPool) ?? defaultPool;
-  // `bridge.ready` is false until Privy finishes initialising -- that's the
-  // same "not checked yet" state quoteReadiness expects. Once ready,
-  // `providerDetected` reflects whether wallet sign-in is configured at all
-  // (bridge.configured), not whether a specific wallet extension exists --
-  // Privy's modal offers email sign-in too.
+  // `bridge.ready` is false until the wallet adapter has mounted client-side
+  // -- that's the same "not checked yet" state quoteReadiness expects. Once
+  // ready, `providerDetected` reflects whether any wallet-standard Solana
+  // wallet was actually found in this browser (bridge.configured) -- there
+  // is no email fallback now, external wallets only.
   const providerDetected = !bridge.ready ? null : bridge.configured;
   const readiness = quoteReadiness({ providerDetected, walletAddress, walletBusy, sessionWallet, sessionNotice });
   const inputIssue = quoteInputIssue({
@@ -678,6 +713,30 @@ function TradeView({
     return () => window.clearInterval(timer);
   }, [quoteState, bestQuote, executionState, complete]);
 
+  // Reset to this category's default asset the moment `category` itself
+  // changes -- e.g. switching from Crypto to Stocks in the nav. Mirrors the
+  // wallet-switch reset just below: state repair during render (a plain
+  // conditional setState, not useEffect+setState, which
+  // react-hooks/set-state-in-effect forbids as an error). Inlines
+  // invalidateQuote's state resets rather than calling it directly, because
+  // that function also bumps requestSeqRef/autoRefreshCountRef -- ref writes
+  // the react-hooks/refs rule forbids during render; the ref bump for a
+  // category change is handled by the effect below instead, alongside the
+  // wallet one.
+  const [resolvedCategory, setResolvedCategory] = useState(category);
+  if (resolvedCategory !== category) {
+    setResolvedCategory(category);
+    setAssetTicker(defaultAssetTicker);
+    setMarketSnapshot(null);
+    setComplete(false);
+    setExecutionState("idle");
+    setExecutionError("");
+    setQuoteState("idle");
+    setQuotes([]);
+    setSelectedQuoteId("");
+    setVsolQuote(null);
+  }
+
   // Signed quotes bind the exact buyer, so switching wallets invalidates them mid-render.
   const [quotedWallet, setQuotedWallet] = useState(walletAddress);
   if (quotedWallet !== walletAddress) {
@@ -692,12 +751,12 @@ function TradeView({
   }
 
   // Refs are read/written outside render (event handlers, effects) only --
-  // this mirrors the wallet-switch reset above without mutating a ref
-  // during render.
+  // this mirrors the wallet-switch and category-switch resets above without
+  // mutating a ref during render.
   useEffect(() => {
     requestSeqRef.current += 1;
     autoRefreshCountRef.current = 0;
-  }, [walletAddress]);
+  }, [walletAddress, category]);
 
   // Clamps the stake into the new tier's bounds as the tier changes, so the
   // ticket is never left in a state that cannot be quoted.
@@ -854,7 +913,6 @@ function TradeView({
   return (
     <main className="trade-layout">
       <section className="market-column">
-        <div className="product-intro"><span className="eyebrow">VSOL · Solana-native defined risk</span><h1>Options, without the trapdoors.</h1><p>Choose up or down. Your loss is capped at the premium, and Solana escrows the writer’s full payout before the trade opens.</p></div>
         <VsolStatus />
         <div className="market-header">
           <div className="asset-heading"><MiniLogo ticker={asset.ticker} /><div><div className="asset-name"><h2>{asset.ticker}</h2>{/* Both strings come from app/lib/markets.ts. SOL was hardcoded as "Stock Token" here, which is simply untrue — the config carries what each instrument actually is so no view can invent it. */}<span>{asset.assetClass}</span></div><p>{asset.blurb}</p></div></div>
@@ -863,37 +921,39 @@ function TradeView({
         </div>
 
         <div className="asset-strip" role="group" aria-label="Available markets">
-          {assetGroups.map((group) => (
-            <section key={group.category} className="asset-group" aria-label={group.label}>
-              <h3 className="asset-group-head">{group.label}<span>{group.tradableCount > 0 ? `${group.tradableCount} tradable` : "Coming soon"}</span></h3>
-              <div className="asset-group-row">
-                {group.assets.map((item) => (
-                  <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
-                    <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : `${shortDataSourceLabel(dataSourceLabel)} pending`}</small></span>
-                    {/* The two coming-soon cases are different in kind (an un-entitled
-                        feed vs no feed at all) and a user cannot tell which is which
-                        from "Coming soon", so the distinction is rendered, not only
-                        tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
-                        full sentence. Three sentences inline made the UNTRADABLE
-                        markets taller than the tradable ones. The authoritative
-                        sentence is still one hover away (the button's `title`), and it
-                        is still the same string the server returns from resolveExpiry,
-                        so the reason shown is the reason enforced.
+          {/* Crypto and Stocks are now separate nav destinations, so this strip
+              lists ONE category's markets -- the two-group layout collapsed to
+              one section, still built from the same asset-group chrome (and the
+              same `marketsByCategory`-sourced data) the combined strip used. */}
+          <section className="asset-group" aria-label={categoryLabel}>
+            <h3 className="asset-group-head">{categoryLabel}<span>{tradableCategoryAssets.length > 0 ? `${tradableCategoryAssets.length} tradable` : "Coming soon"}</span></h3>
+            <div className="asset-group-row">
+              {categoryAssets.map((item) => (
+                <button key={item.ticker} type="button" disabled={!item.tradable} title={item.tradable ? undefined : item.statusNote} aria-disabled={!item.tradable} onClick={() => { if (!item.tradable) return; setAssetTicker(item.ticker); setMarketSnapshot(null); if (!resolveExpiry(expiry, item.ticker, Date.now()).available) setExpiry("7D"); invalidateQuote(); }} className={!item.tradable ? "asset-chip coming-soon" : asset.ticker === item.ticker ? "asset-chip active" : "asset-chip"}>
+                  <MiniLogo ticker={item.ticker} /><span><strong>{item.ticker}</strong><small>{!item.tradable ? "Coming soon" : item.ticker === asset.ticker && displayedPrice !== null ? `$${displayedPrice.toFixed(2)}` : stripPrices[item.ticker] !== undefined ? `$${stripPrices[item.ticker].toFixed(2)}` : `${shortDataSourceLabel(dataSourceLabel)} pending`}</small></span>
+                  {/* The two coming-soon cases are different in kind (an un-entitled
+                      feed vs no feed at all) and a user cannot tell which is which
+                      from "Coming soon", so the distinction is rendered, not only
+                      tooltipped -- but as `statusTag`'s two words, not `statusNote`'s
+                      full sentence. Three sentences inline made the UNTRADABLE
+                      markets taller than the tradable ones. The authoritative
+                      sentence is still one hover away (the button's `title`), and it
+                      is still the same string the server returns from resolveExpiry,
+                      so the reason shown is the reason enforced.
 
-                        A market that is tradable but not selected shows nothing here:
-                        it has a live price in the line above, and an em-dash beside a
-                        real price reads as missing data rather than as "not the
-                        market you are looking at". */}
-                    {item.tradable
-                      ? item.ticker === asset.ticker
-                        ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
-                        : null
-                      : <span className="asset-chip-note">{item.statusTag}</span>}
-                  </button>
-                ))}
-              </div>
-            </section>
-          ))}
+                      A market that is tradable but not selected shows nothing here:
+                      it has a live price in the line above, and an em-dash beside a
+                      real price reads as missing data rather than as "not the
+                      market you are looking at". */}
+                  {item.tradable
+                    ? item.ticker === asset.ticker
+                      ? <em className={marketSnapshot?.mode === "live" ? "positive" : ""}>{marketSnapshot?.mode ?? "—"}</em>
+                      : null
+                    : <span className="asset-chip-note">{item.statusTag}</span>}
+                </button>
+              ))}
+            </div>
+          </section>
         </div>
 
         <div className="market-card">
@@ -908,7 +968,6 @@ function TradeView({
             <div className="market-stats"><div><span>{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
-          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> TradingView is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Pyth feed · mock RWA mint</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
         </div>
 
         <div className="transparency-card">
@@ -971,7 +1030,7 @@ function TradeView({
               can come back. Everything else is pricing evidence, and it now
               sits behind "Pricing detail" instead of ahead of the answer.
 
-              "Max payout" deliberately restates the position size: the payoff
+              "Max winning" deliberately restates the position size: the payoff
               dial does NOT move it -- it moves the PREMIUM. That reads as a
               frozen number unless the ratio is on screen, so the multiple the
               quote actually achieved is shown beside it. It is the quote's own
@@ -1005,7 +1064,7 @@ function TradeView({
                 no partial payout in between, so both outcomes are stated as
                 their own unambiguous headline rows rather than a single
                 number that could read as a coin flip. */}
-            <div className="economics-total"><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>{direction === "up" ? "at or above" : "at or below"} ${bestQuote.strike.toFixed(2)}</small>}</strong></div>
+            <div className="economics-total"><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>{direction === "up" ? "at or above" : "at or below"} ${bestQuote.strike.toFixed(2)} · nets ${netWinning(bestQuote.maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })} after the {PROTOCOL_WIN_FEE_BPS / 100}% fee</small>}</strong></div>
             {/* The price the buyer needs to hit for the FULL payout, stated
                 as its own headline number rather than only the small
                 annotation above -- direction-aware. For a binary, this IS
@@ -1037,6 +1096,8 @@ function TradeView({
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
 
+      <TradePositionsPanel walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} onConnect={onConnect} />
+
       {complete && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setComplete(false)}>
           <div className="review-modal" role="dialog" aria-modal="true" aria-labelledby="review-title">
@@ -1045,14 +1106,14 @@ function TradeView({
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max payout</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div><div><span>You net if you win</span><strong>{maxPayout === null ? "—" : `$${netWinning(maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}<small>after the {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee</small></strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement accepts only a fully verified Pyth update for the market feed; VSOL remains unaudited and must not receive mainnet funds.</p>
+            <p className="preview-disclaimer">A winning position pays a {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee out of its payout; a losing one pays no fee. Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>
@@ -1064,8 +1125,11 @@ function TradeView({
 export function TendTerminal() {
   const bridge = useWalletBridge();
   const walletAddress = bridge.address;
-  const [activeTab, setActiveTab] = useState<Tab>("market");
+  const [activeTab, setActiveTab] = useState<Tab>("pre-ipo");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [walletMenuOpen, setWalletMenuOpen] = useState(false);
+  const [addressCopied, setAddressCopied] = useState(false);
+  const walletMenuRef = useRef<HTMLDivElement>(null);
   const [walletError, setWalletError] = useState("");
   const [walletFunding, setWalletFunding] = useState(false);
   const [walletSigning, setWalletSigning] = useState(false);
@@ -1074,7 +1138,7 @@ export function TendTerminal() {
   const [positions, setPositions] = useState<SavedPosition[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [positionsError, setPositionsError] = useState("");
-  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Trade", [activeTab]);
+  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Pre-IPO", [activeTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1167,10 +1231,10 @@ export function TendTerminal() {
   const onSessionExpired = useCallback(() => setSessionWallet(null), []);
 
   // The accountChanged-equivalent behaviour: bridge.address is a reactive
-  // value (Privy owns the connection), so this effect -- not a provider
-  // event listener -- is what now reacts to a fresh connect, a switched
-  // account, or a disconnect. Session state always resets and re-attempts
-  // silent SIWS (or ends the session for a disconnect); the devnet faucet
+  // value (the wallet adapter owns the connection), so this effect -- not a
+  // provider event listener -- is what now reacts to a fresh connect, a
+  // switched account, or a disconnect. Session state always resets and
+  // re-attempts silent SIWS (or ends the session for a disconnect); the devnet faucet
   // claim runs only on the "" -> address transition, i.e. an actual new
   // connection, exactly as connectWallet() used to trigger it once.
   const previousWalletAddressRef = useRef(walletAddress);
@@ -1181,6 +1245,7 @@ export function TendTerminal() {
 
     setSessionWallet(null);
     setSessionNotice("");
+    setWalletMenuOpen(false);
     if (!walletAddress) {
       void endWalletSession();
       return;
@@ -1197,13 +1262,48 @@ export function TendTerminal() {
     });
   }, [walletAddress, signInWithWallet]);
 
-  // Opening Privy's modal is all this does: the modal reports its own errors,
-  // and dismissing it is not a failure worth a banner. The app reacts to the
-  // outcome through bridge.address (the effect above) and bridge.connecting.
+  // Opening our own wallet picker modal is all this does: the picker (and
+  // the adapter it connects) report their own errors, and dismissing it is
+  // not a failure worth a banner. The app reacts to the outcome through
+  // bridge.address (the effect above) and bridge.connecting.
   const connectWallet = useCallback(async () => {
     setWalletError("");
     await bridge.connect();
   }, [bridge]);
+
+  // bridge.disconnect() throws when the connected wallet never implemented
+  // the (optional) wallet-standard disconnect feature -- rare, but silently
+  // swallowing it would look identical to the bug this fixed: clicking
+  // Disconnect and nothing happening. Surface it instead of hiding it.
+  const disconnectWallet = useCallback(async () => {
+    setWalletMenuOpen(false);
+    try {
+      await bridge.disconnect();
+    } catch {
+      setWalletError("This wallet doesn't support disconnecting from a page. Disconnect this site from inside your wallet extension instead.");
+    }
+  }, [bridge]);
+
+  const copyWalletAddress = useCallback(async () => {
+    if (!walletAddress) return;
+    await navigator.clipboard.writeText(walletAddress);
+    setAddressCopied(true);
+    window.setTimeout(() => setAddressCopied(false), 1500);
+  }, [walletAddress]);
+
+  // Close the wallet menu on an outside click or a disconnect -- there is no
+  // other way to dismiss it (it has no backdrop), so both cases need to be
+  // handled explicitly rather than relying on losing focus.
+  useEffect(() => {
+    if (!walletMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (walletMenuRef.current && !walletMenuRef.current.contains(event.target as Node)) {
+        setWalletMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [walletMenuOpen]);
 
   return (
     <div className="app-shell">
@@ -1213,14 +1313,38 @@ export function TendTerminal() {
         <div className="desktop-nav"><ProductNav active={activeTab} onChange={selectTab} /></div>
         <div className="header-actions">
           <div className="network-pill"><span /><strong>Solana</strong><small>Devnet · VSOL</small></div>
-          <button type="button" className={walletAddress ? "wallet-button connected" : "wallet-button"} onClick={() => { void connectWallet(); }} aria-busy={bridge.connecting || walletFunding}><Wallet size={16} aria-hidden="true" /> {bridge.connecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}</button>
+          <div className="wallet-control" ref={walletMenuRef}>
+            <button
+              type="button"
+              className={walletAddress ? "wallet-button connected" : "wallet-button"}
+              onClick={() => { if (walletAddress) { setWalletMenuOpen((value) => !value); } else { void connectWallet(); } }}
+              aria-busy={bridge.connecting || walletFunding}
+              aria-haspopup={walletAddress ? "menu" : undefined}
+              aria-expanded={walletAddress ? walletMenuOpen : undefined}
+            >
+              <Wallet size={16} aria-hidden="true" /> {bridge.connecting ? "Connecting…" : walletFunding ? "Funding sandbox…" : walletAddress ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}` : "Connect Solana"}
+            </button>
+            {walletMenuOpen && walletAddress && (
+              <div className="wallet-menu" role="menu">
+                <button type="button" role="menuitem" onClick={() => { void copyWalletAddress(); }}>
+                  <Copy size={14} aria-hidden="true" /> {addressCopied ? "Copied" : "Copy address"}
+                </button>
+                <a role="menuitem" href={solanaExplorerUrl("address", walletAddress)} target="_blank" rel="noreferrer" onClick={() => setWalletMenuOpen(false)}>
+                  <ExternalLink size={14} aria-hidden="true" /> View on Explorer
+                </a>
+                <button type="button" role="menuitem" className="wallet-menu-disconnect" onClick={() => { void disconnectWallet(); }}>
+                  <LogOut size={14} aria-hidden="true" /> Disconnect
+                </button>
+              </div>
+            )}
+          </div>
           <button type="button" className="icon-button mobile-menu" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button>
         </div>
       </header>
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "market" ? <TradeView walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); setActiveTab("portfolio"); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("market")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "crypto" || activeTab === "stocks" || activeTab === "pre-ipo" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("pre-ipo")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );

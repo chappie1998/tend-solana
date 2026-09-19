@@ -63,6 +63,9 @@ PYTH_HERMES_URL=https://hermes.pyth.network
 PYTH_API_KEY=<server-only key>
 ```
 
+Stock markets (NVDA/GOOGL/SPACEX) price off Hyperliquid's public "xyz" HIP-3
+dex (`app/lib/hyperliquid-market-data.ts`) -- no API key required.
+
 Never use the program admin, upgrade authority, mainnet wallet, or personally funded key for these roles.
 Solana’s public endpoints are suitable for development but may block or throttle hosted server traffic. Use a private devnet RPC for the deployed app.
 

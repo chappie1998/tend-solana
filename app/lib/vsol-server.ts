@@ -30,8 +30,8 @@ import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
 import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
+  VSOL_CUSTOM_SETTLEMENT_DEPLOYED,
   VSOL_LIQUIDITY,
-  VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RETIRING_LOOKUP_TABLES,
   VSOL_RPC_URL,
@@ -48,6 +48,7 @@ import {
 } from "./series-resolver.ts";
 import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
 import { decodeMarketAccount } from "./vsol-market-accounts.ts";
+import { getClockUnixTimestamp } from "./solana-clock.ts";
 
 // Re-exported: chain-catalog.ts, chain-positions.ts, and vsol-launch.ts all
 // import this from vsol-server.ts. The decoder itself now lives in
@@ -366,6 +367,7 @@ function expectAccount(data: Buffer, size: number, discriminator: Buffer, label:
 export function decodeConfigAccount(data: Buffer) {
   expectAccount(data, 239, CONFIG_ACCOUNT_DISCRIMINATOR, "VSOL config");
   return {
+    oracleAuthority: publicKeyAt(data, 105),
     treasuryOwner: publicKeyAt(data, 169),
     paused: data[203] === 1,
     eligibilityRequired: data[204] === 1,
@@ -378,6 +380,11 @@ export function decodeOracleAccount(data: Buffer) {
   expectAccount(data, 143, ORACLE_ACCOUNT_DISCRIMINATOR, "VSOL oracle");
   return {
     market: publicKeyAt(data, 9),
+    price: data.readBigUInt64LE(41),
+    confidence: data.readBigUInt64LE(49),
+    observedAt: Number(data.readBigInt64LE(57)),
+    publishedAt: Number(data.readBigInt64LE(65)),
+    priceUpdate: publicKeyAt(data, 73),
     pythFeedId: data.subarray(105, 137).toString("hex"),
     finalized: data[141] === 1,
     // Appended after launch: true when the finalized price came from the
@@ -589,10 +596,7 @@ export function vsolFaucet() {
 }
 
 async function clusterTime(connection: Connection) {
-  const slot = await connection.getSlot("confirmed");
-  const timestamp = await connection.getBlockTime(slot);
-  if (timestamp === null) throw new Error("Devnet clock is unavailable");
-  return timestamp;
+  return getClockUnixTimestamp(connection);
 }
 
 export async function getVsolClusterTime(connection = getVsolConnection()) {
@@ -1365,7 +1369,7 @@ export async function buildVsolQuoteTransaction(params: {
    */
   poolCore?: PoolCore;
 }) {
-  if (!VSOL_PYTH_UPGRADE_DEPLOYED) throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
+  if (!VSOL_CUSTOM_SETTLEMENT_DEPLOYED) throw new Error("The custom settlement observation upgrade has not passed devnet verification");
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
   const series = params.series ?? await defaultQuoteSeries();
   if (!series) throw new Error("No verified VSOL V2 quote series is published");
@@ -1469,23 +1473,45 @@ export async function buildVsolQuoteTransaction(params: {
     rent: SYSVAR_RENT_PUBKEY,
   }, quoteData(quote));
   const latest = await connection.getLatestBlockhash("confirmed");
-  // When the manifest publishes an ALT, compile as a v0 transaction so
-  // repeated 32-byte account keys collapse into 1-byte indices. The buyer's
-  // transaction is always the plain two-instruction fill now -- an unlisted
-  // rung was listed by listVsolSeriesOnChain above, in its own server-signed
+  // Prefer the plain legacy shape, and reach for the ALT only if the bytes
+  // genuinely don't fit.
+  //
+  // The buyer's transaction is always the two-instruction fill -- an unlisted
+  // rung is listed by listVsolSeriesOnChain above in its own server-signed
   // transaction, rather than by two extra instructions in here (which composed
-  // to 1265 bytes, over the packet limit, and so could never be sent). Falls
-  // back to the exact legacy shape whenever no table is available.
-  const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
-  const transaction = composeVsolFillTransaction({
+  // to 1265 bytes, over the packet limit, and so could never be sent). That
+  // two-instruction form measures ~1154 bytes as a legacy transaction, so it
+  // already fits with room to spare, and the v0+ALT encoding was only ever a
+  // size optimisation on top of that (repeated 32-byte keys collapsing into
+  // 1-byte indices).
+  //
+  // That optimisation costs real money in wallets: a v0 transaction can only
+  // be simulated by first resolving its lookup table, and third-party wallet
+  // scanners are mainnet-oriented -- Solflare's returns a hard "Security
+  // verification failed / server error" on a devnet ALT it cannot resolve,
+  // leaving the signature blocked with no way to proceed. A legacy fill has no
+  // table to resolve and scans normally.
+  //
+  // The ALT stays as an automatic fallback, so if the fill's shape ever grows
+  // past the packet limit the v0 encoding still rescues it rather than the
+  // quote failing outright. resolveSignedVsolFillTransaction accepts both
+  // shapes, so nothing downstream cares which one this returns.
+  const composeParams = {
     feePayer: params.buyer,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
     instructions: [signatureInstruction, fillInstruction],
-    lookupTableAccount,
-  });
+  };
+  let transaction = composeVsolFillTransaction(composeParams);
+  let serialized = serializeVsolTransaction(transaction);
+  if (serialized.length > MAX_TRANSACTION_BYTES) {
+    const lookupTableAccount = await getVsolAddressLookupTableAccount(connection);
+    if (lookupTableAccount) {
+      transaction = composeVsolFillTransaction({ ...composeParams, lookupTableAccount });
+      serialized = serializeVsolTransaction(transaction);
+    }
+  }
 
-  const serialized = serializeVsolTransaction(transaction);
   if (serialized.length > MAX_TRANSACTION_BYTES) {
     // Do not ship a silently-broken oversized transaction: fail the quote
     // honestly rather than handing the wallet something that can never fit in
@@ -1911,11 +1937,15 @@ export async function resolveSignedVsolFillTransaction(
   } catch {
     return null;
   }
-  if (versioned.message.version === "legacy") return null;
-  // Narrowed (not merely asserted): the check above already ruled out
-  // "legacy", so this is exactly the MessageV0 branch of the VersionedMessage
-  // union -- kept as a local so every access below resolves against the same
-  // narrowed type.
+  // A positive "is v0" check, not "is not legacy": web3.js 1.99 added
+  // MessageV1 to the VersionedMessage union, so ruling out "legacy" alone no
+  // longer narrows to MessageV0. Demanding version 0 keeps this fail-closed --
+  // v0 is the only versioned shape composeVsolFillTransaction ever produces --
+  // and rejects the v1 layout outright rather than verifying signatures
+  // against a message format this path has never been audited against.
+  if (versioned.message.version !== 0) return null;
+  // Narrowed (not merely asserted) by the check above, and kept as a local so
+  // every access below resolves against the same narrowed type.
   const message: MessageV0 = versioned.message;
   if (!verifyVersionedVsolSignatures(versioned)) return null;
 
@@ -1996,7 +2026,7 @@ export function describeRpcFailure(error: unknown, fallback: string) {
     return "The devnet RPC endpoint refused this server's connection (403). Set VSOL_RPC_URL to a private Solana devnet RPC.";
   }
   if (/429|rate.?limit/i.test(message)) {
-    return "The devnet RPC endpoint is rate-limiting this server. Retry shortly or set VSOL_RPC_URL to a private RPC.";
+    return "Solana devnet is busy. Please retry shortly.";
   }
   return message.replace(/https?:\/\/\S+/gi, "[redacted-url]").slice(0, 300);
 }

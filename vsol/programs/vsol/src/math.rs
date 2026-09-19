@@ -29,12 +29,17 @@ pub fn calculate_payout(
 }
 
 /// Protocol fees round up so a positive fee rate cannot be bypassed with dust quotes.
-pub fn calculate_fee(premium: u64, fee_bps: u16) -> Result<u64> {
-    if premium == 0 || fee_bps == 0 {
+///
+/// `amount` is whatever the fee is charged ON -- deliberately not named
+/// `premium` any more: `settle_pool_position` charges it against the WINNING
+/// PAYOUT (so a loser pays nothing), while the legacy `settle` and the
+/// early-close buyback still charge it against the premium.
+pub fn calculate_fee(amount: u64, fee_bps: u16) -> Result<u64> {
+    if amount == 0 || fee_bps == 0 {
         return Ok(0);
     }
 
-    let numerator = (premium as u128)
+    let numerator = (amount as u128)
         .checked_mul(fee_bps as u128)
         .ok_or(VsolError::MathOverflow)?
         .checked_add((BPS_DENOMINATOR - 1) as u128)
@@ -165,6 +170,52 @@ pub fn calculate_bps_limit(amount: u64, bps: u16) -> Result<u64> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The settlement split `settle_pool_position` performs once the fee is
+    /// charged against the WINNING PAYOUT rather than the premium. Conservation
+    /// must hold exactly -- the vault holds `premium + max_payout` and every
+    /// atom of it has to leave -- and a LOSER must pay no fee at all.
+    #[test]
+    fn win_fee_splits_the_vault_exactly_and_never_taxes_a_loss() {
+        let premium: u64 = 100_000_000; // $100
+        let max_payout: u64 = 500_000_000; // $500
+        let expected = premium + max_payout;
+        let fee_bps: u16 = 500; // 5%
+
+        for payout in [0u64, 1, 250_000_000, max_payout] {
+            let fee = calculate_fee(payout, fee_bps).unwrap();
+            let buyer = payout.checked_sub(fee).expect("fee can never exceed the payout");
+            let pool = max_payout - payout + premium;
+            assert_eq!(buyer + pool + fee, expected, "vault must split exactly at payout {payout}");
+            if payout == 0 {
+                assert_eq!(fee, 0, "a losing position must pay no protocol fee");
+                assert_eq!(buyer, 0);
+                assert_eq!(pool, expected, "the pool keeps the whole premium on a loss");
+            } else {
+                assert!(fee > 0, "a winning position must pay a fee at 5%");
+            }
+        }
+
+        // A full win: the buyer keeps 95%, the treasury takes 5%, and the pool
+        // still recovers exactly the premium it was paid.
+        let fee = calculate_fee(max_payout, fee_bps).unwrap();
+        assert_eq!(fee, 25_000_000, "5% of $500 is $25");
+        assert_eq!(max_payout - fee, 475_000_000, "the winner nets $475");
+        assert_eq!(max_payout - max_payout + premium, premium);
+    }
+
+    /// `fee_bps` is capped at MAX_FEE_BPS (10%), so the fee can never exceed the
+    /// payout and `payout - fee` can never underflow -- the property the
+    /// settlement path relies on.
+    #[test]
+    fn win_fee_never_exceeds_the_payout_at_any_allowed_rate() {
+        for payout in [1u64, 7, 1_000, 999_999_999] {
+            for bps in [1u16, 25, 500, 1_000] {
+                let fee = calculate_fee(payout, bps).unwrap();
+                assert!(fee <= payout, "fee {fee} exceeded payout {payout} at {bps} bps");
+            }
+        }
+    }
 
     #[test]
     fn payout_is_linear_and_capped() {

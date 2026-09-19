@@ -11,6 +11,9 @@ import {
 } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import nacl from "tweetnacl";
+import { installOfflineFillFixture } from "./helpers/offline-fill-fixture.mjs";
+
+test.beforeEach(installOfflineFillFixture);
 
 // Pure, offline tests for the mint-on-demand fill flow: a buyer's first fill
 // on a not-yet-minted rung mints (create_market) and authorizes
