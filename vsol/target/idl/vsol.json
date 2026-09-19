@@ -448,6 +448,127 @@
       "args": []
     },
     {
+      "name": "capture_custom_settlement_observation",
+      "discriminator": [
+        135,
+        123,
+        185,
+        104,
+        224,
+        179,
+        28,
+        184
+      ],
+      "accounts": [
+        {
+          "name": "oracle_authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.symbol",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "observation",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  111,
+                  98,
+                  115,
+                  101,
+                  114,
+                  118,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.symbol",
+                "account": "Market"
+              },
+              {
+                "kind": "account",
+                "path": "market.expiry",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_pool_position",
       "docs": [
         "Lets a buyer exit an open pool-backed position before expiry by",
@@ -2528,7 +2649,8 @@
             ]
           },
           "relations": [
-            "market"
+            "market",
+            "observation"
           ]
         },
         {
@@ -2564,7 +2686,7 @@
           ]
         },
         {
-          "name": "feed",
+          "name": "observation",
           "pda": {
             "seeds": [
               {
@@ -2577,15 +2699,27 @@
                   111,
                   109,
                   45,
-                  102,
+                  111,
+                  98,
+                  115,
                   101,
-                  101,
-                  100
+                  114,
+                  118,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
                 ]
               },
               {
                 "kind": "account",
                 "path": "market.symbol",
+                "account": "Market"
+              },
+              {
+                "kind": "account",
+                "path": "market.expiry",
                 "account": "Market"
               }
             ]
@@ -4291,6 +4425,10 @@
         {
           "name": "confidence",
           "type": "u64"
+        },
+        {
+          "name": "observed_at",
+          "type": "i64"
         }
       ]
     },
@@ -4712,6 +4850,19 @@
         81,
         52,
         72
+      ]
+    },
+    {
+      "name": "CustomSettlementObservation",
+      "discriminator": [
+        171,
+        39,
+        252,
+        232,
+        120,
+        205,
+        2,
+        119
       ]
     },
     {
@@ -5647,6 +5798,16 @@
       "code": 6068,
       "name": "CustomFeedStale",
       "msg": "The custom price feed has not updated recently enough to settle with."
+    },
+    {
+      "code": 6069,
+      "name": "CustomFeedFromFuture",
+      "msg": "The custom price feed timestamp is in the future."
+    },
+    {
+      "code": 6070,
+      "name": "CustomFeedTimestampNotIncreasing",
+      "msg": "The custom price feed timestamp must increase strictly."
     }
   ],
   "types": [
@@ -5965,6 +6126,67 @@
           {
             "name": "published_at",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CustomSettlementObservation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "config",
+            "type": "pubkey"
+          },
+          {
+            "name": "symbol",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "expiry",
+            "type": "i64"
+          },
+          {
+            "name": "observation_window_seconds",
+            "type": "u32"
+          },
+          {
+            "name": "price_scale",
+            "type": "u64"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "confidence",
+            "type": "u64"
+          },
+          {
+            "name": "observed_at",
+            "type": "i64"
+          },
+          {
+            "name": "captured_at",
+            "type": "i64"
+          },
+          {
+            "name": "feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "publisher",
+            "type": "pubkey"
           }
         ]
       }

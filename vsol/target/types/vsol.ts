@@ -454,6 +454,127 @@ export type Vsol = {
       "args": []
     },
     {
+      "name": "captureCustomSettlementObservation",
+      "discriminator": [
+        135,
+        123,
+        185,
+        104,
+        224,
+        179,
+        28,
+        184
+      ],
+      "accounts": [
+        {
+          "name": "oracleAuthority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "relations": [
+            "market"
+          ]
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.symbol",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "observation",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  117,
+                  115,
+                  116,
+                  111,
+                  109,
+                  45,
+                  111,
+                  98,
+                  115,
+                  101,
+                  114,
+                  118,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.symbol",
+                "account": "market"
+              },
+              {
+                "kind": "account",
+                "path": "market.expiry",
+                "account": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "closePoolPosition",
       "docs": [
         "Lets a buyer exit an open pool-backed position before expiry by",
@@ -2534,7 +2655,8 @@ export type Vsol = {
             ]
           },
           "relations": [
-            "market"
+            "market",
+            "observation"
           ]
         },
         {
@@ -2570,7 +2692,7 @@ export type Vsol = {
           ]
         },
         {
-          "name": "feed",
+          "name": "observation",
           "pda": {
             "seeds": [
               {
@@ -2583,15 +2705,27 @@ export type Vsol = {
                   111,
                   109,
                   45,
-                  102,
+                  111,
+                  98,
+                  115,
                   101,
-                  101,
-                  100
+                  114,
+                  118,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
                 ]
               },
               {
                 "kind": "account",
                 "path": "market.symbol",
+                "account": "market"
+              },
+              {
+                "kind": "account",
+                "path": "market.expiry",
                 "account": "market"
               }
             ]
@@ -4297,6 +4431,10 @@ export type Vsol = {
         {
           "name": "confidence",
           "type": "u64"
+        },
+        {
+          "name": "observedAt",
+          "type": "i64"
         }
       ]
     },
@@ -4718,6 +4856,19 @@ export type Vsol = {
         81,
         52,
         72
+      ]
+    },
+    {
+      "name": "customSettlementObservation",
+      "discriminator": [
+        171,
+        39,
+        252,
+        232,
+        120,
+        205,
+        2,
+        119
       ]
     },
     {
@@ -5653,6 +5804,16 @@ export type Vsol = {
       "code": 6068,
       "name": "customFeedStale",
       "msg": "The custom price feed has not updated recently enough to settle with."
+    },
+    {
+      "code": 6069,
+      "name": "customFeedFromFuture",
+      "msg": "The custom price feed timestamp is in the future."
+    },
+    {
+      "code": 6070,
+      "name": "customFeedTimestampNotIncreasing",
+      "msg": "The custom price feed timestamp must increase strictly."
     }
   ],
   "types": [
@@ -5971,6 +6132,67 @@ export type Vsol = {
           {
             "name": "publishedAt",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "customSettlementObservation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "config",
+            "type": "pubkey"
+          },
+          {
+            "name": "symbol",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "expiry",
+            "type": "i64"
+          },
+          {
+            "name": "observationWindowSeconds",
+            "type": "u32"
+          },
+          {
+            "name": "priceScale",
+            "type": "u64"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "confidence",
+            "type": "u64"
+          },
+          {
+            "name": "observedAt",
+            "type": "i64"
+          },
+          {
+            "name": "capturedAt",
+            "type": "i64"
+          },
+          {
+            "name": "feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "publisher",
+            "type": "pubkey"
           }
         ]
       }
