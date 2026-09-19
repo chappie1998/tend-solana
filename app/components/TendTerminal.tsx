@@ -420,8 +420,17 @@ function clampedAmountForPayoff(nextPayoff: number, currentAmount: string): stri
   return clamped !== current ? String(clamped) : currentAmount;
 }
 
-/** Short marketing label for a payoff tier button -- covers every value across both the intraday and standard ladders (see payoffTiersFor). */
+/**
+ * Short marketing label for a payoff tier button -- covers every value across
+ * both the intraday and standard ladders (see payoffTiersFor).
+ *
+ * Ordered by how likely the tier is to WIN, not by size of payout: 1.5x lands
+ * around a 58% hit rate, 2x ~43%, 3x ~29%, 10x ~9%. 1.5x previously fell
+ * through to the "Aggressive" default, which labelled the single likeliest
+ * ticket on the board as the riskiest one.
+ */
 function payoffTierLabel(tier: number): string {
+  if (tier === 1.5) return "Likeliest";
   if (tier === 2) return "Even odds";
   if (tier === 3) return "Bold";
   if (tier === 5) return "Popular";
