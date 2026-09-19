@@ -22,11 +22,12 @@ test("ships the VSOL trading surface with honest devnet labels", async () => {
   // execution is degraded -- so pin those labels, and assert the healthy
   // banner stays gone so a revert cannot quietly reinstate the noise.
   assert.match(terminal, /Execution unavailable/);
-  assert.match(terminal, /Pyth deployment pending/);
+  assert.match(terminal, /Settlement upgrade pending/);
   assert.doesNotMatch(terminal, /VSOL V2 pool \+ Pyth series verified/);
   assert.match(terminal, /Execute on Solana devnet/);
   assert.match(terminal, /mock tUSDC/);
-  assert.match(terminal, /fully verified Pyth update/);
+  assert.match(terminal, /centrally signed Coinbase or Hyperliquid reference/);
+  assert.match(layout, /metadataBase: new URL\("https:\/\/solana\.usetend\.xyz"\)/);
   // Wallet connection + signing go through the wallet-adapter-backed bridge
   // (see app/lib/wallet-bridge.tsx), not the legacy injected-wallet helper
   // this used to call directly -- that helper is kept only for
@@ -125,7 +126,7 @@ test("server creates buyer-bound V2 pool RFQs and verifies fills before persiste
 
   assert.match(quotesRoute, /buildVsolQuoteTransaction/);
   assert.match(quotesRoute, /VSOL_TEST_FUNDS_REQUIRED/);
-  assert.match(quotesRoute, /VSOL_PYTH_DEPLOYMENT_PENDING/);
+  assert.match(quotesRoute, /VSOL_CUSTOM_SETTLEMENT_DEPLOYMENT_PENDING/);
   assert.match(server, /poolQuoteMessage/);
   assert.match(server, /nacl\.sign\.detached/);
   assert.match(server, /domainSeparator/);
@@ -310,7 +311,7 @@ test("SOL is live and tradable, and the coming-soon status gate still blocks a n
   assert.match(terminal, /disabled=\{!item\.tradable\}/);
 });
 
-test("the catalog is two categories: crypto is all live, and stocks are all live too (Hyperliquid-priced), across three symbols", async () => {
+test("the catalog is three categories: pre-IPO DEX tokens, Hyperliquid-priced stocks, and Coinbase-priced crypto -- all live", async () => {
   const [markets, expiries, terminal] = await Promise.all([
     import(new URL("app/lib/markets.ts", root)),
     import(new URL("app/lib/expiries.ts", root)),
@@ -318,7 +319,27 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
   ]);
 
   const bySymbol = Object.fromEntries(markets.markets.map((market) => [market.symbol, market]));
-  assert.deepEqual(Object.keys(bySymbol), ["SOL", "BTC", "ETH", "NVDA", "GOOGL", "SPACEX"]);
+  assert.deepEqual(Object.keys(bySymbol), ["SOL", "BTC", "ETH", "NVDA", "GOOGL", "SPACEX", "TOPENAI", "TKALSHI", "TSPACEX", "POPENAI", "PANTHROPIC", "PNEURALINK", "PFIGUREAI"]);
+  // Pre-IPO tokens are a third category, priced off live Solana DEX trading
+  // (see app/lib/preipo-market-data.ts). Their `pythFeedId` deliberately
+  // carries the SPL mint as 32-byte on-chain identity, NOT a Pyth feed --
+  // Pyth publishes nothing for them, and an empty id makes pythFeedIdFor
+  // throw inside the market-PDA derivation, which would leave a market
+  // looking live while being structurally unmintable.
+  const preIpoSymbols = ["TOPENAI", "TKALSHI", "TSPACEX", "POPENAI", "PANTHROPIC", "PNEURALINK", "PFIGUREAI"];
+  for (const symbol of preIpoSymbols) {
+    const m = bySymbol[symbol];
+    assert.equal(m.category, "pre-ipo", `${symbol} is a pre-IPO market`);
+    assert.equal(m.status, "live");
+    assert.match(m.pythFeedId, /^[0-9a-f]{64}$/, `${symbol} carries its mint as identity`);
+    assert.equal(m.coinbaseProductId, "");
+    // Thin books ($71k-$656k) plus permissionless settlement with no on-chain
+    // width floor: a 15-minute binary here is cheap to push at the settlement
+    // instant, so these markets offer standard tenors only.
+    assert.equal(m.intradayEligible, false, `${symbol} must not offer intraday tenors`);
+  }
+  assert.equal(new Set(preIpoSymbols.map((s2) => bySymbol[s2].pythFeedId)).size, preIpoSymbols.length,
+    "no two pre-IPO markets may share a mint");
 
   // Crypto: all three genuinely tradable, each on its OWN entitled 24/7 feed.
   // The per-symbol feed matters beyond labelling -- the feed id is hashed into
@@ -334,8 +355,7 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
     assert.match(market.pythSymbol, /^Crypto\./, "every live feed must be a 24/7 crypto feed");
     assert.match(market.pythFeedId, /^[0-9a-f]{64}$/);
     feedIds.add(market.pythFeedId);
-    // The blurb must name the very feed the market settles on.
-    assert.ok(market.blurb.includes(market.pythSymbol), `${symbol}'s blurb must name ${market.pythSymbol}`);
+    assert.match(market.blurb, /Coinbase Exchange/, `${symbol}'s blurb must name its custom-oracle reference`);
   }
   assert.equal(feedIds.size, 3, "no two markets may share a Pyth feed id");
   assert.deepEqual(markets.liveMarkets.filter((market) => market.category === "crypto").map((market) => market.symbol), crypto);
@@ -389,7 +409,7 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
     liveStockSymbols.length,
     "no two stock markets may share a Pyth feed id",
   );
-  assert.deepEqual(markets.liveMarkets.map((market) => market.symbol), [...crypto, ...liveStockSymbols]);
+  assert.deepEqual(markets.liveMarkets.map((market) => market.symbol), [...crypto, ...liveStockSymbols, ...preIpoSymbols]);
 
   // The ladder step is per market and roughly 2-3% of that asset's spot.
   // Measured 2026-09-05/09-16: SOL $103.36, BTC $80,016, ETH $2,473.52,
@@ -439,9 +459,9 @@ test("the catalog is two categories: crypto is all live, and stocks are all live
   // place that decides) -- pinned so the order stays an explicit config
   // decision rather than something a refactor can silently flip. Order is
   // presentation only: nothing reads it as a tradability signal.
-  assert.deepEqual(markets.marketsByCategory.map((group) => group.category), ["stocks", "crypto"]);
-  assert.deepEqual(markets.marketsByCategory.map((group) => group.label), ["Stocks", "Crypto"]);
-  assert.deepEqual(markets.marketsByCategory.map((group) => group.markets.length), [3, 3]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.category), ["pre-ipo", "stocks", "crypto"]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.label), ["Pre-IPO", "Stocks", "Crypto"]);
+  assert.deepEqual(markets.marketsByCategory.map((group) => group.markets.length), [7, 3, 3]);
   assert.match(terminal, /marketsByCategory/);
   assert.match(terminal, /asset-group-head/);
   // WHICH kind of blocker a coming-soon market has is rendered, not just

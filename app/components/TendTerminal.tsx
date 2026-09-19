@@ -9,6 +9,7 @@ import {
   Copy,
   ExternalLink,
   Info,
+  Landmark,
   LayoutDashboard,
   LineChart,
   LoaderCircle,
@@ -47,7 +48,7 @@ import { PortfolioView, type SavedPosition } from "./PortfolioView";
 import { TradePositionsPanel } from "./TradePositionsPanel";
 import { TradingViewMarketChart, type MarketSnapshot } from "./TradingViewMarketChart";
 
-type Tab = "crypto" | "stocks" | "portfolio" | "earn" | "launch";
+type Tab = "pre-ipo" | "crypto" | "stocks" | "portfolio" | "earn" | "launch";
 type Direction = "up" | "down";
 // "expired" is a distinct value (not "error"): it's the neutral, no-fault
 // state after MAX_AUTO_REFRESHES silent re-quotes, versus a real fetch failure.
@@ -129,6 +130,7 @@ function toAsset(market: (typeof markets)[number]) {
 // sourced from marketsByCategory the same way the old combined groups were.
 
 const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
+  { id: "pre-ipo", label: "Pre-IPO", icon: Landmark },
   { id: "stocks", label: "Stocks", icon: LineChart },
   { id: "crypto", label: "Crypto", icon: Activity },
   { id: "portfolio", label: "Portfolio", icon: LayoutDashboard },
@@ -406,6 +408,7 @@ function shortDataSourceLabel(source: string | null | undefined): string {
   if (source === "Pyth Core Hermes") return "Pyth";
   if (source === "Coinbase Exchange") return "Coinbase";
   if (source === "Hyperliquid") return "Hyperliquid";
+  if (source === "DEX (Solana)") return "DEX";
   return "Market";
 }
 
@@ -1101,7 +1104,7 @@ function TradeView({
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.</p>
+            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>
@@ -1113,7 +1116,7 @@ function TradeView({
 export function TendTerminal() {
   const bridge = useWalletBridge();
   const walletAddress = bridge.address;
-  const [activeTab, setActiveTab] = useState<Tab>("stocks");
+  const [activeTab, setActiveTab] = useState<Tab>("pre-ipo");
   const [menuOpen, setMenuOpen] = useState(false);
   const [walletMenuOpen, setWalletMenuOpen] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
@@ -1126,7 +1129,7 @@ export function TendTerminal() {
   const [positions, setPositions] = useState<SavedPosition[]>([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [positionsError, setPositionsError] = useState("");
-  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Crypto", [activeTab]);
+  const pageTitle = useMemo(() => navItems.find((item) => item.id === activeTab)?.label ?? "Pre-IPO", [activeTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1332,7 +1335,7 @@ export function TendTerminal() {
       {walletError && <div className="wallet-error" role="alert">{walletError}<button type="button" onClick={() => setWalletError("")} aria-label="Dismiss wallet error"><X size={15} /></button></div>}
       {sessionNotice && <div className="wallet-error" role="status">{sessionNotice}<button type="button" onClick={() => setSessionNotice("")} aria-label="Dismiss sign-in notice"><X size={15} /></button></div>}
       {menuOpen && <div className="mobile-nav"><span>{pageTitle}</span><ProductNav active={activeTab} onChange={(tab) => { selectTab(tab); setMenuOpen(false); }} /></div>}
-      <div id="main">{activeTab === "crypto" || activeTab === "stocks" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("stocks")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
+      <div id="main">{activeTab === "crypto" || activeTab === "stocks" || activeTab === "pre-ipo" ? <TradeView category={activeTab} walletAddress={walletAddress} onConnect={connectWallet} onPositionSaved={(position) => { setPositions((current) => [position, ...current]); }} bridge={bridge} walletBusy={bridge.connecting || walletFunding || walletSigning} sessionWallet={sessionWallet} sessionNotice={sessionNotice} onSignIn={signIn} onSessionExpired={onSessionExpired} positions={positions} /> : activeTab === "portfolio" ? <PortfolioView walletAddress={walletAddress} sessionWallet={sessionWallet} positions={positions} isLoading={positionsLoading} error={positionsError} onRetry={loadPositions} onTrade={() => selectTab("pre-ipo")} /> : activeTab === "earn" ? <EarnView walletAddress={walletAddress} onConnect={connectWallet} /> : <LaunchView walletAddress={walletAddress} onConnect={connectWallet} />}</div>
       <footer><div><Logo /><span>VSOL defined-risk markets on Solana.</span></div><div><a href="#risk">Risk</a><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana docs</a><a href={solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">Program</a><span>© 2026 Tend Labs</span></div></footer>
     </div>
   );

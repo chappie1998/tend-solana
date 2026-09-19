@@ -100,7 +100,7 @@ export async function getCoinbaseSnapshot(market: Market): Promise<MarketSnapsho
       mode,
       source: "Coinbase Exchange",
       warning: mode === "live"
-        ? "Fresh Coinbase reference (half the live bid/ask spread stands in for a confidence interval); onchain settlement still requires a separately verified Pyth update."
+        ? "Fresh Coinbase reference (half the live bid/ask spread stands in for confidence); the centrally signed custom oracle retains the first validated observation inside the expiry window."
         : `Reference is ${ageMinutes} min old; Coinbase's ${productId} ticker is not printing fresh updates right now. Gap risk is priced into the quote, not hidden.`,
     };
     snapshotCache.set(productId, { expiresAt: Date.now() + 5_000, value });

@@ -229,7 +229,7 @@ export async function getHyperliquidSnapshot(market: Market, now = Date.now()): 
     mode,
     source: "Hyperliquid",
     warning: mode === "live"
-      ? "Fresh Hyperliquid xyz reference (|mark - oracle| stands in for a confidence interval and can legitimately read near zero); onchain settlement still requires a separately verified Pyth update."
+      ? "Fresh Hyperliquid xyz reference (|mark - oracle| stands in for confidence and can legitimately read near zero); the centrally signed custom oracle retains the first validated fetch inside the expiry window."
       : `Reference is ${ageMinutes} min old; Hyperliquid's ${coin} universe fetch is not refreshing right now. Gap risk is priced into the quote, not hidden.`,
   };
   return value;
