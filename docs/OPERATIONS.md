@@ -137,3 +137,75 @@ Add a second line on a `*/30 * * * *` schedule running
 `npm --prefix vsol run cranker` for the cranker. `launchd` (macOS) or
 `systemd` timers work the same way — a periodic unit invoking the same npm
 command with the same environment and `.devnet` files present.
+
+## Custom settlement oracle service
+
+The demo settlement path uses one local, continuously supervised worker:
+
+```bash
+npm --prefix vsol run custom-oracle:run
+```
+
+It pushes all six live references, captures the first valid observation in
+each market's expiry window, publishes the retained observation, then settles
+or refunds pool positions. Each symbol has its own serialized push/capture
+lane; relay and payout work runs separately. A kernel-held localhost port
+lease prevents a manual invocation from overlapping the supervised worker.
+`custom-oracle:once` performs one complete pass and exits nonzero if any
+operational lane fails.
+
+The machine must stay awake and networked. On macOS, run the launchd command
+under `caffeinate -i`; configure launchd `KeepAlive` for crash restart. Keep
+`VSOL_RPC_URL` and signer material in the process environment or the existing
+gitignored `.devnet` files, never in the plist or logs. Logs redact the RPC
+URL. The authority key is `vsol/.devnet/devnet-custom-oracle-authority.json`.
+
+Crypto references come from Coinbase Exchange. Stock references come from
+Hyperliquid's `xyz` mark price. Hyperliquid does not expose a separate source
+observation timestamp in this API, so its stored timestamp is Tend's bounded
+HTTP fetch time. Changing a source requires a code and review change; do not
+rotate the protocol config merely to switch providers because the config's
+domain version also binds signed quotes.
+
+At expiry, the program permanently retains the first authenticated source
+observation whose source timestamp is inside `[expiry, expiry +
+observation_window]`. Publication may happen later through the market's final
+deadline and does not require the rolling feed to remain fresh. If no valid
+observation is captured during the window, a later price can never replace
+it; the existing refund path applies after the settlement deadline.
+
+Operator commands from the repository root:
+
+```bash
+# one-shot mutating settlement pass; stop the launchd worker first
+npm --prefix vsol run custom-oracle:once
+
+# foreground run (the launchd program uses this same entrypoint)
+npm --prefix vsol run custom-oracle:run
+
+# inspect recent launchd state and logs (replace the label/path used locally)
+launchctl print gui/$(id -u)/xyz.usetend.solana-oracle
+tail -n 100 ~/Library/Logs/tend-solana-oracle/output.log
+tail -n 100 ~/Library/Logs/tend-solana-oracle/error.log
+
+# stop/start the installed service
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/xyz.usetend.solana-oracle.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/xyz.usetend.solana-oracle.plist
+```
+
+Before a devnet demonstration, require `/api/vsol/status` to return `ok: true`,
+confirm every per-symbol feed is ready, and inspect the launchd logs. Do not
+run `custom-oracle:once` while the supervised service owns the lease. Then run the HTTP smoke with an
+isolated wallet. Its default mode fills and early-closes a 15-minute NVDA
+position. `VSOL_SMOKE_SETTLEMENT=1` leaves that position open and emits a
+receipt for independent post-expiry payout verification; it never signs or
+supplies an oracle price. Verify that receipt after expiry with:
+
+```bash
+npm --prefix vsol run smoke:settlement:verify -- /tmp/tend-smoke-settlement-receipt.json
+```
+
+The verifier is read-only. It requires the position account to be closed,
+reads the finalized oracle price, reproduces the program's integer payout and
+round-up fee math, checks the buyer token balance, and proves the pool's locked
+collateral returned to its pre-fill value.

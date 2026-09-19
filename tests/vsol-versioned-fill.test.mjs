@@ -13,6 +13,9 @@ import {
 } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import nacl from "tweetnacl";
+import { installOfflineFillFixture } from "./helpers/offline-fill-fixture.mjs";
+
+test.beforeEach(installOfflineFillFixture);
 
 // Moving VSOL fill transactions to v0 (with an address lookup table) is what
 // lets both the plain 2-instruction fill (~1154 bytes) and the 4-instruction

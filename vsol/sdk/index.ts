@@ -11,6 +11,7 @@ export const ORACLE_SEED = Buffer.from("oracle");
 // symbol (see `deriveCustomPriceFeed`), independent of `ORACLE_SEED`'s
 // per-market `SettlementOracle`.
 export const CUSTOM_FEED_SEED = Buffer.from("custom-feed");
+export const CUSTOM_SETTLEMENT_OBSERVATION_SEED = Buffer.from("custom-observation");
 export const WRITER_SEED = Buffer.from("writer");
 export const WRITER_TOKEN_SEED = Buffer.from("writer-token");
 export const NONCE_SEED = Buffer.from("nonce");
@@ -387,6 +388,14 @@ export function deriveOracle(market: PublicKey, programId = VSOL_PROGRAM_ID): Pu
 /** One `CustomPriceFeed` PDA per symbol (e.g. "SOL"), shared across every expiry/rung of that asset -- see `CUSTOM_FEED_SEED`. */
 export function deriveCustomPriceFeed(symbol: string, programId = VSOL_PROGRAM_ID): PublicKey {
   return PublicKey.findProgramAddressSync([CUSTOM_FEED_SEED, Buffer.from(symbolBytes(symbol))], programId)[0];
+}
+
+/** Immutable first accepted observation for one symbol and expiry. */
+export function deriveCustomSettlementObservation(symbol: string, expiry: bigint, programId = VSOL_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [CUSTOM_SETTLEMENT_OBSERVATION_SEED, Buffer.from(symbolBytes(symbol)), i64(expiry)],
+    programId,
+  )[0];
 }
 
 export function deriveWriterVault(config: PublicKey, maker: PublicKey, mint: PublicKey, programId = VSOL_PROGRAM_ID): PublicKey {

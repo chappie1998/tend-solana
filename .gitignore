@@ -52,3 +52,6 @@ next-env.d.ts
 .dev.vars.*
 .neon
 .shots/
+
+# Marketing/demo video project (Remotion sources + rendered mp4s + captured frames)
+/video/

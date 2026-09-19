@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tend — Stocklana Submission Package</title>
+  <style>
+    :root { --bg:#09110e; --panel:#101b16; --ink:#eff8f1; --muted:#a9bbb0; --line:#284638; --green:#65dd91; --gold:#f1c96b; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 85% 0%,#173b2a 0,transparent 35%),var(--bg); color:var(--ink); font:16px/1.58 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(920px,calc(100% - 32px)); margin:0 auto; padding:64px 0 96px; }
+    .eyebrow { color:var(--green); font-weight:800; letter-spacing:.14em; text-transform:uppercase; font-size:.78rem; }
+    h1 { font-size:clamp(3rem,10vw,6.5rem); line-height:.94; letter-spacing:-.07em; margin:14px 0 20px; }
+    h2 { margin:42px 0 12px; font-size:1.25rem; letter-spacing:-.02em; }
+    p { margin:0 0 16px; } .muted { color:var(--muted); }
+    .tagline { font-size:clamp(1.15rem,3vw,1.5rem); max-width:650px; color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:34px 0; }
+    .card, .note { border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 90%,transparent); border-radius:16px; padding:20px; }
+    .card b { display:block; color:var(--green); font-size:1.35rem; margin-bottom:4px; }
+    .note { border-color:#745d2a; color:#f6e7bc; }
+    a { color:var(--green); text-underline-offset:3px; } code { color:var(--gold); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    ul { padding-left:20px; } li { margin:8px 0; }
+    .field { color:var(--muted); font-size:.78rem; letter-spacing:.12em; font-weight:800; text-transform:uppercase; }
+    @media (max-width:650px) { main { padding-top:40px; } .grid { grid-template-columns:1fr; } }
+    @media print { body { background:#fff; color:#111; } .card,.note { border-color:#bbb; background:#fff; } .muted,.field { color:#555; } a { color:#0645ad; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Stocklana · application package</div>
+  <h1>Tend</h1>
+  <p class="tagline">Defined-risk, on-chain stock-reference positions on Solana devnet.</p>
+  <div class="grid">
+    <div class="card"><b>Devnet demo</b><a href="https://solana.usetend.xyz">solana.usetend.xyz</a></div>
+    <div class="card"><b>435</b><span class="muted">automated tests recorded</span></div>
+    <div class="card"><b>6 feeds</b><span class="muted">2–14 seconds old in 18 Sep validation</span></div>
+  </div>
+  <section><div class="field">Project description · 329 words</div>
+    <p>Short-horizon market views are easy to form and difficult to express with a clear loss limit. Perpetuals can impose margin and liquidation thresholds; option interfaces can require users to navigate strikes and expiries. Tend gives a user a simpler experience: choose UP or DOWN, see the defined payoff before signing, and know the maximum loss is the premium, excluding network fees.</p>
+    <p>Tend is a Solana devnet application for defined-risk UP or DOWN positions against stock-reference prices. In the live demo, a user connects a Solana wallet, receives valueless mock tUSDC from a devnet faucet, signs in, selects a reference such as NVDA, chooses direction, expiry, target payoff, and stake, then receives a signed executable quote. The user reviews and approves a Solana devnet transaction. The resulting position appears in a chain-derived portfolio; it can be closed early back to the pool or held to expiry.</p>
+    <p>Tend does not represent ownership of a share. For stocks, the reference price is Hyperliquid's <code>xyz</code> mark price, including <code>xyz:NVDA</code>, <code>xyz:GOOGL</code>, and <code>xyz:SPCX</code> for the Tend SPACEX market. Positions use mock tUSDC and are for the devnet demonstration only.</p>
+    <p>The protocol is designed around bounded outcomes. At fill, the maximum writer payout is reserved atomically in program-controlled collateral. Quotes are bound to the buyer and protected against replay. At expiry, a centrally signed custom oracle attempts to capture the first valid reference inside a 30-second observation window and publishes that immutable observation. If there is no valid capture, the program refunds after its settlement deadline. This centralized oracle is an explicit current trust boundary.</p>
+    <p>The live devnet proof includes a completed NVDA expiry path. The observed price was 219730000 atoms, below the 219960221 UP strike, so the correct payout was zero; the verifier confirmed the zero outcome, closed position, and returned locked collateral. GOOGL and SPACEX also passed live fill and early-close flows. The release recorded 435 automated tests, 10/10 production health probes, and six oracle feeds aged 2–14 seconds (18 September validation snapshot).</p>
+  </section>
+  <section><div class="field">Why Solana</div>
+    <p>Tend needs a wallet-signed trade, deterministic collateral reservation at fill, a position account that can be independently read from chain state, and a verifiable settlement result. Solana makes that lifecycle a single user-facing transaction flow on devnet: a signed quote is executed, collateral and position state live in program-owned accounts, and the portfolio can display the confirmed on-chain result. The product does not ask a user to trust a database entry for the core position state.</p>
+  </section>
+  <section><div class="field">Technical proof</div>
+    <ul>
+      <li><a href="https://solana.usetend.xyz">Live devnet app</a></li>
+      <li><a href="https://explorer.solana.com/tx/4LCW1wa3zwhCAB8qswZ2dQFrwCNrjZ9sJfdK9motx3y3oGmaz7SgoUiLukq4H6a5r5jfhndyZSVWmmzYo63Z7ssv?cluster=devnet">NVDA expiry settlement</a> — correct zero payout</li>
+      <li><a href="https://explorer.solana.com/tx/3xYUfKL9SA5ovTSE3TPss5A17jXVLnTTL3WDCTojVvZoMK1fGnRg9zkTaMx8qRYAaaUmAa2FTXwiwnq7joGRUNxA?cluster=devnet">GOOGL early close</a> and <a href="https://explorer.solana.com/tx/2atzRmNUe69Rbx3X2LJMbPSXueisJE9mDhUq3ZPRPYCdqTpwktcm6cNbR7tJccHeZbwCWcZ5wppJMho6AE1mCDhQ?cluster=devnet">SPACEX early close</a></li>
+    </ul>
+  </section>
+  <section><div class="field">Current limits</div>
+    <p>Tend is devnet-only and uses valueless mock tUSDC. It is not share ownership, has not received an independent audit, and must not be used with real funds. Settlement currently depends on Tend’s single-authority signed oracle and its availability through the expiry window. A missed valid capture can lead to a refund after the settlement deadline. Stock references use Hyperliquid <code>xyz</code> marks, whose stored timestamp is Tend's bounded HTTP fetch time.</p>
+  </section>
+  <section><div class="field">Next steps</div>
+    <p>Publish the rebuilt technical and demo videos; keep the demo deterministic and show the actual devnet lifecycle. Continue hardening the oracle/operations path, add independent security review, and complete the market, liquidity, custody, governance, and legal work required before any mainnet consideration.</p>
+  </section>
+  <section><div class="field">Team</div><p>Ankit — builder. GitHub username: <code>chappie1998</code>.</p></section>
+  <section class="note"><div class="field">Submission-time fields</div><p><b>Video: pending upload.</b> Add a hosted original demo/technical video URL before submitting; do not use a placeholder. The GitHub repository is private: do not link it or claim it is public/open source. No sponsor/bounty eligibility is claimed here.</p></section>
+</main>
+</body>
+</html>

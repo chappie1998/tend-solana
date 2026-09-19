@@ -30,8 +30,8 @@ import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
 import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
+  VSOL_CUSTOM_SETTLEMENT_DEPLOYED,
   VSOL_LIQUIDITY,
-  VSOL_PYTH_UPGRADE_DEPLOYED,
   VSOL_PROGRAM_ID,
   VSOL_RETIRING_LOOKUP_TABLES,
   VSOL_RPC_URL,
@@ -48,6 +48,7 @@ import {
 } from "./series-resolver.ts";
 import { LAUNCH_MAX_CONFIDENCE_BPS, LAUNCH_PRICE_SCALE } from "./launch-params.ts";
 import { decodeMarketAccount } from "./vsol-market-accounts.ts";
+import { getClockUnixTimestamp } from "./solana-clock.ts";
 
 // Re-exported: chain-catalog.ts, chain-positions.ts, and vsol-launch.ts all
 // import this from vsol-server.ts. The decoder itself now lives in
@@ -366,6 +367,7 @@ function expectAccount(data: Buffer, size: number, discriminator: Buffer, label:
 export function decodeConfigAccount(data: Buffer) {
   expectAccount(data, 239, CONFIG_ACCOUNT_DISCRIMINATOR, "VSOL config");
   return {
+    oracleAuthority: publicKeyAt(data, 105),
     treasuryOwner: publicKeyAt(data, 169),
     paused: data[203] === 1,
     eligibilityRequired: data[204] === 1,
@@ -378,6 +380,11 @@ export function decodeOracleAccount(data: Buffer) {
   expectAccount(data, 143, ORACLE_ACCOUNT_DISCRIMINATOR, "VSOL oracle");
   return {
     market: publicKeyAt(data, 9),
+    price: data.readBigUInt64LE(41),
+    confidence: data.readBigUInt64LE(49),
+    observedAt: Number(data.readBigInt64LE(57)),
+    publishedAt: Number(data.readBigInt64LE(65)),
+    priceUpdate: publicKeyAt(data, 73),
     pythFeedId: data.subarray(105, 137).toString("hex"),
     finalized: data[141] === 1,
     // Appended after launch: true when the finalized price came from the
@@ -589,10 +596,7 @@ export function vsolFaucet() {
 }
 
 async function clusterTime(connection: Connection) {
-  const slot = await connection.getSlot("confirmed");
-  const timestamp = await connection.getBlockTime(slot);
-  if (timestamp === null) throw new Error("Devnet clock is unavailable");
-  return timestamp;
+  return getClockUnixTimestamp(connection);
 }
 
 export async function getVsolClusterTime(connection = getVsolConnection()) {
@@ -1365,7 +1369,7 @@ export async function buildVsolQuoteTransaction(params: {
    */
   poolCore?: PoolCore;
 }) {
-  if (!VSOL_PYTH_UPGRADE_DEPLOYED) throw new Error("The Pyth-bound VSOL deployment has not passed devnet verification");
+  if (!VSOL_CUSTOM_SETTLEMENT_DEPLOYED) throw new Error("The custom settlement observation upgrade has not passed devnet verification");
   if (!VSOL_LIQUIDITY) throw new Error("The verified VSOL V2 liquidity pool is not published");
   const series = params.series ?? await defaultQuoteSeries();
   if (!series) throw new Error("No verified VSOL V2 quote series is published");
@@ -2022,7 +2026,7 @@ export function describeRpcFailure(error: unknown, fallback: string) {
     return "The devnet RPC endpoint refused this server's connection (403). Set VSOL_RPC_URL to a private Solana devnet RPC.";
   }
   if (/429|rate.?limit/i.test(message)) {
-    return "The devnet RPC endpoint is rate-limiting this server. Retry shortly or set VSOL_RPC_URL to a private RPC.";
+    return "Solana devnet is busy. Please retry shortly.";
   }
   return message.replace(/https?:\/\/\S+/gi, "[redacted-url]").slice(0, 300);
 }

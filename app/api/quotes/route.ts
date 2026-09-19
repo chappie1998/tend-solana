@@ -11,6 +11,7 @@ import { rfqQuotes } from "../../../db/schema";
 import { lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
+import { getCustomOracleReadiness } from "../../lib/custom-oracle-readiness";
 import {
   buildVsolQuoteTransaction,
   checkVsolPoolDepth,
@@ -21,17 +22,17 @@ import {
   parsePublicKey,
   toPoolAtoms,
 } from "../../lib/vsol-server";
-import { solanaExplorerUrl, VSOL_PYTH_UPGRADE_DEPLOYED } from "../../lib/vsol";
+import { solanaExplorerUrl, VSOL_CUSTOM_SETTLEMENT_DEPLOYED } from "../../lib/vsol";
 import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return json({ error: "Cross-site quote requests are not allowed." }, 403);
   if (!(await resolveUserKey(request))) return json({ error: "Sign in to request executable quotes." }, 401);
-  if (!VSOL_PYTH_UPGRADE_DEPLOYED) {
+  if (!VSOL_CUSTOM_SETTLEMENT_DEPLOYED) {
     return json({
-      error: "Executable quotes are paused: the Pyth-bound VSOL program and market have not yet been verified on devnet.",
-      code: "VSOL_PYTH_DEPLOYMENT_PENDING",
+      error: "Executable quotes are paused: the custom settlement observation upgrade has not yet been verified on devnet.",
+      code: "VSOL_CUSTOM_SETTLEMENT_DEPLOYMENT_PENDING",
     }, 503);
   }
   await ensureDb();
@@ -83,6 +84,22 @@ export async function POST(request: Request) {
   // resolved onchain series' actual duration, checked against
   // payoffTiersFor once durationMinutes is known below.
   if (!Number.isFinite(payoff) || payoff <= 0) return json({ error: "Choose a valid target payoff." }, 422);
+
+  try {
+    const [oracle] = await getCustomOracleReadiness([market.symbol]);
+    if (!oracle?.ready) {
+      return json({
+        error: `${market.symbol} quoting is paused because its settlement oracle is not fresh. ${oracle?.reason ?? "Feed state is unavailable."}`,
+        code: "VSOL_CUSTOM_ORACLE_NOT_READY",
+        oracle: oracle ?? { symbol: market.symbol, ready: false },
+      }, 503);
+    }
+  } catch (error) {
+    return json({
+      error: describeRpcFailure(error, `${market.symbol} settlement oracle readiness could not be verified.`),
+      code: "VSOL_CUSTOM_ORACLE_UNVERIFIED",
+    }, 503);
+  }
 
   const requestedAt = Date.now();
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
@@ -301,15 +318,10 @@ export async function POST(request: Request) {
     referencePublishTime: snapshot.publishTime,
     referenceAgeSeconds: snapshot.ageSeconds,
     pricingMode: snapshot.mode,
-    // Honest about which provider actually produced `referencePrice`: only
-    // Pyth's exact onchain feed id is the same id settlement will verify
-    // against. Coinbase's number is an off-chain spot reference only --
-    // settlement below still requires its own separately verified Pyth
-    // update regardless of which one priced this quote.
-    referenceSource: snapshot.source === "Pyth Core Hermes"
-      ? "Pyth Core Hermes · exact onchain feed id"
-      : `${snapshot.source} · off-chain reference; settlement still verifies the exact onchain Pyth feed id`,
-    settlement: "European cash-settled · fully verified Pyth PriceUpdateV2",
+    referenceSource: snapshot.source === "Hyperliquid"
+      ? "Hyperliquid xyz mark · timestamp records Tend's HTTP fetch"
+      : `${snapshot.source} · signed into Tend's custom oracle feed`,
+    settlement: "European cash-settled · centrally signed custom oracle with an immutable expiry observation",
     expiry: {
       code: expiry.code,
       label: expiry.label,

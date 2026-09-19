@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
+import idl from "../target/idl/vsol.json" with { type: "json" };
 import {
   buildBurnCompleteSetInstruction,
   buildMintCompleteSetInstruction,
@@ -11,6 +13,7 @@ import {
   calculateWithdrawAmount,
   deriveCompleteSetToken,
   deriveCompleteSetVault,
+  deriveCustomSettlementObservation,
   deriveConfig,
   deriveDownMint,
   deriveLiquidityPool,
@@ -54,6 +57,25 @@ import {
   type Quote,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
+
+test("custom observation PDA and generated discriminators match Anchor encoding", () => {
+  const expiry = 1_800_000_000n;
+  const first = deriveCustomSettlementObservation("NVDA", expiry);
+  assert.equal(deriveCustomSettlementObservation("NVDA", expiry).toBase58(), first.toBase58());
+  assert.notEqual(deriveCustomSettlementObservation("NVDA", expiry + 1n).toBase58(), first.toBase58());
+
+  const instruction = idl.instructions.find((entry) => entry.name === "capture_custom_settlement_observation");
+  const account = idl.accounts.find((entry) => entry.name === "CustomSettlementObservation");
+  assert.deepEqual(instruction?.discriminator, [...createHash("sha256").update("global:capture_custom_settlement_observation").digest().subarray(0, 8)]);
+  assert.deepEqual(account?.discriminator, [...createHash("sha256").update("account:CustomSettlementObservation").digest().subarray(0, 8)]);
+  const update = idl.instructions.find((entry) => entry.name === "update_custom_price_feed");
+  assert.deepEqual(update?.args.map((arg) => arg.name), ["price", "confidence", "observed_at"]);
+  const settlementOracle = idl.types.find((entry) => entry.name === "SettlementOracle");
+  assert.deepEqual(settlementOracle?.type.fields?.map((field) => field.name), [
+    "bump", "market", "price", "confidence", "observed_at", "published_at",
+    "price_update", "feed_id", "exponent", "finalized", "settled_from_stale_price",
+  ]);
+});
 
 const MARKET_ID_FIXTURE = {
   pythFeedId: new Uint8Array(32).fill(0x11),
