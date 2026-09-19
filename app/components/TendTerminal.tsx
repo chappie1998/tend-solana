@@ -4,7 +4,6 @@ import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
-  BadgeCheck,
   BookOpen,
   Clock3,
   Copy,
@@ -352,7 +351,7 @@ function VsolStatus() {
   const explorer = status.explorerUrl ?? solanaExplorerUrl("address", VSOL_PROGRAM_ID.toBase58());
   return (
     <div className="protocol-strip">
-      <div><span className="protocol-pulse" /><span><strong>{status.deploymentReady === false ? "Pyth deployment pending" : "Execution unavailable"}</strong><small>{status.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
+      <div><span className="protocol-pulse" /><span><strong>{status.deploymentReady === false ? "Settlement upgrade pending" : "Execution unavailable"}</strong><small>{status.error ?? "Executable quotes stay paused until every proof passes"}</small></span></div>
       <a href={explorer} target="_blank" rel="noreferrer">View program <ArrowUpRight size={14} /></a>
     </div>
   );
@@ -957,7 +956,6 @@ function TradeView({
             <div className="market-stats"><div><span>{shortDataSourceLabel(marketSnapshot?.source ?? dataSourceLabel)} confidence</span><strong>{marketSnapshot ? `${marketSnapshot.confidenceBps.toFixed(2)} bps` : "—"}</strong></div></div>
           </div>
           <TradingViewMarketChart key={asset.ticker} direction={direction} target={target} ticker={asset.ticker} onSnapshot={setMarketSnapshot} />
-          <div className="market-footer"><span><Clock3 size={14} aria-hidden="true" /> TradingView is display-only</span><span title={asset.token}><BadgeCheck size={14} aria-hidden="true" /> Pyth feed · mock RWA mint</span><span><ShieldCheck size={14} aria-hidden="true" /> Fully collateralized</span></div>
         </div>
 
         <div className="transparency-card">
@@ -1103,7 +1101,7 @@ function TradeView({
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement accepts only a fully verified Pyth update for the market feed; VSOL remains unaudited and must not receive mainnet funds.</p>
+            <p className="preview-disclaimer">Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>

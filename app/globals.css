@@ -328,8 +328,6 @@ code, .tabular, .num {
 .data-mode.live { color: var(--positive); background: color-mix(in srgb, var(--positive) 15%, transparent); }
 .data-mode.stale { color: var(--negative); background: color-mix(in srgb, var(--negative) 15%, transparent); }
 .data-mode.loading { color: var(--ink-3); background: var(--surface-3); }
-.market-footer { min-height: 30px; padding: 5px 12px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 16px; color: var(--ink-3); font-size: var(--t-micro); flex-wrap: wrap; }
-.market-footer span { display: flex; align-items: center; gap: 5px; }
 
 /* Pricing disclosure — a ruled region of the market panel, not a card
    parked underneath it. */
@@ -674,7 +672,6 @@ footer a:hover { color: var(--ink); }
   .resolution-picker button { flex: 1; min-width: 0; min-height: 32px; }
   .chart-source { align-items: flex-start; flex-wrap: wrap; gap: 4px 10px; }
   .chart-source > span:nth-child(3) { order: 4; flex-basis: 100%; white-space: normal; }
-  .market-footer { gap: 6px 14px; }
   .transparency-card { align-items: flex-start; }
   .view-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
