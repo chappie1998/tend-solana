@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
@@ -51,7 +52,9 @@ const devnetDir = resolve(workspace, ".devnet");
 // "~45-60s" per the design spec for CUSTOM_ORACLE_MAX_STALENESS_SECONDS
 // (300s on-chain) -- generous headroom under that ceiling even if a single
 // tick is slow or briefly fails.
-const PUSH_INTERVAL_MS = 55_000;
+const PUSH_INTERVAL_MS = 60_000;
+const MAX_SOURCE_AGE_SECONDS = 30;
+export const DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 
 async function loadRequiredKeypair(name: string): Promise<Keypair> {
   const path = resolve(devnetDir, `${name}.json`);
@@ -81,7 +84,7 @@ function toPriceScaleAtoms(humanAmount: number): bigint {
   return BigInt(Math.round(humanAmount * Number(PRICE_SCALE)));
 }
 
-async function pushOneSymbol(params: {
+export async function pushOneSymbol(params: {
   program: Program<Vsol>;
   authority: Keypair;
   config: PublicKey;
@@ -90,6 +93,12 @@ async function pushOneSymbol(params: {
   const { program, authority, config, market } = params;
   const feed = deriveCustomPriceFeed(market.symbol);
   const snapshot = await getMarketSnapshot(market);
+  if (snapshot.mode !== "live" || snapshot.ageSeconds > MAX_SOURCE_AGE_SECONDS) {
+    throw new Error(`${snapshot.source} snapshot is ${snapshot.mode} (${snapshot.ageSeconds}s old)`);
+  }
+  if (!Number.isSafeInteger(snapshot.publishTime) || snapshot.publishTime <= 0) {
+    throw new Error(`${snapshot.source} returned an invalid observation timestamp`);
+  }
   const price = toPriceScaleAtoms(snapshot.price);
   // `confidence` is always a non-negative, human-scale dispersion proxy
   // regardless of which provider produced the snapshot -- half the live
@@ -105,7 +114,11 @@ async function pushOneSymbol(params: {
   }
 
   const signature = await program.methods
-    .updateCustomPriceFeed(new BN(price.toString()), new BN(confidence.toString()))
+    .updateCustomPriceFeed(
+      new BN(price.toString()),
+      new BN(confidence.toString()),
+      new BN(snapshot.publishTime),
+    )
     .accountsStrict({
       oracleAuthority: authority.publicKey,
       config,
@@ -118,19 +131,35 @@ async function pushOneSymbol(params: {
   );
 }
 
-async function runOnePass(program: Program<Vsol>, authority: Keypair, config: PublicKey): Promise<void> {
-  for (const market of liveMarkets) {
+export async function runCustomOraclePushPass(program: Program<Vsol>, authority: Keypair, config: PublicKey): Promise<number> {
+  const results = await Promise.all(liveMarkets.map(async (market) => {
     try {
       await pushOneSymbol({ program, authority, config, market });
+      return true;
     } catch (error) {
       // Per-symbol isolation: an outage at whichever provider this symbol
       // routes to (Coinbase/Pyth for crypto, Hyperliquid for stocks -- see
       // app/lib/market-data.ts), an un-initialized feed (init_custom_price_feed
       // not yet called for this symbol), or a single failed RPC must cost
       // only that symbol's tick, never the whole pass.
-      console.log(`skip: ${market.symbol} -- ${error instanceof Error ? error.message : String(error)}`);
+      const failure = classifyPushFailure(error, rpcUrl);
+      if (failure.duplicateTimestamp) {
+        console.log(`unchanged: ${market.symbol} source timestamp already published`);
+        return true;
+      }
+      console.log(`skip: ${market.symbol} -- ${failure.message}`);
+      return false;
     }
-  }
+  }));
+  return results.filter((ok) => !ok).length;
+}
+
+export function classifyPushFailure(error: unknown, secret: string): { duplicateTimestamp: boolean; message: string } {
+  const code = error && typeof error === "object" && "error" in error
+    ? (error as { error?: { errorCode?: { code?: string } } }).error?.errorCode?.code
+    : undefined;
+  const message = (error instanceof Error ? error.message : String(error)).split(secret).join("[redacted]");
+  return { duplicateTimestamp: code === "CustomFeedTimestampNotIncreasing", message };
 }
 
 async function main(): Promise<void> {
@@ -139,6 +168,9 @@ async function main(): Promise<void> {
   const programAccount = await connection.getAccountInfo(VSOL_PROGRAM_ID, commitment);
   if (!programAccount?.executable) {
     throw new Error(`VSOL program ${VSOL_PROGRAM_ID.toBase58()} is not deployed on ${cluster}`);
+  }
+  if (cluster === "devnet" && await connection.getGenesisHash() !== DEVNET_GENESIS_HASH) {
+    throw new Error("Configured RPC is not Solana devnet");
   }
 
   const authority = await loadRequiredKeypair("devnet-custom-oracle-authority");
@@ -154,12 +186,15 @@ async function main(): Promise<void> {
   // in runOnePass above), so this loop itself never throws in the steady
   // state; only a startup failure (missing key, program not deployed) exits.
   for (;;) {
-    await runOnePass(program, authority, config);
+    await runCustomOraclePushPass(program, authority, config);
     await sleep(PUSH_INTERVAL_MS);
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(message.split(rpcUrl).join("[redacted]"));
+    process.exitCode = 1;
+  });
+}
