@@ -188,10 +188,12 @@ pub const POOL_UPDATE_TIMELOCK_SECONDS: i64 = 86_400;
 /// price feed -- see that account's own doc comment for the full trust-model
 /// disclosure.
 pub const CUSTOM_FEED_SEED: &[u8] = b"custom-feed";
+pub const CUSTOM_SETTLEMENT_OBSERVATION_SEED: &[u8] = b"custom-observation";
 // Generous vs. an off-chain pusher cadence of ~45-60s; tight enough that a
 // dead pusher fails settlement closed rather than allowing a frozen price to
 // keep being used indefinitely.
 pub const CUSTOM_ORACLE_MAX_STALENESS_SECONDS: i64 = 300;
+pub const CUSTOM_OBSERVATION_MAX_CAPTURE_AGE_SECONDS: i64 = 30;
 
 #[program]
 pub mod vsol {
@@ -1648,19 +1650,34 @@ pub mod vsol {
             oracle.price,
             position.max_payout,
         )?;
-        let fee = calculate_fee(position.premium, position.fee_bps)?;
+        // The protocol fee is a share of the WINNING PAYOUT, taken from the
+        // buyer's side -- not a share of the premium taken from the pool's.
+        // Two consequences follow, and both are the point:
+        //   * a losing position has `payout == 0`, so it pays no fee at all;
+        //   * a winner receives `payout - fee`, so the fee scales with what
+        //     they actually won.
+        // `fee_bps` is still read from the POSITION, not from config, so a
+        // filled quote cannot become more expensive if governance changes the
+        // fee before expiry.
+        let fee = calculate_fee(payout, position.fee_bps)?;
+        let buyer_amount = payout.checked_sub(fee).ok_or(VsolError::MathOverflow)?;
+        // The pool's share is unchanged by the fee: it still recovers the
+        // collateral it did not lose, plus the whole premium.
         let pool_amount = position
             .max_payout
             .checked_sub(payout)
             .and_then(|value| value.checked_add(position.premium))
-            .and_then(|value| value.checked_sub(fee))
             .ok_or(VsolError::MathOverflow)?;
         let expected = position
             .premium
             .checked_add(position.max_payout)
             .ok_or(VsolError::MathOverflow)?;
+        // Conservation still holds exactly, with the fee moved to the buyer's
+        // side of the split:
+        //   (payout - fee) + (max_payout - payout + premium) + fee
+        //     == max_payout + premium
         require!(
-            payout
+            buyer_amount
                 .checked_add(pool_amount)
                 .and_then(|value| value.checked_add(fee))
                 == Some(expected)
@@ -1707,14 +1724,14 @@ pub mod vsol {
             nonce_record_key.as_ref(),
             &[position.bump],
         ];
-        if payout > 0 {
+        if buyer_amount > 0 {
             transfer_checked_signed(
                 ctx.accounts.token_program.key(),
                 ctx.accounts.position_vault.to_account_info(),
                 ctx.accounts.buyer_destination.to_account_info(),
                 ctx.accounts.settlement_mint.to_account_info(),
                 ctx.accounts.position.to_account_info(),
-                payout,
+                buyer_amount,
                 ctx.accounts.settlement_mint.decimals,
                 position_seeds,
             )?;
@@ -2630,13 +2647,17 @@ pub mod vsol {
         ctx: Context<UpdateCustomPriceFeed>,
         price: u64,
         confidence: u64,
+        observed_at: i64,
     ) -> Result<()> {
         require!(price > 0, VsolError::InvalidOraclePrice);
         let clock = Clock::get()?;
         let feed = &mut ctx.accounts.feed;
+        require!(observed_at <= clock.unix_timestamp, VsolError::CustomFeedFromFuture);
+        require!(clock.unix_timestamp.saturating_sub(observed_at) <= CUSTOM_ORACLE_MAX_STALENESS_SECONDS, VsolError::CustomFeedStale);
+        require!(observed_at > feed.published_at, VsolError::CustomFeedTimestampNotIncreasing);
         feed.price = price;
         feed.confidence = confidence;
-        feed.published_at = clock.unix_timestamp;
+        feed.published_at = observed_at;
         feed.publisher = ctx.accounts.oracle_authority.key();
         emit!(CustomPriceFeedUpdated {
             feed: feed.key(),
@@ -2645,6 +2666,41 @@ pub mod vsol {
             confidence,
             published_at: feed.published_at,
         });
+        Ok(())
+    }
+
+    pub fn capture_custom_settlement_observation(
+        ctx: Context<CaptureCustomSettlementObservation>,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let market = &ctx.accounts.market;
+        let feed = &ctx.accounts.feed;
+        require!(feed.publisher == ctx.accounts.config.oracle_authority, VsolError::Unauthorized);
+        require!(feed.symbol == market.symbol, VsolError::InvalidSymbol);
+        require!(feed.price_scale == market.price_scale, VsolError::InvalidPriceScale);
+        require!(feed.price > 0, VsolError::InvalidOraclePrice);
+        require!(feed.published_at <= now, VsolError::CustomFeedFromFuture);
+        require!(now.saturating_sub(feed.published_at) <= CUSTOM_OBSERVATION_MAX_CAPTURE_AGE_SECONDS, VsolError::CustomFeedStale);
+        let observation_end = market.expiry.checked_add(i64::from(market.observation_window_seconds)).ok_or(VsolError::MathOverflow)?;
+        require!(feed.published_at >= market.expiry && feed.published_at <= observation_end, VsolError::InvalidObservationTime);
+        require!(now <= observation_end, VsolError::SettlementWindowClosed);
+        let confidence_bps = (feed.confidence as u128).checked_mul(BPS_DENOMINATOR as u128).ok_or(VsolError::MathOverflow)?;
+        let max_confidence = (feed.price as u128).checked_mul(market.max_confidence_bps as u128).ok_or(VsolError::MathOverflow)?;
+        require!(confidence_bps <= max_confidence, VsolError::OracleConfidenceTooWide);
+
+        let observation = &mut ctx.accounts.observation;
+        observation.bump = ctx.bumps.observation;
+        observation.config = ctx.accounts.config.key();
+        observation.symbol = market.symbol;
+        observation.expiry = market.expiry;
+        observation.observation_window_seconds = market.observation_window_seconds;
+        observation.price_scale = market.price_scale;
+        observation.price = feed.price;
+        observation.confidence = feed.confidence;
+        observation.observed_at = feed.published_at;
+        observation.captured_at = now;
+        observation.feed = feed.key();
+        observation.publisher = feed.publisher;
         Ok(())
     }
 
@@ -2659,29 +2715,30 @@ pub mod vsol {
         let now = clock.unix_timestamp;
         let market = &ctx.accounts.market;
         let oracle = &mut ctx.accounts.oracle;
-        let feed = &ctx.accounts.feed;
+        let observation = &ctx.accounts.observation;
 
         require!(!oracle.finalized, VsolError::OracleAlreadyFinalized);
         require!(now >= market.expiry, VsolError::MarketNotExpired);
         require!(
-            feed.price_scale == market.price_scale,
+            observation.price_scale == market.price_scale,
             VsolError::InvalidPriceScale
         );
+        require!(observation.symbol == market.symbol && observation.expiry == market.expiry, VsolError::InvalidObservationTime);
+        let observation_end = market.expiry.checked_add(i64::from(market.observation_window_seconds)).ok_or(VsolError::MathOverflow)?;
+        require!(observation.observed_at >= market.expiry && observation.observed_at <= observation_end && observation.observed_at <= now, VsolError::InvalidObservationTime);
+        require!(observation.captured_at >= market.expiry && observation.captured_at <= observation_end && observation.captured_at <= now, VsolError::InvalidObservationTime);
+        let confidence_bps = (observation.confidence as u128).checked_mul(BPS_DENOMINATOR as u128).ok_or(VsolError::MathOverflow)?;
+        let max_confidence = (observation.price as u128).checked_mul(market.max_confidence_bps as u128).ok_or(VsolError::MathOverflow)?;
+        require!(confidence_bps <= max_confidence, VsolError::OracleConfidenceTooWide);
 
         let final_deadline = final_settlement_deadline(market)?;
         require!(now <= final_deadline, VsolError::SettlementWindowClosed);
 
-        // The feed's snapshot must be from AT OR AFTER expiry (never settle off a
-        // price the pusher captured before the market even closed) and must
-        // still be live right now (the pusher hasn't gone dark). Both boundary
-        // conditions are the pure, unit-tested `require_custom_feed_fresh` below.
-        require_custom_feed_fresh(feed.published_at, market.expiry, now)?;
-
-        oracle.price = feed.price;
-        oracle.confidence = feed.confidence;
-        oracle.observed_at = feed.published_at;
+        oracle.price = observation.price;
+        oracle.confidence = observation.confidence;
+        oracle.observed_at = observation.observed_at;
         oracle.published_at = now;
-        oracle.price_update = feed.key();
+        oracle.price_update = observation.key();
         oracle.feed_id = market.pyth_feed_id;
         oracle.exponent = -6; // informational only; matches this deployment's fixed 1e6 price_scale, never read by payout math
         oracle.finalized = true;
@@ -2987,7 +3044,7 @@ pub struct Settle<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, token::mint = settlement_mint, constraint = maker_destination.owner == position.maker @ VsolError::InvalidDestination)]
     pub maker_destination: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
+    #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
     /// CHECK: Receives rent and must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
@@ -3174,7 +3231,7 @@ pub struct SettlePoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
+    #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
     /// CHECK: Receives rent and must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
@@ -3237,7 +3294,7 @@ pub struct ClosePoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
+    #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
     /// CHECK: Receives rent and must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
@@ -3530,6 +3587,27 @@ pub struct UpdateCustomPriceFeed<'info> {
     pub feed: Account<'info, CustomPriceFeed>,
 }
 
+#[derive(Accounts)]
+pub struct CaptureCustomSettlementObservation<'info> {
+    #[account(mut)]
+    pub oracle_authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle_authority @ VsolError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    #[account(has_one = config @ VsolError::InvalidMarket)]
+    pub market: Account<'info, Market>,
+    #[account(seeds = [CUSTOM_FEED_SEED, market.symbol.as_ref()], bump = feed.bump)]
+    pub feed: Account<'info, CustomPriceFeed>,
+    #[account(
+        init,
+        payer = oracle_authority,
+        space = 8 + CustomSettlementObservation::INIT_SPACE,
+        seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()],
+        bump,
+    )]
+    pub observation: Account<'info, CustomSettlementObservation>,
+    pub system_program: Program<'info, System>,
+}
+
 /// Mirrors `PublishPythSettlement` exactly, with the Pyth `price_update`
 /// `UncheckedAccount` swapped for the typed `feed`. Like
 /// `PublishPythSettlement`, this instruction takes no `Signer` at all --
@@ -3543,8 +3621,8 @@ pub struct PublishCustomSettlement<'info> {
     pub market: Account<'info, Market>,
     #[account(mut, seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Account<'info, SettlementOracle>,
-    #[account(seeds = [CUSTOM_FEED_SEED, market.symbol.as_ref()], bump = feed.bump)]
-    pub feed: Account<'info, CustomPriceFeed>,
+    #[account(seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()], bump = observation.bump, has_one = config @ VsolError::InvalidOracle)]
+    pub observation: Account<'info, CustomSettlementObservation>,
 }
 
 #[account]
@@ -3638,6 +3716,23 @@ pub struct CustomPriceFeed {
     pub price: u64,
     pub confidence: u64,
     pub published_at: i64,
+    pub publisher: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct CustomSettlementObservation {
+    pub bump: u8,
+    pub config: Pubkey,
+    pub symbol: [u8; 16],
+    pub expiry: i64,
+    pub observation_window_seconds: u32,
+    pub price_scale: u64,
+    pub price: u64,
+    pub confidence: u64,
+    pub observed_at: i64,
+    pub captured_at: i64,
+    pub feed: Pubkey,
     pub publisher: Pubkey,
 }
 
@@ -4235,6 +4330,10 @@ pub enum VsolError {
     CustomFeedNotYetFresh,
     #[msg("The custom price feed has not updated recently enough to settle with.")]
     CustomFeedStale,
+    #[msg("The custom price feed timestamp is in the future.")]
+    CustomFeedFromFuture,
+    #[msg("The custom price feed timestamp must increase strictly.")]
+    CustomFeedTimestampNotIncreasing,
 }
 
 /// Deterministic market id: identical series parameters bind to one PDA, so
@@ -4298,26 +4397,6 @@ fn final_settlement_deadline(market: &Market) -> Result<i64> {
     settlement_deadline
         .checked_add(i64::from(market.max_settlement_staleness_seconds))
         .ok_or(VsolError::MathOverflow.into())
-}
-
-/// Pure boundary check backing `publish_custom_settlement`'s two freshness
-/// requirements on `CustomPriceFeed`: the snapshot must be from AT OR AFTER
-/// `market_expiry` (never settle off a price the pusher captured before the
-/// market even closed) and must still be live right now, within
-/// `CUSTOM_ORACLE_MAX_STALENESS_SECONDS` of `now` (the pusher hasn't gone
-/// dark). Split out from the instruction body purely so these two boundary
-/// conditions are directly unit-testable without constructing a full Anchor
-/// account/context fixture -- see `custom_feed_tests` below.
-fn require_custom_feed_fresh(feed_published_at: i64, market_expiry: i64, now: i64) -> Result<()> {
-    require!(
-        feed_published_at >= market_expiry,
-        VsolError::CustomFeedNotYetFresh
-    );
-    require!(
-        now.saturating_sub(feed_published_at) <= CUSTOM_ORACLE_MAX_STALENESS_SECONDS,
-        VsolError::CustomFeedStale
-    );
-    Ok(())
 }
 
 fn validate_pool_risk_limits(max_utilization_bps: u16, max_position_bps: u16) -> Result<()> {
@@ -4624,47 +4703,3 @@ mod factory_tests {
         assert_eq!(args_with_correct_id.market_id, correct_id);
     }
 }
-
-#[cfg(test)]
-mod custom_feed_tests {
-    use super::*;
-
-    #[test]
-    fn accepts_a_feed_published_exactly_at_expiry_with_no_staleness_yet() {
-        assert!(require_custom_feed_fresh(1_000, 1_000, 1_000).is_ok());
-    }
-
-    #[test]
-    fn accepts_a_feed_exactly_at_the_staleness_ceiling() {
-        let published_at = 1_000;
-        let expiry = 1_000;
-        let now = expiry + CUSTOM_ORACLE_MAX_STALENESS_SECONDS;
-        assert!(require_custom_feed_fresh(published_at, expiry, now).is_ok());
-    }
-
-    #[test]
-    fn rejects_a_feed_one_second_past_the_staleness_ceiling() {
-        let published_at = 1_000;
-        let expiry = 1_000;
-        let now = expiry + CUSTOM_ORACLE_MAX_STALENESS_SECONDS + 1;
-        assert!(require_custom_feed_fresh(published_at, expiry, now).is_err());
-    }
-
-    #[test]
-    fn rejects_a_feed_published_one_second_before_expiry() {
-        // Even though it would otherwise be "fresh enough" relative to `now`,
-        // a snapshot captured before the market closed must never settle it.
-        assert!(require_custom_feed_fresh(999, 1_000, 999).is_err());
-    }
-
-    #[test]
-    fn a_never_updated_feed_with_published_at_zero_never_passes() {
-        // `init_custom_price_feed` leaves `published_at = 0` until a real
-        // update lands; any real market's expiry is far past the Unix
-        // epoch, so the not-yet-fresh check alone keeps a never-updated feed
-        // from ever settling anything.
-        assert!(require_custom_feed_fresh(0, 1_700_000_000, 1_700_000_000).is_err());
-    }
-}
-
-
