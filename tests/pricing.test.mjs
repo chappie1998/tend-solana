@@ -304,22 +304,31 @@ test("the strike solver reaches for an in-the-money strike only when the tier ge
   }
 });
 
-test("the intraday ladder is directional: every tier's target sits AT or ABOVE spot for UP", async () => {
-  // The 1.5x tier was removed precisely because it was NOT directional: a
-  // 1.5x binary needs P(win) ~58%, which places its target BELOW spot -- you
-  // win if the price merely holds. The ladder now starts at 2x (essentially
-  // the entry price) so every intraday tier is a real directional bet.
+test("the intraday ladder is directional at 2x and above; 1.5x is the one deliberate hold-the-line tier", async () => {
+  // 1.5x needs P(win) ~58%, which places its target slightly BELOW spot for
+  // UP -- you win if the price merely holds. That is intentional (see
+  // PAYOFF_TIERS_INTRADAY): a high-hit-rate ticket is the shape that makes a
+  // fee on winning payouts meaningful. It is carved out EXPLICITLY rather
+  // than by loosening the rule, so any OTHER tier drifting to the wrong side
+  // of spot still fails here.
   const { quoteFor, payoffTiersFor } = await loadOptions();
   const spot = 101.64;
   for (const durationMinutes of [15, 60]) {
     for (const payoff of payoffTiersFor(durationMinutes)) {
       for (const volatility of [20, 60, 120]) {
         const up = quoteFor({ spot, amount: 500, durationMinutes, direction: "up", payoff, volatility });
+        const down = quoteFor({ spot, amount: 500, durationMinutes, direction: "down", payoff, volatility });
+        if (payoff === 1.5) {
+          // The carve-out, asserted in the same direction it actually leans:
+          // below spot for UP, above spot for DOWN.
+          assert.ok(up.strike < spot, `UP 1.5x @${durationMinutes}m vol=${volatility}: expected a hold-the-line target below spot, got ${up.strike}`);
+          assert.ok(down.strike > spot, `DOWN 1.5x @${durationMinutes}m vol=${volatility}: expected a hold-the-line target above spot, got ${down.strike}`);
+          continue;
+        }
         assert.ok(
           up.strike >= spot,
           `UP ${payoff}x @${durationMinutes}m vol=${volatility}: target ${up.strike} must sit at or above spot ${spot}`,
         );
-        const down = quoteFor({ spot, amount: 500, durationMinutes, direction: "down", payoff, volatility });
         assert.ok(
           down.strike <= spot,
           `DOWN ${payoff}x @${durationMinutes}m vol=${volatility}: target ${down.strike} must sit at or below spot ${spot}`,
@@ -331,9 +340,9 @@ test("the intraday ladder is directional: every tier's target sits AT or ABOVE s
 
 test("payoffTiersFor offers a near-binary intraday ladder at or under an hour, and the standard ladder beyond it", async () => {
   const { payoffTiersFor } = await loadOptions();
-  assert.deepEqual(payoffTiersFor(1), [2, 3, 6]);
-  assert.deepEqual(payoffTiersFor(15), [2, 3, 6]);
-  assert.deepEqual(payoffTiersFor(60), [2, 3, 6]);
+  assert.deepEqual(payoffTiersFor(1), [1.5, 2, 3]);
+  assert.deepEqual(payoffTiersFor(15), [1.5, 2, 3]);
+  assert.deepEqual(payoffTiersFor(60), [1.5, 2, 3]);
   assert.deepEqual(payoffTiersFor(61), [2, 5, 10]);
   assert.deepEqual(payoffTiersFor(720), [2, 5, 10]); // a typical EOD duration
   assert.deepEqual(payoffTiersFor(10_080), [2, 5, 10]); // 7D
@@ -353,7 +362,7 @@ test("quoteFor rejects a payoff outside the known tier set, but is duration-agno
   // duration on purpose (see tests/close-position.test.mjs, which prices
   // payoff=5 at a 15-minute duration to test buybackFor in isolation).
   const { quoteFor, PAYOFF_TIERS_ALL } = await loadOptions();
-  assert.deepEqual(PAYOFF_TIERS_ALL, [2, 3, 5, 6, 10]);
+  assert.deepEqual(PAYOFF_TIERS_ALL, [1.5, 2, 3, 5, 6, 10]);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 15, direction: "up", payoff: 7, volatility: 40 }), /Payoff must be one of/);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 1_440, direction: "up", payoff: 4, volatility: 40 }), /Payoff must be one of/);
   // Every known tier prices at every duration without throwing.
