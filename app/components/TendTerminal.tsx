@@ -138,6 +138,23 @@ const navItems: { id: Tab; label: string; icon: typeof Activity }[] = [
   { id: "launch", label: "Launch", icon: Rocket },
 ];
 
+/**
+ * The tab a bare URL lands on. It is also the one tab that carries NO ?tab=
+ * param, so the canonical link for the landing page stays clean.
+ */
+const DEFAULT_TAB: Tab = "pre-ipo";
+
+/**
+ * Reads ?tab= and validates it against the real nav rather than a second
+ * hardcoded list, so renaming or removing a destination cannot leave a stale
+ * deep link silently working. Anything unrecognised falls back to the default
+ * instead of rendering an empty shell.
+ */
+function tabFromSearch(search: string): Tab | null {
+  const raw = new URLSearchParams(search).get("tab");
+  return navItems.some((item) => item.id === raw) ? (raw as Tab) : null;
+}
+
 function Logo() {
   return (
     <div className="logo" aria-label="Tend home">
@@ -1132,7 +1149,7 @@ function TradeView({
 export function TendTerminal() {
   const bridge = useWalletBridge();
   const walletAddress = bridge.address;
-  const [activeTab, setActiveTab] = useState<Tab>("pre-ipo");
+  const [activeTab, setActiveTab] = useState<Tab>(DEFAULT_TAB);
   const [menuOpen, setMenuOpen] = useState(false);
   const [walletMenuOpen, setWalletMenuOpen] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
@@ -1188,9 +1205,33 @@ export function TendTerminal() {
     return () => window.clearTimeout(timer);
   }, [sessionWallet, loadPositions]);
 
+  // The page is statically prerendered, so the URL can only be read once the
+  // client has hydrated -- deferred a tick so the effect body itself never
+  // calls setState (react-hooks/set-state-in-effect). The popstate listener is
+  // what makes browser back/forward move between tabs, since selectTab pushes
+  // a real history entry for each one.
+  useEffect(() => {
+    const apply = () => setActiveTab(tabFromSearch(window.location.search) ?? DEFAULT_TAB);
+    const timer = window.setTimeout(apply, 0);
+    window.addEventListener("popstate", apply);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("popstate", apply);
+    };
+  }, []);
+
   const selectTab = useCallback((tab: Tab) => {
     setActiveTab(tab);
     if (tab === "portfolio") void loadPositions();
+    // Mirror the tab into the URL so every destination is linkable, bookmarkable
+    // and survives a reload. history.pushState rather than a router navigation:
+    // the tab swap is local state, and re-running the route would remount the
+    // chart and refetch market data for nothing -- while back/forward still get
+    // a real entry to return to.
+    const url = new URL(window.location.href);
+    if (tab === DEFAULT_TAB) url.searchParams.delete("tab");
+    else url.searchParams.set("tab", tab);
+    if (url.href !== window.location.href) window.history.pushState(null, "", url);
   }, [loadPositions]);
 
   async function claimDevnetFunds(walletAddress: string) {

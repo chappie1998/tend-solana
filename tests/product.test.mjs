@@ -640,3 +640,28 @@ test("the quote route validates the payoff tier against the tenor's OWN ladder, 
   assert.deepEqual(options.payoffTiersFor(15), [1.5, 2, 3]);
   assert.deepEqual(options.payoffTiersFor(1_440), [1.5, 2, 3]);
 });
+
+test("every nav destination is a linkable URL: ?tab= is read on load, pushed on change, and honoured by back/forward", async () => {
+  const terminal = await readFile(new URL("app/components/TendTerminal.tsx", root), "utf8");
+
+  // Read on load, and on back/forward -- without the popstate listener the
+  // browser's back button would change the URL while leaving the rendered tab
+  // behind, which is worse than having no deep links at all.
+  assert.match(terminal, /tabFromSearch\(window\.location\.search\)/);
+  assert.match(terminal, /addEventListener\("popstate"/);
+  assert.match(terminal, /removeEventListener\("popstate"/);
+
+  // Written on change, as a history entry rather than a router navigation:
+  // re-running the route would remount the chart and refetch market data just
+  // to swap a tab.
+  assert.match(terminal, /window\.history\.pushState/);
+  assert.doesNotMatch(terminal, /router\.(push|replace)\(/);
+
+  // The default tab carries no param, so the landing page keeps a clean
+  // canonical URL.
+  assert.match(terminal, /if \(tab === DEFAULT_TAB\) url\.searchParams\.delete\("tab"\)/);
+
+  // The guard validates against the real nav, so a renamed or removed
+  // destination cannot leave a stale deep link silently working.
+  assert.match(terminal, /navItems\.some\(\(item\) => item\.id === raw\)/);
+});
