@@ -1170,6 +1170,24 @@ export function TendTerminal() {
     }
   }, []);
 
+  // Fill history is server provenance for the signed-in wallet, and the Trade
+  // page renders it too (TradePositionsPanel) -- so it has to load there, not
+  // only when the Portfolio tab is opened. Without this a SETTLED position
+  // disappeared from the Trade page entirely: its onchain account closes at
+  // settlement, which correctly empties "Positions", while "Fill history" had
+  // simply never been fetched on that route and sat at 0 forever.
+  //
+  // Deferred a tick so the effect body itself never calls setState (the
+  // loading flag inside loadPositions would otherwise run synchronously here,
+  // which react-hooks/set-state-in-effect rejects), and skipped entirely with
+  // no session because the route answers 401 and would surface a spurious
+  // error on the Portfolio tab.
+  useEffect(() => {
+    if (!sessionWallet) return;
+    const timer = window.setTimeout(() => void loadPositions(), 0);
+    return () => window.clearTimeout(timer);
+  }, [sessionWallet, loadPositions]);
+
   const selectTab = useCallback((tab: Tab) => {
     setActiveTab(tab);
     if (tab === "portfolio") void loadPositions();
