@@ -1039,24 +1039,13 @@ function TradeView({
               unreachable (a short-dated at-the-money spread simply cannot cost
               half the payout), so 2x can settle at 3.3x. Showing the tier here
               would state a multiple the buyer is not getting. */}
+          {/* No "Signed premium" row: it restated the YOU PAY input to the
+              cent (measured across the whole stake range -- the solver
+              inverts the stake exactly, worst case $0.0001 at the top of the
+              range), and the same figure is still stated as "Maximum loss"
+              inside Pricing detail, which is the framing that actually tells
+              the buyer something. */}
           <div className="economics">
-            <div className={bestQuote ? undefined : "econ-row--empty"}>
-              <span>Signed premium</span>
-              <strong className={bestQuote ? "risk" : undefined}>
-                {bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
-                {/* Indicative only, never executable: the fair-value-plus-edge
-                    price of the OPPOSITE direction at this SAME strike (see
-                    otherSidePremium's doc comment). A real quote for the
-                    opposite direction would solve its own strike, so this is
-                    not what /api/quotes would actually return for it -- only
-                    the direction above is ever signed. */}
-                {bestQuote && otherSideEstimate !== null && (
-                  <small title="Indicative: the fair value of the opposite direction at this same strike, plus the maker edge. Not an executable price -- only the direction above is ever signed.">
-                    ≈${otherSideEstimate.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} for the other side
-                  </small>
-                )}
-              </strong>
-            </div>
             {/* TRUE BINARY: the payout is a SWITCH, not a ramp
                 (definedRiskPayout at BINARY_WIDTH, the smallest legal
                 on-chain width -- one price atom). Hit the target and win the
@@ -1090,6 +1079,15 @@ function TradeView({
               <summary>Pricing detail</summary>
               <div className={target === null ? "econ-row--empty" : undefined}><span>RFQ strike <Info size={13} aria-hidden="true" /></span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div>
               <div className={bestQuote ? undefined : "econ-row--empty"}><span>Maximum loss</span><strong className={bestQuote ? "risk" : undefined}>{bestQuote ? `$${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
+              {/* Indicative only, never executable: the fair-value-plus-edge
+                  price of the OPPOSITE direction at this SAME strike (see
+                  otherSidePremium's doc comment). A real quote for the
+                  opposite direction would solve its own strike, so this is
+                  not what /api/quotes would actually return for it -- only
+                  the direction above is ever signed. It sits in Pricing
+                  detail rather than the headline because it is a reference
+                  price, not a number the buyer acts on. */}
+              <div className={bestQuote && otherSideEstimate !== null ? undefined : "econ-row--empty"} title="Indicative: the fair value of the opposite direction at this same strike, plus the maker edge. Not an executable price -- only the direction you selected is ever signed."><span>Cost for the other side</span><strong>{bestQuote && otherSideEstimate !== null ? `≈$${otherSideEstimate.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</strong></div>
               {/* Honest counterweight to the payoff multiple, and the vol
                   actually priced into the premium above (can run hotter than
                   "Realized volatility" when the reference is stale and the
