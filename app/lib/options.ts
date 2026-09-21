@@ -409,8 +409,13 @@ export const INTRADAY_TIER_MAX_MINUTES = 60; // 15M and 1H.
 // the 15M targets land at $99.94 / $100.05 / $100.18. `ladderStrike` only
 // picks the default at-the-money rung when PLANNING a listing.
 export const PAYOFF_TIERS_INTRADAY: readonly number[] = [1.5, 2, 3];
-export const PAYOFF_TIERS_STANDARD: readonly number[] = [2, 5, 10];
-export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3, 5, 6, 10];
+// The standard tenors use the SAME ladder. 5x and 10x were removed: a 10x
+// ticket wins about 9% of the time, which reads as a lottery rather than a
+// tradable view, and the house edge is identical at every tier anyway (it
+// comes from MAKER_EDGE_BPS, not from the multiple), so the long odds bought
+// the protocol nothing while costing the trader a plausible hit rate.
+export const PAYOFF_TIERS_STANDARD: readonly number[] = [1.5, 2, 3];
+export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3];
 
 export function payoffTiersFor(durationMinutes: number): number[] {
   return durationMinutes <= INTRADAY_TIER_MAX_MINUTES

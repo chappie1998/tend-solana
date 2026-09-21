@@ -150,7 +150,7 @@ test("a fill-then-immediately-close round trip is never profitable, across every
   ];
   const spot = 200;
   const amount = 1_000;
-  const payoff = 5;
+  const payoff = 3;
 
   const failures = [];
   for (const volatility of volatilities) {

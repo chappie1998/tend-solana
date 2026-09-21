@@ -612,7 +612,7 @@ test("market-data stays real and the verified deployment remains fail-closed on 
 
 test("maker pricing remains bounded under extreme real volatility inputs", async () => {
   const { quoteFor, definedRiskPayout } = await import(new URL("app/lib/options.ts", root));
-  const quotes = [2, 5, 10].map((payoff) => quoteFor({
+  const quotes = [1.5, 2, 3].map((payoff) => quoteFor({
     spot: 200,
     amount: 1_000,
     durationMinutes: 43_200,
@@ -633,10 +633,10 @@ test("the quote route validates the payoff tier against the tenor's OWN ladder, 
   // The route resolves the ACTUAL onchain duration before it can know which
   // tiers are for sale (payoffTiersFor(durationMinutes)) -- so it must
   // import and call payoffTiersFor, and must NOT hardcode the old
-  // [2, 5, 10] list anywhere (it used to, in two places: the stake-bounds
+  // [1.5, 2, 3] list anywhere (it used to, in two places: the stake-bounds
   // fallback and the strict tier check).
   assert.match(quotesRoute, /payoffTiersFor/);
   assert.doesNotMatch(quotesRoute, /\[2,\s*5,\s*10\]/);
   assert.deepEqual(options.payoffTiersFor(15), [1.5, 2, 3]);
-  assert.deepEqual(options.payoffTiersFor(1_440), [2, 5, 10]);
+  assert.deepEqual(options.payoffTiersFor(1_440), [1.5, 2, 3]);
 });

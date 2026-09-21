@@ -17,8 +17,8 @@ test("otherSidePremium matches an independently re-derived opposite-direction di
   const { quoteFor, digitalFairValue, applyMakerEdge, otherSidePremium, MAKER_EDGE_BPS } = await loadOptions();
   const cases = [
     { spot: 100, durationMinutes: 60, direction: "up", payoff: 2, volatility: 40 },
-    { spot: 63_900, durationMinutes: 43_200, direction: "down", payoff: 10, volatility: 90 },
-    { spot: 2_500, durationMinutes: 15, direction: "up", payoff: 6, volatility: 65 },
+    { spot: 63_900, durationMinutes: 43_200, direction: "down", payoff: 3, volatility: 90 },
+    { spot: 2_500, durationMinutes: 15, direction: "up", payoff: 3, volatility: 65 },
     { spot: 100, durationMinutes: 1_440, direction: "down", payoff: 2, volatility: 30 },
   ];
   for (const c of cases) {
