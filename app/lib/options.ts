@@ -150,11 +150,21 @@ export function digitalFairValue(params: {
 // means the edge shows up as a slightly worse strike, and the advertised
 // multiple is the one actually delivered.
 // ---------------------------------------------------------------------------
-export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
+// 10% over fair value. Lowered from 1500 alongside taking fee_bps to its 1000
+// cap, which together RAISE protocol revenue: the fee is charged on winning
+// payouts only, so protocol take is fee x 1/(1 + edge) -- a thinner edge means
+// the buyer wins more often and the fee lands more often. Cutting the edge
+// costs the POOL, not the treasury.
+//
+// It is not cut further for one reason: this edge is the pool's buffer against
+// the volatility model being wrong. Tend prices off a model, not a two-sided
+// market, so a vol misestimate lands directly on the pool. 10% absorbs a
+// meaningful one; 5% would not. Revisit only against real settlement data.
+export const MAKER_EDGE_BPS = 1_000;
 
 /**
  * The protocol's cut of a WINNING payout, in basis points -- mirrors
- * `config.fee_bps` on chain (set to 500 on 2026-09-19).
+ * `config.fee_bps` on chain (raised to its MAX_FEE_BPS cap of 1000 on 2026-09-21).
  *
  * `settle_pool_position` charges this against the payout and takes it from the
  * buyer's side, so a LOSING position pays nothing at all and a winner receives
@@ -164,7 +174,7 @@ export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
  * settlement actually uses. A filled quote therefore cannot be re-priced by a
  * later governance change.
  */
-export const PROTOCOL_WIN_FEE_BPS = 500;
+export const PROTOCOL_WIN_FEE_BPS = 1_000;
 
 /** What a winner actually receives after the protocol's cut of the payout. */
 export function netWinning(maxPayout: number, feeBps: number = PROTOCOL_WIN_FEE_BPS): number {

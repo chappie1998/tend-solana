@@ -411,11 +411,10 @@ test("per-tenor payoff ladder: every advertised tier lands within 10% of its tar
   }
 });
 
-test("cap distance from spot grows monotonically with tenor at moderate volatility, for the 2x tier every ladder shares", async () => {
-  const { quoteFor } = await loadOptions();
-  // 2x is the one tier present on BOTH the intraday [2,3,6] and standard
-  // [2,5,10] ladders, so it is the only tier comparable across all five
-  // tenors on one axis. Cap distance (not just width, which is now pinned at
+test("the 2x tier solves to its target probability and achieves 2x at every tenor and volatility", async () => {
+  const { quoteFor, MAKER_EDGE_BPS } = await loadOptions();
+  // Every tenor now sells the same 1.5x/2x/3x ladder, so 2x is comparable
+  // across all five tenors on one axis. Cap distance (not just width, which is now pinned at
   // BINARY_WIDTH regardless of tenor -- see the dedicated width test below)
   // widens with tenor at ORDINARY vol, because it is dominated by how far
   // the solved strike itself sits from spot, and more time to expiry means a
@@ -437,15 +436,26 @@ test("cap distance from spot grows monotonically with tenor at moderate volatili
   const tenorDurations = [15, 60, 720, 10_080, 43_200]; // 15M, 1H, EOD, 7D, 30D
   for (const volatility of [20, 60]) {
     for (const direction of ["up", "down"]) {
-      let prevDistance = -Infinity;
       for (const durationMinutes of tenorDurations) {
         const quote = quoteFor({ spot, amount, durationMinutes, direction, payoff: 2, volatility });
-        const distance = Math.abs(quote.cap - spot);
+        // The real, tenor-independent invariant: a tier IS a probability. 2x
+        // must solve to P(win) = 1/((1 + edge) x 2) and achieve exactly 2x at
+        // every tenor. "Cap distance grows with tenor" is NOT invariant and
+        // was only ever true at the old 15% edge -- at 10% the target
+        // probability sits nearer 50%, where the lognormal drag term (sigma^2
+        // T / 2, linear in T) overtakes diffusion (sigma sqrt(T)) and pulls
+        // the strike back toward spot at long tenors. Verified at 30D/vol 60:
+        // strike distance shrinks while P stays 45.45% and the multiple stays
+        // 2.000x, i.e. the engine is right and the old assertion was not.
+        const targetP = 1 / ((1 + MAKER_EDGE_BPS / 10_000) * 2);
         assert.ok(
-          distance > prevDistance,
-          `cap distance must grow with tenor at vol=${volatility} dir=${direction}: ${prevDistance} -> ${distance} at duration=${durationMinutes}`,
+          Math.abs(quote.probabilityItm - targetP) < 1e-6,
+          `2x must solve to P=${targetP} at vol=${volatility} dir=${direction} dur=${durationMinutes}, got ${quote.probabilityItm}`,
         );
-        prevDistance = distance;
+        assert.ok(
+          Math.abs(quote.maxPayout / quote.premium - 2) < 0.01,
+          `2x must achieve 2x at vol=${volatility} dir=${direction} dur=${durationMinutes}, got ${quote.maxPayout / quote.premium}`,
+        );
       }
     }
   }
@@ -606,7 +616,7 @@ test("maker edge is applied inside the strike solve, not added to fair value aft
   // value + edge) is what hits the target multiple, and `fairValue` (no
   // edge) sits strictly below the target -- i.e. below what a naive
   // fair-value-only solve would have produced for the same strike.
-  const { solveStrikeForTargetPremium } = await loadOptions();
+  const { solveStrikeForTargetPremium, MAKER_EDGE_BPS } = await loadOptions();
   const spot = 100;
   const maxPayout = 1_000;
   const targetPremium = 100; // 10x
@@ -617,7 +627,7 @@ test("maker edge is applied inside the strike solve, not added to fair value aft
   assert.ok(Math.abs(solved.premium - targetPremium) < 1e-4, "premium (edge included) must hit the target");
   assert.ok(solved.fairValue < targetPremium, "fair value (no edge) must sit strictly below the edge-inclusive target");
   const impliedEdgeBps = (solved.premium / solved.fairValue - 1) * 10_000;
-  assert.ok(Math.abs(impliedEdgeBps - 1_500) < 1, `implied edge should be ~1500bps, got ${impliedEdgeBps.toFixed(2)}`);
+  assert.ok(Math.abs(impliedEdgeBps - MAKER_EDGE_BPS) < 1, `implied edge should match MAKER_EDGE_BPS, got ${impliedEdgeBps.toFixed(2)}`);
 });
 
 test("probabilityItm and impliedVolatility are surfaced honestly by quoteFor", async () => {
@@ -648,7 +658,7 @@ test("BINARY_WIDTH and strike-offset bound are the documented, defensible values
   // MAX_STRIKE_OFFSET_FRACTION's comment in options.ts for the full
   // derivation.
   assert.equal(MAX_STRIKE_OFFSET_FRACTION, 0.6);
-  assert.equal(MAKER_EDGE_BPS, 1_500);
+  assert.equal(MAKER_EDGE_BPS, 1_000);
 });
 
 // --- Stake -> payout inversion (app/lib/options.ts payoutForStake) ---------
@@ -702,11 +712,12 @@ test("stakeBoundsForPayoff keeps the implied payout inside the pool's limits", a
 
 test("the win fee is a cut of the PAYOUT, mirrors config.fee_bps on chain, and never touches a loss", async () => {
   const { PROTOCOL_WIN_FEE_BPS, netWinning } = await loadOptions();
-  // Mirrors `config.fee_bps`, set to 500 on chain 2026-09-19. If these ever
-  // diverge the ticket quotes a net the settlement will not actually pay.
-  assert.equal(PROTOCOL_WIN_FEE_BPS, 500);
-  assert.equal(netWinning(500), 475);
-  assert.equal(netWinning(1_000), 950);
+  // Mirrors `config.fee_bps`, raised to its MAX_FEE_BPS cap of 1000 on chain
+  // 2026-09-21. If these ever diverge the ticket quotes a net the settlement
+  // will not actually pay.
+  assert.equal(PROTOCOL_WIN_FEE_BPS, 1_000);
+  assert.equal(netWinning(500), 450);
+  assert.equal(netWinning(1_000), 900);
   // A loss has no payout, so there is nothing to take a cut of.
   assert.equal(netWinning(0), 0);
   assert.equal(netWinning(-5), 0);
