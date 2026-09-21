@@ -35,7 +35,12 @@ test("custom oracle readiness validates owner, publisher, scale, price and age",
   assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, price: 0n })), oracleAuthority: authority, now: 1_020 }).reason, /positive/);
   assert.equal(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, confidence: 5_000_000n })), oracleAuthority: authority, now: 1_020 }).ready, true);
   assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, confidence: 5_000_001n })), oracleAuthority: authority, now: 1_020 }).reason, /confidence/);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_031 }).reason, /31s old/);
+  // The age gate tracks CUSTOM_ORACLE_READY_MAX_AGE_SECONDS (150s), which must
+  // stay above the pusher's 60s cadence and below the program's own 300s
+  // staleness cap. Both sides of the boundary are pinned so a change to either
+  // constant has to be deliberate.
+  assert.equal(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_150 }).ready, true);
+  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_151 }).reason, /151s old/);
 });
 
 test("Clock sysvar decoding uses the canonical unix timestamp offset", async () => {

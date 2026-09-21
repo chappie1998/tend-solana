@@ -8,7 +8,13 @@ import { decodeClockUnixTimestamp } from "./solana-clock.ts";
 
 const FEED_DISCRIMINATOR = createHash("sha256").update("account:CustomPriceFeed").digest().subarray(0, 8);
 const FEED_SIZE = 89;
-export const CUSTOM_ORACLE_READY_MAX_AGE_SECONDS = 30;
+// Must stay comfortably ABOVE the pusher's own interval (60s, see
+// vsol/scripts/custom-oracle-pusher.ts) or execution reports itself offline
+// between two perfectly healthy pushes -- at 30s with a 60s cadence it could
+// never be ready. 150s tolerates two missed cycles while still sitting well
+// under the program's own 300s CUSTOM_ORACLE_MAX_STALENESS_SECONDS, so a
+// market shown as ready is always one settlement would actually accept.
+export const CUSTOM_ORACLE_READY_MAX_AGE_SECONDS = 150;
 
 export type CustomOracleReadiness = {
   symbol: string;

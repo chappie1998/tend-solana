@@ -182,11 +182,19 @@ async function main(): Promise<void> {
       `${liveMarkets.map((market) => market.symbol).join(", ")} (signer ${authority.publicKey.toBase58()})`,
   );
 
-  // Runs forever. Each pass is fully isolated per symbol (see the try/catch
-  // in runOnePass above), so this loop itself never throws in the steady
-  // state; only a startup failure (missing key, program not deployed) exits.
+  // Runs forever. Per-symbol failures are already isolated inside the pass,
+  // but the pass itself still talks to the RPC (blockhash fetches, sends),
+  // and a transient network fault there used to escape and kill the process:
+  // an unhandled `fetch failed / ETIMEDOUT` took the pusher down and left
+  // every feed stale for ~30 hours, which in turn took execution offline.
+  // A dropped pass is survivable -- the next one re-pushes everything -- so
+  // the loop swallows it and keeps going. Only a startup failure exits.
   for (;;) {
-    await runCustomOraclePushPass(program, authority, config);
+    try {
+      await runCustomOraclePushPass(program, authority, config);
+    } catch (error: unknown) {
+      console.error(`pass failed, retrying next cycle: ${error instanceof Error ? error.message : String(error)}`);
+    }
     await sleep(PUSH_INTERVAL_MS);
   }
 }
