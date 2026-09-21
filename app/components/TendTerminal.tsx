@@ -1064,7 +1064,16 @@ function TradeView({
                 no partial payout in between, so both outcomes are stated as
                 their own unambiguous headline rows rather than a single
                 number that could read as a coin flip. */}
-            <div className="economics-total"><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}{bestQuote && <small>{direction === "up" ? "at or above" : "at or below"} ${bestQuote.strike.toFixed(2)} · nets ${netWinning(bestQuote.maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })} after the {PROTOCOL_WIN_FEE_BPS / 100}% fee</small>}</strong></div>
+            {/* Just the number. This used to restate the target ("at or
+                above $X") and the net-of-fee figure inline, both of which
+                already have their own rows immediately below -- three facts
+                stacked in the headline made the one number the trader is
+                looking for the hardest thing to read. */}
+            <div className="economics-total"><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div>
+            {/* The fee is charged on the payout, so the amount that actually
+                reaches the wallet is a different number from the headline
+                and has to be shown, not implied. */}
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>You net after the {PROTOCOL_WIN_FEE_BPS / 100}% fee</span><strong>{bestQuote ? `$${netWinning(bestQuote.maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
             {/* The price the buyer needs to hit for the FULL payout, stated
                 as its own headline number rather than only the small
                 annotation above -- direction-aware. For a binary, this IS
