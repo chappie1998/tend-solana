@@ -4,31 +4,20 @@ import { createHash } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import {
-  buildBurnCompleteSetInstruction,
-  buildMintCompleteSetInstruction,
-  buildRedeemUnresolvedInstruction,
-  buildRedeemWinningInstruction,
   calculatePayout,
   calculateDepositShares,
   calculateWithdrawAmount,
-  deriveCompleteSetToken,
-  deriveCompleteSetVault,
   deriveCustomSettlementObservation,
   deriveConfig,
-  deriveDownMint,
   deriveLiquidityPool,
   deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
   deriveLiquidityProvider,
   deriveMarket,
   deriveMarketId,
-  deriveNonce,
   derivePoolNonce,
   derivePoolPosition,
   derivePoolPositionVault,
-  derivePosition,
-  derivePositionVault,
-  deriveUpMint,
   finalSettlementDeadline,
   isPoolUpdatePending,
   isPoolUpdateTightening,
@@ -46,15 +35,9 @@ import {
   POOL_BUYBACK_DOMAIN,
   poolBuybackMessage,
   poolQuoteMessage,
-  quoteMessage,
   symbolBytes,
-  UP_MINT_SEED,
-  DOWN_MINT_SEED,
-  COMPLETE_SET_VAULT_SEED,
-  COMPLETE_SET_TOKEN_SEED,
-  upWins,
   type PoolBuyback,
-  type Quote,
+  type PoolQuote,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
 
@@ -91,7 +74,7 @@ const MARKET_ID_FIXTURE = {
 };
 const MARKET_ID_KNOWN_ANSWER = "305841fbbb6aaefcf048870bda425066777d12e82d8b74f358f13d43caf66adf";
 
-const quote: Quote = {
+const quote: PoolQuote = {
   nonce: 7n,
   direction: 0,
   strike: 100_000_000n,
@@ -100,29 +83,6 @@ const quote: Quote = {
   maxPayout: 5_000_000n,
   quoteExpiry: 1_900_000_000n,
 };
-
-test("quote serialization is fixed-width and domain-separated", () => {
-  const message = quoteMessage({
-    domainSeparator: new Uint8Array(32).fill(9),
-    domainVersion: 1,
-    config: new PublicKey("11111111111111111111111111111111"),
-    market: new PublicKey("SysvarC1ock11111111111111111111111111111111"),
-    buyer: new PublicKey("SysvarRent111111111111111111111111111111111"),
-    maker: VSOL_PROGRAM_ID,
-    quote,
-  });
-  assert.equal(message.length, 251);
-  assert.equal(message.subarray(0, 8).toString("ascii"), "VSOLRFQ1");
-});
-
-test("nonce and position PDAs are deterministic and one-shot", () => {
-  const config = deriveConfig();
-  const maker = new PublicKey("SysvarRent111111111111111111111111111111111");
-  const nonce = deriveNonce(config, maker, 42n);
-  assert.equal(deriveNonce(config, maker, 42n).toBase58(), nonce.toBase58());
-  const position = derivePosition(nonce);
-  assert.notEqual(position.toBase58(), derivePositionVault(position).toBase58());
-});
 
 test("buyer payout is directional, linear, and capped", () => {
   assert.equal(calculatePayout(quote, 90_000_000n), 0n);
@@ -435,235 +395,6 @@ test("isPoolUpdateTightening: raising a cap or rotating the authority is timeloc
     }),
     false,
   );
-});
-
-// =====================================================================
-// Conditional tokens ("complete sets")
-// =====================================================================
-
-test("upWins mirrors the on-chain winner rule, including the tie-goes-to-down case", () => {
-  assert.equal(upWins(100n, 100n), false); // exact tie -> DOWN
-  assert.equal(upWins(101n, 100n), true); // strictly above -> UP
-  assert.equal(upWins(99n, 100n), false); // strictly below -> DOWN
-  assert.equal(upWins(0n, 0n), false);
-  assert.equal(upWins(1n, 0n), true);
-});
-
-test("complete-set PDAs are deterministic and distinct from one another", () => {
-  // Any 32-byte value works as the market id here -- this test only checks
-  // the PDAs derived FROM a market address are distinct/correct, not the
-  // market address's own derivation (covered elsewhere).
-  const market = deriveMarket(deriveConfig(), Buffer.alloc(32, 0x55));
-  const upMint = deriveUpMint(market);
-  const downMint = deriveDownMint(market);
-  const vault = deriveCompleteSetVault(market);
-
-  assert.equal(
-    upMint.toBase58(),
-    PublicKey.findProgramAddressSync([UP_MINT_SEED, market.toBuffer()], VSOL_PROGRAM_ID)[0].toBase58(),
-  );
-  assert.equal(
-    downMint.toBase58(),
-    PublicKey.findProgramAddressSync([DOWN_MINT_SEED, market.toBuffer()], VSOL_PROGRAM_ID)[0].toBase58(),
-  );
-  assert.equal(
-    vault.toBase58(),
-    PublicKey.findProgramAddressSync([COMPLETE_SET_VAULT_SEED, market.toBuffer()], VSOL_PROGRAM_ID)[0].toBase58(),
-  );
-
-  const addresses = [upMint.toBase58(), downMint.toBase58(), vault.toBase58(), market.toBase58()];
-  assert.equal(new Set(addresses).size, addresses.length, "every complete-set PDA must be distinct");
-});
-
-test("deriveCompleteSetToken is keyed by both mint and owner", () => {
-  const mintA = deriveConfig(); // any distinct pubkey stand-in
-  const mintB = deriveMarket(deriveConfig(), Buffer.alloc(32, 0x66));
-  const ownerA = new PublicKey(Buffer.alloc(32, 0x77));
-  const ownerB = new PublicKey(Buffer.alloc(32, 0x88));
-
-  const a = deriveCompleteSetToken(mintA, ownerA);
-  assert.equal(
-    a.toBase58(),
-    PublicKey.findProgramAddressSync(
-      [COMPLETE_SET_TOKEN_SEED, mintA.toBuffer(), ownerA.toBuffer()],
-      VSOL_PROGRAM_ID,
-    )[0].toBase58(),
-  );
-  assert.notEqual(a.toBase58(), deriveCompleteSetToken(mintB, ownerA).toBase58());
-  assert.notEqual(a.toBase58(), deriveCompleteSetToken(mintA, ownerB).toBase58());
-});
-
-function fixtureCompleteSetAccounts() {
-  const market = deriveMarket(deriveConfig(), Buffer.alloc(32, 0x99));
-  const upMint = deriveUpMint(market);
-  const downMint = deriveDownMint(market);
-  const collateralVault = deriveCompleteSetVault(market);
-  const owner = new PublicKey(Buffer.alloc(32, 0xaa));
-  const settlementMint = new PublicKey(Buffer.alloc(32, 0xbb));
-  const oracle = new PublicKey(Buffer.alloc(32, 0xcc));
-  return { market, upMint, downMint, collateralVault, owner, settlementMint, oracle };
-}
-
-test("buildMintCompleteSetInstruction matches the program's discriminator, account order, and data layout", async () => {
-  const f = fixtureCompleteSetAccounts();
-  const source = new PublicKey(Buffer.alloc(32, 0xdd));
-  const upToken = deriveCompleteSetToken(f.upMint, f.owner);
-  const downToken = deriveCompleteSetToken(f.downMint, f.owner);
-  const amount = 12_345n;
-
-  const ix = await buildMintCompleteSetInstruction(
-    {
-      minter: f.owner,
-      config: deriveConfig(),
-      market: f.market,
-      settlementMint: f.settlementMint,
-      upMint: f.upMint,
-      downMint: f.downMint,
-      collateralVault: f.collateralVault,
-      minterSource: source,
-      minterUpToken: upToken,
-      minterDownToken: downToken,
-    },
-    amount,
-  );
-
-  assert.equal(ix.programId.toBase58(), VSOL_PROGRAM_ID.toBase58());
-  // The 8-byte Anchor discriminator: sha256("global:mint_complete_set")[..8],
-  // pinned against the program's own generated IDL
-  // (target/idl/vsol.json) at implementation time.
-  assert.deepEqual([...ix.data.subarray(0, 8)], [70, 222, 130, 148, 234, 103, 137, 61]);
-  assert.equal(ix.data.length, 16); // 8-byte discriminator + u64 amount
-  assert.equal(ix.data.readBigUInt64LE(8), amount);
-
-  assert.equal(ix.keys.length, 13);
-  assert.equal(ix.keys[0].pubkey.toBase58(), f.owner.toBase58());
-  assert.equal(ix.keys[0].isSigner, true);
-  assert.equal(ix.keys[0].isWritable, true);
-  assert.equal(ix.keys[4].pubkey.toBase58(), f.upMint.toBase58());
-  assert.equal(ix.keys[4].isWritable, true);
-  assert.equal(ix.keys[5].pubkey.toBase58(), f.downMint.toBase58());
-  assert.equal(ix.keys[6].pubkey.toBase58(), f.collateralVault.toBase58());
-  assert.equal(ix.keys[9].pubkey.toBase58(), downToken.toBase58());
-});
-
-test("buildBurnCompleteSetInstruction matches the program's discriminator and account order", async () => {
-  const f = fixtureCompleteSetAccounts();
-  const upToken = deriveCompleteSetToken(f.upMint, f.owner);
-  const downToken = deriveCompleteSetToken(f.downMint, f.owner);
-  const destination = new PublicKey(Buffer.alloc(32, 0xee));
-
-  const ix = await buildBurnCompleteSetInstruction(
-    {
-      burner: f.owner,
-      config: deriveConfig(),
-      market: f.market,
-      settlementMint: f.settlementMint,
-      upMint: f.upMint,
-      downMint: f.downMint,
-      collateralVault: f.collateralVault,
-      burnerUpToken: upToken,
-      burnerDownToken: downToken,
-      burnerDestination: destination,
-    },
-    500n,
-  );
-
-  assert.deepEqual([...ix.data.subarray(0, 8)], [183, 36, 119, 130, 123, 198, 110, 211]);
-  assert.equal(ix.data.readBigUInt64LE(8), 500n);
-  assert.equal(ix.keys.length, 11);
-  // burner is a signer but NOT writable -- matches `pub burner: Signer<'info>`
-  // (no `#[account(mut)]`) in the `BurnCompleteSet` Anchor context.
-  assert.equal(ix.keys[0].isSigner, true);
-  assert.equal(ix.keys[0].isWritable, false);
-  assert.equal(ix.keys[9].pubkey.toBase58(), destination.toBase58());
-});
-
-test("buildRedeemWinningInstruction matches the program's discriminator and account order", async () => {
-  const f = fixtureCompleteSetAccounts();
-  const redeemerToken = deriveCompleteSetToken(f.upMint, f.owner);
-  const destination = new PublicKey(Buffer.alloc(32, 0xff));
-
-  const ix = await buildRedeemWinningInstruction(
-    {
-      redeemer: f.owner,
-      config: deriveConfig(),
-      market: f.market,
-      oracle: f.oracle,
-      settlementMint: f.settlementMint,
-      upMint: f.upMint,
-      downMint: f.downMint,
-      collateralVault: f.collateralVault,
-      redeemerToken,
-      redeemerDestination: destination,
-    },
-    77n,
-  );
-
-  assert.deepEqual([...ix.data.subarray(0, 8)], [191, 44, 57, 7, 31, 46, 190, 162]);
-  assert.equal(ix.data.readBigUInt64LE(8), 77n);
-  assert.equal(ix.keys.length, 11);
-  assert.equal(ix.keys[3].pubkey.toBase58(), f.oracle.toBase58());
-  assert.equal(ix.keys[8].pubkey.toBase58(), redeemerToken.toBase58());
-});
-
-// =====================================================================
-// redeem_unresolved (FINDING 2: the escape hatch for an oracle that never
-// finalizes)
-// =====================================================================
-
-test("buildRedeemUnresolvedInstruction matches the program's discriminator, account order, and data layout", async () => {
-  const f = fixtureCompleteSetAccounts();
-  // Deliberately the DOWN side here (unlike buildRedeemWinningInstruction's
-  // own test, which uses UP) -- redeemUnresolved accepts either.
-  const redeemerToken = deriveCompleteSetToken(f.downMint, f.owner);
-  const destination = new PublicKey(Buffer.alloc(32, 0x12));
-  const amount = 12_345_678_901n;
-
-  const ix = await buildRedeemUnresolvedInstruction(
-    {
-      redeemer: f.owner,
-      config: deriveConfig(),
-      market: f.market,
-      oracle: f.oracle,
-      settlementMint: f.settlementMint,
-      upMint: f.upMint,
-      downMint: f.downMint,
-      collateralVault: f.collateralVault,
-      redeemerToken,
-      redeemerDestination: destination,
-    },
-    amount,
-  );
-
-  assert.equal(ix.programId.toBase58(), VSOL_PROGRAM_ID.toBase58());
-  // sha256("global:redeem_unresolved")[..8], pinned against the program's
-  // own generated IDL (target/idl/vsol.json) at implementation time.
-  assert.deepEqual([...ix.data.subarray(0, 8)], [94, 144, 129, 29, 214, 131, 149, 78]);
-  assert.equal(ix.data.length, 16); // 8-byte discriminator + u64 amount
-  assert.equal(ix.data.readBigUInt64LE(8), amount);
-
-  // Same account order as buildRedeemWinningInstruction (see
-  // `RedeemUnresolved`'s doc comment in src/lib.rs: modeled directly on
-  // `RedeemWinning`).
-  assert.equal(ix.keys.length, 11);
-  assert.equal(ix.keys[0].pubkey.toBase58(), f.owner.toBase58());
-  assert.equal(ix.keys[0].isSigner, true);
-  assert.equal(ix.keys[0].isWritable, false);
-  assert.equal(ix.keys[1].pubkey.toBase58(), deriveConfig().toBase58());
-  assert.equal(ix.keys[2].pubkey.toBase58(), f.market.toBase58());
-  assert.equal(ix.keys[3].pubkey.toBase58(), f.oracle.toBase58());
-  assert.equal(ix.keys[4].pubkey.toBase58(), f.settlementMint.toBase58());
-  assert.equal(ix.keys[5].pubkey.toBase58(), f.upMint.toBase58());
-  assert.equal(ix.keys[5].isWritable, true);
-  assert.equal(ix.keys[6].pubkey.toBase58(), f.downMint.toBase58());
-  assert.equal(ix.keys[6].isWritable, true);
-  assert.equal(ix.keys[7].pubkey.toBase58(), f.collateralVault.toBase58());
-  assert.equal(ix.keys[7].isWritable, true);
-  assert.equal(ix.keys[8].pubkey.toBase58(), redeemerToken.toBase58());
-  assert.equal(ix.keys[8].isWritable, true);
-  assert.equal(ix.keys[9].pubkey.toBase58(), destination.toBase58());
-  assert.equal(ix.keys[9].isWritable, true);
-  assert.equal(ix.keys[10].isWritable, false); // token_program
 });
 
 test("finalSettlementDeadline is settlementDeadline plus maxSettlementStalenessSeconds", () => {

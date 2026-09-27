@@ -7,10 +7,8 @@ import {
   decideMarketPublishAction,
   decidePositionAction,
   describeSettlementError,
-  fetchCollateralVaultBalances,
   fetchOracleStates,
   marketsWithOpenPositions,
-  marketsWithOutstandingCollateral,
   refundPoolPositionOnChain,
   selectMarketsNeedingSettlementAttempt,
   settlePoolPositionOnChain,
@@ -36,9 +34,9 @@ import {
 //
 // Takes ALL of `markets`/`poolPositions`/`directPositions` already fetched
 // this pass (the runner's own single getProgramAccounts round) rather than
-// fetching anything program-wide itself, other than the two bounded
-// `getMultipleAccountsInfo`-style lookups (`fetchCollateralVaultBalances`,
-// `fetchOracleStates`) that were always priced per-market, not per-scan.
+// fetching anything program-wide itself, other than the one bounded
+// `getMultipleAccountsInfo`-style lookup (`fetchOracleStates`) that was
+// always priced per-market, not per-scan.
 
 export type SettlementSweepCounters = {
   published: number;
@@ -63,14 +61,15 @@ export async function runFullSettlementPass(params: {
   directPositions: readonly DecodedDirectPosition[];
   now: number;
 }): Promise<SettlementSweepCounters> {
-  const { connection, program, cranker, config, rpcUrl, markets, poolPositions, directPositions, now } = params;
+  // `connection` stays part of the public params shape (oracle-runner.ts
+  // already threads it through) even though this function no longer needs
+  // it directly -- the last direct use was `fetchCollateralVaultBalances`
+  // for the now-removed V1 collateral-vault check.
+  const { program, cranker, config, rpcUrl, markets, poolPositions, directPositions, now } = params;
   const counters = emptyCounters();
 
   const marketByAddress = new Map(markets.map((market) => [market.address, market]));
   const openPositionMarkets = marketsWithOpenPositions({ poolPositions, directPositions });
-
-  const vaultBalances = await fetchCollateralVaultBalances(connection, markets.map((market) => new PublicKey(market.address)));
-  const outstandingCollateralMarkets = marketsWithOutstandingCollateral(vaultBalances);
 
   const oracleStates = await fetchOracleStates(program, markets.map((market) => new PublicKey(market.oracle)));
   const marketsWithFinalizedOracle = new Set(
@@ -82,10 +81,10 @@ export async function runFullSettlementPass(params: {
     now,
     marketsWithFinalizedOracle,
     marketsWithOpenPositions: openPositionMarkets,
-    marketsWithOutstandingCollateral: outstandingCollateralMarkets,
   }).sort((left, right) => left.expiry - right.expiry);
 
   const newlyFinalized = new Set<string>();
+  const configAccount = await program.account.config.fetch(config);
 
   for (const market of publishCandidates) {
     const decision = decideMarketPublishAction({
@@ -113,7 +112,17 @@ export async function runFullSettlementPass(params: {
     try {
       const signature = await program.methods
         .publishCustomSettlement()
-        .accountsStrict({ config, market: new PublicKey(market.address), oracle: new PublicKey(market.oracle), observation: observationPk })
+        .accountsStrict({
+          config,
+          market: new PublicKey(market.address),
+          oracle: new PublicKey(market.oracle),
+          observation: observationPk,
+          // The observation account's rent is reclaimed to the oracle
+          // authority on publish (see PublishCustomSettlement in lib.rs) --
+          // publication itself stays permissionless (no Signer on this
+          // account), it just always pays that rent back to the same key.
+          rentRecipient: configAccount.oracleAuthority,
+        })
         .rpc();
       console.log(
         `published: custom settlement for ${market.address} (${market.symbol}) at price ${observation.price.toString()} (signature ${signature})`,
@@ -130,7 +139,6 @@ export async function runFullSettlementPass(params: {
     }
   }
 
-  const configAccount = await program.account.config.fetch(config);
   for (const position of poolPositions) {
     const market = marketByAddress.get(position.market);
     if (!market || now < market.expiry) continue;

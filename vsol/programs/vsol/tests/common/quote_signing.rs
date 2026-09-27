@@ -11,14 +11,6 @@
 
 use super::Pubkey;
 
-pub struct QuoteMessageContext<'a> {
-    pub program_id: &'a Pubkey,
-    pub config: &'a Pubkey,
-    pub market: &'a Pubkey,
-    pub buyer: &'a Pubkey,
-    pub maker: &'a Pubkey,
-}
-
 pub struct PoolQuoteMessageContext<'a> {
     pub program_id: &'a Pubkey,
     pub config: &'a Pubkey,
@@ -26,31 +18,6 @@ pub struct PoolQuoteMessageContext<'a> {
     pub market: &'a Pubkey,
     pub buyer: &'a Pubkey,
     pub quote_authority: &'a Pubkey,
-}
-
-pub fn quote_message(
-    domain_separator: &[u8; 32],
-    domain_version: u16,
-    context: &QuoteMessageContext<'_>,
-    quote: &vsol::QuoteArgs,
-) -> Vec<u8> {
-    let mut message = Vec::with_capacity(251);
-    message.extend_from_slice(vsol::QUOTE_DOMAIN);
-    message.extend_from_slice(domain_separator);
-    message.extend_from_slice(&domain_version.to_le_bytes());
-    message.extend_from_slice(context.program_id.as_ref());
-    message.extend_from_slice(context.config.as_ref());
-    message.extend_from_slice(context.market.as_ref());
-    message.extend_from_slice(context.buyer.as_ref());
-    message.extend_from_slice(context.maker.as_ref());
-    message.extend_from_slice(&quote.nonce.to_le_bytes());
-    message.push(quote.direction);
-    message.extend_from_slice(&quote.strike.to_le_bytes());
-    message.extend_from_slice(&quote.width.to_le_bytes());
-    message.extend_from_slice(&quote.premium.to_le_bytes());
-    message.extend_from_slice(&quote.max_payout.to_le_bytes());
-    message.extend_from_slice(&quote.quote_expiry.to_le_bytes());
-    message
 }
 
 pub fn pool_quote_message(

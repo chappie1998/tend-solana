@@ -48,7 +48,7 @@ if (deployment.smokeStatus !== undefined && deployment.smokeStatus !== "passed")
 }
 
 const requiredExecutable = ["programId", "pythReceiverProgram"];
-const requiredAccounts = ["config", "settlementMint", "underlyingMint", "writerVault", "writerToken", "uiMarket", "uiOracle"];
+const requiredAccounts = ["config", "settlementMint", "underlyingMint", "uiMarket", "uiOracle"];
 // Every live market gets the full five-rung grid, so the manifest catalog is
 // 5 x however many markets app/lib/markets.ts lists live -- 15 today. Read
 // from the shared config rather than hardcoded, so promoting a market to live

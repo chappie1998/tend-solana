@@ -6,7 +6,7 @@ import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-tok
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import type { Vsol } from "../../target/types/vsol.ts";
 import {
-  deriveCompleteSetVault,
+  deriveLiquidityPoolMarket,
   deriveLiquidityPoolToken,
   derivePoolNonce,
   derivePoolPositionVault,
@@ -443,90 +443,6 @@ export function marketsWithOpenPositions(params: {
   ]);
 }
 
-// --- Conditional-token ("complete set") collateral vault --------------------
-// FINDING 1 fix: `close_settled_market` now requires the market's collateral
-// vault (see `COMPLETE_SET_VAULT_SEED` / `deriveCompleteSetVault`) to be
-// either never-created or fully drained before it will close -- see
-// `CloseSettledMarket::collateral_vault`'s doc comment in
-// vsol/programs/vsol/src/lib.rs. This section gives the off-chain cleanup
-// pass the SAME exclusion, so it stops burning fees retrying
-// `close_settled_market` forever against a market it can no longer close
-// (rather than relying on every caller to discover that the hard way from a
-// `MarketHasOutstandingCollateral` revert).
-
-// Standard SPL Token `Account` layout: mint(32) + owner(32) + amount(8) +
-// ... -- `amount` is the only field this cleanup pass needs.
-const TOKEN_ACCOUNT_AMOUNT_OFFSET = 64;
-const TOKEN_ACCOUNT_MIN_SIZE = TOKEN_ACCOUNT_AMOUNT_OFFSET + 8;
-
-/**
- * Pure decoder: no RPC, so it is directly unit-testable against fixture
- * buffers. Only decodes `amount` -- the one field this cleanup pass needs
- * from the collateral vault.
- */
-export function decodeTokenAccountAmount(data: Buffer): bigint {
-  if (data.length < TOKEN_ACCOUNT_MIN_SIZE) {
-    throw new Error("The token account size is invalid");
-  }
-  return data.readBigUInt64LE(TOKEN_ACCOUNT_AMOUNT_OFFSET);
-}
-
-/**
- * Fetches each market's complete-set collateral vault balance in one batched
- * `getMultipleAccountsInfo` call. A market whose vault PDA does not exist at
- * all (nobody ever called `mint_complete_set` against it) maps to `0n` --
- * exactly the same "nothing to check" state the on-chain handler treats an
- * empty/uninitialized vault as (see `CloseSettledMarket::collateral_vault`'s
- * doc comment). A vault account that exists but fails to decode (wrong size,
- * unexpected shape) is treated as non-zero/unsafe-to-close rather than
- * silently skipped -- unlike the position/market decoders above, silently
- * excluding a malformed vault here would be excluding it from a SAFETY
- * check, not from a candidate list, so the conservative failure direction is
- * reversed.
- */
-export async function fetchCollateralVaultBalances(
-  connection: Connection,
-  markets: readonly PublicKey[],
-  programId: PublicKey = VSOL_PROGRAM_ID,
-): Promise<Map<string, bigint>> {
-  const result = new Map<string, bigint>();
-  if (markets.length === 0) return result;
-  const vaults = markets.map((market) => deriveCompleteSetVault(market, programId));
-  const accounts = await connection.getMultipleAccountsInfo(vaults, { commitment: "confirmed" });
-  markets.forEach((market, index) => {
-    const account = accounts[index];
-    if (!account) {
-      result.set(market.toBase58(), 0n);
-      return;
-    }
-    try {
-      result.set(market.toBase58(), decodeTokenAccountAmount(Buffer.from(account.data)));
-    } catch {
-      // Exists but doesn't decode as a token account: treat as non-zero so
-      // it excludes the market from closing rather than risking stranding it.
-      result.set(market.toBase58(), 1n);
-    }
-  });
-  return result;
-}
-
-/**
- * Builds the "markets with outstanding collateral" set
- * `selectMarketCloseCandidates` uses for its FINDING 1 exclusion, given a
- * balance map from `fetchCollateralVaultBalances`. Pulled into its own pure,
- * exported, unit-tested function for the same reason `marketsWithOpenPositions`
- * is: it isolates "which markets are unsafe to close" from "how their
- * balances were fetched", so the filtering logic is testable with plain
- * fixture data instead of a live RPC connection.
- */
-export function marketsWithOutstandingCollateral(balances: ReadonlyMap<string, bigint>): Set<string> {
-  const result = new Set<string>();
-  for (const [market, balance] of balances) {
-    if (balance > 0n) result.add(market);
-  }
-  return result;
-}
-
 /**
  * The market-cleanup safety predicate. `close_settled_market` cannot verify
  * on-chain that no open position still references the market (positions are
@@ -549,16 +465,13 @@ export function marketsWithOutstandingCollateral(balances: ReadonlyMap<string, b
  *      set and calls this function), so that a position just settled or
  *      refunded this same pass has already dropped out of it before this
  *      predicate runs.
- *   3. Its address is NOT in `marketsWithOutstandingCollateral` -- the
- *      FINDING 1 exclusion, mirroring the on-chain handler's own
- *      `MarketHasOutstandingCollateral` check (see
- *      `CloseSettledMarket::collateral_vault`'s doc comment in lib.rs). This
- *      is a cheap, exact mirror (unlike point 2's position scan, this vault
- *      balance really is fully enumerable from the market alone) -- it
- *      exists here purely so this cleanup pass does not keep re-attempting
- *      (and paying transaction fees for) a `close_settled_market` call the
- *      chain will simply revert, not because the on-chain check is
- *      insufficient on its own.
+ *
+ * This predicate alone is NOT sufficient to attempt a close: the caller must
+ * separately call `selectIdlePoolBindingFor` for each candidate this returns
+ * and skip any market it returns `null` for -- `close_settled_market` now
+ * mandatorily requires a `(pool, pool_market)` binding proven idle (see that
+ * function's doc comment and point 3/4 of `CloseSettledMarket`'s doc comment
+ * in lib.rs), which this predicate does not check since it has no pool data.
  *
  * "Already closed" requires no explicit branch here: a closed market's
  * account no longer exists on-chain, so it is simply absent from the
@@ -572,13 +485,11 @@ export function selectMarketCloseCandidates(params: {
   markets: readonly DecodedMarketForCleanup[];
   now: number;
   marketsWithOpenPositions: ReadonlySet<string>;
-  marketsWithOutstandingCollateral: ReadonlySet<string>;
   maxPerRun: number;
 }): DecodedMarketForCleanup[] {
   const candidates = params.markets.filter((market) => {
     if (params.now <= computeMarketCloseDeadline(market)) return false;
     if (params.marketsWithOpenPositions.has(market.address)) return false;
-    if (params.marketsWithOutstandingCollateral.has(market.address)) return false;
     return true;
   });
   return candidates.slice(0, Math.max(0, params.maxPerRun));
@@ -670,21 +581,23 @@ export function selectViableSettlementTier(
  * Builds the "publish-attempt set": the markets `runSettlementPhase` should
  * even bother calling `decideMarketPublishAction` for this pass.
  *
- * FIX for a confirmed live bug: `runSettlementPhase` used to build its ENTIRE
- * work list from `fetchOpenPoolPositions` -- `[...new Set(positions.map(p =>
- * p.market))]` -- so a market reachable from no `PoolPosition` and no direct
- * `Position` was never enumerated at all. A v2 conditional-token market is
- * exactly that: its only on-chain state is two SPL mints (UP/DOWN) and a
- * complete-set collateral vault, no position account of either kind. Such a
- * market's oracle was therefore NEVER finalized by this cranker, so
- * `redeem_winning` reverted with `OracleNotFinalized` forever, and holders'
- * only recourse was `redeem_unresolved` once `final_deadline` passed -- which
- * pays pro-rata 50/50 regardless of who actually won. That silently turned
- * the product into a coin flip for every conditional-token market. This
- * function is the enumeration fix: it adds "has a non-zero complete-set
- * vault" as an independent reason a market belongs in the publish-attempt
- * set, alongside "has an open position" (pool-backed OR direct-maker -- see
- * `marketsWithOpenPositions`).
+ * ORIGINAL fix for a confirmed live bug: `runSettlementPhase` used to build
+ * its ENTIRE work list from `fetchOpenPoolPositions` -- `[...new
+ * Set(positions.map(p => p.market))]` -- so a market reachable from no
+ * `PoolPosition` and no direct `Position` was never enumerated at all. That
+ * used to include the now-removed V1 conditional-token ("complete set")
+ * markets, whose only on-chain state was two SPL mints and a collateral
+ * vault with no position account of either kind; this function's base
+ * enumeration switched to `fetchAllMarkets` to cover them too. That V1
+ * mechanism (`mint_complete_set`/`burn_complete_set`/`redeem_winning`/
+ * `redeem_unresolved`) has since been removed from the program entirely, so
+ * the "has a non-zero complete-set vault" reason this function used to check
+ * alongside `marketsWithOpenPositions` is gone -- there is no longer any way
+ * for a market to have something at stake without an open `PoolPosition` or
+ * direct-maker `Position`, so "has an open position" is now the only
+ * criterion. `fetchAllMarkets` as the base enumeration is kept regardless:
+ * it costs nothing extra and there is no reason to regress to the narrower,
+ * position-only enumeration the original bug came from.
  *
  * A market belongs in the set when ALL of:
  *   1. It has passed expiry: `now >= market.expiry` (inclusive, matching
@@ -694,8 +607,7 @@ export function selectViableSettlementTier(
  *      further publish attempt (`decideMarketPublishAction` would just skip
  *      it), so excluding it here avoids the wasted Hermes fetch + tx attempt
  *      for every already-settled market on the whole deployment.
- *   3. It has something at stake: its address is in `marketsWithOpenPositions`
- *      OR in `marketsWithOutstandingCollateral`.
+ *   3. It has something at stake: its address is in `marketsWithOpenPositions`.
  *
  * This is deliberately a COARSE pre-filter, not a replacement for
  * `decideMarketPublishAction`: it decides ONLY which markets are worth
@@ -711,26 +623,17 @@ export function selectViableSettlementTier(
  * caller must keep driving that loop from its own expired-position scan
  * (unioned with this set), never from this set alone, or settlement would
  * regress for exactly that already-finalized case.
- *
- * Every market address appears at most once in the input `markets` array
- * (one account per market), so the result is deduplicated by construction:
- * a market present in BOTH `marketsWithOpenPositions` and
- * `marketsWithOutstandingCollateral` is selected exactly once, never twice.
  */
 export function selectMarketsNeedingSettlementAttempt(params: {
   markets: readonly DecodedMarketForCleanup[];
   now: number;
   marketsWithFinalizedOracle: ReadonlySet<string>;
   marketsWithOpenPositions: ReadonlySet<string>;
-  marketsWithOutstandingCollateral: ReadonlySet<string>;
 }): DecodedMarketForCleanup[] {
   return params.markets.filter((market) => {
     if (params.now < market.expiry) return false;
     if (params.marketsWithFinalizedOracle.has(market.address)) return false;
-    return (
-      params.marketsWithOpenPositions.has(market.address) ||
-      params.marketsWithOutstandingCollateral.has(market.address)
-    );
+    return params.marketsWithOpenPositions.has(market.address);
   });
 }
 
@@ -1461,6 +1364,7 @@ export async function settlePoolPositionOnChain(params: {
   const poolToken = deriveLiquidityPoolToken(pool);
   const buyerDestination = settlementMintAta(settlementMint, buyer);
   const treasuryDestination = settlementMintAta(settlementMint, params.treasuryOwner);
+  const poolMarket = deriveLiquidityPoolMarket(pool, market);
   return params.program.methods
     .settlePoolPosition()
     .accountsStrict({
@@ -1469,6 +1373,7 @@ export async function settlePoolPositionOnChain(params: {
       pool,
       market,
       oracle: params.oracle,
+      poolMarket,
       nonceRecord,
       position: positionAddress,
       positionVault,
@@ -1500,6 +1405,7 @@ export async function refundPoolPositionOnChain(params: {
   const positionVault = derivePoolPositionVault(positionAddress);
   const poolToken = deriveLiquidityPoolToken(pool);
   const buyerDestination = settlementMintAta(settlementMint, buyer);
+  const poolMarket = deriveLiquidityPoolMarket(pool, market);
   return params.program.methods
     .refundPoolPosition()
     .accountsStrict({
@@ -1508,6 +1414,7 @@ export async function refundPoolPositionOnChain(params: {
       pool,
       market,
       oracle: params.oracle,
+      poolMarket,
       nonceRecord,
       position: positionAddress,
       positionVault,
@@ -1524,26 +1431,24 @@ export async function refundPoolPositionOnChain(params: {
 
 /**
  * Calls close_settled_market for a market already proven safe by
- * selectMarketCloseCandidates. Deliberately omits the optional pool/pool_market
- * pair -- disabling a pool-market authorization requires an idle pool and is
- * fragile, and the instruction's safety does not depend on it (fill_quote and
- * fill_pool_quote both hard-require `now < market.expiry`, so no new position
- * can open past the close deadline regardless of pool_market.enabled; see the
- * instruction's own doc comment in lib.rs). `authority` and `rentRecipient`
- * are both the caller-supplied signer; the program enforces authority ==
- * market.creator || config.admin, and separately enforces rent_recipient ==
- * market.creator by address constraint, so passing a signer that is not the
- * market's creator (and not config.admin) simply fails with Unauthorized,
- * which the caller treats as a skip.
+ * selectMarketCloseCandidates. `pool`/`poolMarket` are now MANDATORY on chain
+ * (see `CloseSettledMarket`'s doc comment in lib.rs, point 3): the caller
+ * must supply the `[POOL_MARKET_SEED, pool, market]` binding it wants the
+ * handler to prove is idle (`!enabled && open_positions == 0`). This
+ * function itself does not choose which binding to pass or verify it is
+ * idle -- see `selectIdlePoolBindingFor`, which enumerates every binding
+ * referencing the market (a market may have more than one -- point 4's
+ * residual gap) and only ever returns one when ALL of them are idle. Callers
+ * (`runMarketCleanup` in cranker.ts) are expected to call that selector
+ * first and skip the market entirely when it returns `null`, rather than
+ * guessing a binding and eating a guaranteed on-chain revert.
  *
- * `collateralVault` is derived from `market`, not caller-supplied: it is
- * always the market's own `deriveCompleteSetVault(market)` PDA (see
- * `CloseSettledMarket::collateral_vault`'s doc comment in lib.rs -- the
- * on-chain handler itself is what checks its balance, this is just the
- * account address). The caller (`selectMarketCloseCandidates`) should
- * already have proven this market is safe to close via
- * `marketsWithOutstandingCollateral` before calling this function, but the
- * on-chain check is the actual backstop regardless.
+ * `authority` and `rentRecipient` are both the caller-supplied signer; the
+ * program enforces authority == market.creator || config.admin, and
+ * separately enforces rent_recipient == market.creator by address
+ * constraint, so passing a signer that is not the market's creator (and not
+ * config.admin) simply fails with Unauthorized, which the caller treats as
+ * a skip.
  */
 export async function closeSettledMarketOnChain(params: {
   program: Program<Vsol>;
@@ -1551,6 +1456,8 @@ export async function closeSettledMarketOnChain(params: {
   config: PublicKey;
   market: PublicKey;
   oracle: PublicKey;
+  pool: PublicKey;
+  poolMarket: PublicKey;
   rentRecipient: PublicKey;
 }): Promise<string> {
   return params.program.methods
@@ -1560,10 +1467,105 @@ export async function closeSettledMarketOnChain(params: {
       config: params.config,
       market: params.market,
       oracle: params.oracle,
-      collateralVault: deriveCompleteSetVault(params.market),
-      pool: null,
-      poolMarket: null,
+      pool: params.pool,
+      poolMarket: params.poolMarket,
       rentRecipient: params.rentRecipient,
     })
     .rpc();
+}
+
+// --- Pool-market binding enumeration (for market cleanup) -------------------
+// `close_settled_market` now mandatorily requires a `(pool, pool_market)`
+// binding to prove idle (see `closeSettledMarketOnChain`'s doc comment
+// above). A market can be bound to more than one pool over its lifetime
+// (each binding is its own `[POOL_MARKET_SEED, pool, market]` PDA -- see
+// point 4 of `CloseSettledMarket`'s doc comment in lib.rs), so this section
+// enumerates EVERY `LiquidityPoolMarket` account program-wide and groups them
+// by market, so `selectIdlePoolBindingFor` can require all of a market's
+// bindings to be idle before proposing any single one of them to the chain.
+
+// `LiquidityPoolMarket`'s byte length depends on its value (see
+// `OpenPositionCount`'s legacy-tolerant (de)serialization in lib.rs): a
+// pre-upgrade account that was never rewritten stays at 82 bytes forever
+// (discriminator(8) + bump(1) + pool(32) + market(32) + last_trade_at(8) +
+// enabled(1)), while any account `set_liquidity_pool_market` has written
+// since carries 4 more bytes for a known `open_positions` count. A single
+// `dataSize` filter can only match one of the two, so this enumerates both.
+const POOL_MARKET_ACCOUNT_SIZE_LEGACY = 82;
+const POOL_MARKET_ACCOUNT_SIZE_CURRENT = 86;
+const POOL_MARKET_OPEN_POSITIONS_OFFSET = 82;
+
+export type DecodedPoolMarket = {
+  address: string;
+  pool: string;
+  market: string;
+  enabled: boolean;
+  /** `false` for a legacy 82-byte account: its open-position count is the
+   * `UNKNOWN` sentinel, not zero, so it can never be proven idle. */
+  openPositionsKnown: boolean;
+  openPositions: number;
+};
+
+function decodePoolMarketAccountForCleanup(pubkey: PublicKey, data: Buffer): DecodedPoolMarket {
+  if (data.length !== POOL_MARKET_ACCOUNT_SIZE_LEGACY && data.length !== POOL_MARKET_ACCOUNT_SIZE_CURRENT) {
+    throw new Error(`Unexpected LiquidityPoolMarket size: ${data.length}`);
+  }
+  const pool = new PublicKey(data.subarray(9, 41)).toBase58();
+  const market = new PublicKey(data.subarray(41, 73)).toBase58();
+  const enabled = data.readUInt8(81) === 1;
+  const openPositionsKnown = data.length === POOL_MARKET_ACCOUNT_SIZE_CURRENT;
+  const openPositions = openPositionsKnown ? data.readUInt32LE(POOL_MARKET_OPEN_POSITIONS_OFFSET) : 0;
+  return { address: pubkey.toBase58(), pool, market, enabled, openPositionsKnown, openPositions };
+}
+
+/** Enumerates every `LiquidityPoolMarket` account program-wide (both legacy and current byte lengths -- see the comment above). Malformed entries are skipped, never thrown. */
+export async function fetchAllPoolMarkets(
+  connection: Connection,
+  programId: PublicKey = VSOL_PROGRAM_ID,
+): Promise<DecodedPoolMarket[]> {
+  const [legacy, current] = await Promise.all(
+    [POOL_MARKET_ACCOUNT_SIZE_LEGACY, POOL_MARKET_ACCOUNT_SIZE_CURRENT].map((dataSize) =>
+      connection.getProgramAccounts(programId, { commitment: "confirmed", filters: [{ dataSize }] }),
+    ),
+  );
+  const result: DecodedPoolMarket[] = [];
+  for (const { pubkey, account } of [...legacy, ...current]) {
+    try {
+      result.push(decodePoolMarketAccountForCleanup(pubkey, Buffer.from(account.data)));
+    } catch {
+      // Same size but a different account shape (or a corrupt read): not a
+      // LiquidityPoolMarket, so it is silently excluded rather than failing
+      // the run.
+    }
+  }
+  return result;
+}
+
+/**
+ * Chooses the `(pool, poolMarket)` pair to supply `closeSettledMarketOnChain`
+ * for a candidate market, given EVERY `LiquidityPoolMarket` binding on the
+ * deployment (see `fetchAllPoolMarkets`). Closes the residual gap point 4 of
+ * `CloseSettledMarket`'s doc comment documents: the on-chain guard only ever
+ * proves the ONE binding it is handed is idle, so this selector requires
+ * EVERY binding that references the market to be idle
+ * (`!enabled && openPositionsKnown && openPositions === 0`) before it will
+ * hand back any of them. Returns `null` -- meaning "do not attempt to close
+ * this market" -- when:
+ *   - the market has no binding at all (point 3: it can never be closed on
+ *     chain, only its own rent stays stuck -- this selector simply never
+ *     proposes it, rather than trying and eating a guaranteed revert), or
+ *   - any single binding is still enabled, has open positions, or is a
+ *     legacy account whose open-position count is the `UNKNOWN` sentinel
+ *     (`openPositionsKnown === false`) and can therefore never be proven
+ *     zero.
+ */
+export function selectIdlePoolBindingFor(
+  marketAddress: string,
+  poolMarkets: readonly DecodedPoolMarket[],
+): { pool: string; poolMarket: string } | null {
+  const bindings = poolMarkets.filter((binding) => binding.market === marketAddress);
+  if (bindings.length === 0) return null;
+  const allIdle = bindings.every((binding) => !binding.enabled && binding.openPositionsKnown && binding.openPositions === 0);
+  if (!allIdle) return null;
+  return { pool: bindings[0].pool, poolMarket: bindings[0].address };
 }

@@ -179,13 +179,13 @@ test("program covers collateral, replay, signature, pause, and refund invariants
   const signature = await readFile(new URL("vsol/programs/vsol/src/signature.rs", root), "utf8");
   const math = await readFile(new URL("vsol/programs/vsol/src/math.rs", root), "utf8");
 
-  assert.match(source, /writer_token\.amount >= quote\.max_payout/);
+  assert.match(source, /quote\.max_payout <= position_limit/);
   assert.match(source, /verify_preceding_ed25519_instruction/);
   assert.match(source, /domain_separator/);
   assert.match(source, /NonceStatus::Filled/);
   assert.match(source, /position\.fee_bps = config\.fee_bps/);
   assert.match(source, /calculate_fee\(position\.premium, position\.fee_bps\)/);
-  assert.match(source, /pub fn refund_unsettled/);
+  assert.match(source, /pub fn refund_pool_position/);
   assert.match(source, /pub fn set_pause/);
   assert.match(source, /pub fn publish_pyth_settlement/);
   assert.match(source, /pyth_price\.publish_time >= market\.expiry/);

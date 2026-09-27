@@ -96,8 +96,6 @@ export const VSOL_MARKET = new PublicKey(deployment.uiMarket);
 export const VSOL_ORACLE = new PublicKey(deployment.uiOracle);
 export const VSOL_MAKER = new PublicKey(deployment.maker);
 export const VSOL_SETTLEMENT_MINT = new PublicKey(deployment.settlementMint);
-export const VSOL_WRITER_VAULT = new PublicKey(deployment.writerVault);
-export const VSOL_WRITER_TOKEN = new PublicKey(deployment.writerToken);
 // The address lookup table that lets fill transactions compile as v0 (see
 // app/lib/vsol-server.ts). Null until the manifest publishes it -- every
 // caller must keep working with plain legacy transactions in that case.

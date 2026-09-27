@@ -25,10 +25,10 @@ use solana_sdk_ids::{system_program, sysvar::rent};
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
 use vsol::{
-    COMPLETE_SET_TOKEN_SEED, COMPLETE_SET_VAULT_SEED, DOWN_MINT_SEED, ELIGIBILITY_SEED,
-    CUSTOM_FEED_SEED, CUSTOM_SETTLEMENT_OBSERVATION_SEED, MARKET_SEED, NONCE_SEED, ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED, POOL_POSITION_SEED,
-    POOL_POSITION_VAULT_SEED, POOL_SEED, POOL_TOKEN_SEED, POSITION_SEED, POSITION_VAULT_SEED,
-    PROVIDER_SEED, UP_MINT_SEED, WRITER_SEED, WRITER_TOKEN_SEED,
+    ELIGIBILITY_SEED, CUSTOM_FEED_SEED, CUSTOM_SETTLEMENT_OBSERVATION_SEED, MARKET_SEED,
+    ORACLE_SEED, POOL_MARKET_SEED, POOL_NONCE_SEED, POOL_POSITION_SEED,
+    POOL_POSITION_VAULT_SEED, POOL_SEED, POOL_TOKEN_SEED,
+    PROVIDER_SEED,
 };
 
 pub use anchor_lang::prelude::Pubkey;
@@ -180,13 +180,6 @@ impl Harness {
     /// instruction handler -- used by the conditional-token ("complete set")
     /// tests to check `up_mint`/`down_mint` supply against the collateral
     /// vault balance.
-    pub fn mint_supply(&self, mint: &Pubkey) -> u64 {
-        let account = self.get_account(mint);
-        spl_token::state::Mint::unpack(&account.data)
-            .expect("unpack mint")
-            .supply
-    }
-
     pub fn create_mint(&mut self, payer: &Keypair, authority: &Pubkey, decimals: u8) -> Pubkey {
         let mint_kp = Keypair::new();
         let space = spl_token::state::Mint::LEN;
@@ -305,34 +298,6 @@ pub fn custom_observation_pda(symbol: &[u8; 16], expiry: i64) -> Pubkey {
     Pubkey::find_program_address(&[CUSTOM_SETTLEMENT_OBSERVATION_SEED, symbol, &expiry.to_le_bytes()], &vsol::ID).0
 }
 
-pub fn writer_vault_pda(config: &Pubkey, maker: &Pubkey, settlement_mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[WRITER_SEED, config.as_ref(), maker.as_ref(), settlement_mint.as_ref()],
-        &vsol::ID,
-    )
-    .0
-}
-
-pub fn writer_token_pda(writer_vault: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[WRITER_TOKEN_SEED, writer_vault.as_ref()], &vsol::ID).0
-}
-
-pub fn nonce_pda(config: &Pubkey, maker: &Pubkey, nonce: u64) -> Pubkey {
-    Pubkey::find_program_address(
-        &[NONCE_SEED, config.as_ref(), maker.as_ref(), nonce.to_le_bytes().as_ref()],
-        &vsol::ID,
-    )
-    .0
-}
-
-pub fn position_pda(nonce_record: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[POSITION_SEED, nonce_record.as_ref()], &vsol::ID).0
-}
-
-pub fn position_vault_pda(position: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[POSITION_VAULT_SEED, position.as_ref()], &vsol::ID).0
-}
-
 pub fn eligibility_pda(config: &Pubkey, wallet: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[ELIGIBILITY_SEED, config.as_ref(), wallet.as_ref()], &vsol::ID).0
 }
@@ -378,27 +343,6 @@ pub fn pool_position_vault_pda(position: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[POOL_POSITION_VAULT_SEED, position.as_ref()], &vsol::ID).0
 }
 
-// --- Conditional-token ("complete set") PDAs ---
-
-pub fn up_mint_pda(market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[UP_MINT_SEED, market.as_ref()], &vsol::ID).0
-}
-
-pub fn down_mint_pda(market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[DOWN_MINT_SEED, market.as_ref()], &vsol::ID).0
-}
-
-pub fn complete_set_vault_pda(market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[COMPLETE_SET_VAULT_SEED, market.as_ref()], &vsol::ID).0
-}
-
-/// The deterministic address `mint_complete_set` mints into (see
-/// `COMPLETE_SET_TOKEN_SEED`'s doc comment in src/lib.rs). `burn_complete_set`
-/// and `redeem_winning` accept this OR any other token account the caller
-/// holds a balance in -- it is not the only valid source for those two.
-pub fn complete_set_token_pda(mint: &Pubkey, owner: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[COMPLETE_SET_TOKEN_SEED, mint.as_ref(), owner.as_ref()], &vsol::ID).0
-}
 
 pub fn system_program_id() -> Pubkey {
     system_program::ID
@@ -423,14 +367,3 @@ pub fn no_eligibility() -> Pubkey {
     vsol::ID
 }
 
-/// Same "program id means not provided" sentinel as `no_eligibility`, for
-/// `close_settled_market`'s optional `pool` account.
-pub fn no_pool() -> Pubkey {
-    vsol::ID
-}
-
-/// Same sentinel as `no_pool`, for `close_settled_market`'s optional
-/// `pool_market` account.
-pub fn no_pool_market() -> Pubkey {
-    vsol::ID
-}

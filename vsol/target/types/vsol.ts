@@ -136,242 +136,6 @@ export type Vsol = {
       "args": []
     },
     {
-      "name": "burnCompleteSet",
-      "docs": [
-        "Burns `amount` of BOTH the UP and DOWN conditional tokens and returns",
-        "`amount` collateral from the vault. This is the arbitrage that keeps",
-        "UP + DOWN priced at ~1 unit of collateral, so it must work identically",
-        "before AND after settlement -- it is deliberately never gated on",
-        "`oracle.finalized` in either direction.",
-        "",
-        "Guardian: like `settle`/`close_pool_position`, this is a holder's exit",
-        "path, so -- unlike `mint_complete_set` -- it must keep working even",
-        "while the protocol is paused. Deliberately NOT gated on",
-        "`config.paused`."
-      ],
-      "discriminator": [
-        183,
-        36,
-        119,
-        130,
-        123,
-        198,
-        110,
-        211
-      ],
-      "accounts": [
-        {
-          "name": "burner",
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "market"
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "upMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  117,
-                  112,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "downMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  100,
-                  111,
-                  119,
-                  110,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "collateralVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "burnerUpToken",
-          "writable": true
-        },
-        {
-          "name": "burnerDownToken",
-          "writable": true
-        },
-        {
-          "name": "burnerDestination",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "cancelNonce",
-      "discriminator": [
-        75,
-        133,
-        88,
-        103,
-        81,
-        209,
-        139,
-        141
-      ],
-      "accounts": [
-        {
-          "name": "maker",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "nonceRecord",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  110,
-                  111,
-                  110,
-                  99,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "arg",
-                "path": "nonce"
-              }
-            ]
-          }
-        },
-        {
-          "name": "systemProgram",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "nonce",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "cancelPendingPoolUpdate",
       "docs": [
         "Lets the manager clear a pending `update_liquidity_pool` proposal",
@@ -867,69 +631,67 @@ export type Vsol = {
         "every in-flight refund with no margin at all. The buffer is what",
         "makes point 3's off-chain assumption survivable rather than a",
         "coin-flip against the cleaner.",
-        "2. `fill_quote` and `fill_pool_quote` both hard-require",
-        "`now < market.expiry` before opening a new position. Since the",
-        "deadline above is strictly after `expiry`, by the time it has",
-        "elapsed no new writer- or pool-backed position can ever be opened",
-        "against this market again, full stop -- this holds independently",
-        "of `market.enabled`/`pool_market.enabled`, which are therefore not",
-        "load-bearing for \"no new obligations\": that is already guaranteed",
-        "by the expiry check those two instructions perform themselves.",
-        "3. The one obligation this instruction *cannot* cheaply verify",
-        "on-chain is \"no already-open `Position`/`PoolPosition` still",
-        "references this market\". Those are independent PDAs keyed by",
-        "nonce record (not by market), so there is no bounded on-chain",
-        "enumeration of \"every position that ever referenced this market\"",
-        "-- unlike the pool-authorization case below, which is a single",
-        "fixed-address PDA per (pool, market) pair. If an open position",
-        "were left unsettled/unrefunded, closing the market would strand it",
-        "forever: `settle`, `settle_pool_position`, `refund_unsettled`, and",
-        "`refund_pool_position` all load the `Market` account via `has_one`",
-        "and would simply fail once that account no longer exists, with no",
-        "way to ever recover the position's escrowed funds.",
-        "==> OFF-CHAIN ASSUMPTION (required, not enforced by this",
-        "instruction): the caller -- the off-chain cleaner -- must confirm",
-        "every `Position` and `PoolPosition` that ever referenced this",
-        "market has already been settled or refunded (its vault closed)",
-        "before calling `close_settled_market`. This is the documented gap",
-        "the task that added this instruction explicitly flagged and",
-        "accepted, given positions are not cheaply enumerable on-chain.",
-        "`MARKET_CLEANUP_BUFFER_SECONDS` bounds the damage when that",
-        "assumption is violated (a stranded position stays refundable for a",
-        "week after settlement closes) but does NOT discharge it: a caller",
-        "that closes a market with an open position still strands it",
-        "permanently. Enumerating positions on-chain -- e.g. an",
-        "`open_position_count` on `Market`, maintained by fill/settle/refund",
-        "-- is the only way to actually enforce this, and remains the right",
-        "fix before real money.",
-        "4. UNLIKE point 3, the conditional-token (\"complete set\") collateral",
-        "vault IS cheaply, fully enumerable from the market alone: it is a",
-        "single deterministic PDA (`COMPLETE_SET_VAULT_SEED`, keyed only by",
-        "`market.key()`), not a per-nonce record like `Position`/",
-        "`PoolPosition`. `burn_complete_set` and `redeem_winning` both load",
-        "`market: Box<Account<'info, Market>>`, so once this account is",
-        "closed neither can ever execute again -- any balance still in the",
-        "vault at that point is unrecoverable forever. Because this check",
-        "IS cheap, it is a HARD on-chain requirement, not an off-chain",
-        "assumption like point 3: the handler requires the vault to be",
-        "either never created (nobody ever called `mint_complete_set`",
-        "against this market) or fully drained (`amount == 0`) before",
-        "allowing the close. See `CloseSettledMarket::collateral_vault`'s",
-        "own doc comment for why checking the vault balance alone --",
-        "without also inspecting `up_mint`/`down_mint` supply -- is",
-        "sufficient.",
-        "5. As a cheap, *additional* on-chain check (defense-in-depth, not the",
-        "primary safety argument above, which already holds regardless): if",
-        "the caller passes a `pool`/`pool_market` pair, it must be the",
-        "authorization record for *this* market and pool, and it must have",
-        "`enabled == false`. Passing `None` for both is accepted (an",
-        "omitted pair is not proof no pool was ever authorized, but no",
-        "cheaper on-chain check exists -- see point 3).",
-        "6. Permission: the caller must be `market.creator` or `config.admin`.",
+        "2. `fill_pool_quote` hard-requires `now < market.expiry` before",
+        "opening a new position. Since the deadline above is strictly after",
+        "`expiry`, by the time it has elapsed no new pool-backed position",
+        "can ever be opened against this market again, full stop -- this",
+        "holds independently of `market.enabled`/`pool_market.enabled`,",
+        "which are therefore not load-bearing for \"no new obligations\":",
+        "that is already guaranteed by the expiry check `fill_pool_quote`",
+        "performs itself.",
+        "3. `pool` and `pool_market` are now MANDATORY (no `(None, None)`",
+        "bypass -- see `CloseSettledMarket`'s own doc comment for why an",
+        "earlier version of this instruction wrongly accepted omitting",
+        "them). The caller must supply the authorization record for *this*",
+        "market and pool; the handler requires it to have `enabled ==",
+        "false` AND `pool_market.open_positions == 0` (not the legacy",
+        "`UNKNOWN` sentinel either -- see `OpenPositionCount`'s doc comment",
+        "on `LiquidityPoolMarket`) before closing. This is a HARD",
+        "requirement, not defense-in-depth: `settle_pool_position` and",
+        "`refund_pool_position` both load `market: Box<Account<'info,",
+        "Market>>` via `has_one`/a manual key check, so once `Market` is",
+        "closed neither can ever run again -- any `PoolPosition` still open",
+        "against this market at that point has its escrowed",
+        "`premium + max_payout` stranded forever, unrecoverable by any",
+        "instruction in this program. That is exactly the failure this",
+        "check exists to prevent, which is why it cannot be optional.",
+        "Consequence: a market that was never bound to ANY pool (no",
+        "`LiquidityPoolMarket` was ever created for it) can never be closed",
+        "on chain -- only its own (and its oracle's) rent is permanently",
+        "stuck, never any position's funds, since a market nobody ever",
+        "authorized a pool against can have no `PoolPosition`s either",
+        "(`fill_pool_quote` requires an enabled `pool_market`). Accepted:",
+        "fills go through the pool path exclusively, so every market that",
+        "ever actually traded has a binding to supply here.",
+        "4. RESIDUAL GAP (documented, not fixed here): a market can legally be",
+        "bound to MORE THAN ONE pool over its lifetime -- each binding is",
+        "an independent `[POOL_MARKET_SEED, pool, market]` PDA, so there is",
+        "no bounded on-chain enumeration of \"every pool ever authorized",
+        "against this market\" (the same unenumerability problem as",
+        "individual positions, one level up). This instruction only checks",
+        "the ONE `(pool, pool_market)` pair the caller supplies: passing a",
+        "binding that is genuinely idle does not prove every OTHER binding",
+        "against this market is also idle, so a market with a second,",
+        "still-open pool binding could in principle be closed, stranding",
+        "that other binding's open positions. The complete fix is a",
+        "market-level open-position counter (on `Market` itself, maintained",
+        "across every pool's fills/settles/refunds) -- not applicable here",
+        "because it would change `Market`'s layout, and live devnet",
+        "accounts must keep deserializing unchanged (see this crate's",
+        "layout-compatibility constraints); it is free to add on a fresh",
+        "mainnet deploy with no live accounts to preserve, and should be",
+        "the mainnet follow-up. Until then, this gap is bounded by two",
+        "things neither of which is enforced by this instruction itself:",
+        "the caller is already privileged (`market.creator` or",
+        "`config.admin`, see point 5 below), and the off-chain cleaner",
+        "(`vsol/scripts/lib/settlement.ts`'s `selectMarketCloseCandidates`,",
+        "called from `vsol/scripts/cranker.ts`) is expected to check every",
+        "pool binding for a market before requesting a close, not just one.",
+        "5. Permission: the caller must be `market.creator` or `config.admin`.",
         "Rent always returns to `market.creator` (`rent_recipient` is",
         "address-constrained to it), never to an arbitrary caller-supplied",
         "account.",
-        "7. Deliberately *not* gated on `config.paused`: this is maintenance",
+        "6. Deliberately *not* gated on `config.paused`: this is maintenance",
         "cleanup, not a trading action, so it must remain callable while",
         "the protocol is paused (mirrors `close_pool_position`'s guardian",
         "rationale for staying pause-independent)."
@@ -1004,70 +766,17 @@ export type Vsol = {
           ]
         },
         {
-          "name": "collateralVault",
-          "docs": [
-            "vault PDA by `seeds =`/`bump`, so a caller can neither omit it nor",
-            "substitute a different (e.g. always-empty) account to dodge the",
-            "balance check in the handler. Deliberately an `UncheckedAccount`, not",
-            "`Box<Account<'info, TokenAccount>>` like `BurnCompleteSet`/",
-            "`RedeemWinning`'s own `collateral_vault`: THIS vault may legitimately",
-            "never have been created at all (a market nobody ever called",
-            "`mint_complete_set` against), and `Account<TokenAccount>`",
-            "deserialization fails closed on an empty/uninitialized account with",
-            "no `init_if_needed` escape hatch available on a `close`-adjacent",
-            "read-only check. The handler distinguishes \"never created\" (empty",
-            "account data) from \"created but still holds a balance\" (blocked)",
-            "itself, by inspecting the raw account.",
-            "",
-            "Checking ONLY this vault's balance -- not also `up_mint.supply`/",
-            "`down_mint.supply` -- is sufficient, and deliberately not \"hardened\"",
-            "with those two extra accounts: `vault.amount == 0` already implies",
-            "every winning conditional token has been redeemed (`redeem_winning`",
-            "is the only path that debits the vault post-settlement, and it always",
-            "debits the vault and the winning mint's supply by the identical",
-            "amount -- see its own `require!` check), so whatever supply remains",
-            "outstanding on either mint at that point is entirely losing-side",
-            "tokens, which are worthless by construction and carry no claim on",
-            "anything. Checking the vault is checking the one number that",
-            "actually matters; the mint supplies would be two more accounts for",
-            "no additional safety."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "pool",
-          "optional": true
+          "name": "pool"
         },
         {
           "name": "poolMarket",
-          "writable": true,
-          "optional": true
+          "writable": true
         },
         {
           "name": "rentRecipient",
           "docs": [
-            "constrained to the market's own creator so rent can never be",
-            "redirected to an arbitrary caller-supplied account."
+            "rent. Address-constrained to the market's own creator so rent can",
+            "never be redirected to an arbitrary caller-supplied account."
           ],
           "writable": true
         }
@@ -1339,114 +1048,6 @@ export type Vsol = {
         {
           "name": "deadline",
           "type": "i64"
-        }
-      ]
-    },
-    {
-      "name": "depositWriter",
-      "discriminator": [
-        190,
-        219,
-        70,
-        148,
-        227,
-        25,
-        238,
-        35
-      ],
-      "accounts": [
-        {
-          "name": "config",
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "maker",
-          "writable": true,
-          "signer": true,
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "writerVault",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "account",
-                "path": "settlementMint"
-              }
-            ]
-          }
-        },
-        {
-          "name": "writerToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "writerVault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "makerSource",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
         }
       ]
     },
@@ -1736,240 +1337,6 @@ export type Vsol = {
       ]
     },
     {
-      "name": "fillQuote",
-      "discriminator": [
-        12,
-        116,
-        225,
-        132,
-        142,
-        74,
-        167,
-        253
-      ],
-      "accounts": [
-        {
-          "name": "buyer",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "maker"
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market",
-            "writerVault"
-          ]
-        },
-        {
-          "name": "market"
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market",
-            "writerVault"
-          ]
-        },
-        {
-          "name": "writerVault",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "account",
-                "path": "settlementMint"
-              }
-            ]
-          }
-        },
-        {
-          "name": "writerToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "writerVault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "buyerSource",
-          "writable": true
-        },
-        {
-          "name": "nonceRecord",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  110,
-                  111,
-                  110,
-                  99,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "arg",
-                "path": "quote.nonce"
-              }
-            ]
-          }
-        },
-        {
-          "name": "position",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "nonceRecord"
-              }
-            ]
-          }
-        },
-        {
-          "name": "positionVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "position"
-              }
-            ]
-          }
-        },
-        {
-          "name": "eligibility",
-          "optional": true
-        },
-        {
-          "name": "instructionsSysvar",
-          "address": "Sysvar1nstructions1111111111111111111111111"
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        },
-        {
-          "name": "systemProgram",
-          "address": "11111111111111111111111111111111"
-        },
-        {
-          "name": "rent",
-          "address": "SysvarRent111111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "quote",
-          "type": {
-            "defined": {
-              "name": "quoteArgs"
-            }
-          }
-        }
-      ]
-    },
-    {
       "name": "initCustomPriceFeed",
       "docs": [
         "One-time per symbol (e.g. SOL/BTC/ETH): creates the `CustomPriceFeed`",
@@ -2238,346 +1605,6 @@ export type Vsol = {
       ]
     },
     {
-      "name": "initializeWriterVault",
-      "discriminator": [
-        64,
-        80,
-        177,
-        226,
-        118,
-        156,
-        61,
-        17
-      ],
-      "accounts": [
-        {
-          "name": "maker",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "settlementMint"
-        },
-        {
-          "name": "writerVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "account",
-                "path": "settlementMint"
-              }
-            ]
-          }
-        },
-        {
-          "name": "writerToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "writerVault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        },
-        {
-          "name": "systemProgram",
-          "address": "11111111111111111111111111111111"
-        },
-        {
-          "name": "rent",
-          "address": "SysvarRent111111111111111111111111111111111"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "mintCompleteSet",
-      "docs": [
-        "Mints a \"complete set\": pulls `amount` of the market's settlement",
-        "token into a per-market collateral vault PDA and mints `amount` of",
-        "BOTH the UP and DOWN conditional tokens to the caller. Fully",
-        "collateralized by construction -- `up_mint`/`down_mint`'s mint",
-        "authority is the market PDA, which never signs a `mint_to` CPI",
-        "anywhere except here, and this instruction always moves the vault and",
-        "both supplies by the identical `amount` in one transaction, verified",
-        "below by reloading all three and checking the exact expected delta",
-        "(the same defensive \"reload and compare\" pattern `fill_quote` and",
-        "`deposit_liquidity` already use elsewhere in this file).",
-        "",
-        "Gated on `!config.paused` AND `market.enabled`: like",
-        "`fill_quote`/`fill_pool_quote`, this creates new economic exposure,",
-        "so both the global pause guardian and the market's own admin kill",
-        "switch (`set_market_enabled`) block it. `burn_complete_set` and",
-        "`redeem_winning` are deliberately gated on NEITHER -- see their own",
-        "doc comments for why (same reason `settle`/`refund_unsettled`/etc.",
-        "never check `market.enabled` either: it only ever blocks new",
-        "exposure, never an exit)."
-      ],
-      "discriminator": [
-        70,
-        222,
-        130,
-        148,
-        234,
-        103,
-        137,
-        61
-      ],
-      "accounts": [
-        {
-          "name": "minter",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "market"
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "upMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  117,
-                  112,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "downMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  100,
-                  111,
-                  119,
-                  110,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "collateralVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "minterSource",
-          "writable": true
-        },
-        {
-          "name": "minterUpToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "upMint"
-              },
-              {
-                "kind": "account",
-                "path": "minter"
-              }
-            ]
-          }
-        },
-        {
-          "name": "minterDownToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "downMint"
-              },
-              {
-                "kind": "account",
-                "path": "minter"
-              }
-            ]
-          }
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        },
-        {
-          "name": "systemProgram",
-          "address": "11111111111111111111111111111111"
-        },
-        {
-          "name": "rent",
-          "address": "SysvarRent111111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "nominateAdmin",
       "discriminator": [
         134,
@@ -2842,425 +1869,6 @@ export type Vsol = {
       "args": []
     },
     {
-      "name": "redeemUnresolved",
-      "docs": [
-        "Escape hatch for a market whose oracle never finalizes: once",
-        "`publish_pyth_settlement` can no longer ever succeed again (see",
-        "`final_settlement_deadline`), burns `amount` of EITHER conditional",
-        "token for a pro-rata share of the collateral vault --",
-        "`amount * vault_balance / (up_mint.supply + down_mint.supply)`",
-        "(`math::calculate_pro_rata_redemption`) -- rather than requiring a",
-        "winner that will never be determined. This is the conditional-token",
-        "path's analogue of `refund_unsettled` for the older per-position",
-        "path: without it, a holder of only one side of a market whose oracle",
-        "is permanently dead has no way to ever recover anything, and",
-        "`burn_complete_set` does not help them (it requires holding BOTH",
-        "sides).",
-        "",
-        "Timing -- why the gate is `now > final_settlement_deadline(market)`,",
-        "exactly, and not the earlier `settlement_deadline`",
-        "`refund_unsettled`/`redeem_winning`'s sibling paths might suggest:",
-        "`redeem_winning` requires `oracle.finalized`, and",
-        "`publish_pyth_settlement` can still finalize the oracle for any",
-        "`now <= final_settlement_deadline(market)` (tier 1 the whole way;",
-        "tier 2 after its own additional `tier_two_open_at` gate). Opening",
-        "THIS hatch any earlier makes the two payout paths simultaneously",
-        "satisfiable, which is a real insolvency, not just a race: collateral",
-        "could be paid out pro-rata AND the market could later settle with a",
-        "real winner who is then owed more than the vault has left. Concretely,",
-        "with `S = 100` outstanding complete sets: if the hatch opened at the",
-        "bare `settlement_deadline`, Alice could pro-rata-redeem 50 UP for 25",
-        "(vault: 100 -> 75), the oracle could then finalize DOWN, and Bob --",
-        "holding 100 DOWN, owed 100 -- would find only 75 left; his",
-        "`checked_sub` fails and he can never redeem at all, a strictly worse",
-        "outcome (total lockup) than the bug this instruction exists to fix.",
-        "Gating on `final_settlement_deadline` instead makes `redeem_unresolved`",
-        "and `redeem_winning` strictly mutually exclusive: by the time this",
-        "hatch can open, `publish_pyth_settlement` is guaranteed to already be",
-        "permanently closed (see its own doc comment), so `oracle.finalized`",
-        "can never subsequently flip from false to true underneath a",
-        "redemption that already happened.",
-        "",
-        "Payout formula -- why pro-rata rather than a hardcoded `amount / 2`:",
-        "- At the instant the hatch first opens, `vault == up_mint.supply ==",
-        "down_mint.supply` always holds (`mint_complete_set`/",
-        "`burn_complete_set` move all three by the identical amount every",
-        "time -- see their own `require!` checks), so `total == 2 * vault`",
-        "and the formula reduces to exactly `amount / 2` -- the standard",
-        "\"unresolvable market resolves 50/50\" convention (the same rule",
-        "Polymarket applies to markets UMA cannot resolve).",
-        "- It stays exact under ANY redemption order, unlike a hardcoded half:",
-        "floor division leaves rounding dust in the vault after most",
-        "individual redemptions, but the FINAL redemption -- whichever side",
-        "still has supply once the other side has fully burned/redeemed to",
-        "zero -- always has `amount == total_supply`, so its payout is",
-        "`amount * vault / amount == vault` exactly, draining the vault to",
-        "zero with no dust left over (see `math::calculate_pro_rata_redemption`'s",
-        "own doc comment and tests). A flat `amount / 2` would leave dust in",
-        "the vault forever, and with `close_settled_market` now requiring an",
-        "empty vault (see `CloseSettledMarket::collateral_vault`), permanent",
-        "dust would mean the market -- and its rent -- could never be closed.",
-        "- It cannot be manipulated by minting/burning around a redemption:",
-        "`mint_complete_set` moves `vault += a` and `total_supply += 2a`;",
-        "`burn_complete_set` moves `vault -= a` and `total_supply -= 2a`.",
-        "Both preserve `vault / total_supply` exactly, so nobody can shift",
-        "the ratio in their favor before redeeming.",
-        "",
-        "Guardian: like `burn_complete_set`/`redeem_winning`, this is an exit",
-        "path -- deliberately NOT gated on `config.paused` or `market.enabled`."
-      ],
-      "discriminator": [
-        94,
-        144,
-        129,
-        29,
-        214,
-        131,
-        149,
-        78
-      ],
-      "accounts": [
-        {
-          "name": "redeemer",
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "market",
-          "relations": [
-            "oracle"
-          ]
-        },
-        {
-          "name": "oracle",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  97,
-                  99,
-                  108,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "upMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  117,
-                  112,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "downMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  100,
-                  111,
-                  119,
-                  110,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "collateralVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "redeemerToken",
-          "writable": true
-        },
-        {
-          "name": "redeemerDestination",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "redeemWinning",
-      "docs": [
-        "Redeems `amount` of the market's WINNING conditional token for",
-        "`amount` collateral, once the oracle has finalized. The winner rule:",
-        "UP wins if the finalized price is *strictly* above `market.strike`,",
-        "DOWN otherwise (an exact tie goes to DOWN) -- see `math::up_wins`.",
-        "The losing side can never redeem: `redeemer_token.mint` is checked",
-        "against whichever side actually won.",
-        "",
-        "Guardian: like `burn_complete_set`, deliberately NOT gated on",
-        "`config.paused` -- a winner must always be able to claim their",
-        "payout, exactly the same rationale `settle`/`close_pool_position`",
-        "document for staying pause-independent."
-      ],
-      "discriminator": [
-        191,
-        44,
-        57,
-        7,
-        31,
-        46,
-        190,
-        162
-      ],
-      "accounts": [
-        {
-          "name": "redeemer",
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "market",
-          "relations": [
-            "oracle"
-          ]
-        },
-        {
-          "name": "oracle",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  97,
-                  99,
-                  108,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "upMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  117,
-                  112,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "downMint",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  100,
-                  111,
-                  119,
-                  110,
-                  45,
-                  109,
-                  105,
-                  110,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "collateralVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  115,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "redeemerToken",
-          "writable": true
-        },
-        {
-          "name": "redeemerDestination",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "refundPoolPosition",
       "discriminator": [
         45,
@@ -3495,143 +2103,6 @@ export type Vsol = {
           "docs": [
             "must be the buyer stored in the position."
           ],
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "refundUnsettled",
-      "discriminator": [
-        24,
-        76,
-        163,
-        75,
-        241,
-        208,
-        12,
-        204
-      ],
-      "accounts": [
-        {
-          "name": "cranker",
-          "signer": true
-        },
-        {
-          "name": "market",
-          "relations": [
-            "oracle",
-            "position"
-          ]
-        },
-        {
-          "name": "oracle",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  97,
-                  99,
-                  108,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "nonceRecord",
-          "relations": [
-            "position"
-          ]
-        },
-        {
-          "name": "position",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "nonceRecord"
-              }
-            ]
-          }
-        },
-        {
-          "name": "positionVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "position"
-              }
-            ]
-          }
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market",
-            "position"
-          ]
-        },
-        {
-          "name": "buyerDestination",
-          "writable": true
-        },
-        {
-          "name": "makerDestination",
-          "writable": true
-        },
-        {
-          "name": "rentRecipient",
           "writable": true
         },
         {
@@ -3966,168 +2437,6 @@ export type Vsol = {
           "type": "bool"
         }
       ]
-    },
-    {
-      "name": "settle",
-      "discriminator": [
-        175,
-        42,
-        185,
-        87,
-        144,
-        131,
-        102,
-        212
-      ],
-      "accounts": [
-        {
-          "name": "cranker",
-          "signer": true
-        },
-        {
-          "name": "config",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "market",
-          "relations": [
-            "oracle",
-            "position"
-          ]
-        },
-        {
-          "name": "oracle",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  111,
-                  114,
-                  97,
-                  99,
-                  108,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          },
-          "relations": [
-            "market"
-          ]
-        },
-        {
-          "name": "nonceRecord",
-          "relations": [
-            "position"
-          ]
-        },
-        {
-          "name": "position",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "nonceRecord"
-              }
-            ]
-          }
-        },
-        {
-          "name": "positionVault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110,
-                  45,
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "position"
-              }
-            ]
-          }
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "market",
-            "position"
-          ]
-        },
-        {
-          "name": "buyerDestination",
-          "writable": true
-        },
-        {
-          "name": "makerDestination",
-          "writable": true
-        },
-        {
-          "name": "treasuryDestination",
-          "writable": true
-        },
-        {
-          "name": "rentRecipient",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": []
     },
     {
       "name": "settlePoolPosition",
@@ -4837,113 +3146,6 @@ export type Vsol = {
           "type": "i64"
         }
       ]
-    },
-    {
-      "name": "withdrawWriter",
-      "discriminator": [
-        232,
-        244,
-        184,
-        16,
-        129,
-        82,
-        99,
-        248
-      ],
-      "accounts": [
-        {
-          "name": "config",
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "maker",
-          "signer": true,
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "settlementMint",
-          "relations": [
-            "writerVault"
-          ]
-        },
-        {
-          "name": "writerVault",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "config"
-              },
-              {
-                "kind": "account",
-                "path": "maker"
-              },
-              {
-                "kind": "account",
-                "path": "settlementMint"
-              }
-            ]
-          }
-        },
-        {
-          "name": "writerToken",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  119,
-                  114,
-                  105,
-                  116,
-                  101,
-                  114,
-                  45,
-                  116,
-                  111,
-                  107,
-                  101,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "writerVault"
-              }
-            ]
-          }
-        },
-        {
-          "name": "makerDestination",
-          "writable": true
-        },
-        {
-          "name": "tokenProgram",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
     }
   ],
   "accounts": [
@@ -5078,32 +3280,6 @@ export type Vsol = {
       ]
     },
     {
-      "name": "position",
-      "discriminator": [
-        170,
-        188,
-        143,
-        228,
-        122,
-        64,
-        247,
-        208
-      ]
-    },
-    {
-      "name": "quoteNonce",
-      "discriminator": [
-        26,
-        217,
-        189,
-        138,
-        190,
-        234,
-        161,
-        245
-      ]
-    },
-    {
       "name": "settlementOracle",
       "discriminator": [
         197,
@@ -5114,19 +3290,6 @@ export type Vsol = {
         199,
         205,
         249
-      ]
-    },
-    {
-      "name": "writerVault",
-      "discriminator": [
-        121,
-        228,
-        9,
-        143,
-        36,
-        122,
-        20,
-        9
       ]
     }
   ],
@@ -5155,32 +3318,6 @@ export type Vsol = {
         59,
         68,
         112
-      ]
-    },
-    {
-      "name": "completeSetBurned",
-      "discriminator": [
-        202,
-        191,
-        88,
-        162,
-        119,
-        157,
-        167,
-        98
-      ]
-    },
-    {
-      "name": "completeSetMinted",
-      "discriminator": [
-        138,
-        100,
-        135,
-        145,
-        242,
-        178,
-        224,
-        155
       ]
     },
     {
@@ -5379,19 +3516,6 @@ export type Vsol = {
       ]
     },
     {
-      "name": "nonceCancelled",
-      "discriminator": [
-        97,
-        165,
-        3,
-        200,
-        228,
-        217,
-        28,
-        102
-      ]
-    },
-    {
       "name": "pauseUpdated",
       "discriminator": [
         203,
@@ -5457,45 +3581,6 @@ export type Vsol = {
       ]
     },
     {
-      "name": "positionRefunded",
-      "discriminator": [
-        48,
-        21,
-        180,
-        80,
-        135,
-        253,
-        10,
-        255
-      ]
-    },
-    {
-      "name": "positionSettled",
-      "discriminator": [
-        75,
-        100,
-        92,
-        189,
-        245,
-        116,
-        252,
-        221
-      ]
-    },
-    {
-      "name": "quoteFilled",
-      "discriminator": [
-        205,
-        53,
-        159,
-        86,
-        117,
-        4,
-        177,
-        64
-      ]
-    },
-    {
       "name": "settlementPublished",
       "discriminator": [
         189,
@@ -5506,71 +3591,6 @@ export type Vsol = {
         237,
         134,
         134
-      ]
-    },
-    {
-      "name": "unresolvedRedeemed",
-      "discriminator": [
-        45,
-        128,
-        62,
-        73,
-        20,
-        116,
-        3,
-        220
-      ]
-    },
-    {
-      "name": "winningRedeemed",
-      "discriminator": [
-        46,
-        214,
-        83,
-        245,
-        144,
-        28,
-        187,
-        212
-      ]
-    },
-    {
-      "name": "writerDeposited",
-      "discriminator": [
-        107,
-        98,
-        55,
-        224,
-        211,
-        129,
-        117,
-        168
-      ]
-    },
-    {
-      "name": "writerVaultInitialized",
-      "discriminator": [
-        201,
-        103,
-        130,
-        252,
-        47,
-        75,
-        7,
-        22
-      ]
-    },
-    {
-      "name": "writerWithdrawn",
-      "discriminator": [
-        24,
-        148,
-        142,
-        220,
-        115,
-        175,
-        244,
-        84
       ]
     }
   ],
@@ -5707,226 +3727,201 @@ export type Vsol = {
     },
     {
       "code": 6026,
-      "name": "invalidWriterVault",
-      "msg": "The writer vault is invalid."
-    },
-    {
-      "code": 6027,
       "name": "insufficientWriterLiquidity",
       "msg": "The writer does not have enough available collateral."
     },
     {
-      "code": 6028,
+      "code": 6027,
       "name": "collateralMismatch",
       "msg": "Escrow does not exactly equal premium plus maximum payout."
     },
     {
-      "code": 6029,
+      "code": 6028,
       "name": "eligibilityRequired",
       "msg": "An eligibility account is required."
     },
     {
-      "code": 6030,
+      "code": 6029,
       "name": "invalidEligibility",
       "msg": "The eligibility account is invalid."
     },
     {
-      "code": 6031,
+      "code": 6030,
       "name": "ineligibleWallet",
       "msg": "The wallet is not eligible to trade."
     },
     {
-      "code": 6032,
+      "code": 6031,
       "name": "invalidMarket",
       "msg": "The market account is invalid."
     },
     {
-      "code": 6033,
+      "code": 6032,
       "name": "invalidOracle",
       "msg": "The oracle account is invalid."
     },
     {
-      "code": 6034,
+      "code": 6033,
       "name": "oracleAlreadyFinalized",
       "msg": "The settlement oracle is already finalized."
     },
     {
-      "code": 6035,
+      "code": 6034,
       "name": "oracleNotFinalized",
       "msg": "The settlement oracle is not finalized."
     },
     {
-      "code": 6036,
+      "code": 6035,
       "name": "invalidOraclePrice",
       "msg": "The oracle price is invalid."
     },
     {
-      "code": 6037,
+      "code": 6036,
       "name": "invalidObservationTime",
       "msg": "The oracle observation timestamp is outside the approved window."
     },
     {
-      "code": 6038,
+      "code": 6037,
       "name": "settlementWindowClosed",
       "msg": "The settlement publication window is closed."
     },
     {
-      "code": 6039,
+      "code": 6038,
       "name": "oracleConfidenceTooWide",
       "msg": "The oracle confidence interval is too wide."
     },
     {
-      "code": 6040,
+      "code": 6039,
       "name": "settlementWindowOpen",
       "msg": "The settlement fallback window is still open."
     },
     {
-      "code": 6041,
+      "code": 6040,
       "name": "invalidPosition",
       "msg": "The position is invalid."
     },
     {
-      "code": 6042,
+      "code": 6041,
       "name": "positionNotOpen",
       "msg": "The position is not open."
     },
     {
-      "code": 6043,
+      "code": 6042,
       "name": "invalidNonce",
       "msg": "The quote nonce record is invalid."
     },
     {
-      "code": 6044,
+      "code": 6043,
       "name": "invalidDestination",
       "msg": "A settlement destination token account is invalid."
     },
     {
-      "code": 6045,
+      "code": 6044,
       "name": "poolHasOpenPositions",
       "msg": "The liquidity pool has active collateral obligations."
     },
     {
-      "code": 6046,
+      "code": 6045,
       "name": "invalidPoolShares",
       "msg": "The liquidity pool share amount is invalid."
     },
     {
-      "code": 6047,
+      "code": 6046,
       "name": "poolInsolvent",
       "msg": "The liquidity pool has no assets backing outstanding shares."
     },
     {
-      "code": 6048,
+      "code": 6047,
       "name": "depositTooSmall",
       "msg": "The deposit or withdrawal is too small after conservative rounding."
     },
     {
-      "code": 6049,
+      "code": 6048,
       "name": "slippageExceeded",
       "msg": "The requested minimum output was not met."
     },
     {
-      "code": 6050,
+      "code": 6049,
       "name": "deadlineExpired",
       "msg": "The transaction deadline has expired."
     },
     {
-      "code": 6051,
+      "code": 6050,
       "name": "invalidPoolRiskLimits",
       "msg": "The liquidity pool risk limits are invalid."
     },
     {
-      "code": 6052,
+      "code": 6051,
       "name": "poolMarketDisabled",
       "msg": "The liquidity pool is not enabled for this market."
     },
     {
-      "code": 6053,
+      "code": 6052,
       "name": "invalidLastTradeCutoff",
       "msg": "The market's last-trade cutoff is invalid."
     },
     {
-      "code": 6054,
+      "code": 6053,
       "name": "lastTradeCutoffReached",
       "msg": "The market's last-trade cutoff has been reached."
     },
     {
-      "code": 6055,
+      "code": 6054,
       "name": "poolUtilizationExceeded",
       "msg": "The liquidity pool utilization limit would be exceeded."
     },
     {
-      "code": 6056,
+      "code": 6055,
       "name": "poolPositionLimitExceeded",
       "msg": "The position exceeds the liquidity pool's per-position risk limit."
     },
     {
-      "code": 6057,
+      "code": 6056,
       "name": "buybackExceedsMaxPayout",
       "msg": "The buyback amount cannot exceed the position's maximum payout."
     },
     {
-      "code": 6058,
+      "code": 6057,
       "name": "marketNotCloseable",
       "msg": "The market cannot be closed yet: its settlement window has not fully elapsed, or its pool authorization is still enabled."
     },
     {
-      "code": 6059,
+      "code": 6058,
       "name": "invalidPoolMarket",
       "msg": "The supplied pool/pool-market pair is invalid or inconsistent."
     },
     {
-      "code": 6060,
+      "code": 6059,
       "name": "noPendingPoolUpdate",
       "msg": "There is no pending liquidity pool update to apply or cancel."
     },
     {
-      "code": 6061,
+      "code": 6060,
       "name": "poolUpdateTimelocked",
       "msg": "The pending liquidity pool update's timelock has not yet elapsed."
     },
     {
-      "code": 6062,
+      "code": 6061,
       "name": "invalidStrike",
       "msg": "The market strike must be positive."
     },
     {
-      "code": 6063,
-      "name": "losingSideNotRedeemable",
-      "msg": "The supplied token account does not match the market's winning side."
-    },
-    {
-      "code": 6064,
-      "name": "marketHasOutstandingCollateral",
-      "msg": "The market's collateral vault still holds outstanding complete-set collateral: redeem or burn every outstanding complete set before closing this market."
-    },
-    {
-      "code": 6065,
-      "name": "invalidConditionalTokenMint",
-      "msg": "The supplied token account does not belong to either the UP or DOWN mint."
-    },
-    {
-      "code": 6066,
-      "name": "nothingToRedeem",
-      "msg": "There is no outstanding conditional-token supply left to redeem."
-    },
-    {
-      "code": 6067,
+      "code": 6062,
       "name": "customFeedNotYetFresh",
       "msg": "The custom price feed has not yet updated past this market's expiry."
     },
     {
-      "code": 6068,
+      "code": 6063,
       "name": "customFeedStale",
       "msg": "The custom price feed has not updated recently enough to settle with."
     },
     {
-      "code": 6069,
+      "code": 6064,
       "name": "customFeedFromFuture",
       "msg": "The custom price feed timestamp is in the future."
     },
     {
-      "code": 6070,
+      "code": 6065,
       "name": "customFeedTimestampNotIncreasing",
       "msg": "The custom price feed timestamp must increase strictly."
     }
@@ -5952,46 +3947,6 @@ export type Vsol = {
           {
             "name": "pendingAdmin",
             "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
-      "name": "completeSetBurned",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "burner",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "completeSetMinted",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "minter",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
           }
         ]
       }
@@ -6943,22 +4898,6 @@ export type Vsol = {
       }
     },
     {
-      "name": "nonceCancelled",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "nonce",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "openPositionCount",
       "type": {
         "kind": "type",
@@ -7276,234 +5215,6 @@ export type Vsol = {
       }
     },
     {
-      "name": "position",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "vaultBump",
-            "type": "u8"
-          },
-          {
-            "name": "status",
-            "type": "u8"
-          },
-          {
-            "name": "direction",
-            "type": "u8"
-          },
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "nonceRecord",
-            "type": "pubkey"
-          },
-          {
-            "name": "buyer",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "settlementMint",
-            "type": "pubkey"
-          },
-          {
-            "name": "nonce",
-            "type": "u64"
-          },
-          {
-            "name": "strike",
-            "type": "u64"
-          },
-          {
-            "name": "width",
-            "type": "u64"
-          },
-          {
-            "name": "premium",
-            "type": "u64"
-          },
-          {
-            "name": "maxPayout",
-            "type": "u64"
-          },
-          {
-            "name": "feeBps",
-            "type": "u16"
-          },
-          {
-            "name": "openedAt",
-            "type": "i64"
-          },
-          {
-            "name": "quoteExpiry",
-            "type": "i64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "positionRefunded",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "position",
-            "type": "pubkey"
-          },
-          {
-            "name": "premium",
-            "type": "u64"
-          },
-          {
-            "name": "collateral",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "positionSettled",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "position",
-            "type": "pubkey"
-          },
-          {
-            "name": "settlementPrice",
-            "type": "u64"
-          },
-          {
-            "name": "payout",
-            "type": "u64"
-          },
-          {
-            "name": "makerAmount",
-            "type": "u64"
-          },
-          {
-            "name": "fee",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "quoteArgs",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "nonce",
-            "type": "u64"
-          },
-          {
-            "name": "direction",
-            "type": "u8"
-          },
-          {
-            "name": "strike",
-            "type": "u64"
-          },
-          {
-            "name": "width",
-            "type": "u64"
-          },
-          {
-            "name": "premium",
-            "type": "u64"
-          },
-          {
-            "name": "maxPayout",
-            "type": "u64"
-          },
-          {
-            "name": "quoteExpiry",
-            "type": "i64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "quoteFilled",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "position",
-            "type": "pubkey"
-          },
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "buyer",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "nonce",
-            "type": "u64"
-          },
-          {
-            "name": "premium",
-            "type": "u64"
-          },
-          {
-            "name": "maxPayout",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "quoteNonce",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "status",
-            "type": "u8"
-          },
-          {
-            "name": "config",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "nonce",
-            "type": "u64"
-          },
-          {
-            "name": "position",
-            "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
       "name": "setLiquidityPoolMarketArgs",
       "type": {
         "kind": "struct",
@@ -7618,34 +5329,6 @@ export type Vsol = {
       }
     },
     {
-      "name": "unresolvedRedeemed",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "redeemer",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
-          },
-          {
-            "name": "payout",
-            "type": "u64"
-          },
-          {
-            "name": "redeemedUp",
-            "type": "bool"
-          }
-        ]
-      }
-    },
-    {
       "name": "updateConfigArgs",
       "type": {
         "kind": "struct",
@@ -7693,110 +5376,6 @@ export type Vsol = {
           {
             "name": "maxPositionBps",
             "type": "u16"
-          }
-        ]
-      }
-    },
-    {
-      "name": "winningRedeemed",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "redeemer",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
-          },
-          {
-            "name": "upWon",
-            "type": "bool"
-          }
-        ]
-      }
-    },
-    {
-      "name": "writerDeposited",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "writerVault",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "writerVault",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "tokenBump",
-            "type": "u8"
-          },
-          {
-            "name": "config",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "settlementMint",
-            "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
-      "name": "writerVaultInitialized",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "writerVault",
-            "type": "pubkey"
-          },
-          {
-            "name": "maker",
-            "type": "pubkey"
-          },
-          {
-            "name": "settlementMint",
-            "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
-      "name": "writerWithdrawn",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "writerVault",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
           }
         ]
       }
