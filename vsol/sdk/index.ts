@@ -71,6 +71,34 @@ export const MARKET_MAX_CONFIDENCE_BPS = 500;
 // reverting with `InvalidSettlementStaleness`.
 export const MARKET_MAX_SETTLEMENT_STALENESS_SECONDS = 86_400;
 
+// --- Heartbeat feed ----------------------------------------------------------
+// A dedicated `CustomPriceFeed` under its own reserved 16-byte symbol,
+// entirely independent of every real market symbol (SOL/BTC/ETH/NVDA/...).
+// It is never read by `capture_custom_settlement_observation` or
+// `publish_custom_settlement` for any real market -- its only purpose is to
+// answer "is the settlement runner that publishes real feeds still alive",
+// which used to be inferred (wrongly) from every symbol's OWN feed freshness,
+// a proxy that only a continuously-polling pusher could ever satisfy. See
+// vsol/scripts/init-heartbeat-feed.ts (one-time `init_custom_price_feed` call,
+// admin-gated, idempotent), vsol/scripts/lib/heartbeat.ts (the runner's
+// 5-minute `update_custom_price_feed` publish), and
+// app/lib/custom-oracle-readiness.ts (the reader this constant's staleness
+// bound feeds into).
+export const HEARTBEAT_SYMBOL = "HEARTBEAT";
+// How often vsol/scripts/oracle-runner.ts republishes the heartbeat. Well
+// under `CUSTOM_ORACLE_MAX_STALENESS_SECONDS` (300s, the on-chain ceiling
+// `update_custom_price_feed` itself enforces on `now - observed_at`), and
+// with plenty of headroom below `HEARTBEAT_MAX_AGE_SECONDS` for a couple of
+// missed cycles before readiness flips.
+export const HEARTBEAT_PUBLISH_INTERVAL_SECONDS = 300;
+// The readiness ceiling on how old the last heartbeat may be before
+// `app/lib/custom-oracle-readiness.ts` reports the settlement runner as down.
+// Three full publish intervals (15 minutes): generous enough that a single
+// slow RPC round trip or one skipped pass never flips a healthy runner to
+// "unavailable", while still catching a genuinely stalled/crashed process
+// well within the hour.
+export const HEARTBEAT_MAX_AGE_SECONDS = 900;
+
 // --- Conditional-token strike ladder ----------------------------------------
 //
 // `strike` is a LISTED parameter on a fixed ladder, not one derived fresh
