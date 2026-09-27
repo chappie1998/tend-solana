@@ -117,6 +117,19 @@ can't finish bootstrap), `vsol/.devnet/` (12 keypairs),
   valid (`getVsolExecutionReadiness`), never "price fresh". Why it changed: a 60s pusher can
   miss an intraday market's 60s observation window (it may then only refund), and the old
   5s poller exhausted the RPC quota.
+- **RPC: one failover connection everywhere** (`createVsolConnection`, `vsol/sdk/rpc-failover/`):
+  `VSOL_RPC_URL` (Helius) → `VSOL_RPC_BACKUP_URL` (Alchemy devnet) → public devnet. Alchemy's
+  free tier REJECTS `getProgramAccounts`, so those fall through to public devnet. Transaction
+  confirmation polls over HTTP (web3.js's websocket confirm bypasses the failover). Never
+  construct `new Connection(` directly.
+- **Deploying the program: never pass `--use-rpc` against a rate-limited RPC.** ~800 buffer
+  writes exhausted Alchemy and failed mid-deploy (the orphan buffer's rent had to be recovered
+  with `solana program close`). Deploy with `--url https://api.devnet.solana.com` and no
+  `--use-rpc`: writes go straight to leaders over QUIC.
+- **Pool bindings exist at TWO sizes: 82 bytes (pre-2026-09-28) and 86 (with
+  `open_positions`).** Never filter or decode `LiquidityPoolMarket` by a single `dataSize`,
+  and never use Anchor's `program.account.liquidityPoolMarket.fetch*` (it overreads a legacy
+  account). A size-pinned reader broke production executable quotes after the upgrade.
 - **Never poll `getProgramAccounts` on a short loop.** A 5s settle loop (running since
   2026-09-21) exhausted the Helius monthly quota on 2026-09-26 (`-32429 "max usage
   reached"`) and took production down. Expiries are on a known grid — sleep until them.
