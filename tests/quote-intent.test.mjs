@@ -60,7 +60,7 @@ test("the execute branch still builds and persists exactly as before, and marks 
 test("the DB-backed per-wallet rate limit is checked ONLY for intent === execute, and before every chain read on that path", async () => {
   const source = await routeSource();
   const rateLimitCheckIndex = source.indexOf("checkExecutableQuoteRateLimit(recentCreatedAtMsForWallet, requestedAt)");
-  const oracleReadinessIndex = source.indexOf("getCustomOracleReadiness(");
+  const oracleReadinessIndex = source.indexOf("getVsolExecutionReadiness(");
   const seriesResolutionIndex = source.indexOf("resolveOrPlanVsolSeries(");
   const poolDepthIndex = source.indexOf("checkVsolPoolDepth(");
   const buildTransactionIndex = source.indexOf("buildVsolQuoteTransaction({");

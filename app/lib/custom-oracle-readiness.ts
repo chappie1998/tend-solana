@@ -6,7 +6,6 @@ import {
   deriveCustomPriceFeed,
   HEARTBEAT_MAX_AGE_SECONDS,
   HEARTBEAT_SYMBOL,
-  MARKET_MAX_CONFIDENCE_BPS,
   PRICE_SCALE,
 } from "../../vsol/sdk/index.ts";
 import { decodeConfigAccount, getVsolConnection } from "./vsol-server.ts";
@@ -15,33 +14,6 @@ import { decodeClockUnixTimestamp } from "./solana-clock.ts";
 
 const FEED_DISCRIMINATOR = createHash("sha256").update("account:CustomPriceFeed").digest().subarray(0, 8);
 const FEED_SIZE = 89;
-// NOTE ON THIS CONSTANT'S CONTINUED RELEVANCE: it was sized against a
-// continuously-running 60-second-cadence pusher (formerly
-// vsol/scripts/custom-oracle-pusher.ts's forever loop; its push logic now
-// lives, un-looped, in vsol/scripts/lib/oracle-feed.ts). That pusher is
-// RETIRED -- see vsol/scripts/oracle-runner.ts's module doc -- and a live
-// market's own feed is now written only right when that market is about to
-// expire, so it can legitimately sit untouched for hours between
-// settlements under the new architecture. This constant and
-// `assessCustomPriceFeed`/`getCustomOracleReadiness` below are left
-// UNCHANGED regardless: app/api/quotes/route.ts (owned by a different
-// change, not this one) still calls `getCustomOracleReadiness` to gate a
-// SPECIFIC symbol's pre-quote freshness, and that call site's contract must
-// not shift underneath it here. See `getVsolExecutionReadiness` further down
-// for the NEW, heartbeat-based notion of "is the settlement runner alive"
-// that app/api/vsol/status/route.ts now uses instead -- that one does NOT
-// require any symbol's price to be continuously fresh.
-export const CUSTOM_ORACLE_READY_MAX_AGE_SECONDS = 150;
-
-export type CustomOracleReadiness = {
-  symbol: string;
-  ready: boolean;
-  source: "Coinbase Exchange" | "Hyperliquid xyz mark";
-  observedAt: number | null;
-  ageSeconds: number | null;
-  reason?: string;
-};
-
 function symbolBytes(symbol: string): Buffer {
   const result = Buffer.alloc(16);
   result.write(symbol, "ascii");
@@ -62,62 +34,14 @@ export function decodeCustomPriceFeed(data: Buffer) {
   };
 }
 
-export function assessCustomPriceFeed(params: {
-  symbol: string;
-  account: AccountInfo<Buffer> | null;
-  oracleAuthority: PublicKey;
-  now: number;
-}): CustomOracleReadiness {
-  const source = params.symbol === "SOL" || params.symbol === "BTC" || params.symbol === "ETH"
-    ? "Coinbase Exchange" as const
-    : "Hyperliquid xyz mark" as const;
-  const fail = (reason: string, observedAt: number | null = null, ageSeconds: number | null = null): CustomOracleReadiness => ({
-    symbol: params.symbol, source, ready: false, observedAt, ageSeconds, reason,
-  });
-  if (!params.account) return fail("Custom oracle feed is not initialized");
-  if (!params.account.owner.equals(VSOL_PROGRAM_ID)) return fail("Custom oracle feed has the wrong owner");
-  let feed;
-  try { feed = decodeCustomPriceFeed(Buffer.from(params.account.data)); } catch { return fail("Custom oracle feed layout is invalid"); }
-  if (!feed.symbol.equals(symbolBytes(params.symbol))) return fail("Custom oracle feed symbol does not match");
-  if (feed.priceScale !== PRICE_SCALE) return fail("Custom oracle feed price scale does not match");
-  if (feed.price <= 0n) return fail("Custom oracle feed has no positive price", feed.observedAt, null);
-  if (feed.confidence * 10_000n > feed.price * BigInt(MARKET_MAX_CONFIDENCE_BPS)) {
-    return fail("Custom oracle confidence exceeds the market limit", feed.observedAt, null);
-  }
-  if (!feed.publisher.equals(params.oracleAuthority)) return fail("Custom oracle publisher does not match current authority", feed.observedAt, null);
-  if (feed.observedAt > params.now) return fail("Custom oracle timestamp is in the future", feed.observedAt, 0);
-  const ageSeconds = params.now - feed.observedAt;
-  if (ageSeconds > CUSTOM_ORACLE_READY_MAX_AGE_SECONDS) return fail(`Custom oracle feed is ${ageSeconds}s old`, feed.observedAt, ageSeconds);
-  return { symbol: params.symbol, source, ready: true, observedAt: feed.observedAt, ageSeconds };
-}
-
-export async function getCustomOracleReadiness(
-  symbols: readonly string[] = liveMarkets.map((market) => market.symbol),
-  connection: Connection = getVsolConnection(),
-): Promise<CustomOracleReadiness[]> {
-  const configKey = deriveConfig();
-  const feedKeys = symbols.map((symbol) => deriveCustomPriceFeed(symbol));
-  const [configAccount, clockAccount, ...feedAccounts] = await connection.getMultipleAccountsInfo(
-    [configKey, SYSVAR_CLOCK_PUBKEY, ...feedKeys],
-    "confirmed",
-  );
-  if (!configAccount?.owner.equals(VSOL_PROGRAM_ID)) throw new Error("VSOL config is unavailable or has the wrong owner");
-  const config = decodeConfigAccount(Buffer.from(configAccount.data));
-  const blockTime = decodeClockUnixTimestamp(clockAccount);
-  return symbols.map((symbol, index) => assessCustomPriceFeed({
-    symbol,
-    account: feedAccounts[index],
-    oracleAuthority: config.oracleAuthority,
-    now: blockTime,
-  }));
-}
-
-// --- Runner-liveness readiness (the "Execution unavailable" badge) ---------
+// --- Runner-liveness readiness ---------------------------------------------
 //
-// `assessCustomPriceFeed`/`getCustomOracleReadiness` above are UNCHANGED and
-// still power app/api/quotes/route.ts's per-symbol pre-quote gate -- that
-// gate legitimately needs to know a SPECIFIC symbol's feed is fresh before
-// quoting it, and this file must not change what that call site sees.
+// There is deliberately no per-symbol "price is fresh" check any more. The
+// continuous pusher that could keep every feed fresh is retired, and fills
+// never read the feed (CUSTOM_ORACLE_MAX_STALENESS_SECONDS is enforced only
+// by update_custom_price_feed), so freshness was never what a sale depended
+// on. Both the quote route's pre-quote gate and the status badge use
+// getVsolExecutionReadiness below.
 //
 // The functions below answer a DIFFERENT question for
 // app/api/vsol/status/route.ts's UI badge: not "is every symbol's price

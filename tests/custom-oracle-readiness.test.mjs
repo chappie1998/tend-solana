@@ -17,32 +17,6 @@ function feedData({ symbol = "NVDA", price = 100_000_000n, confidence = 10n, sca
   return data;
 }
 
-test("custom oracle readiness validates owner, publisher, scale, price and age", async () => {
-  const { assessCustomPriceFeed } = await import(new URL("app/lib/custom-oracle-readiness.ts", root));
-  const { VSOL_PROGRAM_ID } = await import(new URL("app/lib/vsol.ts", root));
-  const authority = new PublicKey(Buffer.alloc(32, 7));
-  const account = (data, owner = VSOL_PROGRAM_ID) => ({ data, owner, executable: false, lamports: 1, rentEpoch: 0 });
-
-  const healthy = assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_020 });
-  assert.equal(healthy.ready, true);
-  assert.equal(healthy.source, "Hyperliquid xyz mark");
-  assert.equal(healthy.ageSeconds, 20);
-
-  assert.equal(assessCustomPriceFeed({ symbol: "NVDA", account: null, oracleAuthority: authority, now: 1_020 }).ready, false);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority }), PublicKey.default), oracleAuthority: authority, now: 1_020 }).reason, /wrong owner/);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: PublicKey.default })), oracleAuthority: authority, now: 1_020 }).reason, /publisher/);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, scale: 10n })), oracleAuthority: authority, now: 1_020 }).reason, /scale/);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, price: 0n })), oracleAuthority: authority, now: 1_020 }).reason, /positive/);
-  assert.equal(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, confidence: 5_000_000n })), oracleAuthority: authority, now: 1_020 }).ready, true);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority, confidence: 5_000_001n })), oracleAuthority: authority, now: 1_020 }).reason, /confidence/);
-  // The age gate tracks CUSTOM_ORACLE_READY_MAX_AGE_SECONDS (150s), which must
-  // stay above the pusher's 60s cadence and below the program's own 300s
-  // staleness cap. Both sides of the boundary are pinned so a change to either
-  // constant has to be deliberate.
-  assert.equal(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_150 }).ready, true);
-  assert.match(assessCustomPriceFeed({ symbol: "NVDA", account: account(feedData({ publisher: authority })), oracleAuthority: authority, now: 1_151 }).reason, /151s old/);
-});
-
 test("heartbeat readiness: fresh, stale, wrong publisher, and missing feed account", async () => {
   const { assessHeartbeatFeed } = await import(new URL("app/lib/custom-oracle-readiness.ts", root));
   const { VSOL_PROGRAM_ID } = await import(new URL("app/lib/vsol.ts", root));

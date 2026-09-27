@@ -11,7 +11,7 @@ import { rfqQuotes } from "../../../db/schema";
 import { and, gte, like, lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
-import { getCustomOracleReadiness } from "../../lib/custom-oracle-readiness";
+import { getVsolExecutionReadiness } from "../../lib/custom-oracle-readiness";
 import {
   buildVsolQuoteTransaction,
   checkVsolPoolDepth,
@@ -183,12 +183,21 @@ export async function POST(request: Request) {
   }
 
   try {
-    const [oracle] = await getCustomOracleReadiness([market.symbol]);
-    if (!oracle?.ready) {
+    // Gated on whether this market can actually be SETTLED, not on whether its
+    // price was pushed recently. Prices are now published only at expiry, by
+    // the oracle runner, for markets with open interest -- so a symbol's feed
+    // is normally minutes or hours old and "fresh within 150s" would block
+    // nearly every quote. What a sale genuinely depends on is (a) the runner
+    // being alive to publish+capture at expiry (its heartbeat) and (b) this
+    // symbol's feed account being structurally able to accept that capture.
+    // Fills never read the feed (CUSTOM_ORACLE_MAX_STALENESS_SECONDS is only
+    // enforced by update_custom_price_feed), so neither check is about price.
+    const readiness = await getVsolExecutionReadiness([market.symbol]);
+    if (!readiness.ok) {
       return json({
-        error: `${market.symbol} quoting is paused because its settlement oracle is not fresh. ${oracle?.reason ?? "Feed state is unavailable."}`,
+        error: `${market.symbol} quoting is paused because its settlement oracle cannot currently settle new positions. ${readiness.reason ?? "Oracle state is unavailable."}`,
         code: "VSOL_CUSTOM_ORACLE_NOT_READY",
-        oracle: oracle ?? { symbol: market.symbol, ready: false },
+        oracle: { symbol: market.symbol, ready: false, reason: readiness.reason },
       }, 503);
     }
   } catch (error) {
