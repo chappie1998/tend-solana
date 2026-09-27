@@ -224,7 +224,7 @@ const CONFIG_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("Config");
 const ORACLE_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("SettlementOracle");
 const POOL_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPool");
 const PROVIDER_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityProvider");
-const POOL_MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPoolMarket");
+export const POOL_MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPoolMarket");
 const POOL_POSITION_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("PoolPosition");
 
 // Re-exported under the historical name: callers throughout this file (and
@@ -463,13 +463,23 @@ function decodeProviderAccount(data: Buffer) {
   };
 }
 
+// A pool binding is 82 bytes if it predates the 2026-09-28 program upgrade
+// and 86 once it carries the `open_positions` counter. Both are live on
+// devnet, so both must decode; a decoder pinned to one size rejects the
+// other outright (this broke executable quotes the moment the first new
+// binding was listed).
+const POOL_MARKET_ACCOUNT_SIZES = [82, 86] as const;
+
 export function decodePoolMarketAccount(data: Buffer) {
-  expectAccount(data, 82, POOL_MARKET_ACCOUNT_DISCRIMINATOR, "VSOL pool market");
+  const size = (POOL_MARKET_ACCOUNT_SIZES as readonly number[]).includes(data.length) ? data.length : -1;
+  expectAccount(data, size, POOL_MARKET_ACCOUNT_DISCRIMINATOR, "VSOL pool market");
   return {
     pool: publicKeyAt(data, 9),
     market: publicKeyAt(data, 41),
     lastTradeAt: Number(data.readBigInt64LE(73)),
     enabled: data[81] === 1,
+    // null for a legacy binding: its count is the program's UNKNOWN sentinel.
+    openPositions: data.length === 86 ? data.readUInt32LE(82) : null,
   };
 }
 

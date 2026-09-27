@@ -32,6 +32,7 @@ import {
 import {
   fetchAllMarkets,
   fetchLatestPythUpdate,
+  fetchPoolMarketBinding,
   pythPriceToScaledAtoms,
   type DecodedMarketForCleanup,
 } from "./lib/settlement.ts";
@@ -804,8 +805,9 @@ async function authorizeRung(params: {
   }
 
   const poolMarket = deriveLiquidityPoolMarket(pool, market);
-  const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
-  if (existing && existing.enabled && existing.lastTradeAt.toNumber() === series.lastTradeAt) {
+  // Not Anchor's fetchNullable: it cannot decode a legacy 82-byte binding (see fetchPoolMarketBinding).
+  const existing = await fetchPoolMarketBinding(params.managerProgram.provider.connection, poolMarket);
+  if (existing && existing.enabled && existing.lastTradeAt === series.lastTradeAt) {
     console.log(`skip: ${code} pool authorization already current on ${pool.toBase58()}`);
     counters.skipped += 1;
     return;

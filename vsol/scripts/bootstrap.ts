@@ -59,7 +59,7 @@ import {
   type PoolBuyback,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
-import { pythPriceToScaledAtoms } from "./lib/settlement.ts";
+import { fetchPoolMarketBinding, pythPriceToScaledAtoms } from "./lib/settlement.ts";
 // The shared market config -- the same list app/lib/markets.ts serves to the
 // UI and vsol/scripts/keeper.ts mints against. Imported rather than mirrored
 // so "which markets are live" is decided in exactly one file.
@@ -477,8 +477,9 @@ async function authorizePoolMarket(params: {
   lastTradeAt: number;
 }) {
   const poolMarket = deriveLiquidityPoolMarket(params.pool, params.market);
-  const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
-  if (!existing || !existing.enabled || existing.lastTradeAt.toNumber() !== params.lastTradeAt) {
+  // Not Anchor's fetchNullable: it cannot decode a legacy 82-byte binding (see fetchPoolMarketBinding).
+  const existing = await fetchPoolMarketBinding(params.managerProgram.provider.connection, poolMarket);
+  if (!existing || !existing.enabled || existing.lastTradeAt !== params.lastTradeAt) {
     await params.managerProgram.methods
       .setLiquidityPoolMarket({ lastTradeAt: new BN(params.lastTradeAt), enabled: true })
       .accountsStrict({

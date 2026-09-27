@@ -1420,6 +1420,7 @@ export type DecodedPoolMarket = {
   pool: string;
   market: string;
   enabled: boolean;
+  lastTradeAt: number;
   /** `false` for a legacy 82-byte account: its open-position count is the
    * `UNKNOWN` sentinel, not zero, so it can never be proven idle. */
   openPositionsKnown: boolean;
@@ -1433,9 +1434,21 @@ function decodePoolMarketAccountForCleanup(pubkey: PublicKey, data: Buffer): Dec
   const pool = new PublicKey(data.subarray(9, 41)).toBase58();
   const market = new PublicKey(data.subarray(41, 73)).toBase58();
   const enabled = data.readUInt8(81) === 1;
+  const lastTradeAt = Number(data.readBigInt64LE(73));
   const openPositionsKnown = data.length === POOL_MARKET_ACCOUNT_SIZE_CURRENT;
   const openPositions = openPositionsKnown ? data.readUInt32LE(POOL_MARKET_OPEN_POSITIONS_OFFSET) : 0;
-  return { address: pubkey.toBase58(), pool, market, enabled, openPositionsKnown, openPositions };
+  return { address: pubkey.toBase58(), pool, market, enabled, lastTradeAt, openPositionsKnown, openPositions };
+}
+
+/**
+ * Reads ONE pool binding by address, tolerating both byte lengths. Use this
+ * instead of Anchor's `program.account.liquidityPoolMarket.fetch*`: the IDL
+ * declares `open_positions` as a plain u32, so Anchor's decoder reads past
+ * the end of a legacy 82-byte account and throws.
+ */
+export async function fetchPoolMarketBinding(connection: Connection, address: PublicKey): Promise<DecodedPoolMarket | null> {
+  const info = await connection.getAccountInfo(address, "confirmed");
+  return info ? decodePoolMarketAccountForCleanup(address, Buffer.from(info.data)) : null;
 }
 
 /** Enumerates every `LiquidityPoolMarket` account program-wide (both legacy and current byte lengths -- see the comment above). Malformed entries are skipped, never thrown. */
