@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
@@ -106,7 +107,7 @@ async function clusterUnixTime(): Promise<number> {
   return blockTime;
 }
 
-type Counters = { published: number; settled: number; refunded: number; closed: number; skipped: number };
+export type Counters = { published: number; settled: number; refunded: number; closed: number; skipped: number };
 
 function logSummary(counters: Counters): void {
   console.log(
@@ -145,8 +146,15 @@ function isCleanupEnabled(argv: readonly string[], env: NodeJS.ProcessEnv): bool
  * pass never wastes a transaction retrying `close_settled_market` against a
  * market the on-chain `MarketHasOutstandingCollateral` check would simply
  * revert.
+ *
+ * Exported so oracle-runner.ts's hourly cleanup lane can call this exact
+ * function rather than re-implementing the guard -- see that file's module
+ * doc for why cleanup runs on its own, much less frequent cadence than the
+ * 15-minute settlement/refund pass (closing a market has a 7-day buffer
+ * before it is even eligible, via `MARKET_CLEANUP_BUFFER_SECONDS`, so there
+ * is nothing time-sensitive here to justify scanning any more often).
  */
-async function runMarketCleanup(params: {
+export async function runMarketCleanup(params: {
   connection: Connection;
   program: Program<Vsol>;
   cranker: Keypair;
@@ -470,7 +478,15 @@ async function main(): Promise<void> {
   logSummary(counters);
 }
 
-main().catch((error: unknown) => {
-  console.error(redact(error instanceof Error ? error.message : String(error), rpcUrl));
-  process.exitCode = 1;
-});
+// Guarded like every other entrypoint script in this package (see
+// custom-settle.ts / oracle-runner.ts): `runMarketCleanup` above is now also
+// imported directly by oracle-runner.ts's hourly cleanup lane
+// (vsol/tests/*.test.ts import pure helpers from this file too), and an
+// unconditional `main()` call here would fire this cranker's full
+// settlement+cleanup run as a side effect of merely importing the module.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    console.error(redact(error instanceof Error ? error.message : String(error), rpcUrl));
+    process.exitCode = 1;
+  });
+}

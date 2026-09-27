@@ -4,7 +4,7 @@ import { decodeConfigAccount, decodeOracleAccount, decodePoolAccount } from "../
 import { decodeMarketAccount } from "../../app/lib/vsol-market-accounts.ts";
 import { deriveConfig, deriveCustomSettlementObservation } from "../sdk/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
-import { DEVNET_GENESIS_HASH } from "./custom-oracle-pusher.ts";
+import { DEVNET_GENESIS_HASH } from "./lib/oracle-feed.ts";
 import { VSOL_PROGRAM_ID } from "../../app/lib/vsol.ts";
 import { VSOL_RPC_URL } from "../../app/lib/vsol.ts";
 

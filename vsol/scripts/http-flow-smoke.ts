@@ -7,7 +7,7 @@ import { liveMarkets } from "../../app/lib/markets.ts";
 import { siwsMessageBytes } from "../../app/lib/siws.ts";
 import { SESSION_COOKIE_NAME } from "../../app/lib/session-token.ts";
 import { verifyAndCloseSmokePosition } from "./lib/smoke-lifecycle.ts";
-import { DEVNET_GENESIS_HASH } from "./custom-oracle-pusher.ts";
+import { DEVNET_GENESIS_HASH } from "./lib/oracle-feed.ts";
 import { VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "../../app/lib/vsol.ts";
 import { decodePoolPositionAccount } from "../../app/lib/pool-position.ts";
 
