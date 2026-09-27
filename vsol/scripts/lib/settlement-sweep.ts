@@ -12,7 +12,6 @@ import {
   refundPoolPositionOnChain,
   selectMarketsNeedingSettlementAttempt,
   settlePoolPositionOnChain,
-  type DecodedDirectPosition,
   type DecodedMarketForCleanup,
   type DecodedPoolPosition,
 } from "./settlement.ts";
@@ -32,7 +31,7 @@ import {
 // failed, or an earlier pass's did) is simply skipped -- exactly as before --
 // and becomes refundable once its settlement deadline passes, same as ever.
 //
-// Takes ALL of `markets`/`poolPositions`/`directPositions` already fetched
+// Takes ALL of `markets`/`poolPositions` already fetched
 // this pass (the runner's own single getProgramAccounts round) rather than
 // fetching anything program-wide itself, other than the one bounded
 // `getMultipleAccountsInfo`-style lookup (`fetchOracleStates`) that was
@@ -58,18 +57,17 @@ export async function runFullSettlementPass(params: {
   rpcUrl: string;
   markets: readonly DecodedMarketForCleanup[];
   poolPositions: readonly DecodedPoolPosition[];
-  directPositions: readonly DecodedDirectPosition[];
   now: number;
 }): Promise<SettlementSweepCounters> {
   // `connection` stays part of the public params shape (oracle-runner.ts
   // already threads it through) even though this function no longer needs
   // it directly -- the last direct use was `fetchCollateralVaultBalances`
   // for the now-removed V1 collateral-vault check.
-  const { program, cranker, config, rpcUrl, markets, poolPositions, directPositions, now } = params;
+  const { program, cranker, config, rpcUrl, markets, poolPositions, now } = params;
   const counters = emptyCounters();
 
   const marketByAddress = new Map(markets.map((market) => [market.address, market]));
-  const openPositionMarkets = marketsWithOpenPositions({ poolPositions, directPositions });
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions });
 
   const oracleStates = await fetchOracleStates(program, markets.map((market) => new PublicKey(market.oracle)));
   const marketsWithFinalizedOracle = new Set(

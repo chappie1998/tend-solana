@@ -15,7 +15,6 @@ import {
   describeSettlementError,
   fetchAllMarkets,
   fetchAllPoolMarkets,
-  fetchOpenDirectPositions,
   fetchOpenPoolPositions,
   fetchOracleStates,
   fetchPythUpdateForSettlement,
@@ -132,10 +131,9 @@ function isCleanupEnabled(argv: readonly string[], env: NodeJS.ProcessEnv): bool
  * Closes every market that selectMarketCloseCandidates proves safe AND that
  * selectIdlePoolBindingFor can find an idle pool binding for. Must run
  * strictly after the settle/refund phase in the same pass has finished (its
- * caller in main() guarantees this ordering) and re-scans BOTH position
- * account types itself -- via the same fetchOpenPoolPositions the settlement
- * phase uses, plus fetchOpenDirectPositions for the direct-maker path this
- * cranker does not settle -- rather than reusing anything fetched earlier in
+ * caller in main() guarantees this ordering) and re-scans open pool
+ * positions itself -- via the same fetchOpenPoolPositions the settlement
+ * phase uses -- rather than reusing anything fetched earlier in
  * main(), specifically so a PoolPosition just settled or refunded this pass
  * has already dropped out of the union set before any close decision is
  * made. A market referenced by either account type is excluded from
@@ -164,17 +162,13 @@ export async function runMarketCleanup(params: {
   config: PublicKey;
   counters: Counters;
 }): Promise<void> {
-  const [freshPoolPositions, freshDirectPositions, markets, poolMarkets, now] = await Promise.all([
+  const [freshPoolPositions, markets, poolMarkets, now] = await Promise.all([
     fetchOpenPoolPositions(params.connection),
-    fetchOpenDirectPositions(params.connection),
     fetchAllMarkets(params.connection),
     fetchAllPoolMarkets(params.connection),
     clusterUnixTime(),
   ]);
-  const openPositionMarkets = marketsWithOpenPositions({
-    poolPositions: freshPoolPositions,
-    directPositions: freshDirectPositions,
-  });
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions: freshPoolPositions });
 
   const candidates = selectMarketCloseCandidates({
     markets,
@@ -246,9 +240,8 @@ async function runSettlementPhase(params: {
 }): Promise<void> {
   const { connection, program, cranker, config, counters } = params;
 
-  const [poolPositions, directPositions, markets, now] = await Promise.all([
+  const [poolPositions, markets, now] = await Promise.all([
     fetchOpenPoolPositions(connection),
-    fetchOpenDirectPositions(connection),
     fetchAllMarkets(connection),
     clusterUnixTime(),
   ]);
@@ -257,10 +250,7 @@ async function runSettlementPhase(params: {
   }
 
   const marketByAddress = new Map(markets.map((market) => [market.address, market]));
-  const openPositionMarkets = marketsWithOpenPositions({
-    poolPositions,
-    directPositions,
-  });
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions });
 
   // Fetched for every market on the deployment (not just ones already known
   // to be "at stake"), mirroring runMarketCleanup's own philosophy of

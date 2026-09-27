@@ -10,18 +10,14 @@ import {
   confidenceBpsOf,
   decideMarketPublishAction,
   decidePositionAction,
-  decodeDirectPositionMarket,
   decodeMarketAccountForCleanup,
   decodePoolPositionAccount,
   describeSettlementError,
-  DIRECT_POSITION_ACCOUNT_SIZE,
-  DIRECT_POSITION_DISCRIMINATOR,
   filterExpiredOpenPositions,
   groupPositionsByMarket,
   isSettlementPrintAcceptable,
   MARKET_ACCOUNT_DISCRIMINATOR,
   MARKET_ACCOUNT_SIZE,
-  marketsWithOpenPositions,
   POOL_POSITION_ACCOUNT_SIZE,
   POOL_POSITION_DISCRIMINATOR,
   pythPriceToScaledAtoms,
@@ -775,76 +771,6 @@ test("selectMarketCloseCandidates honors the per-run cap, preserving input order
 // is still correct and harmless -- it will simply keep finding zero direct
 // positions on any deployment created after that removal -- but it is a real
 // candidate for deletion in a later, dedicated cleanup pass.
-
-function fixtureDirectPosition(overrides: Partial<{ address: PublicKey; market: PublicKey }> = {}): {
-  address: PublicKey;
-  buffer: Buffer;
-} {
-  const address = overrides.address ?? new PublicKey(Buffer.alloc(32, 0x71));
-  const data = Buffer.alloc(DIRECT_POSITION_ACCOUNT_SIZE);
-  Buffer.from(DIRECT_POSITION_DISCRIMINATOR).copy(data, 0);
-  data[10] = 1; // status: Open
-  (overrides.market ?? new PublicKey(Buffer.alloc(32, 0x72))).toBuffer().copy(data, 12);
-  return { address, buffer: data };
-}
-
-test("decodeDirectPositionMarket reads the market field at its documented offset", () => {
-  const market = new PublicKey(Buffer.alloc(32, 0x81));
-  const { address, buffer } = fixtureDirectPosition({ market });
-  const decoded = decodeDirectPositionMarket(address, buffer);
-  assert.equal(decoded.address, address.toBase58());
-  assert.equal(decoded.market, market.toBase58());
-});
-
-test("decodeDirectPositionMarket rejects the wrong size", () => {
-  const { address, buffer } = fixtureDirectPosition();
-  assert.throws(() => decodeDirectPositionMarket(address, buffer.subarray(0, DIRECT_POSITION_ACCOUNT_SIZE - 1)));
-});
-
-test("decodeDirectPositionMarket rejects a mismatched discriminator", () => {
-  const { address, buffer } = fixtureDirectPosition();
-  buffer[0] = buffer[0] ^ 0xff;
-  assert.throws(() => decodeDirectPositionMarket(address, buffer));
-});
-
-test("marketsWithOpenPositions includes a market referenced only by a direct position (no PoolPosition at all)", () => {
-  // This is the exact function whose original (buggy) inline form only
-  // unioned PoolPosition markets. If it regresses to dropping the
-  // directPositions argument, this assertion fails immediately.
-  const market = new PublicKey(Buffer.alloc(32, 0x91));
-  const directPosition = decodeDirectPositionMarket(
-    new PublicKey(Buffer.alloc(32, 0x92)),
-    fixtureDirectPosition({ market }).buffer,
-  );
-  const result = marketsWithOpenPositions({ poolPositions: [], directPositions: [directPosition] });
-  assert.ok(result.has(market.toBase58()));
-});
-
-test("a market past its deadline with an open DIRECT position (no PoolPosition at all) is NOT a close candidate", () => {
-  // End-to-end (still RPC-free) regression guard for the stranding bug: runs
-  // the exact two-step pipeline runMarketCleanup uses -- build the union via
-  // marketsWithOpenPositions, then filter via selectMarketCloseCandidates --
-  // with zero PoolPositions and one direct Position on this market. Before
-  // the fix (cleanup unioning only PoolPosition markets), this market would
-  // have wrongly come back as a candidate and been closed, stranding the
-  // direct position forever.
-  const market = marketFixture(0x93, CLOSE_WINDOW);
-  const directPosition = decodeDirectPositionMarket(
-    new PublicKey(Buffer.alloc(32, 0x94)),
-    fixtureDirectPosition({ market: new PublicKey(market.address) }).buffer,
-  );
-
-  const openPositionMarkets = marketsWithOpenPositions({ poolPositions: [], directPositions: [directPosition] });
-
-  const result = selectMarketCloseCandidates({
-    markets: [market],
-    now: CLOSE_DEADLINE + 1,
-    marketsWithOpenPositions: openPositionMarkets,
-    maxPerRun: 25,
-  });
-
-  assert.deepEqual(result, []);
-});
 
 // --- selectMarketsNeedingSettlementAttempt (the enumeration fix) ------------
 // Regression coverage for a bug confirmed on a live devnet run:

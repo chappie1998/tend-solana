@@ -13,80 +13,6 @@ import {
   VSOL_PROGRAM_ID,
 } from "../../sdk/index.ts";
 
-// --- Direct-maker Position account decoding ---------------------------------
-// The on-chain account type is named `Position` (see the struct in
-// vsol/programs/vsol/src/lib.rs, ~line 2351); referred to here as "direct
-// position" (as opposed to `PoolPosition`) to keep the two scans and their
-// results unambiguous throughout this module. `fill_quote` (still
-// permissionlessly callable) opens one of these against a maker's own
-// writer vault, and `settle`/`refund_unsettled` are the only instructions
-// that close it -- both `has_one = market`, exactly like `PoolPosition`'s
-// `settle_pool_position`/`refund_pool_position`. A market with an open
-// direct Position is therefore just as unsafe to close as one with an open
-// PoolPosition: `settle`'s `Settle` accounts struct loads `Market` via
-// `has_one` and would fail forever once the market is gone, stranding the
-// position's escrowed premium/collateral with no recovery path. The
-// market-cleanup pass MUST treat both account types as equally load-bearing.
-//
-// Layout mirrors `Position` in vsol/target/idl/vsol.json and is reproduced
-// independently here (not imported from app/, which has no decoder for this
-// account type) --
-//   8  discriminator
-//   8  bump (u8), 9 vault_bump (u8), 10 status (u8), 11 direction (u8)
-//   12 market, 44 nonce_record, 76 buyer, 108 maker, 140 settlement_mint (pubkeys)
-//   172 nonce (u64), 180 strike (u64), 188 width (u64), 196 premium (u64),
-//   204 max_payout (u64), 212 fee_bps (u16), 214 opened_at (i64),
-//   222 quote_expiry (i64) => 230 bytes total.
-export const DIRECT_POSITION_ACCOUNT_SIZE = 230;
-// sha256("account:Position")[0..8].
-export const DIRECT_POSITION_DISCRIMINATOR = Object.freeze([170, 188, 143, 228, 122, 64, 247, 208]);
-
-export type DecodedDirectPosition = {
-  address: string;
-  market: string;
-};
-
-/**
- * Pure decoder: no RPC, so it is directly unit-testable against fixture
- * buffers. Only decodes the `market` field -- the one thing the market-cleanup
- * pass needs from this account type -- rather than the full record, since
- * this scan does not (yet) drive a direct-path settle/refund flow (see the
- * module doc in cranker.ts for what is and is not implemented there).
- */
-export function decodeDirectPositionMarket(address: PublicKey, data: Buffer): DecodedDirectPosition {
-  if (data.length !== DIRECT_POSITION_ACCOUNT_SIZE) {
-    throw new Error("The direct position account size is invalid");
-  }
-  if (!data.subarray(0, 8).equals(Buffer.from(DIRECT_POSITION_DISCRIMINATOR))) {
-    throw new Error("The direct position account discriminator is invalid");
-  }
-  return {
-    address: address.toBase58(),
-    market: publicKeyAt(data, 12),
-  };
-}
-
-/** Enumerates every open direct-maker Position account program-wide via getProgramAccounts (dataSize filter only), the same scanning pattern fetchOpenPoolPositions uses. Malformed entries are skipped, never thrown. */
-export async function fetchOpenDirectPositions(
-  connection: Connection,
-  programId: PublicKey = VSOL_PROGRAM_ID,
-): Promise<DecodedDirectPosition[]> {
-  const accounts = await connection.getProgramAccounts(programId, {
-    commitment: "confirmed",
-    filters: [{ dataSize: DIRECT_POSITION_ACCOUNT_SIZE }],
-  });
-  const positions: DecodedDirectPosition[] = [];
-  for (const { pubkey, account } of accounts) {
-    try {
-      positions.push(decodeDirectPositionMarket(pubkey, Buffer.from(account.data)));
-    } catch {
-      // Same size but a different account shape (or a corrupt read): not a
-      // Position, so it is silently excluded rather than failing the run.
-    }
-  }
-  return positions;
-}
-
 // --- Market account decoding (for the market-cleanup pass AND the keeper's
 // discover-first rung lookup) -------------------------------------------------
 // Layout mirrors `Market` in vsol/target/types/vsol.ts and the byte offsets
@@ -422,33 +348,27 @@ export function groupPositionsByMarket(
 
 /**
  * Builds the "markets with an open position" set selectMarketCloseCandidates
- * uses for its stranding-prevention check. Two account types reference a
- * market via `has_one = market` and both must count: pool-backed
- * `PoolPosition` and direct-maker `Position` (see decodeDirectPositionMarket's
- * doc comment for why the latter is just as load-bearing -- `settle` and
- * `refund_unsettled` both load `Market` via `has_one` exactly like
- * `settle_pool_position`/`refund_pool_position` do). Pulling this into its
- * own pure, exported function (rather than inlining `new Set([...a, ...b])`
- * at the call site) makes the union itself directly unit-testable: a
- * regression that drops one of the two input arrays here is exactly the bug
- * class this function exists to catch.
+ * uses for its stranding-prevention check. Only pool-backed `PoolPosition`
+ * accounts exist now: the V1 direct-maker `Position` type and the
+ * instructions that created and closed it were removed from the program, so
+ * scanning for it cost a getProgramAccounts call per pass to find something
+ * that can no longer be created.
  */
 export function marketsWithOpenPositions(params: {
   poolPositions: readonly DecodedPoolPosition[];
-  directPositions: readonly DecodedDirectPosition[];
 }): Set<string> {
-  return new Set([
-    ...params.poolPositions.map((position) => position.market),
-    ...params.directPositions.map((position) => position.market),
-  ]);
+  return new Set(params.poolPositions.map((position) => position.market));
 }
 
 /**
- * The market-cleanup safety predicate. `close_settled_market` cannot verify
- * on-chain that no open position still references the market (positions are
- * PDAs keyed by nonce, not enumerable from the market), so this predicate is
- * the only thing standing between a candidate market and a permanently
- * stranded position. A market is a close candidate ONLY IF, ALL of:
+ * The market-cleanup safety predicate. On chain, `close_settled_market` now
+ * refuses unless the pool binding it is handed has `open_positions == 0`, but
+ * it can only prove that for the ONE binding passed in: a market bound to
+ * several pools could still be closed through an idle binding while another
+ * binding has open positions (the complete fix is a market-level counter,
+ * which needs a `Market` layout change -- a mainnet follow-up). This
+ * predicate, together with selectIdlePoolBindingFor requiring EVERY binding
+ * to be idle, covers that gap. A market is a close candidate ONLY IF, ALL of:
  *
  *   1. Its close deadline has fully elapsed: `now > computeMarketCloseDeadline(market)`
  *      (`expiry + observationWindowSeconds + settlementGraceSeconds +

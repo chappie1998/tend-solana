@@ -21,7 +21,6 @@ import { RpcCallCounter } from "./lib/rpc-call-counter.ts";
 import {
   describeSettlementError,
   fetchAllMarkets,
-  fetchOpenDirectPositions,
   fetchOpenPoolPositions,
   marketsWithOpenPositions,
   redact,
@@ -59,7 +58,7 @@ import { deriveConfig, deriveCustomPriceFeed, deriveCustomSettlementObservation,
 // what guarantees the fresh price lands inside the window and is captured
 // well within the 30-second capture-age ceiling. A market with no open
 // interest gets NOTHING published for it; that is the main source of the
-// savings this runner exists for. `fill_pool_quote`/`fill_quote` never
+// savings this runner exists for. `fill_pool_quote` never
 // require a fresh feed (`CUSTOM_ORACLE_MAX_STALENESS_SECONDS` is enforced
 // only inside `update_custom_price_feed` itself), so quoting/filling is
 // entirely unaffected by feeds no longer being pushed continuously.
@@ -138,15 +137,14 @@ async function initializeRunner(): Promise<RunnerContext> {
   return contextFor(authority);
 }
 
-/** Fetches the standard scan (all markets + both open-position account types) once, and returns everything downstream logic needs, so callers never issue a second `getProgramAccounts` round for the same pass. */
+/** Fetches the standard scan (all markets + open pool positions) once, and returns everything downstream logic needs, so callers never issue a second `getProgramAccounts` round for the same pass. */
 async function scanChainState(counter: RpcCallCounter) {
-  const [markets, poolPositions, directPositions] = await Promise.all([
+  const [markets, poolPositions] = await Promise.all([
     fetchAllMarkets(connection),
     fetchOpenPoolPositions(connection),
-    fetchOpenDirectPositions(connection),
   ]);
-  counter.increment("getProgramAccounts", 3);
-  return { markets, poolPositions, directPositions };
+  counter.increment("getProgramAccounts", 2);
+  return { markets, poolPositions };
 }
 
 /** Fetches a fresh snapshot and sends the single publish+capture transaction for one due market. Fully isolated: any failure (provider outage, retry exhaustion, a losing race with another runner) is logged and skipped, never thrown, so one bad market can never take down the whole pass. */
@@ -203,8 +201,8 @@ async function runBoundaryPass(
   const counter = new RpcCallCounter();
   const now = await clusterUnixTime();
   counter.increment("getAccountInfo");
-  const { markets, poolPositions, directPositions } = await scanChainState(counter);
-  const openPositionMarkets = marketsWithOpenPositions({ poolPositions, directPositions });
+  const { markets, poolPositions } = await scanChainState(counter);
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions });
   const dueMarkets = dueMarketsSelector({ markets, marketsWithOpenPositions: openPositionMarkets });
 
   console.log(`boundary pass @ ${new Date(now * 1_000).toISOString()}: ${markets.length} market(s) on chain, ${dueMarkets.length} due with open interest`);
@@ -220,12 +218,11 @@ async function runBoundaryPass(
     rpcUrl,
     markets,
     poolPositions,
-    directPositions,
     now,
   });
-  // fetchCollateralVaultBalances + fetchOracleStates + config.fetch, all
-  // getMultipleAccountsInfo-class lookups, never getProgramAccounts.
-  counter.increment("getMultipleAccountsInfo", 3);
+  // fetchOracleStates + config.fetch, both getMultipleAccountsInfo-class
+  // lookups, never getProgramAccounts.
+  counter.increment("getMultipleAccountsInfo", 2);
 
   console.log(
     `boundary pass summary: published ${sweep.published}, settled ${sweep.settled}, refunded ${sweep.refunded}, ` +
