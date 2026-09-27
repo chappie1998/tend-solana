@@ -7,13 +7,13 @@ import { HermesClient } from "@pythnetwork/hermes-client";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
   AddressLookupTableProgram,
-  Connection,
   Keypair,
   PublicKey,
   sendAndConfirmTransaction,
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 // The shared market config -- the same list app/lib/markets.ts serves to the
@@ -64,7 +64,7 @@ import {
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment });
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const manifestPath = resolve(workspace, "deployments", `${cluster}.json`);

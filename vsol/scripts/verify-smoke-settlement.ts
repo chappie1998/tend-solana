@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import { decodeConfigAccount, decodeOracleAccount, decodePoolAccount } from "../../app/lib/vsol-server.ts";
 import { decodeMarketAccount } from "../../app/lib/vsol-market-accounts.ts";
 import { deriveConfig, deriveCustomSettlementObservation } from "../sdk/index.ts";
@@ -33,7 +34,7 @@ const configuredRpcUrl = process.env.VSOL_RPC_URL ?? VSOL_RPC_URL;
 const redactError = (error: unknown) => (error instanceof Error ? error.message : String(error)).split(configuredRpcUrl).join("[redacted]");
 process.once("uncaughtException", (error) => { console.error(redactError(error)); process.exit(1); });
 process.once("unhandledRejection", (error) => { console.error(redactError(error)); process.exit(1); });
-const connection = new Connection(configuredRpcUrl, "confirmed");
+const connection = createVsolConnection({ rpcUrl: configuredRpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, commitment: "confirmed" });
 if (await connection.getGenesisHash() !== DEVNET_GENESIS_HASH) throw new Error("Receipt verifier requires Solana devnet");
 
 const [positionAccount, marketAccount, poolAccount, configAccount, buyerBalance] = await Promise.all([

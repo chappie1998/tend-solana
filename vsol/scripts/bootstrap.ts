@@ -16,7 +16,6 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
-  Connection,
   Ed25519Program,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -27,6 +26,7 @@ import {
   SYSVAR_RENT_PUBKEY,
   Transaction,
 } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { rollingMarketSchedule, type SeriesCode } from "./lib/expiry-grid.ts";
@@ -94,7 +94,13 @@ const commitment = "confirmed" as const;
 // recover from the 429 rate-limiting and dropped connections that make the
 // smoke lifecycle's confirmations flaky. commitment is threaded through
 // from the single `commitment` const above rather than re-hardcoded here.
-const connection = new Connection(rpcUrl, { commitment, confirmTransactionInitialTimeout: 120_000 });
+const connection = createVsolConnection({
+  rpcUrl,
+  backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL,
+  cluster,
+  commitment,
+  confirmTransactionInitialTimeout: 120_000,
+});
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);

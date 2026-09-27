@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { getClockUnixTimestamp } from "../../app/lib/solana-clock.ts";
@@ -88,7 +89,7 @@ import { deriveConfig, deriveCustomPriceFeed, deriveCustomSettlementObservation,
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment });
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 

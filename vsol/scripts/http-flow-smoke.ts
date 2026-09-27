@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { Connection, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import nacl from "tweetnacl";
 import { liveMarkets } from "../../app/lib/markets.ts";
@@ -52,7 +53,7 @@ if (!smokeMarket) throw new Error(`VSOL_SMOKE_SYMBOL ${requestedSymbol} is not a
 const SMOKE_SYMBOL = smokeMarket.symbol;
 const settlementMode = process.env.VSOL_SMOKE_SETTLEMENT === "1";
 const receiptPath = process.env.VSOL_SMOKE_RECEIPT ?? "/tmp/tend-smoke-settlement-receipt.json";
-const connection = new Connection(configuredRpcUrl, "confirmed");
+const connection = createVsolConnection({ rpcUrl: configuredRpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, commitment: "confirmed" });
 if (await connection.getGenesisHash() !== DEVNET_GENESIS_HASH) {
   throw new Error("Refusing smoke transactions: configured RPC is not Solana devnet");
 }

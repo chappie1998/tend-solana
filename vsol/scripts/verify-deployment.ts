@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AddressLookupTableAccount, AddressLookupTableProgram, Connection, PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import { TOKEN_PROGRAM_ID, unpackAccount } from "@solana/spl-token";
 import {
   deriveLiquidityPool,
@@ -24,7 +25,7 @@ const cluster = process.env.VSOL_CLUSTER ?? "devnet";
 const path = resolve(import.meta.dirname, "..", "deployments", `${cluster}.json`);
 const deployment = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
 const rpcUrl = process.env.VSOL_RPC_URL ?? String(deployment.rpcUrl);
-const connection = new Connection(rpcUrl, "confirmed");
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment: "confirmed" });
 const LEGACY_UNSAFE_UI_MARKET = new PublicKey("FoXzcwgxDqvgEdFEqsne3H14nzWCcu3dnqNPQUS3RnaH");
 const programId = new PublicKey(String(deployment.programId));
 

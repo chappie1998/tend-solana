@@ -58,6 +58,7 @@
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { deriveMarket, deriveMarketId, deriveOracle, ladderStrike, PRICE_SCALE, symbolBytes } from "../../vsol/sdk/index.ts";
+import { createVsolConnection } from "../../vsol/sdk/rpc-failover/index.ts";
 import { VSOL_CONFIG, VSOL_PROGRAM_ID, VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "./vsol.ts";
 import { runtimeEnv } from "./runtime-env.ts";
 import { deriveLaunchSeriesParams, type LaunchSeriesParams } from "./launch-params.ts";
@@ -116,8 +117,22 @@ function defaultConnection(): Connection {
   // A tiny, local equivalent of app/lib/vsol-server.ts's getVsolConnection --
   // reproduced here (not imported) because vsol-server.ts imports FROM this
   // module (for resolveVsolSeries et al), so the reverse import would be
-  // circular.
-  return new Connection(runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL, "confirmed");
+  // circular. Both resolve through the same shared failover connection
+  // factory (see vsol/sdk/rpc-failover) rather than a bare `new Connection`.
+  //
+  // ConnectionClass: Connection (this file's own root-resolved import) is
+  // required, not optional -- vsol/'s package.json pins @solana/web3.js@1.98.4
+  // while the app pins ^1.99.0, so without it createVsolConnection would
+  // default to extending vsol-local's copy, a structurally identical but
+  // nominally (and, at runtime, prototype-chain-wise) DIFFERENT class from
+  // every other app/lib file's own "@solana/web3.js" import -- see
+  // vsol/sdk/rpc-failover/confirm.ts's module doc.
+  return createVsolConnection({
+    rpcUrl: runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL,
+    backupRpcUrl: runtimeEnv("VSOL_RPC_BACKUP_URL"),
+    commitment: "confirmed",
+    ConnectionClass: Connection,
+  });
 }
 
 async function defaultFetchSpot(symbol: string): Promise<number> {

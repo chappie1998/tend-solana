@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { deriveConfig, VSOL_PROGRAM_ID } from "../sdk/index.ts";
@@ -74,7 +75,7 @@ import {
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment });
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const hermes = new HermesClient(process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network", {

@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
-import { Connection, Keypair, SystemProgram } from "@solana/web3.js";
+import { Keypair, SystemProgram } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import BN from "bn.js";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
@@ -29,7 +30,7 @@ import { deriveConfig, deriveCustomPriceFeed, HEARTBEAT_SYMBOL, PRICE_SCALE, sym
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment });
 // Same admin keypair convention as bootstrap.ts: SOLANA_WALLET overrides,
 // defaulting to the standard Solana CLI keypair.
 const walletPath = process.env.SOLANA_WALLET?.replace(/^~/, homedir()) ?? `${homedir()}/.config/solana/id.json`;

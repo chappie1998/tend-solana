@@ -27,6 +27,7 @@ import nacl from "tweetnacl";
 import deployment from "../../vsol/deployments/devnet.json" with { type: "json" };
 import idl from "../../vsol/target/idl/vsol.json" with { type: "json" };
 import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
+import { createVsolConnection } from "../../vsol/sdk/rpc-failover/index.ts";
 import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
@@ -58,9 +59,24 @@ import { getClockUnixTimestamp } from "./solana-clock.ts";
 // see that module's header comment.
 export { decodeMarketAccount };
 
-export function getVsolConnection() {
+export function getVsolConnection(): Connection {
   // Resolve this after the request route has installed Cloudflare bindings.
-  return new Connection(runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL, "confirmed");
+  // Fails over across VSOL_RPC_URL / VSOL_RPC_BACKUP_URL / (devnet only) the
+  // public devnet RPC -- see vsol/sdk/rpc-failover for the full policy.
+  //
+  // ConnectionClass: Connection (this file's own root-resolved import) is
+  // required, not optional -- vsol/'s package.json pins @solana/web3.js@1.98.4
+  // while the app pins ^1.99.0, so without it createVsolConnection would
+  // default to extending vsol-local's copy, a structurally identical but
+  // nominally (and, at runtime, prototype-chain-wise) DIFFERENT class from
+  // this file's own "@solana/web3.js" import -- see
+  // vsol/sdk/rpc-failover/confirm.ts's module doc.
+  return createVsolConnection({
+    rpcUrl: runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL,
+    backupRpcUrl: runtimeEnv("VSOL_RPC_BACKUP_URL"),
+    commitment: "confirmed",
+    ConnectionClass: Connection,
+  });
 }
 
 const TOKEN_SCALE = 1_000_000n;
