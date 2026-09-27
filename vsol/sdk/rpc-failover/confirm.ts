@@ -56,7 +56,7 @@ import {
   type TransactionConfirmationStrategy,
   type TransactionSignature,
 } from "@solana/web3.js";
-import { DEFAULT_POLL_INTERVAL_MS, LEGACY_CONFIRM_TIMEOUT_MS_FINALIZED, LEGACY_CONFIRM_TIMEOUT_MS_LOWER } from "./constants.ts";
+import { BLOCKHASH_CONFIRM_HARD_CEILING_MS, DEFAULT_POLL_INTERVAL_MS, LEGACY_CONFIRM_TIMEOUT_MS_FINALIZED, LEGACY_CONFIRM_TIMEOUT_MS_LOWER } from "./constants.ts";
 
 /**
  * The structural (no private members) subset of Connection this override
@@ -167,6 +167,12 @@ export function createFailoverConnectionClass<TBase extends ConnectionConstructo
     }): Promise<RpcResponseAndContext<SignatureResult>> {
       const { signature, commitment, lastValidBlockHeight, timeoutMs, abortSignal } = opts;
       const deadline = lastValidBlockHeight == null && timeoutMs != null ? Date.now() + timeoutMs : undefined;
+      // Hard ceiling for the blockhash strategy. getBlockHeight failures are
+      // swallowed below (so one flaky poll can't fail a confirmation), which
+      // means that without this, persistent failure on every endpoint would
+      // poll forever -- and the oracle runner's lanes are serialized, so one
+      // hung confirmation would stall every later settlement.
+      const hardDeadline = Date.now() + BLOCKHASH_CONFIRM_HARD_CEILING_MS;
 
       for (;;) {
         if (abortSignal?.aborted) throw abortSignal.reason;
@@ -186,6 +192,20 @@ export function createFailoverConnectionClass<TBase extends ConnectionConstructo
         if (lastValidBlockHeight != null) {
           const blockHeight = await this.getBlockHeight(commitment).catch(() => -1);
           if (blockHeight > lastValidBlockHeight) {
+            // The blockhash can no longer land NEW transactions, but ours may
+            // already have been processed and simply not yet reached the
+            // requested commitment. Reporting "expired" then would call a
+            // transaction that landed a failure. So only give up if the
+            // signature is genuinely unknown (or failed); a processed one keeps
+            // polling until it reaches the commitment -- bounded by the ceiling
+            // below, and a transaction dropped from a minority fork reverts to
+            // unknown and fails on the next pass.
+            const recheck = await this.getSignatureStatus(signature);
+            if (recheck.value == null || recheck.value.err) {
+              throw new TransactionExpiredBlockheightExceededError(signature);
+            }
+          }
+          if (Date.now() > hardDeadline) {
             throw new TransactionExpiredBlockheightExceededError(signature);
           }
         } else if (deadline != null && Date.now() > deadline) {

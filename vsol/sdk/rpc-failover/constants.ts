@@ -48,3 +48,10 @@ export const LEGACY_CONFIRM_TIMEOUT_MS_LOWER = 30_000;
 // after the primary and backup endpoints. Slow and rate-limited, but it does
 // serve getProgramAccounts, which some free-tier backup providers refuse.
 export const PUBLIC_DEVNET_RPC_URL = "https://api.devnet.solana.com";
+
+/**
+ * Absolute ceiling for a blockhash-strategy confirmation. A devnet blockhash
+ * lives ~60-90s; 3 minutes leaves room for the post-expiry "processed but not
+ * yet confirmed" wait while guaranteeing the poll always terminates.
+ */
+export const BLOCKHASH_CONFIRM_HARD_CEILING_MS = 180_000;

@@ -459,3 +459,34 @@ test("createVsolConnection never adds the public devnet fallback for a non-devne
   assert.deepEqual(calls, [PRIMARY, BACKUP]);
   assert.ok(!calls.includes(PUBLIC_DEVNET_RPC_URL));
 });
+
+test("confirmTransaction keeps polling when the blockhash expires but the transaction was already processed", async () => {
+  // The blockhash can no longer land new transactions, but this one already
+  // did -- it just hadn't reached `confirmed` yet. Reporting "expired" here
+  // would call a transaction that landed a failure.
+  const Patched = createFailoverConnectionClass(FakeBaseConnection, 1);
+  const connection = new Patched("http://fake", { commitment: "confirmed" });
+  const processed: SignatureStatus = { slot: 1, confirmations: 0, err: null, confirmationStatus: "processed" };
+  connection.signatureStatusQueue = [
+    processed, // pass 1: not yet confirmed
+    processed, // post-expiry recheck: known and not failed, so keep going
+    { slot: 2, confirmations: 5, err: null, confirmationStatus: "confirmed" },
+  ];
+  connection.blockHeightQueue = [101];
+  const result = await connection.confirmTransaction({ signature: "sig1", blockhash: "bh1", lastValidBlockHeight: 100 }, "confirmed");
+  assert.equal((result.value as unknown as SignatureStatus).confirmationStatus, "confirmed");
+});
+
+test("confirmTransaction still expires when the signature is unknown after the blockhash expires", async () => {
+  const Patched = createFailoverConnectionClass(FakeBaseConnection, 1);
+  const connection = new Patched("http://fake", { commitment: "confirmed" });
+  connection.signatureStatusQueue = [
+    { slot: 1, confirmations: 0, err: null, confirmationStatus: "processed" },
+    null, // post-expiry recheck: dropped (e.g. minority fork) -- genuinely gone
+  ];
+  connection.blockHeightQueue = [101];
+  await assert.rejects(
+    connection.confirmTransaction({ signature: "sig1", blockhash: "bh1", lastValidBlockHeight: 100 }, "confirmed"),
+    TransactionExpiredBlockheightExceededError,
+  );
+});
