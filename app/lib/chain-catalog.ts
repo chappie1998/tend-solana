@@ -8,6 +8,7 @@ import {
   decodeMarketAccount,
   decodePoolAccount,
   decodePoolMarketAccount,
+  POOL_MARKET_ACCOUNT_DISCRIMINATOR,
   getVsolConnection,
 } from "./vsol-server";
 import { liveMarkets } from "./markets";
@@ -29,7 +30,13 @@ const MARKET_ACCOUNT_SIZE = 289;
 // decodePoolAccount: a filter size and a decoder size that disagree fail
 // silently, which is exactly how this went unnoticed.
 const POOL_ACCOUNT_SIZE = 266;
-const POOL_MARKET_ACCOUNT_SIZE = 82;
+// Pool bindings come in TWO sizes (82 legacy, 86 since the 2026-09-28
+// upgrade added `open_positions`), so they are matched by discriminator, not
+// dataSize: a dataSize filter silently hides every binding of the other size,
+// and newly listed markets would read as unlisted. One call covers both.
+const POOL_MARKET_FILTER = [{
+  memcmp: { offset: 0, bytes: POOL_MARKET_ACCOUNT_DISCRIMINATOR.toString("base64"), encoding: "base64" as const },
+}];
 
 export type DiscoveredMarket = {
   address: string;
@@ -69,7 +76,7 @@ export async function getVsolChainCatalog(connection: Connection = getVsolConnec
   const [marketAccounts, poolAccounts, poolMarketAccounts] = await Promise.all([
     connection.getProgramAccounts(VSOL_PROGRAM_ID, { commitment: "confirmed", filters: [{ dataSize: MARKET_ACCOUNT_SIZE }] }),
     connection.getProgramAccounts(VSOL_PROGRAM_ID, { commitment: "confirmed", filters: [{ dataSize: POOL_ACCOUNT_SIZE }] }),
-    connection.getProgramAccounts(VSOL_PROGRAM_ID, { commitment: "confirmed", filters: [{ dataSize: POOL_MARKET_ACCOUNT_SIZE }] }),
+    connection.getProgramAccounts(VSOL_PROGRAM_ID, { commitment: "confirmed", filters: POOL_MARKET_FILTER }),
   ]);
 
   const authorizations = new Map<string, string[]>();

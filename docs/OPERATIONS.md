@@ -63,6 +63,7 @@ in the workflow `env:`, written to a file, and never logged.
 | `VSOL_DEVNET_USDC_MINT_KEY` | `vsol/.devnet/devnet-mock-usdc-mint.json` | keeper only |
 | `VSOL_DEVNET_RWA_MINT_KEY` | `vsol/.devnet/devnet-mock-rwa-mint.json` | keeper only |
 | `VSOL_RPC_URL` | env var (not a file) | keeper, cranker |
+| `VSOL_RPC_BACKUP_URL` *(optional)* | env var (not a file) | keeper, cranker, oracle runner |
 | `PYTH_API_KEY` | env var (not a file) | cranker only |
 | `PYTH_HERMES_URL` *(optional)* | env var (not a file) | cranker only |
 
@@ -73,6 +74,40 @@ value — e.g. `[12,34,56,...]`.
 `VSOL_RPC_URL` **must** be a private devnet RPC endpoint. The public
 `api.devnet.solana.com` endpoint 403s or rate-limits under any kind of
 recurring, unattended load — do not point these workflows at it.
+
+### RPC failover (`VSOL_RPC_BACKUP_URL`)
+
+Every script and app route gets its `Connection` from one shared factory,
+`vsol/sdk/rpc-failover` (`createVsolConnection`), instead of constructing
+`new Connection(...)` directly. It fails over, per JSON-RPC request, across
+up to three endpoints in order:
+
+1. `VSOL_RPC_URL` (required — the primary, e.g. a Helius devnet endpoint),
+2. `VSOL_RPC_BACKUP_URL` (optional — e.g. an Alchemy devnet endpoint),
+3. the public `api.devnet.solana.com` (devnet only; never added for another
+   cluster) as a last resort.
+
+It moves to the next endpoint on a network error/timeout, an HTTP 429/5xx,
+or a JSON-RPC error that means the CURRENT endpoint can't serve the request
+(a quota/rate-limit signal, or a "method not found"/"not available on this
+tier" response — the latter demotes that endpoint for just that one method,
+so a free-tier backup that refuses `getProgramAccounts` stays in rotation
+for everything else it can serve). An ordinary JSON-RPC error (invalid
+params, a failed transaction simulation, an expired blockhash, ...) is
+returned to the caller unchanged, from whichever endpoint produced it — this
+is about transport failures, not about retrying real errors against a
+different node. Demotions are logged once (redacted to host only, never the
+full URL/API key) and expire on their own after a cooldown.
+
+Confirmation (`connection.confirmTransaction(...)`) does not depend on the
+primary endpoint's websocket either — it polls over the same failover HTTP
+path instead, so a quota-dead primary can't hang a confirmation.
+
+Setting `VSOL_RPC_BACKUP_URL` is optional everywhere; everything above works
+identically (using only `VSOL_RPC_URL` + the public devnet fallback) if it
+is left unset. See `vsol/sdk/rpc-failover/index.ts`'s module doc for the
+full design, and `vsol/tests/rpc-failover.test.ts` for the offline test
+coverage of every rule above.
 
 `PYTH_API_KEY` and `PYTH_HERMES_URL` are only read by the cranker (it is the
 one calling Hermes for settlement prices; the keeper does not need them). If
@@ -140,25 +175,45 @@ command with the same environment and `.devnet` files present.
 
 ## Custom settlement oracle service
 
-The demo settlement path uses one local, continuously supervised worker:
+The demo settlement path uses ONE local, continuously supervised worker,
+`oracle-runner.ts`, which publishes a price only when a settlement actually
+needs it, instead of the two processes this replaced (a 60-second forever
+pusher for every symbol, and a 5-second `getProgramAccounts` poller) --
+both retired for cost (~$340/month projected in mainnet tx fees for the
+pusher alone), RPC-quota exhaustion (the 5-second poller), and reliability
+(a 60-second pusher tick can miss a 60-second intraday observation window
+outright, silently downgrading a settlement into a refund):
 
 ```bash
-npm --prefix vsol run custom-oracle:run
+npm --prefix vsol run oracle
 ```
 
-It pushes all six live references, captures the first valid observation in
-each market's expiry window, publishes the retained observation, then settles
-or refunds pool positions. Each symbol has its own serialized push/capture
-lane; relay and payout work runs separately. A kernel-held localhost port
-lease prevents a manual invocation from overlapping the supervised worker.
-`custom-oracle:once` performs one complete pass and exits nonzero if any
-operational lane fails.
+It sleeps until the next 15-minute UTC boundary (every tenor's expiry lands
+on one), scans on-chain state ONCE, and for each market expiring at that
+exact instant with at least one open pool position, sends a SINGLE
+transaction containing `update_custom_price_feed` immediately followed by
+`capture_custom_settlement_observation` -- bundling both in one transaction
+is what guarantees the fresh price lands inside the window and is captured
+well within the program's 30-second capture-age ceiling. A market with no
+open interest gets nothing published for it. The same pass then runs the
+existing publish/settle/refund flow over everything already fetched, so
+refunds that became due are paid out at the same 15-minute cadence. A
+separate 5-minute lane publishes a dedicated `HEARTBEAT` feed (see below); a
+separate hourly lane closes markets that are safe to reclaim rent from,
+reusing the cranker's exact `close_settled_market` safety guard. A
+kernel-held localhost port lease prevents a manual invocation from
+overlapping the supervised worker. `oracle:once` performs one startup
+catch-up pass (anything that expired while the process was down), one
+heartbeat, and one cleanup pass, then exits -- it does not loop.
 
 The machine must stay awake and networked. On macOS, run the launchd command
 under `caffeinate -i`; configure launchd `KeepAlive` for crash restart. Keep
 `VSOL_RPC_URL` and signer material in the process environment or the existing
 gitignored `.devnet` files, never in the plist or logs. Logs redact the RPC
 URL. The authority key is `vsol/.devnet/devnet-custom-oracle-authority.json`.
+Every pass is wrapped so a transient RPC/network fault is logged and retried
+with growing (capped) backoff rather than crashing the process; only a
+startup failure (missing key, program not deployed, wrong cluster) exits.
 
 Crypto references come from Coinbase Exchange. Stock references come from
 Hyperliquid's `xyz` mark price. Hyperliquid does not expose a separate source
@@ -170,18 +225,46 @@ domain version also binds signed quotes.
 At expiry, the program permanently retains the first authenticated source
 observation whose source timestamp is inside `[expiry, expiry +
 observation_window]`. Publication may happen later through the market's final
-deadline and does not require the rolling feed to remain fresh. If no valid
-observation is captured during the window, a later price can never replace
-it; the existing refund path applies after the settlement deadline.
+deadline and does not require the feed to have been continuously fresh
+before that -- `fill_pool_quote`/`fill_quote` never require a fresh feed
+either (`CUSTOM_ORACLE_MAX_STALENESS_SECONDS` is enforced only inside
+`update_custom_price_feed`), so quoting and filling are unaffected by a
+symbol's feed going untouched between settlements. If no valid observation
+is captured during the window, a later price can never replace it; the
+existing refund path applies after the settlement deadline.
+
+### Heartbeat feed (one-time setup)
+
+`app/api/vsol/status/route.ts`'s "Execution unavailable" badge no longer
+infers runner liveness from every symbol's own feed freshness (only a
+continuously-polling pusher could ever satisfy that). It instead reads a
+dedicated `HEARTBEAT` feed the runner republishes every 5 minutes. Before the
+runner's heartbeat lane can succeed, initialize that feed once (idempotent;
+safe to re-run):
+
+```bash
+npm --prefix vsol run init-heartbeat
+```
+
+Readiness is now: the heartbeat feed exists, was last published by the
+current `config.oracle_authority`, and is no more than 15 minutes old; AND
+every live market's OWN feed account exists with the right owner/publisher/
+scale (structural -- so a capture can succeed the next time that market
+expires), but NOT that each symbol's price is currently fresh -- a feed can
+legitimately go untouched for hours between settlements under this
+architecture without that being a problem.
 
 Operator commands from the repository root:
 
 ```bash
-# one-shot mutating settlement pass; stop the launchd worker first
-npm --prefix vsol run custom-oracle:once
+# one-time: initialize the heartbeat feed (idempotent)
+npm --prefix vsol run init-heartbeat
+
+# one-shot catch-up + heartbeat + cleanup pass; stop the launchd worker first
+npm --prefix vsol run oracle:once
 
 # foreground run (the launchd program uses this same entrypoint)
-npm --prefix vsol run custom-oracle:run
+npm --prefix vsol run oracle
 
 # inspect recent launchd state and logs (replace the label/path used locally)
 launchctl print gui/$(id -u)/xyz.usetend.solana-oracle
@@ -193,9 +276,10 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/xyz.usetend.solana-oracle.
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/xyz.usetend.solana-oracle.plist
 ```
 
-Before a devnet demonstration, require `/api/vsol/status` to return `ok: true`,
-confirm every per-symbol feed is ready, and inspect the launchd logs. Do not
-run `custom-oracle:once` while the supervised service owns the lease. Then run the HTTP smoke with an
+Before a devnet demonstration, require `/api/vsol/status` to return `ok: true`
+(heartbeat fresh, every live market's feed structurally sound), and inspect
+the launchd logs. Do not run `oracle:once` while the supervised service owns
+the lease. Then run the HTTP smoke with an
 isolated wallet. Its default mode fills and early-closes a 15-minute NVDA
 position. `VSOL_SMOKE_SETTLEMENT=1` leaves that position open and emits a
 receipt for independent post-expiry payout verification; it never signs or

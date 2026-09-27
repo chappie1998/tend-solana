@@ -10,20 +10,14 @@ import {
   confidenceBpsOf,
   decideMarketPublishAction,
   decidePositionAction,
-  decodeDirectPositionMarket,
   decodeMarketAccountForCleanup,
   decodePoolPositionAccount,
-  decodeTokenAccountAmount,
   describeSettlementError,
-  DIRECT_POSITION_ACCOUNT_SIZE,
-  DIRECT_POSITION_DISCRIMINATOR,
   filterExpiredOpenPositions,
   groupPositionsByMarket,
   isSettlementPrintAcceptable,
   MARKET_ACCOUNT_DISCRIMINATOR,
   MARKET_ACCOUNT_SIZE,
-  marketsWithOpenPositions,
-  marketsWithOutstandingCollateral,
   POOL_POSITION_ACCOUNT_SIZE,
   POOL_POSITION_DISCRIMINATOR,
   pythPriceToScaledAtoms,
@@ -720,7 +714,6 @@ test("selectMarketCloseCandidates returns exactly the markets past their close d
     markets: [pastDeadlineNoPosition, pastDeadlineWithPosition, notYetPastDeadline],
     now: CLOSE_DEADLINE + 1,
     marketsWithOpenPositions: new Set([pastDeadlineWithPosition.address]),
-    marketsWithOutstandingCollateral: new Set(),
     maxPerRun: 25,
   });
 
@@ -733,7 +726,6 @@ test("a market past its deadline but WITH an open position referencing it is NOT
     markets: [market],
     now: CLOSE_DEADLINE + 1,
     marketsWithOpenPositions: new Set([market.address]),
-    marketsWithOutstandingCollateral: new Set(),
     maxPerRun: 25,
   });
   assert.deepEqual(result, []);
@@ -745,7 +737,6 @@ test("a market whose deadline has not elapsed is not a candidate, even with no o
     markets: [market],
     now: CLOSE_DEADLINE, // exactly at the deadline: the on-chain check is strict `now > deadline`
     marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: new Set(),
     maxPerRun: 25,
   });
   assert.deepEqual(result, []);
@@ -757,232 +748,86 @@ test("selectMarketCloseCandidates honors the per-run cap, preserving input order
     markets,
     now: CLOSE_DEADLINE + 1,
     marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: new Set(),
     maxPerRun: 2,
   });
   assert.deepEqual(result.map((m) => m.address), markets.slice(0, 2).map((m) => m.address));
 });
 
-// --- Complete-set collateral vault (FINDING 1's off-chain mirror) -----------
-// `close_settled_market` now refuses to close a market whose collateral
-// vault still holds outstanding balance (see `MarketHasOutstandingCollateral`
-// in vsol/programs/vsol/src/lib.rs). These tests exercise the off-chain
-// mirror of that same exclusion: a market with a non-zero vault balance is
-// never a close candidate, even with zero open positions and a fully
-// elapsed close deadline; a market whose vault is empty (or was never
-// created) is unaffected.
-
-// The real SPL Token `Account` layout is 165 bytes; this fixture only needs
-// to be at least long enough to contain the `amount` field at offset 64.
-const TOKEN_ACCOUNT_FIXTURE_SIZE = 165;
-
-test("decodeTokenAccountAmount reads the amount field at its documented offset", () => {
-  const data = Buffer.alloc(TOKEN_ACCOUNT_FIXTURE_SIZE);
-  data.writeBigUInt64LE(123_456_789n, 64);
-  assert.equal(decodeTokenAccountAmount(data), 123_456_789n);
-});
-
-test("decodeTokenAccountAmount rejects a buffer too small to contain the amount field", () => {
-  assert.throws(() => decodeTokenAccountAmount(Buffer.alloc(64)));
-});
-
-test("marketsWithOutstandingCollateral includes only markets with a strictly positive balance", () => {
-  const empty = new PublicKey(Buffer.alloc(32, 0xa1));
-  const neverCreated = new PublicKey(Buffer.alloc(32, 0xa2));
-  const outstanding = new PublicKey(Buffer.alloc(32, 0xa3));
-  const balances = new Map<string, bigint>([
-    [empty.toBase58(), 0n],
-    [neverCreated.toBase58(), 0n],
-    [outstanding.toBase58(), 1n],
-  ]);
-  const result = marketsWithOutstandingCollateral(balances);
-  assert.equal(result.size, 1);
-  assert.ok(result.has(outstanding.toBase58()));
-  assert.ok(!result.has(empty.toBase58()));
-  assert.ok(!result.has(neverCreated.toBase58()));
-});
-
-test("a market past its deadline with an empty complete-set vault (or none ever created) is not excluded", () => {
-  const market = marketFixture(0xa4, CLOSE_WINDOW);
-  const result = selectMarketCloseCandidates({
-    markets: [market],
-    now: CLOSE_DEADLINE + 1,
-    marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: marketsWithOutstandingCollateral(new Map([[market.address, 0n]])),
-    maxPerRun: 25,
-  });
-  assert.deepEqual(result.map((m) => m.address), [market.address]);
-});
-
-test("a market past its deadline with a NON-ZERO complete-set vault balance is NOT a candidate, even with zero open positions", () => {
-  const market = marketFixture(0xa5, CLOSE_WINDOW);
-  const result = selectMarketCloseCandidates({
-    markets: [market],
-    now: CLOSE_DEADLINE + 1,
-    marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: marketsWithOutstandingCollateral(
-      new Map([[market.address, 1_000_000n]]),
-    ),
-    maxPerRun: 25,
-  });
-  assert.deepEqual(result, []);
-});
-
-// --- Direct-maker Position (the `fill_quote`/`settle` path) -----------------
+// --- Direct-maker Position ---------------------------------------------------
 // Regression guard for the stranding bug the coordinator caught: cleanup
 // originally only scanned pool-backed `PoolPosition` accounts, so a market
-// with zero PoolPositions but one open direct-maker `Position` (opened via
-// `fill_quote`, settled via `settle`/`refund_unsettled`) would be wrongly
-// treated as empty and closed -- stranding that Position forever, since
-// `settle`'s accounts struct loads `Market` via `has_one` and fails once the
-// market account is gone. cranker.ts's runMarketCleanup now unions markets
-// referenced by open PoolPositions AND open direct Positions before calling
+// with zero PoolPositions but one open direct-maker `Position` would be
+// wrongly treated as empty and closed -- stranding that Position forever.
+// cranker.ts's runMarketCleanup now unions markets referenced by open
+// PoolPositions AND open direct Positions before calling
 // selectMarketCloseCandidates; these tests exercise the decoder for that
 // second account type and prove the predicate blocks a market referenced
 // only by a direct position, with no PoolPosition in sight.
-
-function fixtureDirectPosition(overrides: Partial<{ address: PublicKey; market: PublicKey }> = {}): {
-  address: PublicKey;
-  buffer: Buffer;
-} {
-  const address = overrides.address ?? new PublicKey(Buffer.alloc(32, 0x71));
-  const data = Buffer.alloc(DIRECT_POSITION_ACCOUNT_SIZE);
-  Buffer.from(DIRECT_POSITION_DISCRIMINATOR).copy(data, 0);
-  data[10] = 1; // status: Open
-  (overrides.market ?? new PublicKey(Buffer.alloc(32, 0x72))).toBuffer().copy(data, 12);
-  return { address, buffer: data };
-}
-
-test("decodeDirectPositionMarket reads the market field at its documented offset", () => {
-  const market = new PublicKey(Buffer.alloc(32, 0x81));
-  const { address, buffer } = fixtureDirectPosition({ market });
-  const decoded = decodeDirectPositionMarket(address, buffer);
-  assert.equal(decoded.address, address.toBase58());
-  assert.equal(decoded.market, market.toBase58());
-});
-
-test("decodeDirectPositionMarket rejects the wrong size", () => {
-  const { address, buffer } = fixtureDirectPosition();
-  assert.throws(() => decodeDirectPositionMarket(address, buffer.subarray(0, DIRECT_POSITION_ACCOUNT_SIZE - 1)));
-});
-
-test("decodeDirectPositionMarket rejects a mismatched discriminator", () => {
-  const { address, buffer } = fixtureDirectPosition();
-  buffer[0] = buffer[0] ^ 0xff;
-  assert.throws(() => decodeDirectPositionMarket(address, buffer));
-});
-
-test("marketsWithOpenPositions includes a market referenced only by a direct position (no PoolPosition at all)", () => {
-  // This is the exact function whose original (buggy) inline form only
-  // unioned PoolPosition markets. If it regresses to dropping the
-  // directPositions argument, this assertion fails immediately.
-  const market = new PublicKey(Buffer.alloc(32, 0x91));
-  const directPosition = decodeDirectPositionMarket(
-    new PublicKey(Buffer.alloc(32, 0x92)),
-    fixtureDirectPosition({ market }).buffer,
-  );
-  const result = marketsWithOpenPositions({ poolPositions: [], directPositions: [directPosition] });
-  assert.ok(result.has(market.toBase58()));
-});
-
-test("a market past its deadline with an open DIRECT position (no PoolPosition at all) is NOT a close candidate", () => {
-  // End-to-end (still RPC-free) regression guard for the stranding bug: runs
-  // the exact two-step pipeline runMarketCleanup uses -- build the union via
-  // marketsWithOpenPositions, then filter via selectMarketCloseCandidates --
-  // with zero PoolPositions and one direct Position on this market. Before
-  // the fix (cleanup unioning only PoolPosition markets), this market would
-  // have wrongly come back as a candidate and been closed, stranding the
-  // direct position forever.
-  const market = marketFixture(0x93, CLOSE_WINDOW);
-  const directPosition = decodeDirectPositionMarket(
-    new PublicKey(Buffer.alloc(32, 0x94)),
-    fixtureDirectPosition({ market: new PublicKey(market.address) }).buffer,
-  );
-
-  const openPositionMarkets = marketsWithOpenPositions({ poolPositions: [], directPositions: [directPosition] });
-
-  const result = selectMarketCloseCandidates({
-    markets: [market],
-    now: CLOSE_DEADLINE + 1,
-    marketsWithOpenPositions: openPositionMarkets,
-    marketsWithOutstandingCollateral: new Set(),
-    maxPerRun: 25,
-  });
-
-  assert.deepEqual(result, []);
-});
+//
+// NOTE: the V1 instructions that used to open/settle a direct-maker
+// `Position` (`fill_quote`/`settle`/`refund_unsettled`) were removed from the
+// program entirely, so no NEW `Position` account can ever be created again.
+// This scanner is kept (rather than removed as dead code) purely because it
+// is still correct and harmless -- it will simply keep finding zero direct
+// positions on any deployment created after that removal -- but it is a real
+// candidate for deletion in a later, dedicated cleanup pass.
 
 // --- selectMarketsNeedingSettlementAttempt (the enumeration fix) ------------
 // Regression coverage for a bug confirmed on a live devnet run:
 // runSettlementPhase used to build its ENTIRE work list from
 // `[...new Set(positions.map(p => p.market))]` over `fetchOpenPoolPositions`
-// alone, so a v2 conditional-token market -- whose only on-chain state is two
-// SPL mints and a complete-set collateral vault, with NO PoolPosition and NO
-// direct Position -- was never enumerated at all. Its oracle was therefore
-// never finalized, and `redeem_winning` reverted with `OracleNotFinalized`
-// forever; holders' only recourse was the pro-rata 50/50 `redeem_unresolved`
-// fallback once `final_deadline` passed, regardless of who actually won. The
-// first test below is exactly that scenario.
+// alone, so a market reachable from no position of either kind was never
+// enumerated at all, and its oracle was therefore never finalized. The base
+// enumeration switched to `fetchAllMarkets`, which these tests exercise
+// directly. (The now-removed V1 conditional-token mechanism this bug
+// originally surfaced through -- a market with no position but a non-zero
+// collateral vault -- no longer exists on chain at all, so the widening
+// `selectMarketsNeedingSettlementAttempt` used to need for it is gone too;
+// see that function's doc comment in lib/settlement.ts.)
 
 const SETTLEMENT_WINDOW = { expiry: 1_000, observationWindowSeconds: 30, settlementGraceSeconds: 900 };
 const SETTLEMENT_NOW = SETTLEMENT_WINDOW.expiry + 10_000; // well past expiry
 
-test("selectMarketsNeedingSettlementAttempt: past expiry, oracle unfinalized, non-zero vault, zero positions -> selected (the regression under test)", () => {
-  const market = marketFixture(0xb1, SETTLEMENT_WINDOW);
-  const result = selectMarketsNeedingSettlementAttempt({
-    markets: [market],
-    now: SETTLEMENT_NOW,
-    marketsWithFinalizedOracle: new Set(),
-    marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: new Set([market.address]),
-  });
-  assert.deepEqual(result.map((m) => m.address), [market.address]);
-});
-
-test("selectMarketsNeedingSettlementAttempt: past expiry, oracle unfinalized, zero vault, zero positions -> not selected (nothing at stake)", () => {
+test("selectMarketsNeedingSettlementAttempt: past expiry, oracle unfinalized, zero positions -> not selected (nothing at stake)", () => {
   const market = marketFixture(0xb2, SETTLEMENT_WINDOW);
   const result = selectMarketsNeedingSettlementAttempt({
     markets: [market],
     now: SETTLEMENT_NOW,
     marketsWithFinalizedOracle: new Set(),
     marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: new Set(),
   });
   assert.deepEqual(result, []);
 });
 
-test("selectMarketsNeedingSettlementAttempt: past expiry, oracle unfinalized, zero vault, open position -> selected (existing behavior preserved)", () => {
+test("selectMarketsNeedingSettlementAttempt: past expiry, oracle unfinalized, open position -> selected", () => {
   const market = marketFixture(0xb3, SETTLEMENT_WINDOW);
   const result = selectMarketsNeedingSettlementAttempt({
     markets: [market],
     now: SETTLEMENT_NOW,
     marketsWithFinalizedOracle: new Set(),
     marketsWithOpenPositions: new Set([market.address]),
-    marketsWithOutstandingCollateral: new Set(),
   });
   assert.deepEqual(result.map((m) => m.address), [market.address]);
 });
 
-test("selectMarketsNeedingSettlementAttempt: oracle already finalized -> not selected, even with something at stake", () => {
+test("selectMarketsNeedingSettlementAttempt: oracle already finalized -> not selected, even with an open position", () => {
   const market = marketFixture(0xb4, SETTLEMENT_WINDOW);
   const result = selectMarketsNeedingSettlementAttempt({
     markets: [market],
     now: SETTLEMENT_NOW,
     marketsWithFinalizedOracle: new Set([market.address]),
     marketsWithOpenPositions: new Set([market.address]),
-    marketsWithOutstandingCollateral: new Set([market.address]),
   });
   assert.deepEqual(result, []);
 });
 
-test("selectMarketsNeedingSettlementAttempt: not yet expired -> not selected regardless of vault or positions", () => {
+test("selectMarketsNeedingSettlementAttempt: not yet expired -> not selected regardless of open positions", () => {
   const market = marketFixture(0xb5, SETTLEMENT_WINDOW);
   const result = selectMarketsNeedingSettlementAttempt({
     markets: [market],
     now: SETTLEMENT_WINDOW.expiry - 1,
     marketsWithFinalizedOracle: new Set(),
     marketsWithOpenPositions: new Set([market.address]),
-    marketsWithOutstandingCollateral: new Set([market.address]),
   });
   assert.deepEqual(result, []);
 });
@@ -993,21 +838,7 @@ test("selectMarketsNeedingSettlementAttempt: at expiry exactly counts as past ex
     markets: [market],
     now: SETTLEMENT_WINDOW.expiry,
     marketsWithFinalizedOracle: new Set(),
-    marketsWithOpenPositions: new Set(),
-    marketsWithOutstandingCollateral: new Set([market.address]),
-  });
-  assert.deepEqual(result.map((m) => m.address), [market.address]);
-});
-
-test("selectMarketsNeedingSettlementAttempt: a market with BOTH an open position and outstanding collateral is selected exactly once, not duplicated", () => {
-  const market = marketFixture(0xb7, SETTLEMENT_WINDOW);
-  const result = selectMarketsNeedingSettlementAttempt({
-    markets: [market],
-    now: SETTLEMENT_NOW,
-    marketsWithFinalizedOracle: new Set(),
     marketsWithOpenPositions: new Set([market.address]),
-    marketsWithOutstandingCollateral: new Set([market.address]),
   });
-  assert.equal(result.length, 1);
   assert.deepEqual(result.map((m) => m.address), [market.address]);
 });

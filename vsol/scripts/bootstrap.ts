@@ -16,7 +16,6 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
-  Connection,
   Ed25519Program,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -27,6 +26,7 @@ import {
   SYSVAR_RENT_PUBKEY,
   Transaction,
 } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { rollingMarketSchedule, type SeriesCode } from "./lib/expiry-grid.ts";
@@ -37,15 +37,10 @@ import {
   deriveLiquidityPoolToken,
   deriveLiquidityProvider,
   deriveMarket,
-  deriveNonce,
   deriveOracle,
   derivePoolNonce,
   derivePoolPosition,
   derivePoolPositionVault,
-  derivePosition,
-  derivePositionVault,
-  deriveWriterToken,
-  deriveWriterVault,
   calculateDepositShares,
   calculatePayout,
   deriveMarketId,
@@ -58,16 +53,13 @@ import {
   poolBuybackMessage,
   poolQuoteMessage,
   PRICE_SCALE,
-  quoteMessage,
   symbolBytes,
   toAnchorPoolBuyback,
-  toAnchorQuote,
-  type Quote,
   type PoolQuote,
   type PoolBuyback,
   VSOL_PROGRAM_ID,
 } from "../sdk/index.ts";
-import { pythPriceToScaledAtoms } from "./lib/settlement.ts";
+import { fetchPoolMarketBinding, pythPriceToScaledAtoms } from "./lib/settlement.ts";
 // The shared market config -- the same list app/lib/markets.ts serves to the
 // UI and vsol/scripts/keeper.ts mints against. Imported rather than mirrored
 // so "which markets are live" is decided in exactly one file.
@@ -102,7 +94,13 @@ const commitment = "confirmed" as const;
 // recover from the 429 rate-limiting and dropped connections that make the
 // smoke lifecycle's confirmations flaky. commitment is threaded through
 // from the single `commitment` const above rather than re-hardcoded here.
-const connection = new Connection(rpcUrl, { commitment, confirmTransactionInitialTimeout: 120_000 });
+const connection = createVsolConnection({
+  rpcUrl,
+  backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL,
+  cluster,
+  commitment,
+  confirmTransactionInitialTimeout: 120_000,
+});
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const deploymentPath = resolve(workspace, "deployments", `${cluster}.json`);
@@ -229,8 +227,6 @@ type Deployment = {
   creator: string;
   settlementMint: string;
   underlyingMint: string;
-  writerVault: string;
-  writerToken: string;
   treasuryToken: string;
   domainSeparator: number[];
   domainVersion: number;
@@ -481,8 +477,9 @@ async function authorizePoolMarket(params: {
   lastTradeAt: number;
 }) {
   const poolMarket = deriveLiquidityPoolMarket(params.pool, params.market);
-  const existing = await params.managerProgram.account.liquidityPoolMarket.fetchNullable(poolMarket);
-  if (!existing || !existing.enabled || existing.lastTradeAt.toNumber() !== params.lastTradeAt) {
+  // Not Anchor's fetchNullable: it cannot decode a legacy 82-byte binding (see fetchPoolMarketBinding).
+  const existing = await fetchPoolMarketBinding(params.managerProgram.provider.connection, poolMarket);
+  if (!existing || !existing.enabled || existing.lastTradeAt !== params.lastTradeAt) {
     await params.managerProgram.methods
       .setLiquidityPoolMarket({ lastTradeAt: new BN(params.lastTradeAt), enabled: true })
       .accountsStrict({
@@ -496,60 +493,6 @@ async function authorizePoolMarket(params: {
       .rpc();
   }
   return poolMarket;
-}
-
-async function buildFill(params: {
-  buyerProgram: Program<Vsol>;
-  buyer: Keypair;
-  buyerSource: PublicKey;
-  maker: Keypair;
-  config: PublicKey;
-  market: PublicKey;
-  settlementMint: PublicKey;
-  writerVault: PublicKey;
-  writerToken: PublicKey;
-  quote: Quote;
-  domainSeparator: Uint8Array;
-  domainVersion: number;
-}) {
-  const nonceRecord = deriveNonce(params.config, params.maker.publicKey, params.quote.nonce);
-  const position = derivePosition(nonceRecord);
-  const positionVault = derivePositionVault(position);
-  const message = quoteMessage({
-    domainSeparator: params.domainSeparator,
-    domainVersion: params.domainVersion,
-    config: params.config,
-    market: params.market,
-    buyer: params.buyer.publicKey,
-    maker: params.maker.publicKey,
-    quote: params.quote,
-  });
-  const signatureInstruction = Ed25519Program.createInstructionWithPrivateKey({
-    privateKey: params.maker.secretKey,
-    message,
-  });
-  const fillInstruction = await params.buyerProgram.methods
-    .fillQuote(toAnchorQuote(params.quote))
-    .accountsStrict({
-      buyer: params.buyer.publicKey,
-      maker: params.maker.publicKey,
-      config: params.config,
-      market: params.market,
-      settlementMint: params.settlementMint,
-      writerVault: params.writerVault,
-      writerToken: params.writerToken,
-      buyerSource: params.buyerSource,
-      nonceRecord,
-      position,
-      positionVault,
-      eligibility: null,
-      instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      systemProgram: SystemProgram.programId,
-      rent: SYSVAR_RENT_PUBKEY,
-    })
-    .instruction();
-  return { transaction: new Transaction().add(signatureInstruction, fillInstruction), nonceRecord, position, positionVault };
 }
 
 function toAnchorPoolQuote(quote: PoolQuote) {
@@ -628,6 +571,7 @@ async function buildPoolClose(params: {
   quoteAuthority: Keypair;
   config: PublicKey;
   pool: PublicKey;
+  poolMarket: PublicKey;
   market: PublicKey;
   oracle: PublicKey;
   position: PublicKey;
@@ -660,6 +604,7 @@ async function buildPoolClose(params: {
       buyer: params.buyer.publicKey,
       config: params.config,
       pool: params.pool,
+      poolMarket: params.poolMarket,
       market: params.market,
       oracle: params.oracle,
       position: params.position,
@@ -896,39 +841,6 @@ async function main(): Promise<void> {
   );
   const treasuryToken = await ensureTokenBalance(admin, settlementMintAuthority, settlementMint, admin.publicKey, 0n);
 
-  const writerVault = deriveWriterVault(config, maker.publicKey, settlementMint);
-  const writerToken = deriveWriterToken(writerVault);
-  if (!(await accountExists(writerVault))) {
-    await makerProgram.methods
-      .initializeWriterVault()
-      .accountsStrict({
-        maker: maker.publicKey,
-        config,
-        settlementMint,
-        writerVault,
-        writerToken,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .rpc();
-  }
-  const writerLiquidity = (await getAccount(connection, writerToken, commitment, TOKEN_PROGRAM_ID)).amount;
-  if (writerLiquidity < 30_000n * 1_000_000n) {
-    await makerProgram.methods
-      .depositWriter(new BN((30_000n * 1_000_000n - writerLiquidity).toString()))
-      .accountsStrict({
-        config,
-        maker: maker.publicKey,
-        settlementMint,
-        writerVault,
-        writerToken,
-        makerSource: makerToken,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
-  }
-
   const now = await clusterUnixTime();
   const schedule = rollingMarketSchedule(now);
 
@@ -1120,8 +1032,6 @@ async function main(): Promise<void> {
     creator: creator.publicKey.toBase58(),
     settlementMint: settlementMint.toBase58(),
     underlyingMint: underlyingMint.toBase58(),
-    writerVault: writerVault.toBase58(),
-    writerToken: writerToken.toBase58(),
     treasuryToken: treasuryToken.toBase58(),
     domainSeparator: [...domainSeparator],
     domainVersion,
@@ -1262,7 +1172,7 @@ async function main(): Promise<void> {
   });
 
   const quoteExpiry = BigInt(smokeExpiry - 5);
-  const successQuote: Quote = {
+  const successQuote: PoolQuote = {
     nonce: BigInt(Date.now()),
     direction: 0,
     strike: 100n * PRICE_SCALE,
@@ -1271,7 +1181,7 @@ async function main(): Promise<void> {
     maxPayout: 5_000n * 1_000_000n,
     quoteExpiry,
   };
-  const refundQuote: Quote = {
+  const refundQuote: PoolQuote = {
     nonce: successQuote.nonce + 1n,
     direction: 1,
     strike: 100n * PRICE_SCALE,
@@ -1282,37 +1192,6 @@ async function main(): Promise<void> {
   };
   const poolSuccessQuote: PoolQuote = { ...successQuote, nonce: successQuote.nonce + 10n };
   const poolRefundQuote: PoolQuote = { ...refundQuote, nonce: successQuote.nonce + 11n };
-
-  const successFill = await buildFill({
-    buyerProgram,
-    buyer,
-    buyerSource: buyerToken,
-    maker,
-    config,
-    market: successMarket.market,
-    settlementMint,
-    writerVault,
-    writerToken,
-    quote: successQuote,
-    domainSeparator,
-    domainVersion,
-  });
-  const successFillSignature = await sendAndConfirmWithRetry(successFill.transaction, [buyer], "success fill");
-  const refundFill = await buildFill({
-    buyerProgram,
-    buyer,
-    buyerSource: buyerToken,
-    maker,
-    config,
-    market: refundMarket.market,
-    settlementMint,
-    writerVault,
-    writerToken,
-    quote: refundQuote,
-    domainSeparator,
-    domainVersion,
-  });
-  const refundFillSignature = await sendAndConfirmWithRetry(refundFill.transaction, [buyer], "refund fill");
 
   const poolSuccessFill = await buildPoolFill({
     buyerProgram,
@@ -1347,17 +1226,10 @@ async function main(): Promise<void> {
   });
   const poolRefundFillSignature = await sendAndConfirmWithRetry(poolRefundFill.transaction, [buyer], "pool refund fill");
 
-  // These two replay checks are deliberately NOT sendAndConfirmWithRetry:
-  // the whole point is that the program itself rejects the resend (a
-  // consumed nonce), so retrying on failure would retry the very outcome
-  // the assertion below requires.
-  let replayRejected = false;
-  try {
-    await sendAndConfirmTransaction(connection, successFill.transaction, [buyer], { commitment });
-  } catch {
-    replayRejected = true;
-  }
-  if (!replayRejected) throw new Error("A filled maker nonce was replayable");
+  // This replay check is deliberately NOT sendAndConfirmWithRetry: the whole
+  // point is that the program itself rejects the resend (a consumed nonce),
+  // so retrying on failure would retry the very outcome the assertion below
+  // requires.
   let poolReplayRejected = false;
   try {
     await sendAndConfirmTransaction(connection, poolSuccessFill.transaction, [buyer], { commitment });
@@ -1377,33 +1249,13 @@ async function main(): Promise<void> {
     expiry: smokeExpiry,
   });
 
-  const settleSignature = await adminProgram.methods
-    .settle()
-    .accountsStrict({
-      cranker: admin.publicKey,
-      config,
-      market: successMarket.market,
-      oracle: successMarket.oracle,
-      nonceRecord: successFill.nonceRecord,
-      position: successFill.position,
-      positionVault: successFill.positionVault,
-      settlementMint,
-      buyerDestination: buyerToken,
-      makerDestination: makerToken,
-      treasuryDestination: treasuryToken,
-      rentRecipient: buyer.publicKey,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .rpc();
-  if (await accountExists(successFill.position)) throw new Error("Settled position account did not close");
-  if (await accountExists(successFill.positionVault)) throw new Error("Settled token vault did not close");
-
   const poolSettleSignature = await adminProgram.methods
     .settlePoolPosition()
     .accountsStrict({
       cranker: admin.publicKey,
       config,
       pool: smokePool.pool,
+      poolMarket: successPoolMarket,
       market: successMarket.market,
       oracle: successMarket.oracle,
       nonceRecord: poolSuccessFill.nonceRecord,
@@ -1422,24 +1274,6 @@ async function main(): Promise<void> {
 
   const refundDeadline = smokeExpiry + 5 + 15;
   await waitUntil(refundDeadline, "Waiting for oracle-timeout refund");
-  const refundSignature = await adminProgram.methods
-    .refundUnsettled()
-    .accountsStrict({
-      cranker: admin.publicKey,
-      market: refundMarket.market,
-      oracle: refundMarket.oracle,
-      nonceRecord: refundFill.nonceRecord,
-      position: refundFill.position,
-      positionVault: refundFill.positionVault,
-      settlementMint,
-      buyerDestination: buyerToken,
-      makerDestination: makerToken,
-      rentRecipient: buyer.publicKey,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .rpc();
-  if (await accountExists(refundFill.position)) throw new Error("Refunded position account did not close");
-  if (await accountExists(refundFill.positionVault)) throw new Error("Refunded token vault did not close");
 
   const poolRefundSignature = await adminProgram.methods
     .refundPoolPosition()
@@ -1447,6 +1281,7 @@ async function main(): Promise<void> {
       cranker: admin.publicKey,
       config,
       pool: smokePool.pool,
+      poolMarket: refundPoolMarket,
       market: refundMarket.market,
       oracle: refundMarket.oracle,
       nonceRecord: poolRefundFill.nonceRecord,
@@ -1592,6 +1427,7 @@ async function main(): Promise<void> {
     quoteAuthority: maker,
     config,
     pool: smokePool.pool,
+    poolMarket: closePoolMarket,
     market: closeMarket.market,
     oracle: closeMarket.oracle,
     position: closeFill.position,
@@ -1691,8 +1527,6 @@ async function main(): Promise<void> {
     smokeStatus: "passed",
     smoke: {
       ...(previousDeployment.smoke ?? {}),
-      successFillSignature,
-      refundFillSignature,
       poolSuccessFillSignature,
       poolRefundFillSignature,
       successMarket: successMarket.market.toBase58(),
@@ -1705,15 +1539,10 @@ async function main(): Promise<void> {
       pythPrice: pythSettlement.pythPrice,
       pythConfidence: pythSettlement.pythConfidence,
       pythExponent: pythSettlement.pythExponent,
-      settleSignature,
       poolSettleSignature,
-      refundSignature,
       poolRefundSignature,
       poolWithdrawSignature,
-      replayRejected,
       poolReplayRejected,
-      successPositionClosed: !(await accountExists(successFill.position)),
-      refundPositionClosed: !(await accountExists(refundFill.position)),
       poolSuccessPositionClosed: !(await accountExists(poolSuccessFill.position)),
       poolRefundPositionClosed: !(await accountExists(poolRefundFill.position)),
       smokePool: smokePool.pool.toBase58(),

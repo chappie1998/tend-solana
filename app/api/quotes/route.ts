@@ -8,10 +8,10 @@ import { payoffTiersFor, payoutForStake, quoteFor, stakeBoundsForPayoff, type Di
 const STAKE_REFERENCE_NOTIONAL = 1_000;
 import { ensureDb, getDb } from "../../../db";
 import { rfqQuotes } from "../../../db/schema";
-import { lt } from "drizzle-orm";
+import { and, gte, like, lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
-import { getCustomOracleReadiness } from "../../lib/custom-oracle-readiness";
+import { getVsolExecutionReadiness } from "../../lib/custom-oracle-readiness";
 import {
   buildVsolQuoteTransaction,
   checkVsolPoolDepth,
@@ -25,22 +25,73 @@ import {
 import { solanaExplorerUrl, VSOL_CUSTOM_SETTLEMENT_DEPLOYED } from "../../lib/vsol";
 import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
+import { enforceInMemoryRateLimit } from "../../lib/in-memory-rate-limit";
+import { buildRfqRequestId, checkExecutableQuoteRateLimit, RFQ_REQUEST_ID_DELIMITER, userKeyFromRfqRequestId } from "../../lib/rate-limit";
+
+/**
+ * Two intents share this route, split so that merely PREVIEWING a price can
+ * never cost the server money (see app/lib/rate-limit.ts's doc comment for
+ * the concrete cost: an unlisted strike triggers a real, server-paid listing
+ * transaction). `indicative` is the safe DEFAULT -- an unrecognised or
+ * missing `intent` gets the cheap, side-effect-free path, never the one that
+ * lists/signs/persists. Only an explicit `intent: "execute"` reaches that
+ * path.
+ *
+ * - `indicative`: the pricing engine's honest read on this ticket right now
+ *   (premium, strike, maxPayout, probability, implied vol), computed exactly
+ *   like `execute` does, PLUS the pool-depth pre-check (a single read-only
+ *   account fetch -- see its own comment below for why that one stays for
+ *   both intents). It NEVER resolves-and-lists a series onchain, never asks
+ *   the pool authority to sign anything, and never writes an `rfq_quotes`
+ *   row -- so it is safe to fire on every keystroke (see the 600ms auto-quote
+ *   debounce in app/components/TendTerminal.tsx). The response has no `vsol`
+ *   field and marks its quote `executable: false`; nothing this route returns
+ *   for this intent may ever reach the wallet-signing path.
+ * - `execute`: today's original behaviour -- series resolution (minting an
+ *   unlisted rung if needed), a server-signed transaction, and a persisted
+ *   `rfq_quotes` row -- gated additionally by the DB-backed per-wallet cap
+ *   below, since this is the intent that can actually spend the server's SOL.
+ *   Only requested when the trader clicks "Review & execute".
+ */
+type QuoteIntent = "indicative" | "execute";
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return json({ error: "Cross-site quote requests are not allowed." }, 403);
-  if (!(await resolveUserKey(request))) return json({ error: "Sign in to request executable quotes." }, 401);
-  if (!VSOL_CUSTOM_SETTLEMENT_DEPLOYED) {
-    return json({
-      error: "Executable quotes are paused: the custom settlement observation upgrade has not yet been verified on devnet.",
-      code: "VSOL_CUSTOM_SETTLEMENT_DEPLOYMENT_PENDING",
-    }, 503);
+  const userKey = await resolveUserKey(request);
+  if (!userKey) return json({ error: "Sign in to request a quote." }, 401);
+  // Best-effort burst dampener only, applied to BOTH intents (see
+  // app/lib/in-memory-rate-limit.ts's doc comment) -- indicative auto-quoting
+  // is the frequent case this bucket sizes for. The DB-backed cap below is
+  // the one that actually protects the server's SOL on the execute path.
+  const inMemoryLimit = enforceInMemoryRateLimit(request, "quotes", userKey);
+  if (inMemoryLimit.limited) {
+    return json(
+      { error: "Too many quote requests. Wait a moment and try again." },
+      429,
+      { "Retry-After": String(inMemoryLimit.retryAfterSeconds) },
+    );
   }
-  await ensureDb();
   let input: Record<string, unknown>;
   try {
     input = await request.json() as Record<string, unknown>;
   } catch {
     return json({ error: "The quote request must be valid JSON." }, 400);
+  }
+
+  // Default to the safe, side-effect-free intent -- see the doc comment
+  // above. Only the literal string "execute" ever reaches the costly path.
+  const intent: QuoteIntent = input.intent === "execute" ? "execute" : "indicative";
+
+  if (intent === "execute" && !VSOL_CUSTOM_SETTLEMENT_DEPLOYED) {
+    // This gate is about EXECUTION specifically (whether it is safe to open
+    // a real position against the current settlement path), not about
+    // computing a preview -- an indicative price is honest regardless of
+    // whether the custom settlement upgrade has been verified, since nothing
+    // gets minted, signed, or settled from it.
+    return json({
+      error: "Executable quotes are paused: the custom settlement observation upgrade has not yet been verified on devnet.",
+      code: "VSOL_CUSTOM_SETTLEMENT_DEPLOYMENT_PENDING",
+    }, 503);
   }
 
   const symbol = typeof input.symbol === "string" ? input.symbol.toUpperCase() : "";
@@ -64,8 +115,11 @@ export async function POST(request: Request) {
   // something that cannot settle is worse than showing nothing.
   const market = tradableMarketBySymbol(symbol);
 
+  // Input validation below is shared by both intents: an indicative preview
+  // is only useful if it prices the SAME ticket an execute request would, so
+  // there is exactly one set of bounds checks, not two that could drift.
   if (!market || !direction) return json({ error: "Choose a supported market and direction." }, 422);
-  if (!buyer) return json({ error: "Connect a valid Solana wallet before requesting an executable quote." }, 422);
+  if (!buyer) return json({ error: "Connect a valid Solana wallet before requesting a quote." }, 422);
   if (!stakeMode && (!Number.isFinite(amount) || amount < 100 || amount > 5_000)) {
     return json({ error: "Devnet order size must be between $100 and $5,000." }, 422);
   }
@@ -85,13 +139,65 @@ export async function POST(request: Request) {
   // payoffTiersFor once durationMinutes is known below.
   if (!Number.isFinite(payoff) || payoff <= 0) return json({ error: "Choose a valid target payoff." }, 422);
 
+  const requestedAt = Date.now();
+
+  if (intent === "execute") {
+    // Authoritative, DB-backed per-wallet cap -- see app/lib/rate-limit.ts's
+    // doc comment for why this (not the in-memory limiter above) is the
+    // control that actually bounds the server's SOL exposure. Runs BEFORE
+    // any chain read below (oracle readiness, series resolution, pool depth),
+    // so a rate-limited caller never causes any of that work, let alone
+    // reaching listVsolSeriesOnChain.
+    await ensureDb();
+    const db = getDb();
+    const rateLimitWindowStart = new Date(requestedAt - 3_600_000);
+    // Narrowed in SQL rather than fetching every wallet's rows for the hour:
+    // `expires_at` is indexed (rfq_quotes_expiry_idx) and is always
+    // created_at + 30s, so bounding it by the window start lets Postgres use
+    // the index; the requestId prefix then keeps only this caller's rows.
+    // LIKE metacharacters in the key are escaped, and the exact
+    // userKeyFromRfqRequestId match below stays the final authority in case
+    // an escaped pattern still over-matches. `rfq_quotes` has no wallet
+    // column (see buildRfqRequestId's doc comment); a real indexed column
+    // is the proper fix if this ever needs to scale.
+    const escapedKey = userKey.replace(/[\\%_]/g, (character) => `\\${character}`);
+    const recentRows = await db
+      .select({ requestId: rfqQuotes.requestId, createdAt: rfqQuotes.createdAt })
+      .from(rfqQuotes)
+      .where(and(
+        gte(rfqQuotes.expiresAt, rateLimitWindowStart),
+        gte(rfqQuotes.createdAt, rateLimitWindowStart),
+        like(rfqQuotes.requestId, `${escapedKey}${RFQ_REQUEST_ID_DELIMITER}%`),
+      ));
+    const recentCreatedAtMsForWallet = recentRows
+      .filter((row) => userKeyFromRfqRequestId(row.requestId) === userKey)
+      .map((row) => row.createdAt.getTime());
+    const rateLimit = checkExecutableQuoteRateLimit(recentCreatedAtMsForWallet, requestedAt);
+    if (rateLimit.limited) {
+      return json(
+        { error: rateLimit.message, code: "VSOL_EXECUTABLE_QUOTE_RATE_LIMITED" },
+        429,
+        { "Retry-After": String(rateLimit.retryAfterSeconds) },
+      );
+    }
+  }
+
   try {
-    const [oracle] = await getCustomOracleReadiness([market.symbol]);
-    if (!oracle?.ready) {
+    // Gated on whether this market can actually be SETTLED, not on whether its
+    // price was pushed recently. Prices are now published only at expiry, by
+    // the oracle runner, for markets with open interest -- so a symbol's feed
+    // is normally minutes or hours old and "fresh within 150s" would block
+    // nearly every quote. What a sale genuinely depends on is (a) the runner
+    // being alive to publish+capture at expiry (its heartbeat) and (b) this
+    // symbol's feed account being structurally able to accept that capture.
+    // Fills never read the feed (CUSTOM_ORACLE_MAX_STALENESS_SECONDS is only
+    // enforced by update_custom_price_feed), so neither check is about price.
+    const readiness = await getVsolExecutionReadiness([market.symbol]);
+    if (!readiness.ok) {
       return json({
-        error: `${market.symbol} quoting is paused because its settlement oracle is not fresh. ${oracle?.reason ?? "Feed state is unavailable."}`,
+        error: `${market.symbol} quoting is paused because its settlement oracle cannot currently settle new positions. ${readiness.reason ?? "Oracle state is unavailable."}`,
         code: "VSOL_CUSTOM_ORACLE_NOT_READY",
-        oracle: oracle ?? { symbol: market.symbol, ready: false },
+        oracle: { symbol: market.symbol, ready: false, reason: readiness.reason },
       }, 503);
     }
   } catch (error) {
@@ -101,7 +207,8 @@ export async function POST(request: Request) {
     }, 503);
   }
 
-  const requestedAt = Date.now();
+  // requestedAt was captured earlier (before the execute-only rate-limit
+  // check above) so both share one timestamp.
   const expiry = resolveExpiry(expiryCode, symbol, requestedAt);
   if (!expiry.available) return json({ error: expiry.availabilityReason }, 422);
   const resolution = await resolveOrPlanVsolSeries(symbol, expiryCode, requestedAt);
@@ -145,7 +252,7 @@ export async function POST(request: Request) {
     ]);
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Market pricing data is unavailable";
-    return json({ error: `Executable pricing requires a fresh spot reference and historical observations: ${reason}` }, 503);
+    return json({ error: `Pricing requires a fresh spot reference and historical observations: ${reason}` }, 503);
   }
   // In stake mode the payout that costs exactly `stake` is derived from one
   // reference quote -- premium is exactly linear in payout, see
@@ -216,7 +323,83 @@ export async function POST(request: Request) {
     }, 422);
   }
 
-  const requestId = crypto.randomUUID();
+  // Read live off the Config account fetched above for the depth check
+  // (poolCore), rather than trusting PROTOCOL_WIN_FEE_BPS
+  // (app/lib/options.ts) -- a hand-maintained mirror of this same value that
+  // can only ever be updated after the fact. Returned in BOTH intents' response
+  // so the UI can show the real fee before a trade is ever signed.
+  const protocolFeeBps = poolCore.config.feeBps;
+
+  // Fields both intents report identically, computed once so indicative and
+  // execute can never disagree about market/expiry state -- only about
+  // whether a real transaction backs the numbers.
+  const responseEnvelope = {
+    symbol,
+    tokenAddress: market.tokenAddress,
+    oracleStatus: market.oracleStatus,
+    referencePrice: snapshot.price,
+    referenceConfidence: snapshot.confidence,
+    referencePublishTime: snapshot.publishTime,
+    referenceAgeSeconds: snapshot.ageSeconds,
+    pricingMode: snapshot.mode,
+    referenceSource: snapshot.source === "Hyperliquid"
+      ? "Hyperliquid xyz mark · timestamp records Tend's HTTP fetch"
+      : `${snapshot.source} · signed into Tend's custom oracle feed`,
+    settlement: "European cash-settled · centrally signed custom oracle with an immutable expiry observation",
+    expiry: {
+      code: expiry.code,
+      label: expiry.label,
+      optionExpiryAt: onchainExpiryAt,
+      observationWindowSeconds: seriesState.observationWindowSeconds,
+      tradeLockSeconds: Math.max(0, seriesState.expiry - seriesState.lastTradeAt),
+    },
+    protocolFeeBps,
+  };
+
+  if (intent === "indicative") {
+    // NEVER resolves-and-lists a series onchain, never asks the pool
+    // authority to sign anything, and never writes an `rfq_quotes` row -- see
+    // the intent doc comment at the top of this file. `id` has no database
+    // row behind it (there is nothing to look up), and `executable: false` is
+    // the flag app/components/TendTerminal.tsx's signing path checks before
+    // it will ever hand a quote to the wallet -- this response must never
+    // reach that path.
+    return json({
+      ...responseEnvelope,
+      intent,
+      requestId: crypto.randomUUID(),
+      quotes: [{
+        id: crypto.randomUUID(),
+        maker: "VSOL V2 Pool",
+        premium: Number(economics.premium.toFixed(2)),
+        maxPayout: Number(economics.maxPayout.toFixed(2)),
+        strike: Number(economics.strike.toFixed(2)),
+        cap: Number(economics.cap.toFixed(2)),
+        breakeven: Number(economics.breakeven.toFixed(2)),
+        pricingVolatility: volatility.value,
+        volatilitySource: volatility.source,
+        effectiveLeverage: Number((economics.maxPayout / economics.premium).toFixed(2)),
+        latencyMs: Date.now() - requestedAt,
+        badge: "Pool escrow",
+        // Indicative prices carry no real signing window (nothing is signed
+        // yet), but the client's auto-refresh cadence keys off this field
+        // regardless of intent -- see the quoteState countdown effect in
+        // TendTerminal.tsx -- so it still gets a short, honest TTL.
+        expiresAt: requestedAt + 30_000,
+        probabilityItm: economics.probabilityItm,
+        impliedVolatility: economics.impliedVolatility,
+        executable: false,
+      }],
+    });
+  }
+
+  // From here on: EXECUTE ONLY. The DB-backed per-wallet rate limit already
+  // ran, before any of the chain reads above, so reaching this point means
+  // this wallet is still within its cap.
+  // Embeds `userKey` (never the unauthenticated `walletAddress` request
+  // field) so the rate-limit check above can find this wallet's own rows on
+  // its next request -- see app/lib/rate-limit.ts.
+  const requestId = buildRfqRequestId(userKey);
   const startedAt = Date.now();
   let vsol;
   try {
@@ -306,29 +489,16 @@ export async function POST(request: Request) {
     // reading, when the reference is stale).
     probabilityItm: economics.probabilityItm,
     impliedVolatility: economics.impliedVolatility,
+    // A real, server-signed transaction backs this quote (see `vsol` below)
+    // -- this is the flag app/components/TendTerminal.tsx's signing path
+    // requires before it will hand a quote to the wallet.
+    executable: true,
   }));
 
   return json({
+    ...responseEnvelope,
+    intent,
     requestId,
-    symbol,
-    tokenAddress: market.tokenAddress,
-    oracleStatus: market.oracleStatus,
-    referencePrice: snapshot.price,
-    referenceConfidence: snapshot.confidence,
-    referencePublishTime: snapshot.publishTime,
-    referenceAgeSeconds: snapshot.ageSeconds,
-    pricingMode: snapshot.mode,
-    referenceSource: snapshot.source === "Hyperliquid"
-      ? "Hyperliquid xyz mark · timestamp records Tend's HTTP fetch"
-      : `${snapshot.source} · signed into Tend's custom oracle feed`,
-    settlement: "European cash-settled · centrally signed custom oracle with an immutable expiry observation",
-    expiry: {
-      code: expiry.code,
-      label: expiry.label,
-      optionExpiryAt: onchainExpiryAt,
-      observationWindowSeconds: seriesState.observationWindowSeconds,
-      tradeLockSeconds: Math.max(0, seriesState.expiry - seriesState.lastTradeAt),
-    },
     quotes,
     vsol: {
       ...vsol,

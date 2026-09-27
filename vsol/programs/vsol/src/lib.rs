@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Burn, CloseAccount, Mint, MintTo, Token, TokenAccount, TransferChecked};
+use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, TransferChecked};
 
 mod math;
 mod pyth;
@@ -7,7 +7,7 @@ mod signature;
 
 use math::{
     calculate_bps_limit, calculate_deposit_shares, calculate_fee, calculate_payout,
-    calculate_pro_rata_redemption, calculate_withdraw_amount, up_wins,
+    calculate_withdraw_amount,
 };
 use pyth::{parse_fully_verified_price_update, PythPrice};
 // Re-exported purely so the LiteSVM integration test suite (a separate crate
@@ -15,8 +15,8 @@ use pyth::{parse_fully_verified_price_update, PythPrice};
 // fixture account without duplicating this address; see tests/common.
 pub use pyth::PYTH_RECEIVER_PROGRAM_ID;
 use signature::{
-    pool_buyback_message, pool_quote_message, quote_message, verify_preceding_ed25519_instruction,
-    PoolBuybackMessageContext, PoolQuoteMessageContext, QuoteMessageContext,
+    pool_buyback_message, pool_quote_message, verify_preceding_ed25519_instruction,
+    PoolBuybackMessageContext, PoolQuoteMessageContext,
 };
 
 declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
@@ -24,11 +24,6 @@ declare_id!("2SgyYptw5rMFsTKHiP95c5K3porxFrcsz6fb4mBfDa1v");
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const MARKET_SEED: &[u8] = b"market";
 pub const ORACLE_SEED: &[u8] = b"oracle";
-pub const WRITER_SEED: &[u8] = b"writer";
-pub const WRITER_TOKEN_SEED: &[u8] = b"writer-token";
-pub const NONCE_SEED: &[u8] = b"nonce";
-pub const POSITION_SEED: &[u8] = b"position";
-pub const POSITION_VAULT_SEED: &[u8] = b"position-vault";
 pub const ELIGIBILITY_SEED: &[u8] = b"eligibility";
 pub const POOL_SEED: &[u8] = b"pool";
 pub const POOL_TOKEN_SEED: &[u8] = b"pool-token";
@@ -37,24 +32,6 @@ pub const POOL_MARKET_SEED: &[u8] = b"pool-market";
 pub const POOL_NONCE_SEED: &[u8] = b"pool-nonce";
 pub const POOL_POSITION_SEED: &[u8] = b"pool-position";
 pub const POOL_POSITION_VAULT_SEED: &[u8] = b"pool-position-vault";
-// Conditional-token ("complete set") PDAs: two SPL mints and one collateral
-// vault, all derived solely from `market.key()` so they need no separate
-// manifest/registry account -- see `mint_complete_set`.
-pub const UP_MINT_SEED: &[u8] = b"up-mint";
-pub const DOWN_MINT_SEED: &[u8] = b"down-mint";
-pub const COMPLETE_SET_VAULT_SEED: &[u8] = b"cs-vault";
-// A minter's own UP/DOWN token account, keyed by (mint, minter) so it is
-// derivable off-chain with no bookkeeping and -- critically -- so
-// `mint_complete_set` can `init_if_needed` it without an extra throwaway
-// signer: on a brand-new market, `up_mint`/`down_mint` do not exist until
-// that same instruction's own `init_if_needed` creates them a few accounts
-// earlier, so the very first minter cannot have pre-created a standard SPL
-// token account (e.g. an ATA) for a mint that didn't exist yet. Only
-// `mint_complete_set` uses this seed; `burn_complete_set`/`redeem_winning`
-// accept any token account the caller already holds a balance in (see their
-// own doc comments).
-pub const COMPLETE_SET_TOKEN_SEED: &[u8] = b"cs-token";
-pub const QUOTE_DOMAIN: &[u8; 8] = b"VSOLRFQ1";
 pub const POOL_QUOTE_DOMAIN: &[u8; 8] = b"VSOLPLP1";
 // Distinct from the fill domains above so a signed early-close buyback quote
 // can never be replayed as (or confused with) a fill quote, even though both
@@ -448,237 +425,6 @@ pub mod vsol {
         Ok(())
     }
 
-    pub fn initialize_writer_vault(ctx: Context<InitializeWriterVault>) -> Result<()> {
-        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
-        let writer_vault = &mut ctx.accounts.writer_vault;
-        writer_vault.bump = ctx.bumps.writer_vault;
-        writer_vault.token_bump = ctx.bumps.writer_token;
-        writer_vault.config = ctx.accounts.config.key();
-        writer_vault.maker = ctx.accounts.maker.key();
-        writer_vault.settlement_mint = ctx.accounts.settlement_mint.key();
-        emit!(WriterVaultInitialized {
-            writer_vault: writer_vault.key(),
-            maker: writer_vault.maker,
-            settlement_mint: writer_vault.settlement_mint,
-        });
-        Ok(())
-    }
-
-    pub fn deposit_writer(ctx: Context<DepositWriter>, amount: u64) -> Result<()> {
-        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
-        require!(amount > 0, VsolError::InvalidAmount);
-        transfer_checked(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.maker_source.to_account_info(),
-            ctx.accounts.writer_token.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.maker.to_account_info(),
-            amount,
-            ctx.accounts.settlement_mint.decimals,
-        )?;
-        emit!(WriterDeposited {
-            writer_vault: ctx.accounts.writer_vault.key(),
-            amount
-        });
-        Ok(())
-    }
-
-    pub fn withdraw_writer(ctx: Context<WithdrawWriter>, amount: u64) -> Result<()> {
-        require!(amount > 0, VsolError::InvalidAmount);
-        require!(
-            ctx.accounts.writer_token.amount >= amount,
-            VsolError::InsufficientWriterLiquidity
-        );
-        let config_key = ctx.accounts.config.key();
-        let maker_key = ctx.accounts.maker.key();
-        let settlement_mint_key = ctx.accounts.settlement_mint.key();
-        let signer_seeds: &[&[u8]] = &[
-            WRITER_SEED,
-            config_key.as_ref(),
-            maker_key.as_ref(),
-            settlement_mint_key.as_ref(),
-            &[ctx.accounts.writer_vault.bump],
-        ];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.writer_token.to_account_info(),
-            ctx.accounts.maker_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.writer_vault.to_account_info(),
-            amount,
-            ctx.accounts.settlement_mint.decimals,
-            signer_seeds,
-        )?;
-        emit!(WriterWithdrawn {
-            writer_vault: ctx.accounts.writer_vault.key(),
-            amount
-        });
-        Ok(())
-    }
-
-    pub fn cancel_nonce(ctx: Context<CancelNonce>, nonce: u64) -> Result<()> {
-        let record = &mut ctx.accounts.nonce_record;
-        record.bump = ctx.bumps.nonce_record;
-        record.status = NonceStatus::Cancelled as u8;
-        record.config = ctx.accounts.config.key();
-        record.maker = ctx.accounts.maker.key();
-        record.nonce = nonce;
-        record.position = Pubkey::default();
-        emit!(NonceCancelled {
-            maker: record.maker,
-            nonce
-        });
-        Ok(())
-    }
-
-    pub fn fill_quote(ctx: Context<FillQuote>, quote: QuoteArgs) -> Result<()> {
-        let now = Clock::get()?.unix_timestamp;
-        let config = &ctx.accounts.config;
-        let market = &ctx.accounts.market;
-        require!(!config.paused, VsolError::ProtocolPaused);
-        require!(market.enabled, VsolError::MarketDisabled);
-        require!(now < market.expiry, VsolError::MarketExpired);
-        require!(
-            now <= quote.quote_expiry && quote.quote_expiry < market.expiry,
-            VsolError::QuoteExpired
-        );
-        require!(
-            quote.premium > 0 && quote.max_payout > 0,
-            VsolError::InvalidAmount
-        );
-        require!(quote.strike > 0 && quote.width > 0, VsolError::InvalidWidth);
-        Direction::try_from(quote.direction)?;
-
-        if config.eligibility_required {
-            let eligibility = ctx
-                .accounts
-                .eligibility
-                .as_ref()
-                .ok_or(VsolError::EligibilityRequired)?;
-            require_keys_eq!(
-                eligibility.config,
-                config.key(),
-                VsolError::InvalidEligibility
-            );
-            require_keys_eq!(
-                eligibility.wallet,
-                ctx.accounts.buyer.key(),
-                VsolError::InvalidEligibility
-            );
-            require!(
-                eligibility.can_trade && eligibility.expires_at >= now,
-                VsolError::IneligibleWallet
-            );
-        }
-
-        let config_key = config.key();
-        let market_key = market.key();
-        let buyer_key = ctx.accounts.buyer.key();
-        let maker_key = ctx.accounts.maker.key();
-        let quote_context = QuoteMessageContext {
-            program_id: &crate::ID,
-            config: &config_key,
-            market: &market_key,
-            buyer: &buyer_key,
-            maker: &maker_key,
-        };
-        let message = quote_message(
-            &config.domain_separator,
-            config.domain_version,
-            &quote_context,
-            &quote,
-        );
-        verify_preceding_ed25519_instruction(
-            &ctx.accounts.instructions_sysvar.to_account_info(),
-            &ctx.accounts.maker.key(),
-            &message,
-        )?;
-
-        require!(
-            ctx.accounts.writer_token.amount >= quote.max_payout,
-            VsolError::InsufficientWriterLiquidity
-        );
-
-        transfer_checked(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.buyer_source.to_account_info(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.buyer.to_account_info(),
-            quote.premium,
-            ctx.accounts.settlement_mint.decimals,
-        )?;
-
-        let config_key = config.key();
-        let maker_key = ctx.accounts.maker.key();
-        let settlement_mint_key = ctx.accounts.settlement_mint.key();
-        let writer_seeds: &[&[u8]] = &[
-            WRITER_SEED,
-            config_key.as_ref(),
-            maker_key.as_ref(),
-            settlement_mint_key.as_ref(),
-            &[ctx.accounts.writer_vault.bump],
-        ];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.writer_token.to_account_info(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.writer_vault.to_account_info(),
-            quote.max_payout,
-            ctx.accounts.settlement_mint.decimals,
-            writer_seeds,
-        )?;
-
-        ctx.accounts.position_vault.reload()?;
-        let expected_escrow = quote
-            .premium
-            .checked_add(quote.max_payout)
-            .ok_or(VsolError::MathOverflow)?;
-        require!(
-            ctx.accounts.position_vault.amount == expected_escrow,
-            VsolError::CollateralMismatch
-        );
-
-        let record = &mut ctx.accounts.nonce_record;
-        record.bump = ctx.bumps.nonce_record;
-        record.status = NonceStatus::Filled as u8;
-        record.config = config.key();
-        record.maker = ctx.accounts.maker.key();
-        record.nonce = quote.nonce;
-        record.position = ctx.accounts.position.key();
-
-        let position = &mut ctx.accounts.position;
-        position.bump = ctx.bumps.position;
-        position.vault_bump = ctx.bumps.position_vault;
-        position.status = PositionStatus::Open as u8;
-        position.direction = quote.direction;
-        position.market = market.key();
-        position.nonce_record = record.key();
-        position.buyer = ctx.accounts.buyer.key();
-        position.maker = ctx.accounts.maker.key();
-        position.settlement_mint = ctx.accounts.settlement_mint.key();
-        position.nonce = quote.nonce;
-        position.strike = quote.strike;
-        position.width = quote.width;
-        position.premium = quote.premium;
-        position.max_payout = quote.max_payout;
-        position.fee_bps = config.fee_bps;
-        position.opened_at = now;
-        position.quote_expiry = quote.quote_expiry;
-
-        emit!(QuoteFilled {
-            position: position.key(),
-            market: market.key(),
-            buyer: position.buyer,
-            maker: position.maker,
-            nonce: position.nonce,
-            premium: position.premium,
-            max_payout: position.max_payout,
-        });
-        Ok(())
-    }
-
     pub fn publish_pyth_settlement(ctx: Context<PublishPythSettlement>) -> Result<()> {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp;
@@ -839,172 +585,6 @@ pub mod vsol {
         Ok(())
     }
 
-    pub fn settle(ctx: Context<Settle>) -> Result<()> {
-        let position = &ctx.accounts.position;
-        let market = &ctx.accounts.market;
-        let oracle = &ctx.accounts.oracle;
-        require!(
-            position.status == PositionStatus::Open as u8,
-            VsolError::PositionNotOpen
-        );
-        require!(oracle.finalized, VsolError::OracleNotFinalized);
-        require!(
-            Clock::get()?.unix_timestamp >= market.expiry,
-            VsolError::MarketNotExpired
-        );
-
-        let payout = calculate_payout(
-            position.direction,
-            position.strike,
-            position.width,
-            oracle.price,
-            position.max_payout,
-        )?;
-        // A filled quote must not become more expensive if governance updates
-        // the protocol fee before expiry.
-        let fee = calculate_fee(position.premium, position.fee_bps)?;
-        let maker_amount = position
-            .max_payout
-            .checked_sub(payout)
-            .and_then(|value| value.checked_add(position.premium))
-            .and_then(|value| value.checked_sub(fee))
-            .ok_or(VsolError::MathOverflow)?;
-        let total = payout
-            .checked_add(maker_amount)
-            .and_then(|value| value.checked_add(fee))
-            .ok_or(VsolError::MathOverflow)?;
-        let expected = position
-            .premium
-            .checked_add(position.max_payout)
-            .ok_or(VsolError::MathOverflow)?;
-        require!(
-            total == expected && ctx.accounts.position_vault.amount == expected,
-            VsolError::CollateralMismatch
-        );
-
-        let nonce_record_key = ctx.accounts.nonce_record.key();
-        let position_seeds: &[&[u8]] =
-            &[POSITION_SEED, nonce_record_key.as_ref(), &[position.bump]];
-        if payout > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.buyer_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                payout,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
-        }
-        if maker_amount > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.maker_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                maker_amount,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
-        }
-        if fee > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.treasury_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                fee,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
-        }
-        close_token_account(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.rent_recipient.to_account_info(),
-            ctx.accounts.position.to_account_info(),
-            position_seeds,
-        )?;
-
-        emit!(PositionSettled {
-            position: position.key(),
-            settlement_price: oracle.price,
-            payout,
-            maker_amount,
-            fee,
-        });
-        Ok(())
-    }
-
-    pub fn refund_unsettled(ctx: Context<RefundUnsettled>) -> Result<()> {
-        let now = Clock::get()?.unix_timestamp;
-        let position = &ctx.accounts.position;
-        let market = &ctx.accounts.market;
-        require!(
-            position.status == PositionStatus::Open as u8,
-            VsolError::PositionNotOpen
-        );
-        require!(
-            !ctx.accounts.oracle.finalized,
-            VsolError::OracleAlreadyFinalized
-        );
-
-        let deadline = market
-            .expiry
-            .checked_add(i64::from(market.observation_window_seconds))
-            .and_then(|value| value.checked_add(i64::from(market.settlement_grace_seconds)))
-            .ok_or(VsolError::MathOverflow)?;
-        require!(now > deadline, VsolError::SettlementWindowOpen);
-
-        let expected = position
-            .premium
-            .checked_add(position.max_payout)
-            .ok_or(VsolError::MathOverflow)?;
-        require!(
-            ctx.accounts.position_vault.amount == expected,
-            VsolError::CollateralMismatch
-        );
-        let nonce_record_key = ctx.accounts.nonce_record.key();
-        let position_seeds: &[&[u8]] =
-            &[POSITION_SEED, nonce_record_key.as_ref(), &[position.bump]];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.buyer_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.position.to_account_info(),
-            position.premium,
-            ctx.accounts.settlement_mint.decimals,
-            position_seeds,
-        )?;
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.maker_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.position.to_account_info(),
-            position.max_payout,
-            ctx.accounts.settlement_mint.decimals,
-            position_seeds,
-        )?;
-        close_token_account(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.position_vault.to_account_info(),
-            ctx.accounts.rent_recipient.to_account_info(),
-            ctx.accounts.position.to_account_info(),
-            position_seeds,
-        )?;
-        emit!(PositionRefunded {
-            position: position.key(),
-            premium: position.premium,
-            collateral: position.max_payout,
-        });
-        Ok(())
-    }
-
     pub fn initialize_liquidity_pool(
         ctx: Context<InitializeLiquidityPool>,
         args: InitializeLiquidityPoolArgs,
@@ -1056,20 +636,20 @@ pub mod vsol {
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
 
-        // `pool_market` is `init_if_needed`: this call either creates a brand
-        // new authorization record or mutates one that already exists.
-        // Anchor zero-initializes an account on creation, and `pool` is only
-        // ever written to a non-default value right below in this same
-        // instruction (it is never left at `Pubkey::default()` once set), so
-        // "pool_market.pool is still the zero pubkey" is a sound signal that
-        // this account did not exist before this instruction ran. We check
-        // it before making any writes. We deliberately do not use
-        // `last_trade_at == 0` for this: `enabled == false` is a legitimate,
-        // reachable state for `last_trade_at` to be left at (or reset to)
-        // zero, so that field can't distinguish "never created" from
-        // "created and since disabled".
-        let is_first_time_enable =
-            ctx.accounts.pool_market.pool == Pubkey::default() && args.enabled;
+        // `pool_market` is created or mutated BY HAND here (not via Anchor's
+        // `init_if_needed` sugar) -- see `SetLiquidityPoolMarket::pool_market`'s
+        // own doc comment for why: that sugar's automatic
+        // `space == data_len()` equality check would hard-reject every
+        // pre-existing, legacy 82-byte `LiquidityPoolMarket` account the
+        // moment the struct grew by `OpenPositionCount`'s 4 bytes, breaking
+        // this instruction for every binding that already existed before
+        // this upgrade. A brand new (never-created) PDA is still owned by
+        // the System Program, which is what distinguishes the two cases --
+        // this is the same signal Anchor's own `init_if_needed` codegen uses
+        // internally, just applied by hand.
+        let pool_market_info = ctx.accounts.pool_market.to_account_info();
+        let needs_creation = pool_market_info.owner == &System::id();
+        let is_first_time_enable = needs_creation && args.enabled;
 
         // Authorizing a brand-new series is additive: it cannot change the
         // risk of any position that already exists, because per-position
@@ -1098,17 +678,66 @@ pub mod vsol {
             );
         }
 
-        let pool_market = &mut ctx.accounts.pool_market;
-        pool_market.bump = ctx.bumps.pool_market;
-        pool_market.pool = ctx.accounts.pool.key();
-        pool_market.market = ctx.accounts.market.key();
-        pool_market.last_trade_at = args.last_trade_at;
-        pool_market.enabled = args.enabled;
+        let bump = ctx.bumps.pool_market;
+        let pool_key = ctx.accounts.pool.key();
+        let market_key = ctx.accounts.market.key();
+
+        if needs_creation {
+            let space = 8 + LiquidityPoolMarket::INIT_SPACE;
+            let lamports = Rent::get()?.minimum_balance(space);
+            let signer_seeds: &[&[u8]] =
+                &[POOL_MARKET_SEED, pool_key.as_ref(), market_key.as_ref(), &[bump]];
+            anchor_lang::system_program::create_account(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::CreateAccount {
+                        from: ctx.accounts.manager.to_account_info(),
+                        to: pool_market_info.clone(),
+                    },
+                )
+                .with_signer(&[signer_seeds]),
+                lamports,
+                space as u64,
+                &crate::ID,
+            )?;
+            let fresh = LiquidityPoolMarket {
+                bump,
+                pool: pool_key,
+                market: market_key,
+                last_trade_at: args.last_trade_at,
+                enabled: args.enabled,
+                open_positions: OpenPositionCount::ZERO,
+            };
+            let mut data = pool_market_info.try_borrow_mut_data()?;
+            let mut writer = anchor_lang::__private::BpfWriter::new(&mut data[..]);
+            fresh.try_serialize(&mut writer)?;
+        } else {
+            // Owned by us already (the only two possible owners of this
+            // exact PDA are the System Program, handled above, and this
+            // program -- see the doc comment above).
+            require_keys_eq!(
+                *pool_market_info.owner,
+                crate::ID,
+                VsolError::InvalidPoolMarket
+            );
+            let mut existing: LiquidityPoolMarket = {
+                let data = pool_market_info.try_borrow_data()?;
+                LiquidityPoolMarket::try_deserialize(&mut &data[..])?
+            };
+            require_keys_eq!(existing.pool, pool_key, VsolError::InvalidPoolMarket);
+            require_keys_eq!(existing.market, market_key, VsolError::InvalidPoolMarket);
+            existing.last_trade_at = args.last_trade_at;
+            existing.enabled = args.enabled;
+            let mut data = pool_market_info.try_borrow_mut_data()?;
+            let mut writer = anchor_lang::__private::BpfWriter::new(&mut data[..]);
+            existing.try_serialize(&mut writer)?;
+        }
+
         emit!(LiquidityPoolMarketUpdated {
-            pool: pool_market.pool,
-            market: pool_market.market,
-            last_trade_at: pool_market.last_trade_at,
-            enabled: pool_market.enabled,
+            pool: pool_key,
+            market: market_key,
+            last_trade_at: args.last_trade_at,
+            enabled: args.enabled,
         });
         Ok(())
     }
@@ -1617,6 +1246,11 @@ pub mod vsol {
             .total_assets
             .checked_sub(quote.max_payout)
             .ok_or(VsolError::MathOverflow)?;
+        // Per-market counter used by `close_settled_market` to refuse
+        // closing this market while it still has an open pool position --
+        // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_increment()?;
         emit!(PoolQuoteFilled {
             position: position.key(),
             pool: pool_key,
@@ -1634,6 +1268,19 @@ pub mod vsol {
         let position = &ctx.accounts.position;
         let market = &ctx.accounts.market;
         let oracle = &ctx.accounts.oracle;
+        // See `SettlePoolPosition::pool_market`'s doc comment: this replaces
+        // a `has_one` constraint that would have exceeded the BPF stack
+        // frame limit in `try_accounts`.
+        require_keys_eq!(
+            ctx.accounts.pool_market.pool,
+            ctx.accounts.pool.key(),
+            VsolError::InvalidPoolMarket
+        );
+        require_keys_eq!(
+            ctx.accounts.pool_market.market,
+            market.key(),
+            VsolError::InvalidPoolMarket
+        );
         require!(
             position.status == PositionStatus::Open as u8,
             VsolError::PositionNotOpen
@@ -1697,6 +1344,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         ctx.accounts.pool.cumulative_premium = ctx
             .accounts
             .pool
@@ -1724,17 +1373,57 @@ pub mod vsol {
             nonce_record_key.as_ref(),
             &[position.bump],
         ];
-        if buyer_amount > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.buyer_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                buyer_amount,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
+        // The buyer may also be `config.treasury_owner` (see
+        // `SettlePoolPosition::treasury_destination`'s `dup` constraint,
+        // which permits `buyer_destination == treasury_destination` while
+        // the owner/mint constraints above still reject any OTHER alias).
+        // When that happens, fold the two transfers into one: it is
+        // economically identical (the buyer ends up with exactly
+        // `buyer_amount + fee == payout`, same as two sequential transfers
+        // into the same account would produce), and it means this program
+        // never issues two token transfers into the literal same
+        // destination account in one instruction.
+        let buyer_is_treasury =
+            ctx.accounts.buyer_destination.key() == ctx.accounts.treasury_destination.key();
+        if buyer_is_treasury {
+            let combined = buyer_amount.checked_add(fee).ok_or(VsolError::MathOverflow)?;
+            if combined > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.buyer_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    combined,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
+        } else {
+            if buyer_amount > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.buyer_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    buyer_amount,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
+            if fee > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.treasury_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    fee,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
         }
         if pool_amount > 0 {
             transfer_checked_signed(
@@ -1744,18 +1433,6 @@ pub mod vsol {
                 ctx.accounts.settlement_mint.to_account_info(),
                 ctx.accounts.position.to_account_info(),
                 pool_amount,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
-        }
-        if fee > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.treasury_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                fee,
                 ctx.accounts.settlement_mint.decimals,
                 position_seeds,
             )?;
@@ -1782,6 +1459,19 @@ pub mod vsol {
         let now = Clock::get()?.unix_timestamp;
         let position = &ctx.accounts.position;
         let market = &ctx.accounts.market;
+        // See `SettlePoolPosition::pool_market`'s doc comment: this replaces
+        // a `has_one` constraint that would have exceeded the BPF stack
+        // frame limit in `try_accounts`.
+        require_keys_eq!(
+            ctx.accounts.pool_market.pool,
+            ctx.accounts.pool.key(),
+            VsolError::InvalidPoolMarket
+        );
+        require_keys_eq!(
+            ctx.accounts.pool_market.market,
+            market.key(),
+            VsolError::InvalidPoolMarket
+        );
         require!(
             position.status == PositionStatus::Open as u8,
             VsolError::PositionNotOpen
@@ -1816,6 +1506,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         // `position.max_payout` is what actually lands back in `pool_token`
         // below (the premium goes to the buyer, not the pool) -- see
         // `total_assets`'s doc comment on `LiquidityPool`.
@@ -1968,6 +1660,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         // `pool_amount` is what actually lands back in `pool_token` below --
         // see `total_assets`'s doc comment on `LiquidityPool`.
         ctx.accounts.pool.total_assets = ctx
@@ -2072,69 +1766,67 @@ pub mod vsol {
     ///    every in-flight refund with no margin at all. The buffer is what
     ///    makes point 3's off-chain assumption survivable rather than a
     ///    coin-flip against the cleaner.
-    /// 2. `fill_quote` and `fill_pool_quote` both hard-require
-    ///    `now < market.expiry` before opening a new position. Since the
-    ///    deadline above is strictly after `expiry`, by the time it has
-    ///    elapsed no new writer- or pool-backed position can ever be opened
-    ///    against this market again, full stop -- this holds independently
-    ///    of `market.enabled`/`pool_market.enabled`, which are therefore not
-    ///    load-bearing for "no new obligations": that is already guaranteed
-    ///    by the expiry check those two instructions perform themselves.
-    /// 3. The one obligation this instruction *cannot* cheaply verify
-    ///    on-chain is "no already-open `Position`/`PoolPosition` still
-    ///    references this market". Those are independent PDAs keyed by
-    ///    nonce record (not by market), so there is no bounded on-chain
-    ///    enumeration of "every position that ever referenced this market"
-    ///    -- unlike the pool-authorization case below, which is a single
-    ///    fixed-address PDA per (pool, market) pair. If an open position
-    ///    were left unsettled/unrefunded, closing the market would strand it
-    ///    forever: `settle`, `settle_pool_position`, `refund_unsettled`, and
-    ///    `refund_pool_position` all load the `Market` account via `has_one`
-    ///    and would simply fail once that account no longer exists, with no
-    ///    way to ever recover the position's escrowed funds.
-    ///    ==> OFF-CHAIN ASSUMPTION (required, not enforced by this
-    ///    instruction): the caller -- the off-chain cleaner -- must confirm
-    ///    every `Position` and `PoolPosition` that ever referenced this
-    ///    market has already been settled or refunded (its vault closed)
-    ///    before calling `close_settled_market`. This is the documented gap
-    ///    the task that added this instruction explicitly flagged and
-    ///    accepted, given positions are not cheaply enumerable on-chain.
-    ///    `MARKET_CLEANUP_BUFFER_SECONDS` bounds the damage when that
-    ///    assumption is violated (a stranded position stays refundable for a
-    ///    week after settlement closes) but does NOT discharge it: a caller
-    ///    that closes a market with an open position still strands it
-    ///    permanently. Enumerating positions on-chain -- e.g. an
-    ///    `open_position_count` on `Market`, maintained by fill/settle/refund
-    ///    -- is the only way to actually enforce this, and remains the right
-    ///    fix before real money.
-    /// 4. UNLIKE point 3, the conditional-token ("complete set") collateral
-    ///    vault IS cheaply, fully enumerable from the market alone: it is a
-    ///    single deterministic PDA (`COMPLETE_SET_VAULT_SEED`, keyed only by
-    ///    `market.key()`), not a per-nonce record like `Position`/
-    ///    `PoolPosition`. `burn_complete_set` and `redeem_winning` both load
-    ///    `market: Box<Account<'info, Market>>`, so once this account is
-    ///    closed neither can ever execute again -- any balance still in the
-    ///    vault at that point is unrecoverable forever. Because this check
-    ///    IS cheap, it is a HARD on-chain requirement, not an off-chain
-    ///    assumption like point 3: the handler requires the vault to be
-    ///    either never created (nobody ever called `mint_complete_set`
-    ///    against this market) or fully drained (`amount == 0`) before
-    ///    allowing the close. See `CloseSettledMarket::collateral_vault`'s
-    ///    own doc comment for why checking the vault balance alone --
-    ///    without also inspecting `up_mint`/`down_mint` supply -- is
-    ///    sufficient.
-    /// 5. As a cheap, *additional* on-chain check (defense-in-depth, not the
-    ///    primary safety argument above, which already holds regardless): if
-    ///    the caller passes a `pool`/`pool_market` pair, it must be the
-    ///    authorization record for *this* market and pool, and it must have
-    ///    `enabled == false`. Passing `None` for both is accepted (an
-    ///    omitted pair is not proof no pool was ever authorized, but no
-    ///    cheaper on-chain check exists -- see point 3).
-    /// 6. Permission: the caller must be `market.creator` or `config.admin`.
+    /// 2. `fill_pool_quote` hard-requires `now < market.expiry` before
+    ///    opening a new position. Since the deadline above is strictly after
+    ///    `expiry`, by the time it has elapsed no new pool-backed position
+    ///    can ever be opened against this market again, full stop -- this
+    ///    holds independently of `market.enabled`/`pool_market.enabled`,
+    ///    which are therefore not load-bearing for "no new obligations":
+    ///    that is already guaranteed by the expiry check `fill_pool_quote`
+    ///    performs itself.
+    /// 3. `pool` and `pool_market` are now MANDATORY (no `(None, None)`
+    ///    bypass -- see `CloseSettledMarket`'s own doc comment for why an
+    ///    earlier version of this instruction wrongly accepted omitting
+    ///    them). The caller must supply the authorization record for *this*
+    ///    market and pool; the handler requires it to have `enabled ==
+    ///    false` AND `pool_market.open_positions == 0` (not the legacy
+    ///    `UNKNOWN` sentinel either -- see `OpenPositionCount`'s doc comment
+    ///    on `LiquidityPoolMarket`) before closing. This is a HARD
+    ///    requirement, not defense-in-depth: `settle_pool_position` and
+    ///    `refund_pool_position` both load `market: Box<Account<'info,
+    ///    Market>>` via `has_one`/a manual key check, so once `Market` is
+    ///    closed neither can ever run again -- any `PoolPosition` still open
+    ///    against this market at that point has its escrowed
+    ///    `premium + max_payout` stranded forever, unrecoverable by any
+    ///    instruction in this program. That is exactly the failure this
+    ///    check exists to prevent, which is why it cannot be optional.
+    ///    Consequence: a market that was never bound to ANY pool (no
+    ///    `LiquidityPoolMarket` was ever created for it) can never be closed
+    ///    on chain -- only its own (and its oracle's) rent is permanently
+    ///    stuck, never any position's funds, since a market nobody ever
+    ///    authorized a pool against can have no `PoolPosition`s either
+    ///    (`fill_pool_quote` requires an enabled `pool_market`). Accepted:
+    ///    fills go through the pool path exclusively, so every market that
+    ///    ever actually traded has a binding to supply here.
+    /// 4. RESIDUAL GAP (documented, not fixed here): a market can legally be
+    ///    bound to MORE THAN ONE pool over its lifetime -- each binding is
+    ///    an independent `[POOL_MARKET_SEED, pool, market]` PDA, so there is
+    ///    no bounded on-chain enumeration of "every pool ever authorized
+    ///    against this market" (the same unenumerability problem as
+    ///    individual positions, one level up). This instruction only checks
+    ///    the ONE `(pool, pool_market)` pair the caller supplies: passing a
+    ///    binding that is genuinely idle does not prove every OTHER binding
+    ///    against this market is also idle, so a market with a second,
+    ///    still-open pool binding could in principle be closed, stranding
+    ///    that other binding's open positions. The complete fix is a
+    ///    market-level open-position counter (on `Market` itself, maintained
+    ///    across every pool's fills/settles/refunds) -- not applicable here
+    ///    because it would change `Market`'s layout, and live devnet
+    ///    accounts must keep deserializing unchanged (see this crate's
+    ///    layout-compatibility constraints); it is free to add on a fresh
+    ///    mainnet deploy with no live accounts to preserve, and should be
+    ///    the mainnet follow-up. Until then, this gap is bounded by two
+    ///    things neither of which is enforced by this instruction itself:
+    ///    the caller is already privileged (`market.creator` or
+    ///    `config.admin`, see point 5 below), and the off-chain cleaner
+    ///    (`vsol/scripts/lib/settlement.ts`'s `selectMarketCloseCandidates`,
+    ///    called from `vsol/scripts/cranker.ts`) is expected to check every
+    ///    pool binding for a market before requesting a close, not just one.
+    /// 5. Permission: the caller must be `market.creator` or `config.admin`.
     ///    Rent always returns to `market.creator` (`rent_recipient` is
     ///    address-constrained to it), never to an arbitrary caller-supplied
     ///    account.
-    /// 7. Deliberately *not* gated on `config.paused`: this is maintenance
+    /// 6. Deliberately *not* gated on `config.paused`: this is maintenance
     ///    cleanup, not a trading action, so it must remain callable while
     ///    the protocol is paused (mirrors `close_pool_position`'s guardian
     ///    rationale for staying pause-independent).
@@ -2156,462 +1848,37 @@ pub mod vsol {
             .ok_or(VsolError::MathOverflow)?;
         require!(now > cleanup_deadline, VsolError::MarketNotCloseable);
 
-        // See point 4 of this instruction's doc comment, and
-        // `CloseSettledMarket::collateral_vault`'s own doc comment for why
-        // checking ONLY the vault's balance (not also `up_mint`/`down_mint`
-        // supply) is sufficient. `data_is_empty()` is true both for a PDA
-        // that was never created (nobody ever called `mint_complete_set`
-        // against this market) and, defensively, for one the runtime has
-        // reset to empty/system-owned after being closed elsewhere -- either
-        // way, "no data" means "no complete set was ever outstanding here",
-        // so there is nothing to check.
-        let vault_info = ctx.accounts.collateral_vault.to_account_info();
-        if !vault_info.data_is_empty() {
-            let vault_data = vault_info.try_borrow_data()?;
-            let vault = TokenAccount::try_deserialize(&mut &vault_data[..])?;
-            require!(vault.amount == 0, VsolError::MarketHasOutstandingCollateral);
-        }
+        let pool = &ctx.accounts.pool;
+        let pool_market = &ctx.accounts.pool_market;
+        require_keys_eq!(pool_market.pool, pool.key(), VsolError::InvalidPoolMarket);
+        require_keys_eq!(pool_market.market, market.key(), VsolError::InvalidPoolMarket);
+        require!(!pool_market.enabled, VsolError::MarketNotCloseable);
+        // Direct, robust invariant on top of the `!enabled` check above --
+        // see `OpenPositionCount`'s own doc comment on `LiquidityPoolMarket`.
+        // A legacy (pre-upgrade) binding reads `UNKNOWN` here forever, which
+        // can never equal `ZERO`, so THIS PARTICULAR pool/pool_market pair
+        // can never satisfy this check: only its own rent stays stuck if the
+        // caller never has another, non-legacy binding to supply instead.
+        // That is not a claim that any open position is safe regardless of
+        // this check -- see point 3 on this instruction's own doc comment
+        // above: once `Market` closes (via whichever binding does satisfy
+        // this check), every `PoolPosition` still open against it, under ANY
+        // binding, legacy or not, has its escrowed funds stranded for good.
+        require!(
+            pool_market.open_positions == OpenPositionCount::ZERO,
+            VsolError::MarketNotCloseable
+        );
 
-        match (ctx.accounts.pool.as_ref(), ctx.accounts.pool_market.as_ref()) {
-            (Some(pool), Some(pool_market)) => {
-                require_keys_eq!(pool_market.pool, pool.key(), VsolError::InvalidPoolMarket);
-                require_keys_eq!(pool_market.market, market.key(), VsolError::InvalidPoolMarket);
-                require!(!pool_market.enabled, VsolError::MarketNotCloseable);
-            }
-            (None, None) => {}
-            _ => return err!(VsolError::InvalidPoolMarket),
-        }
+        // Reclaim the pool authorization record's rent too, to the same
+        // recipient as the market/oracle above, now that it has passed
+        // every check above. `pool`/`pool_market` are mandatory (see this
+        // instruction's own doc comment, point 3), so there is always
+        // something here to close.
+        ctx.accounts.pool_market.close(ctx.accounts.rent_recipient.to_account_info())?;
 
         emit!(MarketClosed {
             market: market.key(),
             creator: market.creator,
-        });
-        Ok(())
-    }
-
-    /// Mints a "complete set": pulls `amount` of the market's settlement
-    /// token into a per-market collateral vault PDA and mints `amount` of
-    /// BOTH the UP and DOWN conditional tokens to the caller. Fully
-    /// collateralized by construction -- `up_mint`/`down_mint`'s mint
-    /// authority is the market PDA, which never signs a `mint_to` CPI
-    /// anywhere except here, and this instruction always moves the vault and
-    /// both supplies by the identical `amount` in one transaction, verified
-    /// below by reloading all three and checking the exact expected delta
-    /// (the same defensive "reload and compare" pattern `fill_quote` and
-    /// `deposit_liquidity` already use elsewhere in this file).
-    ///
-    /// Gated on `!config.paused` AND `market.enabled`: like
-    /// `fill_quote`/`fill_pool_quote`, this creates new economic exposure,
-    /// so both the global pause guardian and the market's own admin kill
-    /// switch (`set_market_enabled`) block it. `burn_complete_set` and
-    /// `redeem_winning` are deliberately gated on NEITHER -- see their own
-    /// doc comments for why (same reason `settle`/`refund_unsettled`/etc.
-    /// never check `market.enabled` either: it only ever blocks new
-    /// exposure, never an exit).
-    pub fn mint_complete_set(ctx: Context<MintCompleteSet>, amount: u64) -> Result<()> {
-        require!(!ctx.accounts.config.paused, VsolError::ProtocolPaused);
-        require!(ctx.accounts.market.enabled, VsolError::MarketDisabled);
-        require!(amount > 0, VsolError::InvalidAmount);
-
-        let vault_before = ctx.accounts.collateral_vault.amount;
-        let up_supply_before = ctx.accounts.up_mint.supply;
-        let down_supply_before = ctx.accounts.down_mint.supply;
-
-        transfer_checked(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.minter_source.to_account_info(),
-            ctx.accounts.collateral_vault.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.minter.to_account_info(),
-            amount,
-            ctx.accounts.settlement_mint.decimals,
-        )?;
-
-        let config_key = ctx.accounts.config.key();
-        let market_id = ctx.accounts.market.market_id;
-        let market_seeds: &[&[u8]] = &[
-            MARKET_SEED,
-            config_key.as_ref(),
-            market_id.as_ref(),
-            &[ctx.accounts.market.bump],
-        ];
-        mint_to_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.up_mint.to_account_info(),
-            ctx.accounts.minter_up_token.to_account_info(),
-            ctx.accounts.market.to_account_info(),
-            amount,
-            market_seeds,
-        )?;
-        mint_to_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.down_mint.to_account_info(),
-            ctx.accounts.minter_down_token.to_account_info(),
-            ctx.accounts.market.to_account_info(),
-            amount,
-            market_seeds,
-        )?;
-
-        ctx.accounts.collateral_vault.reload()?;
-        ctx.accounts.up_mint.reload()?;
-        ctx.accounts.down_mint.reload()?;
-        require!(
-            ctx.accounts.collateral_vault.amount
-                == vault_before
-                    .checked_add(amount)
-                    .ok_or(VsolError::MathOverflow)?
-                && ctx.accounts.up_mint.supply
-                    == up_supply_before
-                        .checked_add(amount)
-                        .ok_or(VsolError::MathOverflow)?
-                && ctx.accounts.down_mint.supply
-                    == down_supply_before
-                        .checked_add(amount)
-                        .ok_or(VsolError::MathOverflow)?,
-            VsolError::CollateralMismatch
-        );
-
-        emit!(CompleteSetMinted {
-            market: ctx.accounts.market.key(),
-            minter: ctx.accounts.minter.key(),
-            amount,
-        });
-        Ok(())
-    }
-
-    /// Burns `amount` of BOTH the UP and DOWN conditional tokens and returns
-    /// `amount` collateral from the vault. This is the arbitrage that keeps
-    /// UP + DOWN priced at ~1 unit of collateral, so it must work identically
-    /// before AND after settlement -- it is deliberately never gated on
-    /// `oracle.finalized` in either direction.
-    ///
-    /// Guardian: like `settle`/`close_pool_position`, this is a holder's exit
-    /// path, so -- unlike `mint_complete_set` -- it must keep working even
-    /// while the protocol is paused. Deliberately NOT gated on
-    /// `config.paused`.
-    pub fn burn_complete_set(ctx: Context<BurnCompleteSet>, amount: u64) -> Result<()> {
-        require!(amount > 0, VsolError::InvalidAmount);
-
-        let vault_before = ctx.accounts.collateral_vault.amount;
-        let up_supply_before = ctx.accounts.up_mint.supply;
-        let down_supply_before = ctx.accounts.down_mint.supply;
-
-        burn_tokens(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.up_mint.to_account_info(),
-            ctx.accounts.burner_up_token.to_account_info(),
-            ctx.accounts.burner.to_account_info(),
-            amount,
-        )?;
-        burn_tokens(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.down_mint.to_account_info(),
-            ctx.accounts.burner_down_token.to_account_info(),
-            ctx.accounts.burner.to_account_info(),
-            amount,
-        )?;
-
-        let config_key = ctx.accounts.config.key();
-        let market_id = ctx.accounts.market.market_id;
-        let market_seeds: &[&[u8]] = &[
-            MARKET_SEED,
-            config_key.as_ref(),
-            market_id.as_ref(),
-            &[ctx.accounts.market.bump],
-        ];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.collateral_vault.to_account_info(),
-            ctx.accounts.burner_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.market.to_account_info(),
-            amount,
-            ctx.accounts.settlement_mint.decimals,
-            market_seeds,
-        )?;
-
-        ctx.accounts.collateral_vault.reload()?;
-        ctx.accounts.up_mint.reload()?;
-        ctx.accounts.down_mint.reload()?;
-        require!(
-            ctx.accounts.collateral_vault.amount
-                == vault_before
-                    .checked_sub(amount)
-                    .ok_or(VsolError::MathOverflow)?
-                && ctx.accounts.up_mint.supply
-                    == up_supply_before
-                        .checked_sub(amount)
-                        .ok_or(VsolError::MathOverflow)?
-                && ctx.accounts.down_mint.supply
-                    == down_supply_before
-                        .checked_sub(amount)
-                        .ok_or(VsolError::MathOverflow)?,
-            VsolError::CollateralMismatch
-        );
-
-        emit!(CompleteSetBurned {
-            market: ctx.accounts.market.key(),
-            burner: ctx.accounts.burner.key(),
-            amount,
-        });
-        Ok(())
-    }
-
-    /// Redeems `amount` of the market's WINNING conditional token for
-    /// `amount` collateral, once the oracle has finalized. The winner rule:
-    /// UP wins if the finalized price is *strictly* above `market.strike`,
-    /// DOWN otherwise (an exact tie goes to DOWN) -- see `math::up_wins`.
-    /// The losing side can never redeem: `redeemer_token.mint` is checked
-    /// against whichever side actually won.
-    ///
-    /// Guardian: like `burn_complete_set`, deliberately NOT gated on
-    /// `config.paused` -- a winner must always be able to claim their
-    /// payout, exactly the same rationale `settle`/`close_pool_position`
-    /// document for staying pause-independent.
-    pub fn redeem_winning(ctx: Context<RedeemWinning>, amount: u64) -> Result<()> {
-        require!(amount > 0, VsolError::InvalidAmount);
-        require!(ctx.accounts.oracle.finalized, VsolError::OracleNotFinalized);
-        require_keys_eq!(
-            ctx.accounts.redeemer_token.owner,
-            ctx.accounts.redeemer.key(),
-            VsolError::InvalidDestination
-        );
-
-        let winner_is_up = up_wins(ctx.accounts.oracle.price, ctx.accounts.market.strike);
-        let winning_mint_key = if winner_is_up {
-            ctx.accounts.up_mint.key()
-        } else {
-            ctx.accounts.down_mint.key()
-        };
-        require_keys_eq!(
-            ctx.accounts.redeemer_token.mint,
-            winning_mint_key,
-            VsolError::LosingSideNotRedeemable
-        );
-
-        let vault_before = ctx.accounts.collateral_vault.amount;
-        let winning_supply_before = if winner_is_up {
-            ctx.accounts.up_mint.supply
-        } else {
-            ctx.accounts.down_mint.supply
-        };
-        let winning_mint_info = if winner_is_up {
-            ctx.accounts.up_mint.to_account_info()
-        } else {
-            ctx.accounts.down_mint.to_account_info()
-        };
-        burn_tokens(
-            ctx.accounts.token_program.key(),
-            winning_mint_info,
-            ctx.accounts.redeemer_token.to_account_info(),
-            ctx.accounts.redeemer.to_account_info(),
-            amount,
-        )?;
-
-        let config_key = ctx.accounts.config.key();
-        let market_id = ctx.accounts.market.market_id;
-        let market_seeds: &[&[u8]] = &[
-            MARKET_SEED,
-            config_key.as_ref(),
-            market_id.as_ref(),
-            &[ctx.accounts.market.bump],
-        ];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.collateral_vault.to_account_info(),
-            ctx.accounts.redeemer_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.market.to_account_info(),
-            amount,
-            ctx.accounts.settlement_mint.decimals,
-            market_seeds,
-        )?;
-
-        ctx.accounts.collateral_vault.reload()?;
-        let winning_supply_after = if winner_is_up {
-            ctx.accounts.up_mint.reload()?;
-            ctx.accounts.up_mint.supply
-        } else {
-            ctx.accounts.down_mint.reload()?;
-            ctx.accounts.down_mint.supply
-        };
-        require!(
-            ctx.accounts.collateral_vault.amount
-                == vault_before
-                    .checked_sub(amount)
-                    .ok_or(VsolError::MathOverflow)?
-                && winning_supply_after
-                    == winning_supply_before
-                        .checked_sub(amount)
-                        .ok_or(VsolError::MathOverflow)?,
-            VsolError::CollateralMismatch
-        );
-
-        emit!(WinningRedeemed {
-            market: ctx.accounts.market.key(),
-            redeemer: ctx.accounts.redeemer.key(),
-            amount,
-            up_won: winner_is_up,
-        });
-        Ok(())
-    }
-
-    /// Escape hatch for a market whose oracle never finalizes: once
-    /// `publish_pyth_settlement` can no longer ever succeed again (see
-    /// `final_settlement_deadline`), burns `amount` of EITHER conditional
-    /// token for a pro-rata share of the collateral vault --
-    /// `amount * vault_balance / (up_mint.supply + down_mint.supply)`
-    /// (`math::calculate_pro_rata_redemption`) -- rather than requiring a
-    /// winner that will never be determined. This is the conditional-token
-    /// path's analogue of `refund_unsettled` for the older per-position
-    /// path: without it, a holder of only one side of a market whose oracle
-    /// is permanently dead has no way to ever recover anything, and
-    /// `burn_complete_set` does not help them (it requires holding BOTH
-    /// sides).
-    ///
-    /// Timing -- why the gate is `now > final_settlement_deadline(market)`,
-    /// exactly, and not the earlier `settlement_deadline`
-    /// `refund_unsettled`/`redeem_winning`'s sibling paths might suggest:
-    /// `redeem_winning` requires `oracle.finalized`, and
-    /// `publish_pyth_settlement` can still finalize the oracle for any
-    /// `now <= final_settlement_deadline(market)` (tier 1 the whole way;
-    /// tier 2 after its own additional `tier_two_open_at` gate). Opening
-    /// THIS hatch any earlier makes the two payout paths simultaneously
-    /// satisfiable, which is a real insolvency, not just a race: collateral
-    /// could be paid out pro-rata AND the market could later settle with a
-    /// real winner who is then owed more than the vault has left. Concretely,
-    /// with `S = 100` outstanding complete sets: if the hatch opened at the
-    /// bare `settlement_deadline`, Alice could pro-rata-redeem 50 UP for 25
-    /// (vault: 100 -> 75), the oracle could then finalize DOWN, and Bob --
-    /// holding 100 DOWN, owed 100 -- would find only 75 left; his
-    /// `checked_sub` fails and he can never redeem at all, a strictly worse
-    /// outcome (total lockup) than the bug this instruction exists to fix.
-    /// Gating on `final_settlement_deadline` instead makes `redeem_unresolved`
-    /// and `redeem_winning` strictly mutually exclusive: by the time this
-    /// hatch can open, `publish_pyth_settlement` is guaranteed to already be
-    /// permanently closed (see its own doc comment), so `oracle.finalized`
-    /// can never subsequently flip from false to true underneath a
-    /// redemption that already happened.
-    ///
-    /// Payout formula -- why pro-rata rather than a hardcoded `amount / 2`:
-    /// - At the instant the hatch first opens, `vault == up_mint.supply ==
-    ///   down_mint.supply` always holds (`mint_complete_set`/
-    ///   `burn_complete_set` move all three by the identical amount every
-    ///   time -- see their own `require!` checks), so `total == 2 * vault`
-    ///   and the formula reduces to exactly `amount / 2` -- the standard
-    ///   "unresolvable market resolves 50/50" convention (the same rule
-    ///   Polymarket applies to markets UMA cannot resolve).
-    /// - It stays exact under ANY redemption order, unlike a hardcoded half:
-    ///   floor division leaves rounding dust in the vault after most
-    ///   individual redemptions, but the FINAL redemption -- whichever side
-    ///   still has supply once the other side has fully burned/redeemed to
-    ///   zero -- always has `amount == total_supply`, so its payout is
-    ///   `amount * vault / amount == vault` exactly, draining the vault to
-    ///   zero with no dust left over (see `math::calculate_pro_rata_redemption`'s
-    ///   own doc comment and tests). A flat `amount / 2` would leave dust in
-    ///   the vault forever, and with `close_settled_market` now requiring an
-    ///   empty vault (see `CloseSettledMarket::collateral_vault`), permanent
-    ///   dust would mean the market -- and its rent -- could never be closed.
-    /// - It cannot be manipulated by minting/burning around a redemption:
-    ///   `mint_complete_set` moves `vault += a` and `total_supply += 2a`;
-    ///   `burn_complete_set` moves `vault -= a` and `total_supply -= 2a`.
-    ///   Both preserve `vault / total_supply` exactly, so nobody can shift
-    ///   the ratio in their favor before redeeming.
-    ///
-    /// Guardian: like `burn_complete_set`/`redeem_winning`, this is an exit
-    /// path -- deliberately NOT gated on `config.paused` or `market.enabled`.
-    pub fn redeem_unresolved(ctx: Context<RedeemUnresolved>, amount: u64) -> Result<()> {
-        require!(amount > 0, VsolError::InvalidAmount);
-        require!(
-            !ctx.accounts.oracle.finalized,
-            VsolError::OracleAlreadyFinalized
-        );
-        let now = Clock::get()?.unix_timestamp;
-        let final_deadline = final_settlement_deadline(&ctx.accounts.market)?;
-        require!(now > final_deadline, VsolError::SettlementWindowOpen);
-        require_keys_eq!(
-            ctx.accounts.redeemer_token.owner,
-            ctx.accounts.redeemer.key(),
-            VsolError::InvalidDestination
-        );
-
-        let up_mint_key = ctx.accounts.up_mint.key();
-        let down_mint_key = ctx.accounts.down_mint.key();
-        let redeemer_token_mint = ctx.accounts.redeemer_token.mint;
-        require!(
-            redeemer_token_mint == up_mint_key || redeemer_token_mint == down_mint_key,
-            VsolError::InvalidConditionalTokenMint
-        );
-        let redeeming_up = redeemer_token_mint == up_mint_key;
-
-        let vault_before = ctx.accounts.collateral_vault.amount;
-        let up_supply_before = ctx.accounts.up_mint.supply;
-        let down_supply_before = ctx.accounts.down_mint.supply;
-        let total_supply_before = (up_supply_before as u128)
-            .checked_add(down_supply_before as u128)
-            .ok_or(VsolError::MathOverflow)?;
-
-        let payout = calculate_pro_rata_redemption(amount, vault_before, total_supply_before)?;
-
-        let mint_info = if redeeming_up {
-            ctx.accounts.up_mint.to_account_info()
-        } else {
-            ctx.accounts.down_mint.to_account_info()
-        };
-        burn_tokens(
-            ctx.accounts.token_program.key(),
-            mint_info,
-            ctx.accounts.redeemer_token.to_account_info(),
-            ctx.accounts.redeemer.to_account_info(),
-            amount,
-        )?;
-
-        let config_key = ctx.accounts.config.key();
-        let market_id = ctx.accounts.market.market_id;
-        let market_seeds: &[&[u8]] = &[
-            MARKET_SEED,
-            config_key.as_ref(),
-            market_id.as_ref(),
-            &[ctx.accounts.market.bump],
-        ];
-        transfer_checked_signed(
-            ctx.accounts.token_program.key(),
-            ctx.accounts.collateral_vault.to_account_info(),
-            ctx.accounts.redeemer_destination.to_account_info(),
-            ctx.accounts.settlement_mint.to_account_info(),
-            ctx.accounts.market.to_account_info(),
-            payout,
-            ctx.accounts.settlement_mint.decimals,
-            market_seeds,
-        )?;
-
-        ctx.accounts.collateral_vault.reload()?;
-        let redeemed_supply_before = if redeeming_up { up_supply_before } else { down_supply_before };
-        let redeemed_supply_after = if redeeming_up {
-            ctx.accounts.up_mint.reload()?;
-            ctx.accounts.up_mint.supply
-        } else {
-            ctx.accounts.down_mint.reload()?;
-            ctx.accounts.down_mint.supply
-        };
-        require!(
-            ctx.accounts.collateral_vault.amount
-                == vault_before
-                    .checked_sub(payout)
-                    .ok_or(VsolError::MathOverflow)?
-                && redeemed_supply_after
-                    == redeemed_supply_before
-                        .checked_sub(amount)
-                        .ok_or(VsolError::MathOverflow)?,
-            VsolError::CollateralMismatch
-        );
-
-        emit!(UnresolvedRedeemed {
-            market: ctx.accounts.market.key(),
-            redeemer: ctx.accounts.redeemer.key(),
-            amount,
-            payout,
-            redeemed_up: redeeming_up,
         });
         Ok(())
     }
@@ -2801,17 +2068,6 @@ pub struct CreateMarketArgs {
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QuoteArgs {
-    pub nonce: u64,
-    pub direction: u8,
-    pub strike: u64,
-    pub width: u64,
-    pub premium: u64,
-    pub max_payout: u64,
-    pub quote_expiry: i64,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitializeLiquidityPoolArgs {
     pub pool_id: [u8; 32],
     pub quote_authority: Pubkey,
@@ -2922,96 +2178,6 @@ pub struct SetEligibility<'info> {
 }
 
 #[derive(Accounts)]
-pub struct InitializeWriterVault<'info> {
-    #[account(mut)]
-    pub maker: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
-    pub settlement_mint: Account<'info, Mint>,
-    #[account(init, payer = maker, space = 8 + WriterVault::INIT_SPACE, seeds = [WRITER_SEED, config.key().as_ref(), maker.key().as_ref(), settlement_mint.key().as_ref()], bump)]
-    pub writer_vault: Account<'info, WriterVault>,
-    #[account(init, payer = maker, token::mint = settlement_mint, token::authority = writer_vault, seeds = [WRITER_TOKEN_SEED, writer_vault.key().as_ref()], bump)]
-    pub writer_token: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct DepositWriter<'info> {
-    pub config: Account<'info, Config>,
-    #[account(mut)]
-    pub maker: Signer<'info>,
-    pub settlement_mint: Account<'info, Mint>,
-    #[account(seeds = [WRITER_SEED, config.key().as_ref(), maker.key().as_ref(), settlement_mint.key().as_ref()], bump = writer_vault.bump, has_one = config, has_one = maker, has_one = settlement_mint)]
-    pub writer_vault: Account<'info, WriterVault>,
-    #[account(mut, seeds = [WRITER_TOKEN_SEED, writer_vault.key().as_ref()], bump = writer_vault.token_bump, token::mint = settlement_mint, token::authority = writer_vault)]
-    pub writer_token: Account<'info, TokenAccount>,
-    #[account(mut, token::mint = settlement_mint, token::authority = maker)]
-    pub maker_source: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct WithdrawWriter<'info> {
-    pub config: Account<'info, Config>,
-    pub maker: Signer<'info>,
-    pub settlement_mint: Account<'info, Mint>,
-    #[account(seeds = [WRITER_SEED, config.key().as_ref(), maker.key().as_ref(), settlement_mint.key().as_ref()], bump = writer_vault.bump, has_one = config, has_one = maker, has_one = settlement_mint)]
-    pub writer_vault: Account<'info, WriterVault>,
-    #[account(mut, seeds = [WRITER_TOKEN_SEED, writer_vault.key().as_ref()], bump = writer_vault.token_bump, token::mint = settlement_mint, token::authority = writer_vault)]
-    pub writer_token: Account<'info, TokenAccount>,
-    #[account(mut, token::mint = settlement_mint, token::authority = maker)]
-    pub maker_destination: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-#[instruction(nonce: u64)]
-pub struct CancelNonce<'info> {
-    #[account(mut)]
-    pub maker: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
-    #[account(init, payer = maker, space = 8 + QuoteNonce::INIT_SPACE, seeds = [NONCE_SEED, config.key().as_ref(), maker.key().as_ref(), nonce.to_le_bytes().as_ref()], bump)]
-    pub nonce_record: Account<'info, QuoteNonce>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-#[instruction(quote: QuoteArgs)]
-pub struct FillQuote<'info> {
-    #[account(mut)]
-    pub buyer: Signer<'info>,
-    /// CHECK: The maker is authenticated by the immediately preceding Ed25519 instruction.
-    pub maker: UncheckedAccount<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(seeds = [WRITER_SEED, config.key().as_ref(), maker.key().as_ref(), settlement_mint.key().as_ref()], bump = writer_vault.bump, has_one = config, has_one = settlement_mint, constraint = writer_vault.maker == maker.key() @ VsolError::InvalidWriterVault)]
-    pub writer_vault: Box<Account<'info, WriterVault>>,
-    #[account(mut, seeds = [WRITER_TOKEN_SEED, writer_vault.key().as_ref()], bump = writer_vault.token_bump, token::mint = settlement_mint, token::authority = writer_vault)]
-    pub writer_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, token::authority = buyer)]
-    pub buyer_source: Box<Account<'info, TokenAccount>>,
-    #[account(init, payer = buyer, space = 8 + QuoteNonce::INIT_SPACE, seeds = [NONCE_SEED, config.key().as_ref(), maker.key().as_ref(), quote.nonce.to_le_bytes().as_ref()], bump)]
-    pub nonce_record: Box<Account<'info, QuoteNonce>>,
-    #[account(init, payer = buyer, space = 8 + Position::INIT_SPACE, seeds = [POSITION_SEED, nonce_record.key().as_ref()], bump)]
-    pub position: Box<Account<'info, Position>>,
-    #[account(init, payer = buyer, token::mint = settlement_mint, token::authority = position, seeds = [POSITION_VAULT_SEED, position.key().as_ref()], bump)]
-    pub position_vault: Box<Account<'info, TokenAccount>>,
-    pub eligibility: Option<Box<Account<'info, Eligibility>>>,
-    /// CHECK: Address-constrained to the transaction instructions sysvar.
-    #[account(address = solana_instructions_sysvar::ID)]
-    pub instructions_sysvar: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
 pub struct PublishPythSettlement<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
@@ -3022,58 +2188,6 @@ pub struct PublishPythSettlement<'info> {
     /// CHECK: The parser verifies the upgraded Pyth receiver owner, account discriminator,
     /// full guardian verification, exact feed id, and serialized account length.
     pub price_update: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct Settle<'info> {
-    pub cranker: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
-    pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce)]
-    pub nonce_record: Box<Account<'info, QuoteNonce>>,
-    #[account(mut, close = rent_recipient, seeds = [POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
-    pub position: Box<Account<'info, Position>>,
-    #[account(mut, seeds = [POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
-    pub position_vault: Box<Account<'info, TokenAccount>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = settlement_mint, constraint = buyer_destination.owner == position.buyer @ VsolError::InvalidDestination)]
-    pub buyer_destination: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = maker_destination.owner == position.maker @ VsolError::InvalidDestination)]
-    pub maker_destination: Box<Account<'info, TokenAccount>>,
-    #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
-    pub treasury_destination: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
-    #[account(mut, address = position.buyer)]
-    pub rent_recipient: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct RefundUnsettled<'info> {
-    pub cranker: Signer<'info>,
-    #[account(has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
-    pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce)]
-    pub nonce_record: Box<Account<'info, QuoteNonce>>,
-    #[account(mut, close = rent_recipient, seeds = [POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
-    pub position: Box<Account<'info, Position>>,
-    #[account(mut, seeds = [POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
-    pub position_vault: Box<Account<'info, TokenAccount>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = settlement_mint, constraint = buyer_destination.owner == position.buyer @ VsolError::InvalidDestination)]
-    pub buyer_destination: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = maker_destination.owner == position.maker @ VsolError::InvalidDestination)]
-    pub maker_destination: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
-    #[account(mut, address = position.buyer)]
-    pub rent_recipient: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -3104,8 +2218,18 @@ pub struct SetLiquidityPoolMarket<'info> {
     pub pool: Account<'info, LiquidityPool>,
     #[account(has_one = config @ VsolError::InvalidMarket)]
     pub market: Account<'info, Market>,
-    #[account(init_if_needed, payer = manager, space = 8 + LiquidityPoolMarket::INIT_SPACE, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump)]
-    pub pool_market: Account<'info, LiquidityPoolMarket>,
+    /// CHECK: created or loaded BY HAND in the handler, not via Anchor's
+    /// `init_if_needed` sugar -- see the handler's own doc comment for why
+    /// (that sugar's automatic `space == data_len()` equality check would
+    /// hard-reject every pre-existing, legacy 82-byte `LiquidityPoolMarket`
+    /// once the struct grew by `OpenPositionCount`'s 4 bytes). `seeds =`/
+    /// `bump` here still fully authenticates the address -- an account can
+    /// only ever exist at this exact PDA if THIS program created it (via
+    /// `invoke_signed` with these same seeds), or it doesn't exist yet
+    /// (owned by the System Program) -- the handler checks and handles
+    /// both cases explicitly.
+    #[account(mut, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump)]
+    pub pool_market: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -3187,7 +2311,9 @@ pub struct FillPoolQuote<'info> {
     pub pool: Box<Account<'info, LiquidityPool>>,
     #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
     pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump = pool_market.bump, has_one = pool, has_one = market)]
+    // `mut`: `fill_pool_quote` increments `open_positions` on this record --
+    // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    #[account(mut, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump = pool_market.bump, has_one = pool, has_one = market)]
     pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     pub settlement_mint: Box<Account<'info, Mint>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
@@ -3220,7 +2346,39 @@ pub struct SettlePoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    // `mut`: settlement decrements `open_positions` on this record -- see
+    // `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =`/`has_one =` here (unlike
+    // `FillPoolQuote::pool_market`): this instruction's `try_accounts` is
+    // right at the BPF stack frame limit, and each of those constraints'
+    // codegen was enough to push it over (measured: 120 bytes over with
+    // `seeds =`/`bump =`; still 8 bytes over with only `has_one =` left).
+    // Verified instead by `require_keys_eq!` first thing in the handler body
+    // (a separate function, so it does not count against `try_accounts`'s
+    // own frame). Safe for the same reason `has_one` would have been: the
+    // only instruction that can ever create an account with this
+    // discriminator is `set_liquidity_pool_market`, always at the canonical
+    // `[POOL_MARKET_SEED, pool, market]` PDA, so an account that
+    // deserializes AND matches `pool`/`market` is necessarily that canonical
+    // account for THIS exact (pool, market) pair.
+    #[account(mut)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
+    /// Closed here (rent to `rent_recipient`, i.e. the buyer -- see that
+    /// field's own doc comment) rather than left to rot forever. Replay
+    /// safety: `fill_pool_quote` only accepts a quote while
+    /// `now <= quote.quote_expiry < market.expiry`, and this instruction only
+    /// runs once `now >= market.expiry`, so by the time the nonce PDA
+    /// disappears the exact ed25519-signed `PoolQuoteArgs` (nonce included)
+    /// that created it can never satisfy `fill_pool_quote`'s own expiry check
+    /// again -- an attacker cannot forge a fresh `quote_expiry` without
+    /// invalidating the signature. Re-submitting the original signed quote
+    /// therefore fails closed with `QuoteExpired`, PDA or no PDA. Proven by
+    /// `settle_pool_position_closes_nonce_and_original_quote_cannot_replay`.
+    /// `close_pool_position` (early close, before expiry) must NOT do this:
+    /// the quote can still be unexpired there, so closing the nonce would let
+    /// the same signed quote be filled a second time once the PDA is gone.
+    #[account(mut, close = rent_recipient, constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
     pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
     pub position: Box<Account<'info, PoolPosition>>,
@@ -3231,9 +2389,38 @@ pub struct SettlePoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
+    /// When `config.treasury_owner` is the position's own buyer,
+    /// `buyer_destination` and `treasury_destination` are the exact same
+    /// token account. Anchor 1.0.2/1.1.2's generated `try_accounts` collects
+    /// every `mut` field that (a) is not marked `dup` and (b) serializes on
+    /// `exit()` (see `anchor-syn`'s `generate_duplicate_mutable_checks` and
+    /// `AccountsExit` impls) into a `HashSet`, erroring
+    /// `ConstraintDuplicateMutableAccount` if any two collide -- this exists
+    /// to stop the classic double-write bug where two `Account<'info, T>`
+    /// views of the same address each independently re-serialize their own
+    /// (possibly divergent) copy of the account's data on exit, and the
+    /// second write silently clobbers the first.
+    /// `dup` here is exactly the intended escape hatch for a case that bug
+    /// cannot occur in: `TokenAccount`'s owning program is the SPL Token
+    /// program, not this one, so `Account<'info, TokenAccount>::exit()`
+    /// (see `exit_with_expected_owner`) is a complete no-op for it --  this
+    /// program's mutations to `treasury_destination`'s and
+    /// `buyer_destination`'s balances only ever happen via CPI `transfer_checked`,
+    /// which writes the real on-chain bytes directly, not through Anchor's
+    /// in-memory struct. Two `Account<TokenAccount>` handles aliasing the
+    /// same address therefore cannot diverge or clobber each other; `dup`
+    /// only tells Anchor's constraint pass that, it changes no runtime
+    /// behavior. Validation the duplicate check would otherwise have
+    /// provided nothing towards anyway (token-program ownership, correct
+    /// mint, correct token owner) is fully carried by `token::mint =` and
+    /// the `owner ==` constraint above regardless of aliasing. See
+    /// `settle_pool_position`'s handler for the matching transfer logic
+    /// (folds into one CPI instead of two when the keys are equal).
     #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
+    /// CHECK: Receives rent (this account's own nonce and position rent, plus
+    /// -- see `nonce_record`'s doc comment -- the closed nonce's rent too)
+    /// and must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
     pub rent_recipient: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
@@ -3250,7 +2437,25 @@ pub struct RefundPoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    // `mut`: refund decrements `open_positions` on this record -- see
+    // `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =`/`has_one =` -- see
+    // `SettlePoolPosition::pool_market`'s own comment for why the equality
+    // check is instead a manual `require_keys_eq!` in the handler body, and
+    // why that is both safe and required to stay under the BPF stack frame
+    // limit.
+    #[account(mut)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
+    /// Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety
+    /// argument is identical to `SettlePoolPosition::nonce_record`'s own doc
+    /// comment: this instruction also only runs once `now >= market.expiry`
+    /// (via the settlement-window deadline check below, which is itself
+    /// `>= market.expiry`), strictly after `quote.quote_expiry` could ever
+    /// again satisfy `fill_pool_quote`'s expiry check, so replaying the
+    /// original signed quote fails closed with `QuoteExpired` regardless of
+    /// whether this PDA still exists.
+    #[account(mut, close = rent_recipient, constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
     pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
     pub position: Box<Account<'info, PoolPosition>>,
@@ -3261,7 +2466,8 @@ pub struct RefundPoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
+    /// CHECK: Receives rent (this account's own nonce and position rent) and
+    /// must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
     pub rent_recipient: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
@@ -3274,6 +2480,15 @@ pub struct RefundPoolPosition<'info> {
 /// PDA) and `cranker` (replaced by the buyer, who must sign in person and
 /// must equal `position.buyer`), plus `instructions_sysvar` for the Ed25519
 /// check that authenticates the pool's signed buyback quote.
+///
+/// Deliberately never closes the `PoolQuoteNonce`, unlike
+/// `SettlePoolPosition`/`RefundPoolPosition` (see their `nonce_record` doc
+/// comments): early close can run at any time before `market.expiry`, while
+/// the original signed `PoolQuoteArgs` from `fill_pool_quote` may still be
+/// within its own `quote.quote_expiry`. Closing the nonce PDA here would
+/// free its seeds for reuse while that quote could still pass
+/// `fill_pool_quote`'s expiry check, letting the exact same signed quote be
+/// filled a second time.
 #[derive(Accounts)]
 pub struct ClosePoolPosition<'info> {
     pub buyer: Signer<'info>,
@@ -3285,6 +2500,15 @@ pub struct ClosePoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
+    // `mut`: an early close also decrements `open_positions` on this record --
+    // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =` -- see `SettlePoolPosition::pool_market`'s own
+    // comment for why it is both unnecessary (safety is fully carried by
+    // `has_one = pool, has_one = market` given the discriminator argument
+    // there) and required to stay under the BPF stack frame limit.
+    #[account(mut, has_one = pool, has_one = market)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, position.nonce_record.as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = settlement_mint @ VsolError::InvalidPosition, constraint = position.buyer == buyer.key() @ VsolError::Unauthorized)]
     pub position: Box<Account<'info, PoolPosition>>,
     #[account(mut, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
@@ -3308,12 +2532,17 @@ pub struct ClosePoolPosition<'info> {
 /// Accounts for `close_settled_market`. See that instruction's doc comment
 /// for the full safety argument.
 ///
-/// `pool`/`pool_market` are optional and must be supplied together (both
-/// `Some` or both `None`): they let the caller demonstrate that a specific
-/// pool authorization for this market has been disabled, but omitting them
-/// is accepted too (see point 3/5 of the safety argument -- this cannot be
-/// made a hard on-chain requirement because positions/authorizations are not
-/// cheaply enumerable from the market alone).
+/// `pool`/`pool_market` are MANDATORY (no `Option`, no bypass path): the
+/// caller must supply the `[POOL_MARKET_SEED, pool, market]` authorization
+/// record for this market and prove (via the handler's checks) that it
+/// carries zero open positions before the market can close -- see point 3 of
+/// the safety argument. A market that was never bound to any pool therefore
+/// cannot be closed on chain (only its own rent stays stuck); point 3 there
+/// also explains why that is acceptable (fills go through the pool path
+/// exclusively, so every market that ever actually traded has a binding to
+/// supply here). Point 4 documents the residual gap this does NOT close: a
+/// market may have more than one such binding over its lifetime, and this
+/// struct only ever sees the one the caller chose to pass.
 #[derive(Accounts)]
 pub struct CloseSettledMarket<'info> {
     #[account(
@@ -3338,226 +2567,17 @@ pub struct CloseSettledMarket<'info> {
         has_one = market @ VsolError::InvalidOracle
     )]
     pub oracle: Box<Account<'info, SettlementOracle>>,
-    /// CHECK: address-constrained to the market's complete-set collateral
-    /// vault PDA by `seeds =`/`bump`, so a caller can neither omit it nor
-    /// substitute a different (e.g. always-empty) account to dodge the
-    /// balance check in the handler. Deliberately an `UncheckedAccount`, not
-    /// `Box<Account<'info, TokenAccount>>` like `BurnCompleteSet`/
-    /// `RedeemWinning`'s own `collateral_vault`: THIS vault may legitimately
-    /// never have been created at all (a market nobody ever called
-    /// `mint_complete_set` against), and `Account<TokenAccount>`
-    /// deserialization fails closed on an empty/uninitialized account with
-    /// no `init_if_needed` escape hatch available on a `close`-adjacent
-    /// read-only check. The handler distinguishes "never created" (empty
-    /// account data) from "created but still holds a balance" (blocked)
-    /// itself, by inspecting the raw account.
-    ///
-    /// Checking ONLY this vault's balance -- not also `up_mint.supply`/
-    /// `down_mint.supply` -- is sufficient, and deliberately not "hardened"
-    /// with those two extra accounts: `vault.amount == 0` already implies
-    /// every winning conditional token has been redeemed (`redeem_winning`
-    /// is the only path that debits the vault post-settlement, and it always
-    /// debits the vault and the winning mint's supply by the identical
-    /// amount -- see its own `require!` check), so whatever supply remains
-    /// outstanding on either mint at that point is entirely losing-side
-    /// tokens, which are worthless by construction and carry no claim on
-    /// anything. Checking the vault is checking the one number that
-    /// actually matters; the mint supplies would be two more accounts for
-    /// no additional safety.
-    #[account(seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump)]
-    pub collateral_vault: UncheckedAccount<'info>,
-    pub pool: Option<Box<Account<'info, LiquidityPool>>>,
-    pub pool_market: Option<Box<Account<'info, LiquidityPoolMarket>>>,
-    /// CHECK: Receives the market's and oracle's reclaimed rent. Address-
-    /// constrained to the market's own creator so rent can never be
-    /// redirected to an arbitrary caller-supplied account.
+    pub pool: Box<Account<'info, LiquidityPool>>,
+    // `mut`: the handler always closes this record (rent to
+    // `rent_recipient`) once it has proven `open_positions == 0` -- see
+    // `close_settled_market`'s own comment.
+    #[account(mut)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
+    /// CHECK: Receives the market's, oracle's and pool_market's reclaimed
+    /// rent. Address-constrained to the market's own creator so rent can
+    /// never be redirected to an arbitrary caller-supplied account.
     #[account(mut, address = market.creator)]
     pub rent_recipient: UncheckedAccount<'info>,
-}
-
-/// Mints a complete set: `amount` of the market's settlement token moves into
-/// `collateral_vault`, and `amount` of both `up_mint` and `down_mint` is
-/// minted to the caller. `up_mint`/`down_mint`/`collateral_vault` are
-/// `init_if_needed` here (rather than requiring a separate initialize
-/// instruction) because they are pure PDAs of `market.key()` with no
-/// additional state of their own to set up -- the first `mint_complete_set`
-/// call against a given market creates them, every subsequent call just
-/// verifies the existing accounts match. This mirrors `init_if_needed`
-/// already in use elsewhere in this file (`SetEligibility::eligibility`,
-/// `SetLiquidityPoolMarket::pool_market`, `DepositLiquidity::provider_position`).
-///
-/// `market` itself signs the two `mint_to` CPIs and the vault-inbound
-/// transfer via its own PDA seeds -- it is never mutated by this
-/// instruction, so it does not need `#[account(mut)]` (same pattern as
-/// `WithdrawWriter::writer_vault` signing `transfer_checked_signed` without
-/// being `mut`).
-#[derive(Accounts)]
-pub struct MintCompleteSet<'info> {
-    #[account(mut)]
-    pub minter: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(
-        init_if_needed,
-        payer = minter,
-        mint::decimals = settlement_mint.decimals,
-        mint::authority = market,
-        seeds = [UP_MINT_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub up_mint: Box<Account<'info, Mint>>,
-    #[account(
-        init_if_needed,
-        payer = minter,
-        mint::decimals = settlement_mint.decimals,
-        mint::authority = market,
-        seeds = [DOWN_MINT_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub down_mint: Box<Account<'info, Mint>>,
-    #[account(
-        init_if_needed,
-        payer = minter,
-        token::mint = settlement_mint,
-        token::authority = market,
-        seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub collateral_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, token::authority = minter)]
-    pub minter_source: Box<Account<'info, TokenAccount>>,
-    // `init_if_needed` AND seeded (`COMPLETE_SET_TOKEN_SEED`), unlike
-    // `burner_up_token`/`down_token`/`redeemer_token` in the two structs
-    // below: see `COMPLETE_SET_TOKEN_SEED`'s doc comment for why a seeded
-    // address (not a plain caller-supplied account, and not a standard ATA)
-    // is what solves the bootstrap problem here specifically.
-    #[account(
-        init_if_needed,
-        payer = minter,
-        token::mint = up_mint,
-        token::authority = minter,
-        seeds = [COMPLETE_SET_TOKEN_SEED, up_mint.key().as_ref(), minter.key().as_ref()],
-        bump,
-    )]
-    pub minter_up_token: Box<Account<'info, TokenAccount>>,
-    #[account(
-        init_if_needed,
-        payer = minter,
-        token::mint = down_mint,
-        token::authority = minter,
-        seeds = [COMPLETE_SET_TOKEN_SEED, down_mint.key().as_ref(), minter.key().as_ref()],
-        bump,
-    )]
-    pub minter_down_token: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-/// Burns `amount` of both `up_mint` and `down_mint`, returning `amount`
-/// collateral. `up_mint`/`down_mint`/`collateral_vault` are NOT
-/// `init_if_needed` here: burning requires the accounts (and a caller
-/// balance to burn) to already exist, so a plain `seeds =/bump`
-/// re-derivation is all that's needed -- Anchor recomputes and validates the
-/// PDA on every call rather than reading a stored bump off `Market` (which
-/// has no field for one; none of these three PDAs do -- see
-/// `mint_complete_set`'s doc comment).
-///
-/// `burner_up_token`/`burner_down_token` are deliberately plain
-/// `token::mint =/token::authority =`-constrained accounts, NOT seeded to
-/// `COMPLETE_SET_TOKEN_SEED` like `mint_complete_set`'s `minter_up_token`/
-/// `minter_down_token`: there is no bootstrap problem here (burning requires
-/// already holding a balance somewhere), so the caller is free to burn from
-/// whichever token account actually holds their tokens -- the seeded
-/// account `mint_complete_set` created for them, a standard ATA they
-/// consolidated into, or wherever an AMM/transfer left the tokens.
-#[derive(Accounts)]
-pub struct BurnCompleteSet<'info> {
-    pub burner: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
-    pub up_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
-    pub down_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
-    pub collateral_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = up_mint, token::authority = burner)]
-    pub burner_up_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = down_mint, token::authority = burner)]
-    pub burner_down_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = burner_destination.owner == burner.key() @ VsolError::InvalidDestination)]
-    pub burner_destination: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
-}
-
-/// Redeems `amount` of the market's WINNING conditional token for `amount`
-/// collateral. Which side is winning is computed in the handler
-/// (`oracle.price > market.strike` => up) and checked against
-/// `redeemer_token.mint` there -- deliberately a `require_keys_eq!` in the
-/// handler body, not an `#[account(...)]` constraint, matching how
-/// `settle`/`refund_unsettled` keep their own business-logic checks
-/// (`oracle.finalized`, escrow equality) in the handler rather than the
-/// account-validation layer. `redeemer_token` is therefore a plain
-/// `TokenAccount` here with no `token::mint =` constraint at all: which mint
-/// is correct depends on the finalized price, which isn't known until the
-/// handler runs.
-#[derive(Accounts)]
-pub struct RedeemWinning<'info> {
-    pub redeemer: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
-    pub oracle: Box<Account<'info, SettlementOracle>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
-    pub up_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
-    pub down_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
-    pub collateral_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut)]
-    pub redeemer_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = redeemer_destination.owner == redeemer.key() @ VsolError::InvalidDestination)]
-    pub redeemer_destination: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
-}
-
-/// Accounts for `redeem_unresolved` -- modeled directly on `RedeemWinning`
-/// above, with one difference: `redeemer_token` may hold EITHER side (there
-/// is no winner yet), so which mint it belongs to is validated in the
-/// handler (`redeemer_token.mint == up_mint.key() || == down_mint.key()`),
-/// the same "business logic in the handler, not the account-validation
-/// layer" pattern `RedeemWinning` already uses for its own winner check.
-#[derive(Accounts)]
-pub struct RedeemUnresolved<'info> {
-    pub redeemer: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(has_one = config @ VsolError::InvalidMarket, has_one = oracle @ VsolError::InvalidOracle, has_one = settlement_mint @ VsolError::InvalidMarket)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
-    pub oracle: Box<Account<'info, SettlementOracle>>,
-    pub settlement_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [UP_MINT_SEED, market.key().as_ref()], bump)]
-    pub up_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [DOWN_MINT_SEED, market.key().as_ref()], bump)]
-    pub down_mint: Box<Account<'info, Mint>>,
-    #[account(mut, seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump, token::mint = settlement_mint, token::authority = market)]
-    pub collateral_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut)]
-    pub redeemer_token: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = settlement_mint, constraint = redeemer_destination.owner == redeemer.key() @ VsolError::InvalidDestination)]
-    pub redeemer_destination: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -3621,8 +2641,26 @@ pub struct PublishCustomSettlement<'info> {
     pub market: Account<'info, Market>,
     #[account(mut, seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Account<'info, SettlementOracle>,
-    #[account(seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()], bump = observation.bump, has_one = config @ VsolError::InvalidOracle)]
+    /// Closed here (rent to `rent_recipient`, i.e. `config.oracle_authority`,
+    /// the account that paid for it at `capture_custom_settlement_observation`)
+    /// once its data has been fully consumed into `oracle` above. Nothing else
+    /// in the program ever reads a `CustomSettlementObservation` again after
+    /// this point: `settle_pool_position`/`refund_pool_position`/`settle`/
+    /// `refund_unsettled` all gate on `oracle.finalized`, never on this
+    /// account, and the only two instructions that ever reference this type
+    /// are this one and `CaptureCustomSettlementObservation`'s own `init`.
+    /// `oracle.price_update` retains this account's now-stale pubkey purely
+    /// as an audit-trail pointer -- like `publish_pyth_settlement`'s own
+    /// `price_update` field, it is write-only and never dereferenced by any
+    /// instruction, so closing the account it points to is harmless.
+    #[account(mut, close = rent_recipient, seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()], bump = observation.bump, has_one = config @ VsolError::InvalidOracle)]
     pub observation: Account<'info, CustomSettlementObservation>,
+    /// CHECK: Receives the observation's reclaimed rent. Address-constrained
+    /// to `config.oracle_authority`, who paid for it originally. Publication
+    /// itself stays permissionless: this account is not a `Signer`, only a
+    /// payout target, so anyone may still call `publish_custom_settlement`.
+    #[account(mut, address = config.oracle_authority)]
+    pub rent_recipient: UncheckedAccount<'info>,
 }
 
 #[account]
@@ -3738,49 +2776,6 @@ pub struct CustomSettlementObservation {
 
 #[account]
 #[derive(InitSpace)]
-pub struct WriterVault {
-    pub bump: u8,
-    pub token_bump: u8,
-    pub config: Pubkey,
-    pub maker: Pubkey,
-    pub settlement_mint: Pubkey,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct QuoteNonce {
-    pub bump: u8,
-    pub status: u8,
-    pub config: Pubkey,
-    pub maker: Pubkey,
-    pub nonce: u64,
-    pub position: Pubkey,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct Position {
-    pub bump: u8,
-    pub vault_bump: u8,
-    pub status: u8,
-    pub direction: u8,
-    pub market: Pubkey,
-    pub nonce_record: Pubkey,
-    pub buyer: Pubkey,
-    pub maker: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub nonce: u64,
-    pub strike: u64,
-    pub width: u64,
-    pub premium: u64,
-    pub max_payout: u64,
-    pub fee_bps: u16,
-    pub opened_at: i64,
-    pub quote_expiry: i64,
-}
-
-#[account]
-#[derive(InitSpace)]
 pub struct Eligibility {
     pub bump: u8,
     pub config: Pubkey,
@@ -3864,6 +2859,140 @@ pub struct LiquidityProvider {
     pub total_withdrawn: u64,
 }
 
+/// A per-`LiquidityPoolMarket` counter of that binding's own currently-open
+/// `PoolPosition`s. `close_settled_market` uses it to refuse closing a
+/// market while a pool-backed position against it is still unsettled or
+/// unrefunded -- see that instruction's own doc comment for the full
+/// argument, and this field's doc comment on `LiquidityPoolMarket` for why
+/// it is a legacy-tolerant appended field rather than a plain `u32`.
+///
+/// Backward-compatible by construction with the pre-existing 82-byte
+/// `LiquidityPoolMarket` layout already live on devnet: this type's manual
+/// (de)serialization makes the field OPTIONAL on the wire, not fixed-width.
+///   * Deserialize: reads 4 little-endian bytes if the buffer still has
+///     them; if the buffer is already exhausted (a legacy 82-byte account,
+///     which has none), yields the sentinel `UNKNOWN` (`u32::MAX`) instead
+///     of erroring.
+///   * Serialize: writes NOTHING for `UNKNOWN`, and 4 bytes otherwise.
+///
+/// A legacy account therefore deserializes to `UNKNOWN` and re-serializes
+/// back to exactly its original 82 bytes forever -- Anchor's `exit` writes
+/// back only as many bytes as `serialize` produces, never more or less. A
+/// newly created binding (`LiquidityPoolMarket::INIT_SPACE` now includes
+/// this field's 4-byte `Space` contribution, so `init_if_needed` always
+/// allocates 86 bytes for a brand new record) deserializes its
+/// zero-initialized trailing bytes as a real `0` and stays a real, tracked
+/// counter from then on -- see `set_liquidity_pool_market`'s handler, which
+/// deliberately never overwrites this field on an already-existing record.
+///
+/// `UNKNOWN` is a sentinel, not a valid count. `close_settled_market`
+/// requires the count to be exactly zero to close, so a legacy binding
+/// (which can only ever read `UNKNOWN`) can never satisfy that check: only
+/// ITS rent is permanently stuck, never any position's escrowed funds
+/// (those live in independent per-position vaults, always settleable or
+/// refundable on their own regardless of whether the market itself is ever
+/// closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenPositionCount(u32);
+
+impl OpenPositionCount {
+    pub const ZERO: OpenPositionCount = OpenPositionCount(0);
+    pub const UNKNOWN: OpenPositionCount = OpenPositionCount(u32::MAX);
+
+    pub fn is_unknown(self) -> bool {
+        self == Self::UNKNOWN
+    }
+
+    /// No-op on `UNKNOWN`: a legacy binding never tracks a real count, in
+    /// either direction.
+    pub fn checked_increment(self) -> Result<Self> {
+        if self.is_unknown() {
+            return Ok(self);
+        }
+        let next = self.0.checked_add(1).ok_or(VsolError::MathOverflow)?;
+        // Never let a real, growing count collide with the UNKNOWN sentinel.
+        require!(next != u32::MAX, VsolError::MathOverflow);
+        Ok(OpenPositionCount(next))
+    }
+
+    /// No-op on `UNKNOWN`: a legacy binding never tracks a real count, in
+    /// either direction.
+    pub fn checked_decrement(self) -> Result<Self> {
+        if self.is_unknown() {
+            return Ok(self);
+        }
+        let next = self.0.checked_sub(1).ok_or(VsolError::MathOverflow)?;
+        Ok(OpenPositionCount(next))
+    }
+}
+
+impl anchor_lang::Space for OpenPositionCount {
+    const INIT_SPACE: usize = 4;
+}
+
+impl AnchorSerialize for OpenPositionCount {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        if self.is_unknown() {
+            // Write nothing: a legacy 82-byte account must round-trip at
+            // exactly 82 bytes forever, never gaining these 4 bytes back.
+            Ok(())
+        } else {
+            writer.write_all(&self.0.to_le_bytes())
+        }
+    }
+}
+
+impl AnchorDeserialize for OpenPositionCount {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let mut buf = [0u8; 4];
+        let mut filled = 0usize;
+        while filled < 4 {
+            let n = reader.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        match filled {
+            // Buffer was already exhausted: a legacy account with no
+            // trailing bytes for this field at all.
+            0 => Ok(OpenPositionCount::UNKNOWN),
+            4 => Ok(OpenPositionCount(u32::from_le_bytes(buf))),
+            // Neither "nothing left" nor "a full 4 bytes": not a shape any
+            // real account layout (82 or 86 bytes) can produce. Fail closed
+            // rather than silently guessing.
+            _ => Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::UnexpectedEof,
+                "OpenPositionCount: truncated trailing bytes",
+            )),
+        }
+    }
+}
+
+// Only compiled during `anchor build`'s separate IDL-generation pass (the
+// `idl-build` feature). Anchor's `#[account]`/`InitSpace` macros require
+// every field type to implement `IdlBuild` under that pass; the default
+// (empty) impl would compile but silently drop the field from the
+// generated IDL, so a client could never see or decode `open_positions`.
+// Representing it as a plain type alias to `u32` is accurate: on the wire
+// it either IS a little-endian u32 (present) or entirely absent (a legacy
+// account) -- there is no richer shape to describe.
+#[cfg(feature = "idl-build")]
+impl anchor_lang::idl::build::IdlBuild for OpenPositionCount {
+    fn create_type() -> Option<anchor_lang::idl::types::IdlTypeDef> {
+        Some(anchor_lang::idl::types::IdlTypeDef {
+            name: "OpenPositionCount".to_string(),
+            docs: vec![],
+            serialization: anchor_lang::idl::types::IdlSerialization::default(),
+            repr: None,
+            generics: vec![],
+            ty: anchor_lang::idl::types::IdlTypeDefTy::Type {
+                alias: anchor_lang::idl::types::IdlType::U32,
+            },
+        })
+    }
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct LiquidityPoolMarket {
@@ -3872,6 +3001,11 @@ pub struct LiquidityPoolMarket {
     pub market: Pubkey,
     pub last_trade_at: i64,
     pub enabled: bool,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. See `OpenPositionCount`'s own doc comment for the legacy-
+    // tolerant (de)serialization that keeps a pre-existing 82-byte account
+    // reading this as `UNKNOWN` and re-serializing at exactly 82 bytes.
+    pub open_positions: OpenPositionCount,
 }
 
 #[account]
@@ -3928,7 +3062,6 @@ impl TryFrom<u8> for Direction {
 #[repr(u8)]
 pub enum NonceStatus {
     Filled = 1,
-    Cancelled = 2,
 }
 
 #[repr(u8)]
@@ -3979,37 +3112,6 @@ pub struct EligibilityUpdated {
     pub expires_at: i64,
 }
 #[event]
-pub struct WriterVaultInitialized {
-    pub writer_vault: Pubkey,
-    pub maker: Pubkey,
-    pub settlement_mint: Pubkey,
-}
-#[event]
-pub struct WriterDeposited {
-    pub writer_vault: Pubkey,
-    pub amount: u64,
-}
-#[event]
-pub struct WriterWithdrawn {
-    pub writer_vault: Pubkey,
-    pub amount: u64,
-}
-#[event]
-pub struct NonceCancelled {
-    pub maker: Pubkey,
-    pub nonce: u64,
-}
-#[event]
-pub struct QuoteFilled {
-    pub position: Pubkey,
-    pub market: Pubkey,
-    pub buyer: Pubkey,
-    pub maker: Pubkey,
-    pub nonce: u64,
-    pub premium: u64,
-    pub max_payout: u64,
-}
-#[event]
 pub struct SettlementPublished {
     pub market: Pubkey,
     pub price: u64,
@@ -4038,21 +3140,6 @@ pub struct CustomSettlementPublished {
     pub confidence: u64,
     pub published_at: i64,
 }
-#[event]
-pub struct PositionSettled {
-    pub position: Pubkey,
-    pub settlement_price: u64,
-    pub payout: u64,
-    pub maker_amount: u64,
-    pub fee: u64,
-}
-#[event]
-pub struct PositionRefunded {
-    pub position: Pubkey,
-    pub premium: u64,
-    pub collateral: u64,
-}
-
 #[event]
 pub struct LiquidityPoolInitialized {
     pub pool: Pubkey,
@@ -4159,37 +3246,6 @@ pub struct MarketClosed {
     pub creator: Pubkey,
 }
 
-#[event]
-pub struct CompleteSetMinted {
-    pub market: Pubkey,
-    pub minter: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct CompleteSetBurned {
-    pub market: Pubkey,
-    pub burner: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct WinningRedeemed {
-    pub market: Pubkey,
-    pub redeemer: Pubkey,
-    pub amount: u64,
-    pub up_won: bool,
-}
-
-#[event]
-pub struct UnresolvedRedeemed {
-    pub market: Pubkey,
-    pub redeemer: Pubkey,
-    pub amount: u64,
-    pub payout: u64,
-    pub redeemed_up: bool,
-}
-
 #[error_code]
 pub enum VsolError {
     #[msg("The protocol is paused.")]
@@ -4244,8 +3300,6 @@ pub enum VsolError {
     MissingMakerSignature,
     #[msg("The maker signature or signed quote message is invalid.")]
     InvalidMakerSignature,
-    #[msg("The writer vault is invalid.")]
-    InvalidWriterVault,
     #[msg("The writer does not have enough available collateral.")]
     InsufficientWriterLiquidity,
     #[msg("Escrow does not exactly equal premium plus maximum payout.")]
@@ -4318,14 +3372,6 @@ pub enum VsolError {
     PoolUpdateTimelocked,
     #[msg("The market strike must be positive.")]
     InvalidStrike,
-    #[msg("The supplied token account does not match the market's winning side.")]
-    LosingSideNotRedeemable,
-    #[msg("The market's collateral vault still holds outstanding complete-set collateral: redeem or burn every outstanding complete set before closing this market.")]
-    MarketHasOutstandingCollateral,
-    #[msg("The supplied token account does not belong to either the UP or DOWN mint.")]
-    InvalidConditionalTokenMint,
-    #[msg("There is no outstanding conditional-token supply left to redeem.")]
-    NothingToRedeem,
     #[msg("The custom price feed has not yet updated past this market's expiry.")]
     CustomFeedNotYetFresh,
     #[msg("The custom price feed has not updated recently enough to settle with.")]
@@ -4500,43 +3546,6 @@ fn transfer_checked_signed<'info>(
         ),
         amount,
         decimals,
-    )
-}
-
-/// Mints `amount` of `mint` to `to`, signed by a PDA (the market, for the
-/// conditional-token mints -- their `mint::authority`).
-fn mint_to_signed<'info>(
-    token_program: Pubkey,
-    mint: AccountInfo<'info>,
-    to: AccountInfo<'info>,
-    authority: AccountInfo<'info>,
-    amount: u64,
-    signer_seeds: &[&[u8]],
-) -> Result<()> {
-    token::mint_to(
-        CpiContext::new_with_signer(
-            token_program,
-            MintTo { mint, to, authority },
-            &[signer_seeds],
-        ),
-        amount,
-    )
-}
-
-/// Burns `amount` of `mint` from `from`. Unlike the transfer/mint helpers
-/// above, every caller of this so far burns from an account the burner
-/// themself owns (never a PDA-owned vault), so it takes no signer seeds --
-/// `authority` is always a real `Signer` in the current CPI contexts.
-fn burn_tokens<'info>(
-    token_program: Pubkey,
-    mint: AccountInfo<'info>,
-    from: AccountInfo<'info>,
-    authority: AccountInfo<'info>,
-    amount: u64,
-) -> Result<()> {
-    token::burn(
-        CpiContext::new(token_program, Burn { mint, from, authority }),
-        amount,
     )
 }
 

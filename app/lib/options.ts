@@ -150,11 +150,21 @@ export function digitalFairValue(params: {
 // means the edge shows up as a slightly worse strike, and the advertised
 // multiple is the one actually delivered.
 // ---------------------------------------------------------------------------
-export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
+// 10% over fair value. Lowered from 1500 alongside taking fee_bps to its 1000
+// cap, which together RAISE protocol revenue: the fee is charged on winning
+// payouts only, so protocol take is fee x 1/(1 + edge) -- a thinner edge means
+// the buyer wins more often and the fee lands more often. Cutting the edge
+// costs the POOL, not the treasury.
+//
+// It is not cut further for one reason: this edge is the pool's buffer against
+// the volatility model being wrong. Tend prices off a model, not a two-sided
+// market, so a vol misestimate lands directly on the pool. 10% absorbs a
+// meaningful one; 5% would not. Revisit only against real settlement data.
+export const MAKER_EDGE_BPS = 1_000;
 
 /**
  * The protocol's cut of a WINNING payout, in basis points -- mirrors
- * `config.fee_bps` on chain (set to 500 on 2026-09-19).
+ * `config.fee_bps` on chain (raised to its MAX_FEE_BPS cap of 1000 on 2026-09-21).
  *
  * `settle_pool_position` charges this against the payout and takes it from the
  * buyer's side, so a LOSING position pays nothing at all and a winner receives
@@ -164,7 +174,7 @@ export const MAKER_EDGE_BPS = 1_500; // 15% over fair value.
  * settlement actually uses. A filled quote therefore cannot be re-priced by a
  * later governance change.
  */
-export const PROTOCOL_WIN_FEE_BPS = 500;
+export const PROTOCOL_WIN_FEE_BPS = 1_000;
 
 /** What a winner actually receives after the protocol's cut of the payout. */
 export function netWinning(maxPayout: number, feeBps: number = PROTOCOL_WIN_FEE_BPS): number {
@@ -409,8 +419,13 @@ export const INTRADAY_TIER_MAX_MINUTES = 60; // 15M and 1H.
 // the 15M targets land at $99.94 / $100.05 / $100.18. `ladderStrike` only
 // picks the default at-the-money rung when PLANNING a listing.
 export const PAYOFF_TIERS_INTRADAY: readonly number[] = [1.5, 2, 3];
-export const PAYOFF_TIERS_STANDARD: readonly number[] = [2, 5, 10];
-export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3, 5, 6, 10];
+// The standard tenors use the SAME ladder. 5x and 10x were removed: a 10x
+// ticket wins about 9% of the time, which reads as a lottery rather than a
+// tradable view, and the house edge is identical at every tier anyway (it
+// comes from MAKER_EDGE_BPS, not from the multiple), so the long odds bought
+// the protocol nothing while costing the trader a plausible hit rate.
+export const PAYOFF_TIERS_STANDARD: readonly number[] = [1.5, 2, 3];
+export const PAYOFF_TIERS_ALL: readonly number[] = [1.5, 2, 3];
 
 export function payoffTiersFor(durationMinutes: number): number[] {
   return durationMinutes <= INTRADAY_TIER_MAX_MINUTES

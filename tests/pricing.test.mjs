@@ -182,7 +182,7 @@ test("digital sanity check: at-the-money prices near 2x before edge, and the mul
   }
 });
 
-test("quoteFor achieves the requested 5×/10× payoff exactly across the measured audit matrix, both directions", async () => {
+test("quoteFor achieves the requested 1.5×/3× payoff exactly across the measured audit matrix, both directions", async () => {
   const { quoteFor } = await loadOptions();
   // The exact spot/notional the reviewer measured the old engine against:
   // 55x movement in true fair value produced only a 1.07x movement in the
@@ -203,7 +203,7 @@ test("quoteFor achieves the requested 5×/10× payoff exactly across the measure
 
   for (const { volatility, durationMinutes } of cases) {
     for (const direction of ["up", "down"]) {
-      for (const payoff of [5, 10]) {
+      for (const payoff of [1.5, 3]) {
         const quote = quoteFor({ spot, amount, durationMinutes, direction, payoff, volatility });
         const achievedLeverage = quote.maxPayout / quote.premium;
         const relativeError = Math.abs(achievedLeverage - payoff) / payoff;
@@ -277,14 +277,14 @@ test("strike distance from spot moves meaningfully with volatility for a fixed p
   // 2x/3x/6x ladder (see payoffTiersFor), and 10x is only valid on the
   // standard ladder.
   const distances = [33, 60, 120].map((volatility) => {
-    const q = quoteFor({ spot, amount, durationMinutes: 90, direction: "up", payoff: 10, volatility });
+    const q = quoteFor({ spot, amount, durationMinutes: 90, direction: "up", payoff: 3, volatility });
     assert.ok(Math.abs((q.cap - q.strike) - BINARY_WIDTH) < 1e-9, "width must stay pinned at BINARY_WIDTH regardless of vol");
     return q.strike - spot;
   });
   assert.ok(distances[0] < distances[1] && distances[1] < distances[2], `strike distance from spot must strictly widen with vol: ${distances}`);
 });
 
-test("the strike solver reaches for an in-the-money strike only when the tier genuinely needs it -- the cheapest standard tier (10x) stays out-of-the-money", async () => {
+test("the strike solver reaches for an in-the-money strike only when the tier genuinely needs it -- longer odds always sit further out of the money", async () => {
   const { quoteFor } = await loadOptions();
   // Digital pricing: target P = 1 / (payoff * 1.15). 10x needs P ~= 0.087,
   // deep below the ~0.5-ish at-the-money value (see the "digital sanity
@@ -296,9 +296,21 @@ test("the strike solver reaches for an in-the-money strike only when the tier ge
     for (const volatility of [33, 400]) {
       for (const durationMinutes of [90, 1_440, 43_200]) { // standard-ladder tenors only
         const spot = 100;
-        const quote = quoteFor({ spot, amount: 1_000, durationMinutes, direction, payoff: 10, volatility });
-        if (direction === "up") assert.ok(quote.strike >= spot - 1e-9, `up strike ${quote.strike} should stay out-of-the-money (>= spot ${spot}) at 10x`);
-        else assert.ok(quote.strike <= spot + 1e-9, `down strike ${quote.strike} should stay out-of-the-money (<= spot ${spot}) at 10x`);
+        // The invariant is ORDERING, not absolute position against spot. A
+        // longer-odds tier must always sit further out of the money than a
+        // shorter-odds one, which is what "the solver reaches for an ITM
+        // strike only when the tier needs it" actually means. Asserting
+        // "3x stays above spot" was only ever true because the old ladder
+        // topped out at 10x (P(win) ~9%); at 3x (~29%) and 400% vol the
+        // lognormal's 29th percentile genuinely sits below spot, so that
+        // form of the check tested the old tier menu rather than the solver.
+        const [cheap, mid, rich] = [3, 2, 1.5].map((payoff) =>
+          quoteFor({ spot, amount: 1_000, durationMinutes, direction, payoff, volatility }).strike);
+        if (direction === "up") {
+          assert.ok(cheap > mid && mid > rich, `up strikes must widen with the payoff tier at vol=${volatility} dur=${durationMinutes}: 3x ${cheap}, 2x ${mid}, 1.5x ${rich}`);
+        } else {
+          assert.ok(cheap < mid && mid < rich, `down strikes must widen with the payoff tier at vol=${volatility} dur=${durationMinutes}: 3x ${cheap}, 2x ${mid}, 1.5x ${rich}`);
+        }
       }
     }
   }
@@ -338,15 +350,15 @@ test("the intraday ladder is directional at 2x and above; 1.5x is the one delibe
   }
 });
 
-test("payoffTiersFor offers a near-binary intraday ladder at or under an hour, and the standard ladder beyond it", async () => {
+test("payoffTiersFor offers the SAME 1.5x/2x/3x ladder at every tenor", async () => {
   const { payoffTiersFor } = await loadOptions();
   assert.deepEqual(payoffTiersFor(1), [1.5, 2, 3]);
   assert.deepEqual(payoffTiersFor(15), [1.5, 2, 3]);
   assert.deepEqual(payoffTiersFor(60), [1.5, 2, 3]);
-  assert.deepEqual(payoffTiersFor(61), [2, 5, 10]);
-  assert.deepEqual(payoffTiersFor(720), [2, 5, 10]); // a typical EOD duration
-  assert.deepEqual(payoffTiersFor(10_080), [2, 5, 10]); // 7D
-  assert.deepEqual(payoffTiersFor(43_200), [2, 5, 10]); // 30D
+  assert.deepEqual(payoffTiersFor(61), [1.5, 2, 3]);
+  assert.deepEqual(payoffTiersFor(720), [1.5, 2, 3]); // a typical EOD duration
+  assert.deepEqual(payoffTiersFor(10_080), [1.5, 2, 3]); // 7D
+  assert.deepEqual(payoffTiersFor(43_200), [1.5, 2, 3]); // 30D
 });
 
 test("quoteFor rejects a payoff outside the known tier set, but is duration-agnostic about WHICH known tier -- the product catalog restriction lives in payoffTiersFor/app/api/quotes/route.ts instead", async () => {
@@ -362,7 +374,7 @@ test("quoteFor rejects a payoff outside the known tier set, but is duration-agno
   // duration on purpose (see tests/close-position.test.mjs, which prices
   // payoff=5 at a 15-minute duration to test buybackFor in isolation).
   const { quoteFor, PAYOFF_TIERS_ALL } = await loadOptions();
-  assert.deepEqual(PAYOFF_TIERS_ALL, [1.5, 2, 3, 5, 6, 10]);
+  assert.deepEqual(PAYOFF_TIERS_ALL, [1.5, 2, 3]);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 15, direction: "up", payoff: 7, volatility: 40 }), /Payoff must be one of/);
   assert.throws(() => quoteFor({ spot: 100, amount: 1_000, durationMinutes: 1_440, direction: "up", payoff: 4, volatility: 40 }), /Payoff must be one of/);
   // Every known tier prices at every duration without throwing.
@@ -399,11 +411,10 @@ test("per-tenor payoff ladder: every advertised tier lands within 10% of its tar
   }
 });
 
-test("cap distance from spot grows monotonically with tenor at moderate volatility, for the 2x tier every ladder shares", async () => {
-  const { quoteFor } = await loadOptions();
-  // 2x is the one tier present on BOTH the intraday [2,3,6] and standard
-  // [2,5,10] ladders, so it is the only tier comparable across all five
-  // tenors on one axis. Cap distance (not just width, which is now pinned at
+test("the 2x tier solves to its target probability and achieves 2x at every tenor and volatility", async () => {
+  const { quoteFor, MAKER_EDGE_BPS } = await loadOptions();
+  // Every tenor now sells the same 1.5x/2x/3x ladder, so 2x is comparable
+  // across all five tenors on one axis. Cap distance (not just width, which is now pinned at
   // BINARY_WIDTH regardless of tenor -- see the dedicated width test below)
   // widens with tenor at ORDINARY vol, because it is dominated by how far
   // the solved strike itself sits from spot, and more time to expiry means a
@@ -425,15 +436,26 @@ test("cap distance from spot grows monotonically with tenor at moderate volatili
   const tenorDurations = [15, 60, 720, 10_080, 43_200]; // 15M, 1H, EOD, 7D, 30D
   for (const volatility of [20, 60]) {
     for (const direction of ["up", "down"]) {
-      let prevDistance = -Infinity;
       for (const durationMinutes of tenorDurations) {
         const quote = quoteFor({ spot, amount, durationMinutes, direction, payoff: 2, volatility });
-        const distance = Math.abs(quote.cap - spot);
+        // The real, tenor-independent invariant: a tier IS a probability. 2x
+        // must solve to P(win) = 1/((1 + edge) x 2) and achieve exactly 2x at
+        // every tenor. "Cap distance grows with tenor" is NOT invariant and
+        // was only ever true at the old 15% edge -- at 10% the target
+        // probability sits nearer 50%, where the lognormal drag term (sigma^2
+        // T / 2, linear in T) overtakes diffusion (sigma sqrt(T)) and pulls
+        // the strike back toward spot at long tenors. Verified at 30D/vol 60:
+        // strike distance shrinks while P stays 45.45% and the multiple stays
+        // 2.000x, i.e. the engine is right and the old assertion was not.
+        const targetP = 1 / ((1 + MAKER_EDGE_BPS / 10_000) * 2);
         assert.ok(
-          distance > prevDistance,
-          `cap distance must grow with tenor at vol=${volatility} dir=${direction}: ${prevDistance} -> ${distance} at duration=${durationMinutes}`,
+          Math.abs(quote.probabilityItm - targetP) < 1e-6,
+          `2x must solve to P=${targetP} at vol=${volatility} dir=${direction} dur=${durationMinutes}, got ${quote.probabilityItm}`,
         );
-        prevDistance = distance;
+        assert.ok(
+          Math.abs(quote.maxPayout / quote.premium - 2) < 0.01,
+          `2x must achieve 2x at vol=${volatility} dir=${direction} dur=${durationMinutes}, got ${quote.maxPayout / quote.premium}`,
+        );
       }
     }
   }
@@ -594,7 +616,7 @@ test("maker edge is applied inside the strike solve, not added to fair value aft
   // value + edge) is what hits the target multiple, and `fairValue` (no
   // edge) sits strictly below the target -- i.e. below what a naive
   // fair-value-only solve would have produced for the same strike.
-  const { solveStrikeForTargetPremium } = await loadOptions();
+  const { solveStrikeForTargetPremium, MAKER_EDGE_BPS } = await loadOptions();
   const spot = 100;
   const maxPayout = 1_000;
   const targetPremium = 100; // 10x
@@ -605,21 +627,21 @@ test("maker edge is applied inside the strike solve, not added to fair value aft
   assert.ok(Math.abs(solved.premium - targetPremium) < 1e-4, "premium (edge included) must hit the target");
   assert.ok(solved.fairValue < targetPremium, "fair value (no edge) must sit strictly below the edge-inclusive target");
   const impliedEdgeBps = (solved.premium / solved.fairValue - 1) * 10_000;
-  assert.ok(Math.abs(impliedEdgeBps - 1_500) < 1, `implied edge should be ~1500bps, got ${impliedEdgeBps.toFixed(2)}`);
+  assert.ok(Math.abs(impliedEdgeBps - MAKER_EDGE_BPS) < 1, `implied edge should match MAKER_EDGE_BPS, got ${impliedEdgeBps.toFixed(2)}`);
 });
 
 test("probabilityItm and impliedVolatility are surfaced honestly by quoteFor", async () => {
   const { quoteFor } = await loadOptions();
-  const quote = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 5, volatility: 40 });
+  const quote = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 3, volatility: 40 });
   assert.ok(quote.probabilityItm > 0 && quote.probabilityItm < 1, `probabilityItm ${quote.probabilityItm} should be a real probability`);
   // Deeper leverage (further out-of-the-money) must have a lower win probability.
   const shallow = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 2, volatility: 40 });
-  const deep = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 10, volatility: 40 });
+  const deep = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 3, volatility: 40 });
   assert.ok(deep.probabilityItm <= shallow.probabilityItm, "higher payoff (further OTM) must not have a higher win probability");
   // impliedVolatility reflects the gap-risk-adjusted vol, so a stale
   // reference must push it above the raw input.
-  const fresh = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 5, volatility: 40, referenceAgeSeconds: 0 });
-  const stale = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 5, volatility: 40, referenceAgeSeconds: 6 * 3_600 });
+  const fresh = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 3, volatility: 40, referenceAgeSeconds: 0 });
+  const stale = quoteFor({ spot: 100, amount: 1_000, durationMinutes: 60, direction: "up", payoff: 3, volatility: 40, referenceAgeSeconds: 6 * 3_600 });
   assert.ok(stale.impliedVolatility > fresh.impliedVolatility, "a stale reference must raise the priced-in (implied) volatility");
   assert.ok(Math.abs(fresh.impliedVolatility - 40) < 1e-9, "a fresh reference prices at exactly the raw input vol (no gap-risk bump)");
 });
@@ -636,7 +658,7 @@ test("BINARY_WIDTH and strike-offset bound are the documented, defensible values
   // MAX_STRIKE_OFFSET_FRACTION's comment in options.ts for the full
   // derivation.
   assert.equal(MAX_STRIKE_OFFSET_FRACTION, 0.6);
-  assert.equal(MAKER_EDGE_BPS, 1_500);
+  assert.equal(MAKER_EDGE_BPS, 1_000);
 });
 
 // --- Stake -> payout inversion (app/lib/options.ts payoutForStake) ---------
@@ -645,7 +667,7 @@ test("BINARY_WIDTH and strike-offset bound are the documented, defensible values
 
 test("premium is exactly linear in payout, so one reference quote inverts it", async () => {
   const { quoteFor } = await loadOptions();
-  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 60 };
+  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 3, volatility: 60 };
   const small = quoteFor({ ...inputs, amount: 100 });
   const large = quoteFor({ ...inputs, amount: 5_000 });
   // Strike/width/probability are size-independent: the solver matches
@@ -659,9 +681,9 @@ test("premium is exactly linear in payout, so one reference quote inverts it", a
 
 test("payoutForStake returns the payout whose premium is the requested stake", async () => {
   const { quoteFor, payoutForStake } = await loadOptions();
-  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 60 };
+  const inputs = { spot: 101, durationMinutes: 43_200, direction: "up", payoff: 3, volatility: 60 };
   const reference = quoteFor({ ...inputs, amount: 1_000 });
-  for (const stake of [25, 100, 250, 900]) {
+  for (const stake of [50, 100, 250, 900]) {
     const payout = payoutForStake({ stake, referencePremium: reference.premium, referenceNotional: 1_000 });
     const repriced = quoteFor({ ...inputs, amount: payout });
     // Re-pricing at the derived payout must cost what the buyer asked to pay.
@@ -680,7 +702,7 @@ test("payoutForStake clamps to what the pool underwrites, and rejects nonsense",
 
 test("stakeBoundsForPayoff keeps the implied payout inside the pool's limits", async () => {
   const { stakeBoundsForPayoff, MIN_PAYOUT_NOTIONAL, MAX_PAYOUT_NOTIONAL } = await loadOptions();
-  for (const payoff of [2, 5, 10]) {
+  for (const payoff of [1.5, 2, 3]) {
     const { min, max } = stakeBoundsForPayoff(payoff);
     assert.ok(min * payoff >= MIN_PAYOUT_NOTIONAL, `${payoff}x min`);
     assert.ok(max * payoff <= MAX_PAYOUT_NOTIONAL, `${payoff}x max`);
@@ -690,11 +712,12 @@ test("stakeBoundsForPayoff keeps the implied payout inside the pool's limits", a
 
 test("the win fee is a cut of the PAYOUT, mirrors config.fee_bps on chain, and never touches a loss", async () => {
   const { PROTOCOL_WIN_FEE_BPS, netWinning } = await loadOptions();
-  // Mirrors `config.fee_bps`, set to 500 on chain 2026-09-19. If these ever
-  // diverge the ticket quotes a net the settlement will not actually pay.
-  assert.equal(PROTOCOL_WIN_FEE_BPS, 500);
-  assert.equal(netWinning(500), 475);
-  assert.equal(netWinning(1_000), 950);
+  // Mirrors `config.fee_bps`, raised to its MAX_FEE_BPS cap of 1000 on chain
+  // 2026-09-21. If these ever diverge the ticket quotes a net the settlement
+  // will not actually pay.
+  assert.equal(PROTOCOL_WIN_FEE_BPS, 1_000);
+  assert.equal(netWinning(500), 450);
+  assert.equal(netWinning(1_000), 900);
   // A loss has no payout, so there is nothing to take a cut of.
   assert.equal(netWinning(0), 0);
   assert.equal(netWinning(-5), 0);

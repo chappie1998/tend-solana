@@ -1,9 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AnchorProvider, Program, Wallet as AnchorWallet } from "@anchor-lang/core";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 import type { Vsol } from "../target/types/vsol.ts";
 import { deriveConfig, VSOL_PROGRAM_ID } from "../sdk/index.ts";
@@ -13,18 +15,17 @@ import {
   decidePositionAction,
   describeSettlementError,
   fetchAllMarkets,
-  fetchCollateralVaultBalances,
-  fetchOpenDirectPositions,
+  fetchAllPoolMarkets,
   fetchOpenPoolPositions,
   fetchOracleStates,
   fetchPythUpdateForSettlement,
   filterExpiredOpenPositions,
   groupPositionsByMarket,
   marketsWithOpenPositions,
-  marketsWithOutstandingCollateral,
   publishSettlementForMarket,
   redact,
   refundPoolPositionOnChain,
+  selectIdlePoolBindingFor,
   selectMarketCloseCandidates,
   selectMarketsNeedingSettlementAttempt,
   settlePoolPositionOnChain,
@@ -74,7 +75,7 @@ import {
 const rpcUrl = process.env.VSOL_RPC_URL ?? "https://api.devnet.solana.com";
 const cluster = rpcUrl.includes("127.0.0.1") || rpcUrl.includes("localhost") ? "localnet" : "devnet";
 const commitment = "confirmed" as const;
-const connection = new Connection(rpcUrl, commitment);
+const connection = createVsolConnection({ rpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, cluster, commitment });
 const workspace = resolve(import.meta.dirname, "..");
 const devnetDir = resolve(workspace, ".devnet");
 const hermes = new HermesClient(process.env.PYTH_HERMES_URL?.trim() || "https://hermes.pyth.network", {
@@ -106,7 +107,7 @@ async function clusterUnixTime(): Promise<number> {
   return blockTime;
 }
 
-type Counters = { published: number; settled: number; refunded: number; closed: number; skipped: number };
+export type Counters = { published: number; settled: number; refunded: number; closed: number; skipped: number };
 
 function logSummary(counters: Counters): void {
   console.log(
@@ -128,56 +129,62 @@ function isCleanupEnabled(argv: readonly string[], env: NodeJS.ProcessEnv): bool
 }
 
 /**
- * Closes every market that selectMarketCloseCandidates proves safe. Must run
+ * Closes every market that selectMarketCloseCandidates proves safe AND that
+ * selectIdlePoolBindingFor can find an idle pool binding for. Must run
  * strictly after the settle/refund phase in the same pass has finished (its
- * caller in main() guarantees this ordering) and re-scans BOTH position
- * account types itself -- via the same fetchOpenPoolPositions the settlement
- * phase uses, plus fetchOpenDirectPositions for the direct-maker path this
- * cranker does not settle -- rather than reusing anything fetched earlier in
+ * caller in main() guarantees this ordering) and re-scans open pool
+ * positions itself -- via the same fetchOpenPoolPositions the settlement
+ * phase uses -- rather than reusing anything fetched earlier in
  * main(), specifically so a PoolPosition just settled or refunded this pass
  * has already dropped out of the union set before any close decision is
  * made. A market referenced by either account type is excluded from
  * candidates; see selectMarketCloseCandidates's doc for the full predicate.
  *
- * Also fetches every candidate-window market's complete-set collateral vault
- * balance (FINDING 1's off-chain mirror -- see
- * `marketsWithOutstandingCollateral`/`fetchCollateralVaultBalances`) so this
- * pass never wastes a transaction retrying `close_settled_market` against a
- * market the on-chain `MarketHasOutstandingCollateral` check would simply
- * revert.
+ * `close_settled_market` now mandatorily requires a `(pool, pool_market)`
+ * binding proven idle (see `CloseSettledMarket`'s doc comment in lib.rs,
+ * point 3). Since a market may be bound to more than one pool over its
+ * lifetime (point 4's documented residual gap), this fetches EVERY
+ * `LiquidityPoolMarket` binding on the deployment once per pass
+ * (fetchAllPoolMarkets) and asks selectIdlePoolBindingFor to require ALL of
+ * a candidate market's bindings to be idle before proposing any one of them
+ * -- a market it returns `null` for is skipped, not retried with a guess.
+ *
+ * Exported so oracle-runner.ts's hourly cleanup lane can call this exact
+ * function rather than re-implementing the guard -- see that file's module
+ * doc for why cleanup runs on its own, much less frequent cadence than the
+ * 15-minute settlement/refund pass (closing a market has a 7-day buffer
+ * before it is even eligible, via `MARKET_CLEANUP_BUFFER_SECONDS`, so there
+ * is nothing time-sensitive here to justify scanning any more often).
  */
-async function runMarketCleanup(params: {
+export async function runMarketCleanup(params: {
   connection: Connection;
   program: Program<Vsol>;
   cranker: Keypair;
   config: PublicKey;
   counters: Counters;
 }): Promise<void> {
-  const [freshPoolPositions, freshDirectPositions, markets, now] = await Promise.all([
+  const [freshPoolPositions, markets, poolMarkets, now] = await Promise.all([
     fetchOpenPoolPositions(params.connection),
-    fetchOpenDirectPositions(params.connection),
     fetchAllMarkets(params.connection),
+    fetchAllPoolMarkets(params.connection),
     clusterUnixTime(),
   ]);
-  const openPositionMarkets = marketsWithOpenPositions({
-    poolPositions: freshPoolPositions,
-    directPositions: freshDirectPositions,
-  });
-  const vaultBalances = await fetchCollateralVaultBalances(
-    params.connection,
-    markets.map((market) => new PublicKey(market.address)),
-  );
-  const outstandingCollateralMarkets = marketsWithOutstandingCollateral(vaultBalances);
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions: freshPoolPositions });
 
   const candidates = selectMarketCloseCandidates({
     markets,
     now,
     marketsWithOpenPositions: openPositionMarkets,
-    marketsWithOutstandingCollateral: outstandingCollateralMarkets,
     maxPerRun: MAX_MARKETS_CLOSED_PER_RUN,
   });
 
   for (const market of candidates) {
+    const binding = selectIdlePoolBindingFor(market.address, poolMarkets);
+    if (!binding) {
+      console.log(`skip: close for market ${market.address} -- no idle pool binding available yet`);
+      params.counters.skipped += 1;
+      continue;
+    }
     try {
       const signature = await closeSettledMarketOnChain({
         program: params.program,
@@ -185,6 +192,8 @@ async function runMarketCleanup(params: {
         config: params.config,
         market: new PublicKey(market.address),
         oracle: new PublicKey(market.oracle),
+        pool: new PublicKey(binding.pool),
+        poolMarket: new PublicKey(binding.poolMarket),
         rentRecipient: new PublicKey(market.creator),
       });
       console.log(`closed: market ${market.address} (signature ${signature})`);
@@ -202,17 +211,15 @@ async function runMarketCleanup(params: {
 /**
  * The settlement/refund phase.
  *
- * FIX for a confirmed live bug: this used to build its ENTIRE work list from
- * `fetchOpenPoolPositions` -- `[...new Set(positions.map(p => p.market))]` --
- * so a market reachable from no position of either kind (a v2
- * conditional-token market, whose only state is two SPL mints and a
- * complete-set collateral vault) was never enumerated, its oracle never
- * finalized, and `redeem_winning` reverted with `OracleNotFinalized` forever.
- * The base enumeration is now `fetchAllMarkets` (the same helper
- * `runMarketCleanup` already uses), and the publish-attempt set is widened
- * via `selectMarketsNeedingSettlementAttempt` to include any market with a
- * non-zero complete-set vault, even with zero positions -- see that
- * function's doc comment in lib/settlement.ts for the full rationale.
+ * ORIGINAL fix for a confirmed live bug: this used to build its ENTIRE work
+ * list from `fetchOpenPoolPositions` -- `[...new Set(positions.map(p =>
+ * p.market))]` -- so a market reachable from no position of either kind (the
+ * now-removed V1 conditional-token markets, whose only state was two SPL
+ * mints and a collateral vault) was never enumerated, its oracle never
+ * finalized. The base enumeration is now `fetchAllMarkets` (the same helper
+ * `runMarketCleanup` already uses) -- see `selectMarketsNeedingSettlementAttempt`'s
+ * doc comment in lib/settlement.ts for why that V1-specific widening is gone
+ * too, now that the mechanism it covered no longer exists.
  *
  * The position-driven settle/refund behavior below is UNCHANGED: every
  * market with an expired open `PoolPosition` still gets its positions
@@ -234,9 +241,8 @@ async function runSettlementPhase(params: {
 }): Promise<void> {
   const { connection, program, cranker, config, counters } = params;
 
-  const [poolPositions, directPositions, markets, now] = await Promise.all([
+  const [poolPositions, markets, now] = await Promise.all([
     fetchOpenPoolPositions(connection),
-    fetchOpenDirectPositions(connection),
     fetchAllMarkets(connection),
     clusterUnixTime(),
   ]);
@@ -245,16 +251,7 @@ async function runSettlementPhase(params: {
   }
 
   const marketByAddress = new Map(markets.map((market) => [market.address, market]));
-  const openPositionMarkets = marketsWithOpenPositions({
-    poolPositions,
-    directPositions,
-  });
-
-  const vaultBalances = await fetchCollateralVaultBalances(
-    connection,
-    markets.map((market) => new PublicKey(market.address)),
-  );
-  const outstandingCollateralMarkets = marketsWithOutstandingCollateral(vaultBalances);
+  const openPositionMarkets = marketsWithOpenPositions({ poolPositions });
 
   // Fetched for every market on the deployment (not just ones already known
   // to be "at stake"), mirroring runMarketCleanup's own philosophy of
@@ -274,7 +271,6 @@ async function runSettlementPhase(params: {
     now,
     marketsWithFinalizedOracle,
     marketsWithOpenPositions: openPositionMarkets,
-    marketsWithOutstandingCollateral: outstandingCollateralMarkets,
   });
 
   const positionsWithKnownMarket = poolPositions.filter((position) => marketByAddress.has(position.market));
@@ -470,7 +466,15 @@ async function main(): Promise<void> {
   logSummary(counters);
 }
 
-main().catch((error: unknown) => {
-  console.error(redact(error instanceof Error ? error.message : String(error), rpcUrl));
-  process.exitCode = 1;
-});
+// Guarded like every other entrypoint script in this package (see
+// custom-settle.ts / oracle-runner.ts): `runMarketCleanup` above is now also
+// imported directly by oracle-runner.ts's hourly cleanup lane
+// (vsol/tests/*.test.ts import pure helpers from this file too), and an
+// unconditional `main()` call here would fire this cranker's full
+// settlement+cleanup run as a side effect of merely importing the module.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    console.error(redact(error instanceof Error ? error.message : String(error), rpcUrl));
+    process.exitCode = 1;
+  });
+}

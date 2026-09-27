@@ -1,13 +1,14 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { Connection, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import nacl from "tweetnacl";
 import { liveMarkets } from "../../app/lib/markets.ts";
 import { siwsMessageBytes } from "../../app/lib/siws.ts";
 import { SESSION_COOKIE_NAME } from "../../app/lib/session-token.ts";
 import { verifyAndCloseSmokePosition } from "./lib/smoke-lifecycle.ts";
-import { DEVNET_GENESIS_HASH } from "./custom-oracle-pusher.ts";
+import { DEVNET_GENESIS_HASH } from "./lib/oracle-feed.ts";
 import { VSOL_RPC_URL, VSOL_SETTLEMENT_MINT } from "../../app/lib/vsol.ts";
 import { decodePoolPositionAccount } from "../../app/lib/pool-position.ts";
 
@@ -52,7 +53,7 @@ if (!smokeMarket) throw new Error(`VSOL_SMOKE_SYMBOL ${requestedSymbol} is not a
 const SMOKE_SYMBOL = smokeMarket.symbol;
 const settlementMode = process.env.VSOL_SMOKE_SETTLEMENT === "1";
 const receiptPath = process.env.VSOL_SMOKE_RECEIPT ?? "/tmp/tend-smoke-settlement-receipt.json";
-const connection = new Connection(configuredRpcUrl, "confirmed");
+const connection = createVsolConnection({ rpcUrl: configuredRpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, commitment: "confirmed" });
 if (await connection.getGenesisHash() !== DEVNET_GENESIS_HASH) {
   throw new Error("Refusing smoke transactions: configured RPC is not Solana devnet");
 }
@@ -91,6 +92,10 @@ const quoteRequest = {
   expiryCode: "15M",
   payoff: 2,
   walletAddress,
+  // The quote route defaults to the side-effect-free `indicative` intent,
+  // which returns no transaction. A smoke test that means to FILL must ask
+  // for an executable quote explicitly, exactly as "Review & execute" does.
+  intent: "execute",
 };
 if (marketData.snapshot?.mode !== "live") {
   throw new Error(`${SMOKE_SYMBOL} snapshot is not live; refusing a false-positive smoke pass`);

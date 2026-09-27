@@ -8,7 +8,7 @@ sessions — don't read, edit or deploy there from here.
 
 ## Where things are
 
-- Branch **`sol`**, not `main` (PR #1 open, unmerged). Confirm with
+- Branch **`sol`**, not `main` (PRs #1 and #3 are merged into `main`; `sol` runs ahead). Confirm with
   `git remote get-url origin` → must end `tend-solana.git`.
 - Vercel project `tend-solana` → https://solana.usetend.xyz ·
   https://tend-solana.vercel.app
@@ -105,8 +105,34 @@ can't finish bootstrap), `vsol/.devnet/` (12 keypairs),
 - **A custom backup oracle exists** (`CustomPriceFeed`/`publish_custom_settlement`,
   program-upgraded 2026-09-14): centrally-sourced, signer-gated to `config.oracle_authority`
   (dedicated key in `vsol/.devnet/devnet-custom-oracle-authority.json`), used only because
-  Pyth is unavailable. Run `npm run custom-oracle:push` (in `vsol/`) continuously to keep
-  it live — nothing runs it automatically.
+  Pyth is unavailable.
+- **Oracle operating model (2026-09-27): one process, `npm run oracle` in `vsol/`**
+  (`vsol/scripts/oracle-runner.ts`). It wakes on each 15-minute UTC boundary (every tenor
+  expires on one), and for markets expiring there WITH open positions sends ONE transaction
+  `update_custom_price_feed` + `capture_custom_settlement_observation`, then publishes,
+  settles, refunds; cleanup hourly; a `HEARTBEAT` feed every 5 min. Run `npm run
+  init-heartbeat` once per cluster. There is NO continuous per-symbol pusher any more, by
+  design: fills never read the feed (`CUSTOM_ORACLE_MAX_STALENESS_SECONDS` is enforced only
+  by `update_custom_price_feed`), so readiness = heartbeat alive + feed accounts structurally
+  valid (`getVsolExecutionReadiness`), never "price fresh". Why it changed: a 60s pusher can
+  miss an intraday market's 60s observation window (it may then only refund), and the old
+  5s poller exhausted the RPC quota.
+- **RPC: one failover connection everywhere** (`createVsolConnection`, `vsol/sdk/rpc-failover/`):
+  `VSOL_RPC_URL` (Helius) → `VSOL_RPC_BACKUP_URL` (Alchemy devnet) → public devnet. Alchemy's
+  free tier REJECTS `getProgramAccounts`, so those fall through to public devnet. Transaction
+  confirmation polls over HTTP (web3.js's websocket confirm bypasses the failover). Never
+  construct `new Connection(` directly.
+- **Deploying the program: never pass `--use-rpc` against a rate-limited RPC.** ~800 buffer
+  writes exhausted Alchemy and failed mid-deploy (the orphan buffer's rent had to be recovered
+  with `solana program close`). Deploy with `--url https://api.devnet.solana.com` and no
+  `--use-rpc`: writes go straight to leaders over QUIC.
+- **Pool bindings exist at TWO sizes: 82 bytes (pre-2026-09-28) and 86 (with
+  `open_positions`).** Never filter or decode `LiquidityPoolMarket` by a single `dataSize`,
+  and never use Anchor's `program.account.liquidityPoolMarket.fetch*` (it overreads a legacy
+  account). A size-pinned reader broke production executable quotes after the upgrade.
+- **Never poll `getProgramAccounts` on a short loop.** A 5s settle loop (running since
+  2026-09-21) exhausted the Helius monthly quota on 2026-09-26 (`-32429 "max usage
+  reached"`) and took production down. Expiries are on a known grid — sleep until them.
 - **`update_config` silently bumps `Config.domain_version`.** Any call to it (e.g.
   rotating an authority) MUST be followed by updating `vsol/deployments/devnet.json`'s
   `domainVersion` to match, or `app/lib/vsol-server.ts`'s `getPoolCore()` hard-fails
@@ -126,9 +152,17 @@ can't finish bootstrap), `vsol/.devnet/` (12 keypairs),
   Off-chain data now comes from Coinbase (`app/lib/market-data.ts`,
   `MARKET_DATA_PROVIDER`, no fallback). Verified live in commit `2a7b34d`:
   catalog 15/15, chart 1,440 bars, real SOL 30D fill at slot 497926508.
-- **Settlement is still Pyth-only** (`vsol/programs/vsol/src/pyth.rs`), so the
-  keeper can't post updates and **expired positions refund their premium
-  instead of settling.** Disclose that in demos. See memory `oracle-provider-options`.
+- **Economics (2026-09-21):** every tenor sells 1.5x / 2x / 3x. `MAKER_EDGE_BPS` = 1000
+  (the POOL's edge, paid to LPs) and on-chain `fee_bps` = 1000, charged on the WINNING
+  payout from the buyer's side (a loser pays nothing) and paid to the treasury.
+  Protocol revenue is `fee x 1/(1 + edge)` per unit staked, so LOWERING the maker edge
+  raises it; raising the edge only pays LPs. Don't cut the edge below ~10% without
+  settlement data: it is the pool's only buffer against the vol model being wrong.
+  `domainVersion` is 4 after the fee change.
+- **Quotes have two intents.** Auto-quoting is `indicative` (priced, never listed, signed
+  or persisted). Only "Review & execute" sends `intent: "execute"`, which may list a
+  market on chain at the server's expense — so it is rate-limited per wallet via
+  `rfq_quotes` (5/min, 25/hour). Never let a preview reach the listing path.
 - **15 `npm test` failures come and go with devnet state, not code.** The
   `mint-on-demand` and `vsol-versioned-fill` suites need a *listed* SOL/30D rung
   at the current spot, so they pass right after a fill and fail once SOL drifts
@@ -137,14 +171,14 @@ can't finish bootstrap), `vsol/.devnet/` (12 keypairs),
 - `npm run test:vsol` fails at `anchor build`: `vsol/target/deploy/vsol-keypair.json`
   was overwritten 2026-09-12 and no longer matches `declare_id!`. The upgrade
   authority (`~/.config/solana/id.json`) is intact, so deploys still work.
-- **GitHub Actions crons disabled** since 2026-09-11 (quota). Re-enable only
-  `vsol-keeper.yml` and `vsol-cranker.yml`; leave NVDA feed tracking off.
+- **All GitHub Actions workflows are disabled** (keeper, cranker, feed tracking). The
+  oracle runner now owns publish, settle, refund and cleanup, so they aren't needed for
+  settlement; leave NVDA feed tracking off.
 - **NVDA, GOOGL and SPACEX are all `status: "live"`**, priced off Hyperliquid's
   `xyz` HIP-3 dex (spot, bars, and realized vol all from one module,
   `app/lib/hyperliquid-market-data.ts`) since 2026-09-16 — see the Hyperliquid
-  bullet above. `vsol/scripts/custom-oracle-pusher.ts` reads through
-  `getMarketSnapshot` (provider-neutral) instead of calling a provider
-  directly, so it no longer throws on every stock tick.
+  bullet above. The oracle runner reads prices through the provider-neutral
+  `getMarketSnapshot` (`vsol/scripts/lib/oracle-feed.ts`).
 - Unreviewed 2026-09-12 work parked on local branch `wip/2026-09-12-carryover`.
 - Open: ladder-crossing race in `findVsolSeriesCandidateForMarket`; `ORACLE
   SLOT` reads `—` under Coinbase (there is no slot); rotate the Neon

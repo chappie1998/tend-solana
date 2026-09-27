@@ -30,7 +30,7 @@ test("no configured market has opted into a pricing override yet, and the clamp 
 
 test("quoteFor with no makerEdgeBps prices byte-identically to passing the global default explicitly", async () => {
   const { quoteFor, MAKER_EDGE_BPS } = await loadOptions();
-  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 45 };
+  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 3, volatility: 45 };
   const implicit = quoteFor(base);
   const explicitDefault = quoteFor({ ...base, makerEdgeBps: MAKER_EDGE_BPS });
   assert.equal(implicit.premium, explicitDefault.premium);
@@ -63,7 +63,7 @@ test("a per-market volatility floor actually changes the priced strike and impli
   const clampedVol = clampVolatilityForMarket(overriddenMarket, rawVol);
   assert.equal(clampedVol, 80);
 
-  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 5 };
+  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 3 };
   const unclamped = quoteFor({ ...base, volatility: rawVol });
   const clamped = quoteFor({ ...base, volatility: clampedVol });
   assert.notEqual(unclamped.strike, clamped.strike);
@@ -73,7 +73,7 @@ test("a per-market volatility floor actually changes the priced strike and impli
 
 test("a per-market makerEdgeBps override actually engages inside the strike solve, not a dead parameter", async () => {
   const { quoteFor } = await loadOptions();
-  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 5, volatility: 45 };
+  const base = { spot: 200, amount: 1_000, durationMinutes: 43_200, direction: "up", payoff: 3, volatility: 45 };
   const globalEdge = quoteFor(base);
   const richerEdge = quoteFor({ ...base, makerEdgeBps: 3_000 }); // 30%, double the 15% default
   assert.equal(globalEdge.reachability, "solved");

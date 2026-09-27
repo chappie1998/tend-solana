@@ -179,13 +179,13 @@ test("program covers collateral, replay, signature, pause, and refund invariants
   const signature = await readFile(new URL("vsol/programs/vsol/src/signature.rs", root), "utf8");
   const math = await readFile(new URL("vsol/programs/vsol/src/math.rs", root), "utf8");
 
-  assert.match(source, /writer_token\.amount >= quote\.max_payout/);
+  assert.match(source, /quote\.max_payout <= position_limit/);
   assert.match(source, /verify_preceding_ed25519_instruction/);
   assert.match(source, /domain_separator/);
   assert.match(source, /NonceStatus::Filled/);
   assert.match(source, /position\.fee_bps = config\.fee_bps/);
   assert.match(source, /calculate_fee\(position\.premium, position\.fee_bps\)/);
-  assert.match(source, /pub fn refund_unsettled/);
+  assert.match(source, /pub fn refund_pool_position/);
   assert.match(source, /pub fn set_pause/);
   assert.match(source, /pub fn publish_pyth_settlement/);
   assert.match(source, /pyth_price\.publish_time >= market\.expiry/);
@@ -612,7 +612,7 @@ test("market-data stays real and the verified deployment remains fail-closed on 
 
 test("maker pricing remains bounded under extreme real volatility inputs", async () => {
   const { quoteFor, definedRiskPayout } = await import(new URL("app/lib/options.ts", root));
-  const quotes = [2, 5, 10].map((payoff) => quoteFor({
+  const quotes = [1.5, 2, 3].map((payoff) => quoteFor({
     spot: 200,
     amount: 1_000,
     durationMinutes: 43_200,
@@ -633,10 +633,35 @@ test("the quote route validates the payoff tier against the tenor's OWN ladder, 
   // The route resolves the ACTUAL onchain duration before it can know which
   // tiers are for sale (payoffTiersFor(durationMinutes)) -- so it must
   // import and call payoffTiersFor, and must NOT hardcode the old
-  // [2, 5, 10] list anywhere (it used to, in two places: the stake-bounds
+  // [1.5, 2, 3] list anywhere (it used to, in two places: the stake-bounds
   // fallback and the strict tier check).
   assert.match(quotesRoute, /payoffTiersFor/);
   assert.doesNotMatch(quotesRoute, /\[2,\s*5,\s*10\]/);
   assert.deepEqual(options.payoffTiersFor(15), [1.5, 2, 3]);
-  assert.deepEqual(options.payoffTiersFor(1_440), [2, 5, 10]);
+  assert.deepEqual(options.payoffTiersFor(1_440), [1.5, 2, 3]);
+});
+
+test("every nav destination is a linkable URL: ?tab= is read on load, pushed on change, and honoured by back/forward", async () => {
+  const terminal = await readFile(new URL("app/components/TendTerminal.tsx", root), "utf8");
+
+  // Read on load, and on back/forward -- without the popstate listener the
+  // browser's back button would change the URL while leaving the rendered tab
+  // behind, which is worse than having no deep links at all.
+  assert.match(terminal, /tabFromSearch\(window\.location\.search\)/);
+  assert.match(terminal, /addEventListener\("popstate"/);
+  assert.match(terminal, /removeEventListener\("popstate"/);
+
+  // Written on change, as a history entry rather than a router navigation:
+  // re-running the route would remount the chart and refetch market data just
+  // to swap a tab.
+  assert.match(terminal, /window\.history\.pushState/);
+  assert.doesNotMatch(terminal, /router\.(push|replace)\(/);
+
+  // The default tab carries no param, so the landing page keeps a clean
+  // canonical URL.
+  assert.match(terminal, /if \(tab === DEFAULT_TAB\) url\.searchParams\.delete\("tab"\)/);
+
+  // The guard validates against the real nav, so a renamed or removed
+  // destination cannot leave a stale deep link silently working.
+  assert.match(terminal, /navItems\.some\(\(item\) => item\.id === raw\)/);
 });

@@ -4,6 +4,7 @@ import { ensureDb, getDb } from "../../../db";
 import { positions, rfqQuotes, transactionSimulations } from "../../../db/schema";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 import { parsePublicKey, verifyVsolFill } from "../../lib/vsol-server";
+import { enforceInMemoryRateLimit } from "../../lib/in-memory-rate-limit";
 
 function isUniqueConstraint(error: unknown) {
   let current: unknown = error;
@@ -46,6 +47,17 @@ export async function POST(request: Request) {
   if (!sameOrigin(request)) return json({ error: "Cross-site position requests are not allowed." }, 403);
   const owner = await resolveUserKey(request);
   if (!owner) return json({ error: "Sign in to confirm positions." }, 401);
+  // Best-effort burst dampener only (see app/lib/in-memory-rate-limit.ts) --
+  // the signature/simulation verification below is the real guard against a
+  // fabricated position; this only keeps a scripted burst off the DB.
+  const rateLimit = enforceInMemoryRateLimit(request, "positions", owner);
+  if (rateLimit.limited) {
+    return json(
+      { error: "Too many position submissions. Wait a moment and try again." },
+      429,
+      { "Retry-After": String(rateLimit.retryAfterSeconds) },
+    );
+  }
   let input: Record<string, unknown>;
   try {
     input = await request.json() as Record<string, unknown>;

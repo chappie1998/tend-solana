@@ -27,6 +27,7 @@ import nacl from "tweetnacl";
 import deployment from "../../vsol/deployments/devnet.json" with { type: "json" };
 import idl from "../../vsol/target/idl/vsol.json" with { type: "json" };
 import { deriveMarketId, symbolBytes } from "../../vsol/sdk/index.ts";
+import { createVsolConnection } from "../../vsol/sdk/rpc-failover/index.ts";
 import {
   VSOL_ADDRESS_LOOKUP_TABLE,
   VSOL_CONFIG,
@@ -58,9 +59,24 @@ import { getClockUnixTimestamp } from "./solana-clock.ts";
 // see that module's header comment.
 export { decodeMarketAccount };
 
-export function getVsolConnection() {
+export function getVsolConnection(): Connection {
   // Resolve this after the request route has installed Cloudflare bindings.
-  return new Connection(runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL, "confirmed");
+  // Fails over across VSOL_RPC_URL / VSOL_RPC_BACKUP_URL / (devnet only) the
+  // public devnet RPC -- see vsol/sdk/rpc-failover for the full policy.
+  //
+  // ConnectionClass: Connection (this file's own root-resolved import) is
+  // required, not optional -- vsol/'s package.json pins @solana/web3.js@1.98.4
+  // while the app pins ^1.99.0, so without it createVsolConnection would
+  // default to extending vsol-local's copy, a structurally identical but
+  // nominally (and, at runtime, prototype-chain-wise) DIFFERENT class from
+  // this file's own "@solana/web3.js" import -- see
+  // vsol/sdk/rpc-failover/confirm.ts's module doc.
+  return createVsolConnection({
+    rpcUrl: runtimeEnv("VSOL_RPC_URL") || VSOL_RPC_URL,
+    backupRpcUrl: runtimeEnv("VSOL_RPC_BACKUP_URL"),
+    commitment: "confirmed",
+    ConnectionClass: Connection,
+  });
 }
 
 const TOKEN_SCALE = 1_000_000n;
@@ -208,7 +224,7 @@ const CONFIG_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("Config");
 const ORACLE_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("SettlementOracle");
 const POOL_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPool");
 const PROVIDER_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityProvider");
-const POOL_MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPoolMarket");
+export const POOL_MARKET_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("LiquidityPoolMarket");
 const POOL_POSITION_ACCOUNT_DISCRIMINATOR = idlAccountDiscriminator("PoolPosition");
 
 // Re-exported under the historical name: callers throughout this file (and
@@ -369,6 +385,15 @@ export function decodeConfigAccount(data: Buffer) {
   return {
     oracleAuthority: publicKeyAt(data, 105),
     treasuryOwner: publicKeyAt(data, 169),
+    // u16 at byte 201: bump(1) + admin(32) + pending_admin(32) +
+    // pause_authority(32) + oracle_authority(32) + eligibility_authority(32)
+    // + treasury_owner(32) = 193, +8-byte discriminator = 201. Verified
+    // against the IDL's Config struct (vsol/target/idl/vsol.json) and the
+    // existing paused/domainVersion offsets below, which this must stay
+    // consistent with. This is the SAME value `netWinning`'s callers mirror
+    // by hand as PROTOCOL_WIN_FEE_BPS (app/lib/options.ts) -- reading it here
+    // lets the quote route return the live on-chain figure instead.
+    feeBps: data.readUInt16LE(201),
     paused: data[203] === 1,
     eligibilityRequired: data[204] === 1,
     domainSeparator: data.subarray(205, 237),
@@ -438,13 +463,23 @@ function decodeProviderAccount(data: Buffer) {
   };
 }
 
+// A pool binding is 82 bytes if it predates the 2026-09-28 program upgrade
+// and 86 once it carries the `open_positions` counter. Both are live on
+// devnet, so both must decode; a decoder pinned to one size rejects the
+// other outright (this broke executable quotes the moment the first new
+// binding was listed).
+const POOL_MARKET_ACCOUNT_SIZES = [82, 86] as const;
+
 export function decodePoolMarketAccount(data: Buffer) {
-  expectAccount(data, 82, POOL_MARKET_ACCOUNT_DISCRIMINATOR, "VSOL pool market");
+  const size = (POOL_MARKET_ACCOUNT_SIZES as readonly number[]).includes(data.length) ? data.length : -1;
+  expectAccount(data, size, POOL_MARKET_ACCOUNT_DISCRIMINATOR, "VSOL pool market");
   return {
     pool: publicKeyAt(data, 9),
     market: publicKeyAt(data, 41),
     lastTradeAt: Number(data.readBigInt64LE(73)),
     enabled: data[81] === 1,
+    // null for a legacy binding: its count is the program's UNKNOWN sentinel.
+    openPositions: data.length === 86 ? data.readUInt32LE(82) : null,
   };
 }
 

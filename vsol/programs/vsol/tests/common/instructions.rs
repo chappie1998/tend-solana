@@ -146,8 +146,8 @@ pub fn capture_custom_observation_ix(authority: &Pubkey, config: &Pubkey, market
     Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new(*authority, true), AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new_readonly(*feed, false), AccountMeta::new(*observation, false), AccountMeta::new_readonly(system_program_id(), false)], data: vsol::instruction::CaptureCustomSettlementObservation.data() }
 }
 
-pub fn publish_custom_settlement_ix(config: &Pubkey, market: &Pubkey, oracle: &Pubkey, observation: &Pubkey) -> Instruction {
-    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new(*oracle, false), AccountMeta::new_readonly(*observation, false)], data: vsol::instruction::PublishCustomSettlement.data() }
+pub fn publish_custom_settlement_ix(config: &Pubkey, market: &Pubkey, oracle: &Pubkey, observation: &Pubkey, rent_recipient: &Pubkey) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new(*oracle, false), AccountMeta::new(*observation, false), AccountMeta::new(*rent_recipient, false)], data: vsol::instruction::PublishCustomSettlement.data() }
 }
 
 /// `publish_pyth_settlement` takes no signer at all (it's a permissionless
@@ -237,226 +237,6 @@ pub fn set_eligibility_ix(
             expires_at,
         }
         .data(),
-    }
-}
-
-// --- Writer vaults ---
-
-pub fn initialize_writer_vault_ix(
-    maker: &Pubkey,
-    config: &Pubkey,
-    settlement_mint: &Pubkey,
-    writer_vault: &Pubkey,
-    writer_token: &Pubkey,
-) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new(*maker, true),
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new_readonly(*settlement_mint, false),
-            AccountMeta::new(*writer_vault, false),
-            AccountMeta::new(*writer_token, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-            AccountMeta::new_readonly(system_program_id(), false),
-            AccountMeta::new_readonly(rent_sysvar_id(), false),
-        ],
-        data: vsol::instruction::InitializeWriterVault.data(),
-    }
-}
-
-pub fn deposit_writer_ix(
-    config: &Pubkey,
-    maker: &Pubkey,
-    settlement_mint: &Pubkey,
-    writer_vault: &Pubkey,
-    writer_token: &Pubkey,
-    maker_source: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new(*maker, true),
-            AccountMeta::new_readonly(*settlement_mint, false),
-            AccountMeta::new_readonly(*writer_vault, false),
-            AccountMeta::new(*writer_token, false),
-            AccountMeta::new(*maker_source, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::DepositWriter { amount }.data(),
-    }
-}
-
-pub fn withdraw_writer_ix(
-    config: &Pubkey,
-    maker: &Pubkey,
-    settlement_mint: &Pubkey,
-    writer_vault: &Pubkey,
-    writer_token: &Pubkey,
-    maker_destination: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new_readonly(*maker, true),
-            AccountMeta::new_readonly(*settlement_mint, false),
-            AccountMeta::new_readonly(*writer_vault, false),
-            AccountMeta::new(*writer_token, false),
-            AccountMeta::new(*maker_destination, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::WithdrawWriter { amount }.data(),
-    }
-}
-
-// --- Nonces / quotes ---
-
-pub fn cancel_nonce_ix(maker: &Pubkey, config: &Pubkey, nonce_record: &Pubkey, nonce: u64) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new(*maker, true),
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new(*nonce_record, false),
-            AccountMeta::new_readonly(system_program_id(), false),
-        ],
-        data: vsol::instruction::CancelNonce { nonce }.data(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub struct FillQuoteAccounts {
-    pub buyer: Pubkey,
-    pub maker: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub writer_vault: Pubkey,
-    pub writer_token: Pubkey,
-    pub buyer_source: Pubkey,
-    pub nonce_record: Pubkey,
-    pub position: Pubkey,
-    pub position_vault: Pubkey,
-    pub eligibility: Option<Pubkey>,
-}
-
-/// Builds the two-instruction transaction body `fill_quote` requires: an
-/// Ed25519 precompile instruction carrying the maker's signature over the
-/// quote message, immediately followed by `fill_quote` itself. See
-/// `src/signature.rs::verify_preceding_ed25519_instruction`.
-pub fn fill_quote_ixs(
-    maker: &Keypair,
-    accounts: &FillQuoteAccounts,
-    domain_separator: &[u8; 32],
-    domain_version: u16,
-    quote: vsol::QuoteArgs,
-) -> Vec<Instruction> {
-    let context = quote_signing::QuoteMessageContext {
-        program_id: &vsol::ID,
-        config: &accounts.config,
-        market: &accounts.market,
-        buyer: &accounts.buyer,
-        maker: &accounts.maker,
-    };
-    let message = quote_signing::quote_message(domain_separator, domain_version, &context, &quote);
-    let signature_ix = ed25519_ix_for(maker, &message);
-
-    let fill_ix = Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new(accounts.buyer, true),
-            AccountMeta::new_readonly(accounts.maker, false),
-            AccountMeta::new_readonly(accounts.config, false),
-            AccountMeta::new_readonly(accounts.market, false),
-            AccountMeta::new_readonly(accounts.settlement_mint, false),
-            AccountMeta::new_readonly(accounts.writer_vault, false),
-            AccountMeta::new(accounts.writer_token, false),
-            AccountMeta::new(accounts.buyer_source, false),
-            AccountMeta::new(accounts.nonce_record, false),
-            AccountMeta::new(accounts.position, false),
-            AccountMeta::new(accounts.position_vault, false),
-            AccountMeta::new_readonly(accounts.eligibility.unwrap_or_else(no_eligibility), false),
-            AccountMeta::new_readonly(instructions_sysvar_id(), false),
-            AccountMeta::new_readonly(token_program_id(), false),
-            AccountMeta::new_readonly(system_program_id(), false),
-            AccountMeta::new_readonly(rent_sysvar_id(), false),
-        ],
-        data: vsol::instruction::FillQuote { quote }.data(),
-    };
-    vec![signature_ix, fill_ix]
-}
-
-pub struct SettleAccounts {
-    pub cranker: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub oracle: Pubkey,
-    pub nonce_record: Pubkey,
-    pub position: Pubkey,
-    pub position_vault: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub buyer_destination: Pubkey,
-    pub maker_destination: Pubkey,
-    pub treasury_destination: Pubkey,
-    pub rent_recipient: Pubkey,
-}
-
-pub fn settle_ix(a: &SettleAccounts) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(a.cranker, true),
-            AccountMeta::new_readonly(a.config, false),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.nonce_record, false),
-            AccountMeta::new(a.position, false),
-            AccountMeta::new(a.position_vault, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.buyer_destination, false),
-            AccountMeta::new(a.maker_destination, false),
-            AccountMeta::new(a.treasury_destination, false),
-            AccountMeta::new(a.rent_recipient, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::Settle.data(),
-    }
-}
-
-pub struct RefundUnsettledAccounts {
-    pub cranker: Pubkey,
-    pub market: Pubkey,
-    pub oracle: Pubkey,
-    pub nonce_record: Pubkey,
-    pub position: Pubkey,
-    pub position_vault: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub buyer_destination: Pubkey,
-    pub maker_destination: Pubkey,
-    pub rent_recipient: Pubkey,
-}
-
-pub fn refund_unsettled_ix(a: &RefundUnsettledAccounts) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(a.cranker, true),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.nonce_record, false),
-            AccountMeta::new(a.position, false),
-            AccountMeta::new(a.position_vault, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.buyer_destination, false),
-            AccountMeta::new(a.maker_destination, false),
-            AccountMeta::new(a.rent_recipient, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::RefundUnsettled.data(),
     }
 }
 
@@ -664,7 +444,7 @@ pub fn fill_pool_quote_ixs(
             AccountMeta::new_readonly(accounts.config, false),
             AccountMeta::new(accounts.pool, false),
             AccountMeta::new_readonly(accounts.market, false),
-            AccountMeta::new_readonly(accounts.pool_market, false),
+            AccountMeta::new(accounts.pool_market, false),
             AccountMeta::new_readonly(accounts.settlement_mint, false),
             AccountMeta::new(accounts.pool_token, false),
             AccountMeta::new(accounts.buyer_source, false),
@@ -688,6 +468,7 @@ pub struct SettlePoolPositionAccounts {
     pub pool: Pubkey,
     pub market: Pubkey,
     pub oracle: Pubkey,
+    pub pool_market: Pubkey,
     pub nonce_record: Pubkey,
     pub position: Pubkey,
     pub position_vault: Pubkey,
@@ -707,7 +488,8 @@ pub fn settle_pool_position_ix(a: &SettlePoolPositionAccounts) -> Instruction {
             AccountMeta::new(a.pool, false),
             AccountMeta::new_readonly(a.market, false),
             AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.nonce_record, false),
+            AccountMeta::new(a.pool_market, false),
+            AccountMeta::new(a.nonce_record, false),
             AccountMeta::new(a.position, false),
             AccountMeta::new(a.position_vault, false),
             AccountMeta::new_readonly(a.settlement_mint, false),
@@ -727,6 +509,7 @@ pub struct RefundPoolPositionAccounts {
     pub pool: Pubkey,
     pub market: Pubkey,
     pub oracle: Pubkey,
+    pub pool_market: Pubkey,
     pub nonce_record: Pubkey,
     pub position: Pubkey,
     pub position_vault: Pubkey,
@@ -745,7 +528,8 @@ pub fn refund_pool_position_ix(a: &RefundPoolPositionAccounts) -> Instruction {
             AccountMeta::new(a.pool, false),
             AccountMeta::new_readonly(a.market, false),
             AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.nonce_record, false),
+            AccountMeta::new(a.pool_market, false),
+            AccountMeta::new(a.nonce_record, false),
             AccountMeta::new(a.position, false),
             AccountMeta::new(a.position_vault, false),
             AccountMeta::new_readonly(a.settlement_mint, false),
@@ -764,6 +548,7 @@ pub struct ClosePoolPositionAccounts {
     pub pool: Pubkey,
     pub market: Pubkey,
     pub oracle: Pubkey,
+    pub pool_market: Pubkey,
     pub position: Pubkey,
     pub position_vault: Pubkey,
     pub settlement_mint: Pubkey,
@@ -805,6 +590,7 @@ pub fn close_pool_position_ixs(
             AccountMeta::new(accounts.pool, false),
             AccountMeta::new_readonly(accounts.market, false),
             AccountMeta::new_readonly(accounts.oracle, false),
+            AccountMeta::new(accounts.pool_market, false),
             AccountMeta::new(accounts.position, false),
             AccountMeta::new(accounts.position_vault, false),
             AccountMeta::new_readonly(accounts.settlement_mint, false),
@@ -825,18 +611,11 @@ pub struct CloseSettledMarketAccounts {
     pub config: Pubkey,
     pub market: Pubkey,
     pub oracle: Pubkey,
-    /// The market's complete-set collateral vault PDA (`COMPLETE_SET_VAULT_SEED`,
-    /// keyed by `market.key()`). Always required -- see
-    /// `CloseSettledMarket::collateral_vault`'s doc comment in `src/lib.rs`:
-    /// the handler treats an account with no data as "no complete set was
-    /// ever minted here" (fine), and otherwise requires `amount == 0`.
-    pub collateral_vault: Pubkey,
-    /// `Some` only when demonstrating that a specific pool's authorization
-    /// for this market has been disabled; `None` when no pool ever traded
-    /// this market (or the caller relies solely on the elapsed-window
-    /// argument -- see `CloseSettledMarket`'s doc comment in `src/lib.rs`).
-    pub pool: Option<Pubkey>,
-    pub pool_market: Option<Pubkey>,
+    /// Mandatory: the `[POOL_MARKET_SEED, pool, market]` authorization
+    /// record the caller proves is idle -- see `CloseSettledMarket`'s doc
+    /// comment in `src/lib.rs`.
+    pub pool: Pubkey,
+    pub pool_market: Pubkey,
     pub rent_recipient: Pubkey,
 }
 
@@ -848,149 +627,11 @@ pub fn close_settled_market_ix(a: &CloseSettledMarketAccounts) -> Instruction {
             AccountMeta::new_readonly(a.config, false),
             AccountMeta::new(a.market, false),
             AccountMeta::new(a.oracle, false),
-            AccountMeta::new_readonly(a.collateral_vault, false),
-            AccountMeta::new_readonly(a.pool.unwrap_or_else(no_pool), false),
-            AccountMeta::new_readonly(a.pool_market.unwrap_or_else(no_pool_market), false),
+            AccountMeta::new_readonly(a.pool, false),
+            AccountMeta::new(a.pool_market, false),
             AccountMeta::new(a.rent_recipient, false),
         ],
         data: vsol::instruction::CloseSettledMarket.data(),
-    }
-}
-
-// --- Conditional tokens ("complete sets") ---
-
-#[allow(clippy::too_many_arguments)]
-pub struct MintCompleteSetAccounts {
-    pub minter: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub up_mint: Pubkey,
-    pub down_mint: Pubkey,
-    pub collateral_vault: Pubkey,
-    pub minter_source: Pubkey,
-    pub minter_up_token: Pubkey,
-    pub minter_down_token: Pubkey,
-}
-
-pub fn mint_complete_set_ix(a: &MintCompleteSetAccounts, amount: u64) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new(a.minter, true),
-            AccountMeta::new_readonly(a.config, false),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.up_mint, false),
-            AccountMeta::new(a.down_mint, false),
-            AccountMeta::new(a.collateral_vault, false),
-            AccountMeta::new(a.minter_source, false),
-            AccountMeta::new(a.minter_up_token, false),
-            AccountMeta::new(a.minter_down_token, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-            AccountMeta::new_readonly(system_program_id(), false),
-            AccountMeta::new_readonly(rent_sysvar_id(), false),
-        ],
-        data: vsol::instruction::MintCompleteSet { amount }.data(),
-    }
-}
-
-pub struct BurnCompleteSetAccounts {
-    pub burner: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub up_mint: Pubkey,
-    pub down_mint: Pubkey,
-    pub collateral_vault: Pubkey,
-    pub burner_up_token: Pubkey,
-    pub burner_down_token: Pubkey,
-    pub burner_destination: Pubkey,
-}
-
-pub fn burn_complete_set_ix(a: &BurnCompleteSetAccounts, amount: u64) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(a.burner, true),
-            AccountMeta::new_readonly(a.config, false),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.up_mint, false),
-            AccountMeta::new(a.down_mint, false),
-            AccountMeta::new(a.collateral_vault, false),
-            AccountMeta::new(a.burner_up_token, false),
-            AccountMeta::new(a.burner_down_token, false),
-            AccountMeta::new(a.burner_destination, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::BurnCompleteSet { amount }.data(),
-    }
-}
-
-pub struct RedeemWinningAccounts {
-    pub redeemer: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub oracle: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub up_mint: Pubkey,
-    pub down_mint: Pubkey,
-    pub collateral_vault: Pubkey,
-    pub redeemer_token: Pubkey,
-    pub redeemer_destination: Pubkey,
-}
-
-pub fn redeem_winning_ix(a: &RedeemWinningAccounts, amount: u64) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(a.redeemer, true),
-            AccountMeta::new_readonly(a.config, false),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.up_mint, false),
-            AccountMeta::new(a.down_mint, false),
-            AccountMeta::new(a.collateral_vault, false),
-            AccountMeta::new(a.redeemer_token, false),
-            AccountMeta::new(a.redeemer_destination, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::RedeemWinning { amount }.data(),
-    }
-}
-
-pub struct RedeemUnresolvedAccounts {
-    pub redeemer: Pubkey,
-    pub config: Pubkey,
-    pub market: Pubkey,
-    pub oracle: Pubkey,
-    pub settlement_mint: Pubkey,
-    pub up_mint: Pubkey,
-    pub down_mint: Pubkey,
-    pub collateral_vault: Pubkey,
-    pub redeemer_token: Pubkey,
-    pub redeemer_destination: Pubkey,
-}
-
-pub fn redeem_unresolved_ix(a: &RedeemUnresolvedAccounts, amount: u64) -> Instruction {
-    Instruction {
-        program_id: vsol::ID,
-        accounts: vec![
-            AccountMeta::new_readonly(a.redeemer, true),
-            AccountMeta::new_readonly(a.config, false),
-            AccountMeta::new_readonly(a.market, false),
-            AccountMeta::new_readonly(a.oracle, false),
-            AccountMeta::new_readonly(a.settlement_mint, false),
-            AccountMeta::new(a.up_mint, false),
-            AccountMeta::new(a.down_mint, false),
-            AccountMeta::new(a.collateral_vault, false),
-            AccountMeta::new(a.redeemer_token, false),
-            AccountMeta::new(a.redeemer_destination, false),
-            AccountMeta::new_readonly(token_program_id(), false),
-        ],
-        data: vsol::instruction::RedeemUnresolved { amount }.data(),
     }
 }
 

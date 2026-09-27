@@ -1,10 +1,11 @@
 import { readFile } from "node:fs/promises";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
+import { createVsolConnection } from "../sdk/rpc-failover/index.ts";
 import { decodeConfigAccount, decodeOracleAccount, decodePoolAccount } from "../../app/lib/vsol-server.ts";
 import { decodeMarketAccount } from "../../app/lib/vsol-market-accounts.ts";
 import { deriveConfig, deriveCustomSettlementObservation } from "../sdk/index.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
-import { DEVNET_GENESIS_HASH } from "./custom-oracle-pusher.ts";
+import { DEVNET_GENESIS_HASH } from "./lib/oracle-feed.ts";
 import { VSOL_PROGRAM_ID } from "../../app/lib/vsol.ts";
 import { VSOL_RPC_URL } from "../../app/lib/vsol.ts";
 
@@ -33,7 +34,7 @@ const configuredRpcUrl = process.env.VSOL_RPC_URL ?? VSOL_RPC_URL;
 const redactError = (error: unknown) => (error instanceof Error ? error.message : String(error)).split(configuredRpcUrl).join("[redacted]");
 process.once("uncaughtException", (error) => { console.error(redactError(error)); process.exit(1); });
 process.once("unhandledRejection", (error) => { console.error(redactError(error)); process.exit(1); });
-const connection = new Connection(configuredRpcUrl, "confirmed");
+const connection = createVsolConnection({ rpcUrl: configuredRpcUrl, backupRpcUrl: process.env.VSOL_RPC_BACKUP_URL, commitment: "confirmed" });
 if (await connection.getGenesisHash() !== DEVNET_GENESIS_HASH) throw new Error("Receipt verifier requires Solana devnet");
 
 const [positionAccount, marketAccount, poolAccount, configAccount, buyerBalance] = await Promise.all([
@@ -59,20 +60,33 @@ if (!oracle.finalized || !oracle.market.equals(new PublicKey(receipt.market))) t
 const settlementPrice = oracle.price;
 const observationAddress = deriveCustomSettlementObservation(receipt.symbol, BigInt(receipt.expiryAt / 1000));
 const observationAccount = await connection.getAccountInfo(observationAddress, "confirmed");
-const observationDefinition = (idl.accounts as Array<{ name: string; discriminator: number[] }>).find((entry) => entry.name === "CustomSettlementObservation");
-if (!observationAccount?.owner.equals(VSOL_PROGRAM_ID) || observationAccount.data.length !== 173 || !observationDefinition ||
-    !Buffer.from(observationAccount.data.subarray(0, 8)).equals(Buffer.from(observationDefinition.discriminator))) {
-  throw new Error("The immutable custom settlement observation is unavailable");
-}
-const observationExpiry = Number(observationAccount.data.readBigInt64LE(57));
-const observationPrice = observationAccount.data.readBigUInt64LE(77);
-const observationObservedAt = Number(observationAccount.data.readBigInt64LE(93));
-const observationCapturedAt = Number(observationAccount.data.readBigInt64LE(101));
-if (observationExpiry !== market.expiry || observationPrice !== settlementPrice || oracle.observedAt !== observationObservedAt ||
-    !oracle.priceUpdate.equals(observationAddress) ||
-    observationObservedAt < market.expiry || observationObservedAt > market.expiry + market.observationWindowSeconds ||
-    observationCapturedAt > market.expiry + market.observationWindowSeconds) {
-  throw new Error("Finalized settlement is not bound to the retained in-window observation");
+const inWindow = (timestamp: number) => timestamp >= market.expiry && timestamp <= market.expiry + market.observationWindowSeconds;
+if (observationAccount) {
+  // Settled before the 2026-09-28 upgrade: the observation was never closed,
+  // so bind the finalized price to it field by field.
+  const observationDefinition = (idl.accounts as Array<{ name: string; discriminator: number[] }>).find((entry) => entry.name === "CustomSettlementObservation");
+  if (!observationAccount.owner.equals(VSOL_PROGRAM_ID) || observationAccount.data.length !== 173 || !observationDefinition ||
+      !Buffer.from(observationAccount.data.subarray(0, 8)).equals(Buffer.from(observationDefinition.discriminator))) {
+    throw new Error("The custom settlement observation account is malformed");
+  }
+  const observationExpiry = Number(observationAccount.data.readBigInt64LE(57));
+  const observationPrice = observationAccount.data.readBigUInt64LE(77);
+  const observationObservedAt = Number(observationAccount.data.readBigInt64LE(93));
+  const observationCapturedAt = Number(observationAccount.data.readBigInt64LE(101));
+  if (observationExpiry !== market.expiry || observationPrice !== settlementPrice || oracle.observedAt !== observationObservedAt ||
+      !oracle.priceUpdate.equals(observationAddress) || !inWindow(observationObservedAt) ||
+      observationCapturedAt > market.expiry + market.observationWindowSeconds) {
+    throw new Error("Finalized settlement is not bound to the retained in-window observation");
+  }
+} else {
+  // Since the upgrade, publish_custom_settlement CLOSES the observation to
+  // reclaim its rent, so it is normally gone by now. The binding survives on
+  // the finalized oracle itself: `price_update` records which observation the
+  // price came from, and `observed_at` its source timestamp. (The capture
+  // timing was enforced on chain by capture + publish before the close.)
+  if (!oracle.priceUpdate.equals(observationAddress) || !inWindow(oracle.observedAt)) {
+    throw new Error("Finalized settlement is not bound to an in-window custom observation for this market");
+  }
 }
 
 const signatureInfos = await connection.getSignaturesForAddress(new PublicKey(receipt.position), { limit: 20 }, "confirmed");
@@ -109,12 +123,19 @@ const delta = receipt.direction === "up"
   ? (settlementPrice > strike ? settlementPrice - strike : 0n)
   : (strike > settlementPrice ? strike - settlementPrice : 0n);
 const payout = maxPayout * (delta < width ? delta : width) / width;
-const fee = premium === 0n || receipt.feeBps === 0
+// Fee model since the 2026-09-21 program upgrade: the protocol takes feeBps
+// of the WINNING PAYOUT (rounded up, as calculate_fee does), deducted from
+// the buyer's side, so a losing position pays nothing. It used to be a share
+// of the premium taken from the pool, which is what this check encoded
+// before. When the buyer IS the treasury owner the program sends payout and
+// fee to the same account in one transfer, so the buyer nets the whole payout.
+const fee = payout === 0n || receipt.feeBps === 0
   ? 0n
-  : (premium * BigInt(receipt.feeBps) + 9_999n) / 10_000n;
+  : (payout * BigInt(receipt.feeBps) + 9_999n) / 10_000n;
 const config = decodeConfigAccount(Buffer.from(configAccount.data));
 const buyerReceivesFee = config.treasuryOwner.equals(new PublicKey(receipt.walletAddress));
-const expectedBalance = BigInt(receipt.preBalanceAtoms) - premium + payout + (buyerReceivesFee ? fee : 0n);
+const buyerNet = payout - fee;
+const expectedBalance = BigInt(receipt.preBalanceAtoms) - premium + buyerNet + (buyerReceivesFee ? fee : 0n);
 const actualBalance = BigInt(buyerBalance.value.amount);
 if (actualBalance !== expectedBalance) {
   throw new Error(`Buyer balance mismatch: expected ${expectedBalance}, received ${actualBalance}`);
@@ -134,10 +155,10 @@ console.log(JSON.stringify({
   settlementSignature,
   settlementPriceAtoms: settlementPrice.toString(),
   observation: observationAddress.toBase58(),
-  observationObservedAt,
-  observationCapturedAt,
+  observedAt: oracle.observedAt,
   expectedPayoutAtoms: payout.toString(),
   protocolFeeAtoms: fee.toString(),
+  buyerNetAtoms: buyerNet.toString(),
   buyerReceivesFee,
   expectedBuyerBalanceAtoms: expectedBalance.toString(),
   actualBuyerBalanceAtoms: actualBalance.toString(),
