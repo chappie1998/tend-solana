@@ -63,6 +63,7 @@ in the workflow `env:`, written to a file, and never logged.
 | `VSOL_DEVNET_USDC_MINT_KEY` | `vsol/.devnet/devnet-mock-usdc-mint.json` | keeper only |
 | `VSOL_DEVNET_RWA_MINT_KEY` | `vsol/.devnet/devnet-mock-rwa-mint.json` | keeper only |
 | `VSOL_RPC_URL` | env var (not a file) | keeper, cranker |
+| `VSOL_RPC_BACKUP_URL` *(optional)* | env var (not a file) | keeper, cranker, oracle runner |
 | `PYTH_API_KEY` | env var (not a file) | cranker only |
 | `PYTH_HERMES_URL` *(optional)* | env var (not a file) | cranker only |
 
@@ -73,6 +74,40 @@ value — e.g. `[12,34,56,...]`.
 `VSOL_RPC_URL` **must** be a private devnet RPC endpoint. The public
 `api.devnet.solana.com` endpoint 403s or rate-limits under any kind of
 recurring, unattended load — do not point these workflows at it.
+
+### RPC failover (`VSOL_RPC_BACKUP_URL`)
+
+Every script and app route gets its `Connection` from one shared factory,
+`vsol/sdk/rpc-failover` (`createVsolConnection`), instead of constructing
+`new Connection(...)` directly. It fails over, per JSON-RPC request, across
+up to three endpoints in order:
+
+1. `VSOL_RPC_URL` (required — the primary, e.g. a Helius devnet endpoint),
+2. `VSOL_RPC_BACKUP_URL` (optional — e.g. an Alchemy devnet endpoint),
+3. the public `api.devnet.solana.com` (devnet only; never added for another
+   cluster) as a last resort.
+
+It moves to the next endpoint on a network error/timeout, an HTTP 429/5xx,
+or a JSON-RPC error that means the CURRENT endpoint can't serve the request
+(a quota/rate-limit signal, or a "method not found"/"not available on this
+tier" response — the latter demotes that endpoint for just that one method,
+so a free-tier backup that refuses `getProgramAccounts` stays in rotation
+for everything else it can serve). An ordinary JSON-RPC error (invalid
+params, a failed transaction simulation, an expired blockhash, ...) is
+returned to the caller unchanged, from whichever endpoint produced it — this
+is about transport failures, not about retrying real errors against a
+different node. Demotions are logged once (redacted to host only, never the
+full URL/API key) and expire on their own after a cooldown.
+
+Confirmation (`connection.confirmTransaction(...)`) does not depend on the
+primary endpoint's websocket either — it polls over the same failover HTTP
+path instead, so a quota-dead primary can't hang a confirmation.
+
+Setting `VSOL_RPC_BACKUP_URL` is optional everywhere; everything above works
+identically (using only `VSOL_RPC_URL` + the public devnet fallback) if it
+is left unset. See `vsol/sdk/rpc-failover/index.ts`'s module doc for the
+full design, and `vsol/tests/rpc-failover.test.ts` for the offline test
+coverage of every rule above.
 
 `PYTH_API_KEY` and `PYTH_HERMES_URL` are only read by the cranker (it is the
 one calling Hermes for settlement prices; the keeper does not need them). If
