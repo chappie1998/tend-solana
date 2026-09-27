@@ -3655,8 +3655,26 @@ pub struct PublishCustomSettlement<'info> {
     pub market: Account<'info, Market>,
     #[account(mut, seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Account<'info, SettlementOracle>,
-    #[account(seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()], bump = observation.bump, has_one = config @ VsolError::InvalidOracle)]
+    /// Closed here (rent to `rent_recipient`, i.e. `config.oracle_authority`,
+    /// the account that paid for it at `capture_custom_settlement_observation`)
+    /// once its data has been fully consumed into `oracle` above. Nothing else
+    /// in the program ever reads a `CustomSettlementObservation` again after
+    /// this point: `settle_pool_position`/`refund_pool_position`/`settle`/
+    /// `refund_unsettled` all gate on `oracle.finalized`, never on this
+    /// account, and the only two instructions that ever reference this type
+    /// are this one and `CaptureCustomSettlementObservation`'s own `init`.
+    /// `oracle.price_update` retains this account's now-stale pubkey purely
+    /// as an audit-trail pointer -- like `publish_pyth_settlement`'s own
+    /// `price_update` field, it is write-only and never dereferenced by any
+    /// instruction, so closing the account it points to is harmless.
+    #[account(mut, close = rent_recipient, seeds = [CUSTOM_SETTLEMENT_OBSERVATION_SEED, market.symbol.as_ref(), &market.expiry.to_le_bytes()], bump = observation.bump, has_one = config @ VsolError::InvalidOracle)]
     pub observation: Account<'info, CustomSettlementObservation>,
+    /// CHECK: Receives the observation's reclaimed rent. Address-constrained
+    /// to `config.oracle_authority`, who paid for it originally. Publication
+    /// itself stays permissionless: this account is not a `Signer`, only a
+    /// payout target, so anyone may still call `publish_custom_settlement`.
+    #[account(mut, address = config.oracle_authority)]
+    pub rent_recipient: UncheckedAccount<'info>,
 }
 
 #[account]

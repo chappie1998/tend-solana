@@ -146,8 +146,8 @@ pub fn capture_custom_observation_ix(authority: &Pubkey, config: &Pubkey, market
     Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new(*authority, true), AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new_readonly(*feed, false), AccountMeta::new(*observation, false), AccountMeta::new_readonly(system_program_id(), false)], data: vsol::instruction::CaptureCustomSettlementObservation.data() }
 }
 
-pub fn publish_custom_settlement_ix(config: &Pubkey, market: &Pubkey, oracle: &Pubkey, observation: &Pubkey) -> Instruction {
-    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new(*oracle, false), AccountMeta::new_readonly(*observation, false)], data: vsol::instruction::PublishCustomSettlement.data() }
+pub fn publish_custom_settlement_ix(config: &Pubkey, market: &Pubkey, oracle: &Pubkey, observation: &Pubkey, rent_recipient: &Pubkey) -> Instruction {
+    Instruction { program_id: vsol::ID, accounts: vec![AccountMeta::new_readonly(*config, false), AccountMeta::new_readonly(*market, false), AccountMeta::new(*oracle, false), AccountMeta::new(*observation, false), AccountMeta::new(*rent_recipient, false)], data: vsol::instruction::PublishCustomSettlement.data() }
 }
 
 /// `publish_pyth_settlement` takes no signer at all (it's a permissionless

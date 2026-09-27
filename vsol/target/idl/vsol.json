@@ -2687,6 +2687,21 @@
         },
         {
           "name": "observation",
+          "docs": [
+            "Closed here (rent to `rent_recipient`, i.e. `config.oracle_authority`,",
+            "the account that paid for it at `capture_custom_settlement_observation`)",
+            "once its data has been fully consumed into `oracle` above. Nothing else",
+            "in the program ever reads a `CustomSettlementObservation` again after",
+            "this point: `settle_pool_position`/`refund_pool_position`/`settle`/",
+            "`refund_unsettled` all gate on `oracle.finalized`, never on this",
+            "account, and the only two instructions that ever reference this type",
+            "are this one and `CaptureCustomSettlementObservation`'s own `init`.",
+            "`oracle.price_update` retains this account's now-stale pubkey purely",
+            "as an audit-trail pointer -- like `publish_pyth_settlement`'s own",
+            "`price_update` field, it is write-only and never dereferenced by any",
+            "instruction, so closing the account it points to is harmless."
+          ],
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -2724,6 +2739,15 @@
               }
             ]
           }
+        },
+        {
+          "name": "rent_recipient",
+          "docs": [
+            "to `config.oracle_authority`, who paid for it originally. Publication",
+            "itself stays permissionless: this account is not a `Signer`, only a",
+            "payout target, so anyone may still call `publish_custom_settlement`."
+          ],
+          "writable": true
         }
       ],
       "args": []

@@ -5120,11 +5120,52 @@ fn custom_observation_is_authorized_immutable_and_supports_delayed_relay() {
     assert_eq!(harness.read_account::<vsol::CustomSettlementObservation>(&observation).price, 101 * ONE_TOKEN);
 
     harness.warp_to_timestamp(market.expiry + i64::from(market.observation_window_seconds) + i64::from(market.settlement_grace_seconds));
-    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &market.market, &market.oracle, &observation)], &[]);
+    // `capture_custom_settlement_observation` charged `oracle_authority` rent
+    // for `observation`; `publish_custom_settlement` should now return it.
+    let oracle_authority_lamports_before_publish = harness.get_account(&fixture.oracle_authority.pubkey()).lamports;
+    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &market.market, &market.oracle, &observation, &fixture.oracle_authority.pubkey())], &[]);
     let oracle: vsol::SettlementOracle = harness.read_account(&market.oracle);
     assert!(oracle.finalized);
     assert_eq!(oracle.price, 101 * ONE_TOKEN);
     assert_eq!(oracle.observed_at, market.expiry + 1);
+    assert!(harness.svm.get_account(&observation).is_none());
+    assert!(
+        harness.get_account(&fixture.oracle_authority.pubkey()).lamports
+            > oracle_authority_lamports_before_publish
+    );
+}
+
+/// `publish_custom_settlement` takes no `Signer` (publication is
+/// permissionless-relay -- see its own doc comment), but the rent it
+/// reclaims from `observation` must still land only on `config.oracle_authority`,
+/// never on an arbitrary caller-supplied account.
+#[test]
+fn publish_custom_settlement_rejects_rent_recipient_other_than_oracle_authority() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let creator = harness.funded_keypair();
+    let impostor = harness.funded_keypair();
+    let settlement_mint = harness.create_mint(&creator, &creator.pubkey(), SETTLEMENT_DECIMALS);
+    let market = setup_market(&mut harness, &fixture, &creator, settlement_mint);
+    let symbol = symbol_bytes("NVDA");
+    let feed = custom_feed_pda(&symbol);
+    let observation = custom_observation_pda(&symbol, market.expiry);
+    harness.send_ok(&fixture.admin, &[init_custom_price_feed_ix(&fixture.admin.pubkey(), &fixture.config, &feed, symbol, ONE_TOKEN)], &[]);
+    harness.warp_to_timestamp(market.expiry + 1);
+    harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, market.expiry + 1)], &[]);
+    harness.send_ok(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &market.market, &feed, &observation)], &[]);
+
+    harness.warp_to_timestamp(market.expiry + i64::from(market.observation_window_seconds) + i64::from(market.settlement_grace_seconds));
+    let failed = harness.send_err(
+        &creator,
+        &[publish_custom_settlement_ix(&fixture.config, &market.market, &market.oracle, &observation, &impostor.pubkey())],
+        &[],
+    );
+    // Anchor's built-in `ConstraintAddress` (2012), not a `VsolError`: the
+    // `rent_recipient` field is address-constrained via `#[account(address = ...)]`.
+    assert_eq!(anchor_error_code(&failed), 2012);
+    assert!(harness.svm.get_account(&observation).is_some());
+    assert!(!harness.read_account::<vsol::SettlementOracle>(&market.oracle).finalized);
 }
 
 #[test]
@@ -5161,9 +5202,9 @@ fn shared_expiry_observation_respects_each_markets_capture_window() {
     harness.send_ok(&fixture.oracle_authority, &[update_custom_price_feed_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &feed, 101 * ONE_TOKEN, 1, long.expiry + 1)], &[]);
     harness.send_ok(&fixture.oracle_authority, &[capture_custom_observation_ix(&fixture.oracle_authority.pubkey(), &fixture.config, &long.market, &feed, &observation)], &[]);
 
-    let short_failed = harness.send_err(&creator, &[publish_custom_settlement_ix(&fixture.config, &short.market, &short.oracle, &observation)], &[]);
+    let short_failed = harness.send_err(&creator, &[publish_custom_settlement_ix(&fixture.config, &short.market, &short.oracle, &observation, &fixture.oracle_authority.pubkey())], &[]);
     assert_vsol_error(&short_failed, vsol::VsolError::InvalidObservationTime);
-    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &long.market, &long.oracle, &observation)], &[]);
+    harness.send_ok(&creator, &[publish_custom_settlement_ix(&fixture.config, &long.market, &long.oracle, &observation, &fixture.oracle_authority.pubkey())], &[]);
     assert_eq!(harness.read_account::<vsol::SettlementOracle>(&long.oracle).price, 101 * ONE_TOKEN);
 }
 
