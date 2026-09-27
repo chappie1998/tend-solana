@@ -3334,6 +3334,17 @@ export type Vsol = {
         },
         {
           "name": "nonceRecord",
+          "docs": [
+            "Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety",
+            "argument is identical to `SettlePoolPosition::nonce_record`'s own doc",
+            "comment: this instruction also only runs once `now >= market.expiry`",
+            "(via the settlement-window deadline check below, which is itself",
+            "`>= market.expiry`), strictly after `quote.quote_expiry` could ever",
+            "again satisfy `fill_pool_quote`'s expiry check, so replaying the",
+            "original signed quote fails closed with `QuoteExpired` regardless of",
+            "whether this PDA still exists."
+          ],
+          "writable": true,
           "relations": [
             "position"
           ]
@@ -3445,6 +3456,9 @@ export type Vsol = {
         },
         {
           "name": "rentRecipient",
+          "docs": [
+            "must be the buyer stored in the position."
+          ],
           "writable": true
         },
         {
@@ -4174,6 +4188,23 @@ export type Vsol = {
         },
         {
           "name": "nonceRecord",
+          "docs": [
+            "Closed here (rent to `rent_recipient`, i.e. the buyer -- see that",
+            "field's own doc comment) rather than left to rot forever. Replay",
+            "safety: `fill_pool_quote` only accepts a quote while",
+            "`now <= quote.quote_expiry < market.expiry`, and this instruction only",
+            "runs once `now >= market.expiry`, so by the time the nonce PDA",
+            "disappears the exact ed25519-signed `PoolQuoteArgs` (nonce included)",
+            "that created it can never satisfy `fill_pool_quote`'s own expiry check",
+            "again -- an attacker cannot forge a fresh `quote_expiry` without",
+            "invalidating the signature. Re-submitting the original signed quote",
+            "therefore fails closed with `QuoteExpired`, PDA or no PDA. Proven by",
+            "`settle_pool_position_closes_nonce_and_original_quote_cannot_replay`.",
+            "`close_pool_position` (early close, before expiry) must NOT do this:",
+            "the quote can still be unexpired there, so closing the nonce would let",
+            "the same signed quote be filled a second time once the PDA is gone."
+          ],
+          "writable": true,
           "relations": [
             "position"
           ]
@@ -4289,6 +4320,10 @@ export type Vsol = {
         },
         {
           "name": "rentRecipient",
+          "docs": [
+            "-- see `nonce_record`'s doc comment -- the closed nonce's rent too)",
+            "and must be the buyer stored in the position."
+          ],
           "writable": true
         },
         {

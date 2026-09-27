@@ -2148,6 +2148,252 @@ fn refund_pool_position_returns_funds_when_settlement_window_closes_unfinalized(
 }
 
 // =====================================================================
+// PoolQuoteNonce rent reclamation at settle/refund (never at early close).
+//
+// `fill_pool_quote` charges the buyer rent for `PoolQuoteNonce`
+// (~0.00168 SOL) and, before this fix, never returned it: every filled trade
+// permanently cost the buyer that rent. `settle_pool_position` and
+// `refund_pool_position` now close it (see their own `nonce_record` doc
+// comments for the full replay-safety argument); `close_pool_position`
+// deliberately does not (see `ClosePoolPosition`'s doc comment).
+//
+// These two tests prove the replay-safety half of that argument directly:
+// once the nonce PDA is gone, resubmitting the EXACT original ed25519-signed
+// `PoolQuoteArgs` to `fill_pool_quote` -- same nonce, same signature, same
+// everything -- still fails closed. In practice `MarketExpired` fires first
+// (it is checked before `QuoteExpired` in `fill_pool_quote`), but the
+// argument does not depend on which of the two rejects it: `fill_pool_quote`
+// itself enforces `quote.quote_expiry < market.expiry` at fill time, so by
+// the time `now >= market.expiry` (required by both settle and refund) the
+// quote's own expiry has necessarily ALSO already passed. Either check alone
+// is sufficient; both hold simultaneously.
+// =====================================================================
+
+#[test]
+fn settle_pool_position_closes_nonce_and_original_quote_cannot_replay() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
+
+    let provider = harness.funded_keypair();
+    let provider_position = provider_position_pda(&pool.pool, &provider.pubkey());
+    let provider_source = harness.create_token_account(&provider, &pool.settlement_mint, &provider.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &provider,
+        &[deposit_liquidity_ix(
+            &provider.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider_position,
+            &provider_source,
+            100 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let buyer = harness.funded_keypair();
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_pool_quote(1, harness.now() + 30);
+    let pool_nonce_record = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote.nonce);
+    let pool_position = pool_position_pda(&pool_nonce_record);
+    let pool_position_vault = pool_position_vault_pda(&pool_position);
+    let fill_accounts = FillPoolQuoteAccounts {
+        buyer: buyer.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        pool_market,
+        settlement_mint: market.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    // The nonce PDA exists and is rent-exempt right after the fill.
+    let nonce_lamports_after_fill = harness.get_account(&pool_nonce_record).lamports;
+    assert!(nonce_lamports_after_fill > 0);
+    let buyer_lamports_before_settle = harness.get_account(&buyer.pubkey()).lamports;
+
+    harness.warp_to_timestamp(market.expiry);
+    finalize_oracle(&mut harness, &market, 200 * ONE_TOKEN);
+
+    let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&pool.manager, &market.settlement_mint, &fixture.treasury_owner);
+    let settle_accounts = SettlePoolPositionAccounts {
+        cranker: buyer.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        oracle: market.oracle,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        settlement_mint: market.settlement_mint,
+        buyer_destination,
+        pool_token: pool.pool_token,
+        treasury_destination,
+        rent_recipient: buyer.pubkey(),
+    };
+    harness.send_ok(&buyer, &[settle_pool_position_ix(&settle_accounts)], &[]);
+
+    // The nonce PDA is gone, and its rent landed on the buyer (rent_recipient
+    // is address-constrained to `position.buyer`), on top of the position's
+    // own rent -- net of the one transaction fee this settle call itself paid.
+    assert!(harness.svm.get_account(&pool_nonce_record).is_none());
+    assert!(harness.svm.get_account(&pool_position).is_none());
+    let buyer_lamports_after_settle = harness.get_account(&buyer.pubkey()).lamports;
+    assert!(buyer_lamports_after_settle > buyer_lamports_before_settle);
+
+    // Replay: resubmit the EXACT original signed quote. The nonce PDA's seeds
+    // are free again (the old account is closed), so `init` would otherwise
+    // be able to recreate it -- but the quote itself is expired relative to
+    // the (also expired) market, so the fill is rejected before any account
+    // is touched.
+    let replay_ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    let failed = harness.send_err(&buyer, &replay_ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketExpired);
+    assert!(harness.svm.get_account(&pool_nonce_record).is_none());
+}
+
+#[test]
+fn refund_pool_position_closes_nonce_and_original_quote_cannot_replay() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let market = setup_market(&mut harness, &fixture, &pool.manager, pool.settlement_mint);
+
+    let provider = harness.funded_keypair();
+    let provider_position = provider_position_pda(&pool.pool, &provider.pubkey());
+    let provider_source = harness.create_token_account(&provider, &pool.settlement_mint, &provider.pubkey());
+    harness.mint_to(&pool.manager, &pool.settlement_mint, &pool.manager, &provider_source, 100 * ONE_TOKEN);
+    harness.send_ok(
+        &provider,
+        &[deposit_liquidity_ix(
+            &provider.pubkey(),
+            &fixture.config,
+            &pool.settlement_mint,
+            &pool.pool,
+            &pool.pool_token,
+            &provider_position,
+            &provider_source,
+            100 * ONE_TOKEN,
+            0,
+            harness.now() + 3600,
+        )],
+        &[],
+    );
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+
+    let buyer = harness.funded_keypair();
+    let buyer_source = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    harness.mint_to(&pool.manager, &market.settlement_mint, &pool.manager, &buyer_source, 10 * ONE_TOKEN);
+    let quote = default_pool_quote(1, harness.now() + 30);
+    let pool_nonce_record = pool_nonce_pda(&pool.pool, &pool.quote_authority.pubkey(), quote.nonce);
+    let pool_position = pool_position_pda(&pool_nonce_record);
+    let pool_position_vault = pool_position_vault_pda(&pool_position);
+    let fill_accounts = FillPoolQuoteAccounts {
+        buyer: buyer.pubkey(),
+        quote_authority: pool.quote_authority.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        pool_market,
+        settlement_mint: market.settlement_mint,
+        pool_token: pool.pool_token,
+        buyer_source,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        eligibility: None,
+    };
+    let ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    harness.send_ok(&buyer, &ixs, &[]);
+
+    let buyer_lamports_before_refund = harness.get_account(&buyer.pubkey()).lamports;
+
+    // Never finalize the oracle; let the whole settlement window elapse so
+    // `refund_pool_position` (not `settle_pool_position`) is the applicable path.
+    let deadline = market.expiry + i64::from(OBSERVATION_WINDOW) + i64::from(SETTLEMENT_GRACE) + 1;
+    harness.warp_to_timestamp(deadline);
+
+    let buyer_destination = harness.create_token_account(&buyer, &market.settlement_mint, &buyer.pubkey());
+    let refund_accounts = RefundPoolPositionAccounts {
+        cranker: buyer.pubkey(),
+        config: fixture.config,
+        pool: pool.pool,
+        market: market.market,
+        oracle: market.oracle,
+        nonce_record: pool_nonce_record,
+        position: pool_position,
+        position_vault: pool_position_vault,
+        settlement_mint: market.settlement_mint,
+        buyer_destination,
+        pool_token: pool.pool_token,
+        rent_recipient: buyer.pubkey(),
+    };
+    harness.send_ok(&buyer, &[refund_pool_position_ix(&refund_accounts)], &[]);
+
+    assert!(harness.svm.get_account(&pool_nonce_record).is_none());
+    assert!(harness.svm.get_account(&pool_position).is_none());
+    let buyer_lamports_after_refund = harness.get_account(&buyer.pubkey()).lamports;
+    assert!(buyer_lamports_after_refund > buyer_lamports_before_refund);
+
+    // Replay: same conclusion as the settle case above -- `now` is now well
+    // past both `market.expiry` and the original `quote.quote_expiry`.
+    let replay_ixs = fill_pool_quote_ixs(&pool.quote_authority, &fill_accounts, &fixture.domain_separator, 1, quote);
+    let failed = harness.send_err(&buyer, &replay_ixs, &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketExpired);
+    assert!(harness.svm.get_account(&pool_nonce_record).is_none());
+}
+
+// =====================================================================
 // LiquidityPool::total_assets: the pool's own internal ledger of free
 // (unlocked) settlement tokens, immune to donations. Before this field
 // existed, deposit_liquidity/withdraw_liquidity used `pool_token.amount`

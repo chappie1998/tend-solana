@@ -3220,7 +3220,21 @@ pub struct SettlePoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    /// Closed here (rent to `rent_recipient`, i.e. the buyer -- see that
+    /// field's own doc comment) rather than left to rot forever. Replay
+    /// safety: `fill_pool_quote` only accepts a quote while
+    /// `now <= quote.quote_expiry < market.expiry`, and this instruction only
+    /// runs once `now >= market.expiry`, so by the time the nonce PDA
+    /// disappears the exact ed25519-signed `PoolQuoteArgs` (nonce included)
+    /// that created it can never satisfy `fill_pool_quote`'s own expiry check
+    /// again -- an attacker cannot forge a fresh `quote_expiry` without
+    /// invalidating the signature. Re-submitting the original signed quote
+    /// therefore fails closed with `QuoteExpired`, PDA or no PDA. Proven by
+    /// `settle_pool_position_closes_nonce_and_original_quote_cannot_replay`.
+    /// `close_pool_position` (early close, before expiry) must NOT do this:
+    /// the quote can still be unexpired there, so closing the nonce would let
+    /// the same signed quote be filled a second time once the PDA is gone.
+    #[account(mut, close = rent_recipient, constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
     pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
     pub position: Box<Account<'info, PoolPosition>>,
@@ -3233,7 +3247,9 @@ pub struct SettlePoolPosition<'info> {
     pub pool_token: Box<Account<'info, TokenAccount>>,
     #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
+    /// CHECK: Receives rent (this account's own nonce and position rent, plus
+    /// -- see `nonce_record`'s doc comment -- the closed nonce's rent too)
+    /// and must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
     pub rent_recipient: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
@@ -3250,7 +3266,15 @@ pub struct RefundPoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
-    #[account(constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
+    /// Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety
+    /// argument is identical to `SettlePoolPosition::nonce_record`'s own doc
+    /// comment: this instruction also only runs once `now >= market.expiry`
+    /// (via the settlement-window deadline check below, which is itself
+    /// `>= market.expiry`), strictly after `quote.quote_expiry` could ever
+    /// again satisfy `fill_pool_quote`'s expiry check, so replaying the
+    /// original signed quote fails closed with `QuoteExpired` regardless of
+    /// whether this PDA still exists.
+    #[account(mut, close = rent_recipient, constraint = nonce_record.status == NonceStatus::Filled as u8 @ VsolError::InvalidNonce, constraint = nonce_record.position == position.key() @ VsolError::InvalidNonce, constraint = nonce_record.pool == pool.key() @ VsolError::InvalidNonce)]
     pub nonce_record: Box<Account<'info, PoolQuoteNonce>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, nonce_record.key().as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = nonce_record @ VsolError::InvalidNonce, has_one = settlement_mint @ VsolError::InvalidPosition)]
     pub position: Box<Account<'info, PoolPosition>>,
@@ -3261,7 +3285,8 @@ pub struct RefundPoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Receives rent and must be the buyer stored in the position.
+    /// CHECK: Receives rent (this account's own nonce and position rent) and
+    /// must be the buyer stored in the position.
     #[account(mut, address = position.buyer)]
     pub rent_recipient: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
@@ -3274,6 +3299,15 @@ pub struct RefundPoolPosition<'info> {
 /// PDA) and `cranker` (replaced by the buyer, who must sign in person and
 /// must equal `position.buyer`), plus `instructions_sysvar` for the Ed25519
 /// check that authenticates the pool's signed buyback quote.
+///
+/// Deliberately never closes the `PoolQuoteNonce`, unlike
+/// `SettlePoolPosition`/`RefundPoolPosition` (see their `nonce_record` doc
+/// comments): early close can run at any time before `market.expiry`, while
+/// the original signed `PoolQuoteArgs` from `fill_pool_quote` may still be
+/// within its own `quote.quote_expiry`. Closing the nonce PDA here would
+/// free its seeds for reuse while that quote could still pass
+/// `fill_pool_quote`'s expiry check, letting the exact same signed quote be
+/// filled a second time.
 #[derive(Accounts)]
 pub struct ClosePoolPosition<'info> {
     pub buyer: Signer<'info>,
