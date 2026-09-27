@@ -8,7 +8,7 @@ import { payoffTiersFor, payoutForStake, quoteFor, stakeBoundsForPayoff, type Di
 const STAKE_REFERENCE_NOTIONAL = 1_000;
 import { ensureDb, getDb } from "../../../db";
 import { rfqQuotes } from "../../../db/schema";
-import { gte, lt } from "drizzle-orm";
+import { and, gte, like, lt } from "drizzle-orm";
 import { expiryCodes, resolveExpiry, type ExpiryCode } from "../../lib/expiries";
 import { getMarketRealizedVolatility, getMarketSnapshot } from "../../lib/market-data";
 import { getCustomOracleReadiness } from "../../lib/custom-oracle-readiness";
@@ -26,11 +26,7 @@ import { solanaExplorerUrl, VSOL_CUSTOM_SETTLEMENT_DEPLOYED } from "../../lib/vs
 import { resolveOrPlanVsolSeries } from "../../lib/series-resolver";
 import { json, resolveUserKey, sameOrigin } from "../../lib/session";
 import { enforceInMemoryRateLimit } from "../../lib/in-memory-rate-limit";
-import {
-  buildRfqRequestId,
-  checkExecutableQuoteRateLimit,
-  userKeyFromRfqRequestId,
-} from "../../lib/rate-limit";
+import { buildRfqRequestId, checkExecutableQuoteRateLimit, RFQ_REQUEST_ID_DELIMITER, userKeyFromRfqRequestId } from "../../lib/rate-limit";
 
 /**
  * Two intents share this route, split so that merely PREVIEWING a price can
@@ -155,15 +151,24 @@ export async function POST(request: Request) {
     await ensureDb();
     const db = getDb();
     const rateLimitWindowStart = new Date(requestedAt - 3_600_000);
-    // Scans all wallets' rows from the last hour rather than a per-wallet
-    // indexed lookup: `rfq_quotes` has no wallet column (see
-    // buildRfqRequestId's doc comment for why, and why this change adds
-    // none), and this table is devnet-scale. Correctness over a fancier
-    // query here; revisit if volume ever makes this scan expensive.
+    // Narrowed in SQL rather than fetching every wallet's rows for the hour:
+    // `expires_at` is indexed (rfq_quotes_expiry_idx) and is always
+    // created_at + 30s, so bounding it by the window start lets Postgres use
+    // the index; the requestId prefix then keeps only this caller's rows.
+    // LIKE metacharacters in the key are escaped, and the exact
+    // userKeyFromRfqRequestId match below stays the final authority in case
+    // an escaped pattern still over-matches. `rfq_quotes` has no wallet
+    // column (see buildRfqRequestId's doc comment); a real indexed column
+    // is the proper fix if this ever needs to scale.
+    const escapedKey = userKey.replace(/[\\%_]/g, (character) => `\\${character}`);
     const recentRows = await db
       .select({ requestId: rfqQuotes.requestId, createdAt: rfqQuotes.createdAt })
       .from(rfqQuotes)
-      .where(gte(rfqQuotes.createdAt, rateLimitWindowStart));
+      .where(and(
+        gte(rfqQuotes.expiresAt, rateLimitWindowStart),
+        gte(rfqQuotes.createdAt, rateLimitWindowStart),
+        like(rfqQuotes.requestId, `${escapedKey}${RFQ_REQUEST_ID_DELIMITER}%`),
+      ));
     const recentCreatedAtMsForWallet = recentRows
       .filter((row) => userKeyFromRfqRequestId(row.requestId) === userKey)
       .map((row) => row.createdAt.getTime());

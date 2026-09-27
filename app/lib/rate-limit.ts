@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 /** Separates the embedded identity from the random suffix in `requestId`. Chosen because
  * neither a base58 wallet address nor this project's email-shaped fallback identities
  * (see app/lib/session.ts) can contain it. */
-const RFQ_REQUEST_ID_DELIMITER = "::";
+export const RFQ_REQUEST_ID_DELIMITER = "::";
 
 /** Builds an `rfq_quotes.request_id` value that embeds the requester's identity for later rate-limit lookups. */
 export function buildRfqRequestId(userKey: string): string {
