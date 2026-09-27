@@ -22,10 +22,9 @@
     "prove:redeem": "node --env-file-if-exists=.env --import tsx scripts/prove-redeem-winning.ts",
     "feed:sample": "node --env-file-if-exists=.env --import tsx scripts/feed-tracking-sample.ts",
     "feed:report": "node --env-file-if-exists=.env --import tsx scripts/feed-tracking-report.ts",
-    "custom-oracle:push": "node --env-file-if-exists=.env --import tsx scripts/custom-oracle-pusher.ts",
-    "custom-oracle:settle": "node --env-file-if-exists=.env --import tsx scripts/custom-settle.ts",
-    "custom-oracle:run": "node --env-file-if-exists=.env --import tsx scripts/custom-settle.ts",
-    "custom-oracle:once": "node --env-file-if-exists=.env --import tsx scripts/custom-settle.ts --once",
+    "oracle": "node --env-file-if-exists=.env --import tsx scripts/oracle-runner.ts",
+    "oracle:once": "node --env-file-if-exists=.env --import tsx scripts/oracle-runner.ts --once",
+    "init-heartbeat": "node --env-file-if-exists=.env --import tsx scripts/init-heartbeat-feed.ts",
     "smoke:settlement:verify": "node --env-file-if-exists=.env --import tsx scripts/verify-smoke-settlement.ts"
   },
   "dependencies": {
