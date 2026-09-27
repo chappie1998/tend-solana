@@ -1793,17 +1793,57 @@ pub mod vsol {
             nonce_record_key.as_ref(),
             &[position.bump],
         ];
-        if buyer_amount > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.buyer_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                buyer_amount,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
+        // The buyer may also be `config.treasury_owner` (see
+        // `SettlePoolPosition::treasury_destination`'s `dup` constraint,
+        // which permits `buyer_destination == treasury_destination` while
+        // the owner/mint constraints above still reject any OTHER alias).
+        // When that happens, fold the two transfers into one: it is
+        // economically identical (the buyer ends up with exactly
+        // `buyer_amount + fee == payout`, same as two sequential transfers
+        // into the same account would produce), and it means this program
+        // never issues two token transfers into the literal same
+        // destination account in one instruction.
+        let buyer_is_treasury =
+            ctx.accounts.buyer_destination.key() == ctx.accounts.treasury_destination.key();
+        if buyer_is_treasury {
+            let combined = buyer_amount.checked_add(fee).ok_or(VsolError::MathOverflow)?;
+            if combined > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.buyer_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    combined,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
+        } else {
+            if buyer_amount > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.buyer_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    buyer_amount,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
+            if fee > 0 {
+                transfer_checked_signed(
+                    ctx.accounts.token_program.key(),
+                    ctx.accounts.position_vault.to_account_info(),
+                    ctx.accounts.treasury_destination.to_account_info(),
+                    ctx.accounts.settlement_mint.to_account_info(),
+                    ctx.accounts.position.to_account_info(),
+                    fee,
+                    ctx.accounts.settlement_mint.decimals,
+                    position_seeds,
+                )?;
+            }
         }
         if pool_amount > 0 {
             transfer_checked_signed(
@@ -1813,18 +1853,6 @@ pub mod vsol {
                 ctx.accounts.settlement_mint.to_account_info(),
                 ctx.accounts.position.to_account_info(),
                 pool_amount,
-                ctx.accounts.settlement_mint.decimals,
-                position_seeds,
-            )?;
-        }
-        if fee > 0 {
-            transfer_checked_signed(
-                ctx.accounts.token_program.key(),
-                ctx.accounts.position_vault.to_account_info(),
-                ctx.accounts.treasury_destination.to_account_info(),
-                ctx.accounts.settlement_mint.to_account_info(),
-                ctx.accounts.position.to_account_info(),
-                fee,
                 ctx.accounts.settlement_mint.decimals,
                 position_seeds,
             )?;
@@ -3382,6 +3410,33 @@ pub struct SettlePoolPosition<'info> {
     pub buyer_destination: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
     pub pool_token: Box<Account<'info, TokenAccount>>,
+    /// When `config.treasury_owner` is the position's own buyer,
+    /// `buyer_destination` and `treasury_destination` are the exact same
+    /// token account. Anchor 1.0.2/1.1.2's generated `try_accounts` collects
+    /// every `mut` field that (a) is not marked `dup` and (b) serializes on
+    /// `exit()` (see `anchor-syn`'s `generate_duplicate_mutable_checks` and
+    /// `AccountsExit` impls) into a `HashSet`, erroring
+    /// `ConstraintDuplicateMutableAccount` if any two collide -- this exists
+    /// to stop the classic double-write bug where two `Account<'info, T>`
+    /// views of the same address each independently re-serialize their own
+    /// (possibly divergent) copy of the account's data on exit, and the
+    /// second write silently clobbers the first.
+    /// `dup` here is exactly the intended escape hatch for a case that bug
+    /// cannot occur in: `TokenAccount`'s owning program is the SPL Token
+    /// program, not this one, so `Account<'info, TokenAccount>::exit()`
+    /// (see `exit_with_expected_owner`) is a complete no-op for it --  this
+    /// program's mutations to `treasury_destination`'s and
+    /// `buyer_destination`'s balances only ever happen via CPI `transfer_checked`,
+    /// which writes the real on-chain bytes directly, not through Anchor's
+    /// in-memory struct. Two `Account<TokenAccount>` handles aliasing the
+    /// same address therefore cannot diverge or clobber each other; `dup`
+    /// only tells Anchor's constraint pass that, it changes no runtime
+    /// behavior. Validation the duplicate check would otherwise have
+    /// provided nothing towards anyway (token-program ownership, correct
+    /// mint, correct token owner) is fully carried by `token::mint =` and
+    /// the `owner ==` constraint above regardless of aliasing. See
+    /// `settle_pool_position`'s handler for the matching transfer logic
+    /// (folds into one CPI instead of two when the keys are equal).
     #[account(mut, dup, token::mint = settlement_mint, constraint = treasury_destination.owner == config.treasury_owner @ VsolError::InvalidDestination)]
     pub treasury_destination: Box<Account<'info, TokenAccount>>,
     /// CHECK: Receives rent (this account's own nonce and position rent, plus

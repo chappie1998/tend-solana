@@ -1981,8 +1981,14 @@ fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
     let pool_after_settle: vsol::LiquidityPool = harness.read_account(&pool.pool);
     assert_eq!(pool_after_settle.open_positions, 0);
     assert_eq!(pool_after_settle.locked_collateral, 0);
-    let expected_fee = quote.premium * 50 / 10_000;
-    assert_eq!(harness.token_balance(&buyer_destination), quote.max_payout + expected_fee);
+    // The fee is a cut of the WINNING PAYOUT (see settle_pool_position's own
+    // comment), not of the premium: `buyer_amount = payout - fee`. Once
+    // `treasury_destination` aliases `buyer_destination`, the fee returns to
+    // the exact same account it was cut from, so the buyer's net balance is
+    // just `buyer_amount + fee == payout` -- never `payout + fee` on top.
+    // Settlement price here is far past strike + width, so payout is capped
+    // at exactly `max_payout`.
+    assert_eq!(harness.token_balance(&buyer_destination), quote.max_payout);
     assert!(harness.svm.get_account(&pool_position).is_none());
     assert!(harness.svm.get_account(&pool_position_vault).is_none());
 
