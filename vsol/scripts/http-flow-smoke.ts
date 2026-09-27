@@ -92,6 +92,10 @@ const quoteRequest = {
   expiryCode: "15M",
   payoff: 2,
   walletAddress,
+  // The quote route defaults to the side-effect-free `indicative` intent,
+  // which returns no transaction. A smoke test that means to FILL must ask
+  // for an executable quote explicitly, exactly as "Review & execute" does.
+  intent: "execute",
 };
 if (marketData.snapshot?.mode !== "live") {
   throw new Error(`${SMOKE_SYMBOL} snapshot is not live; refusing a false-positive smoke pass`);
