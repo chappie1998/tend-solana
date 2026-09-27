@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
-import { classifyPushFailure, DEVNET_GENESIS_HASH } from "../scripts/custom-oracle-pusher.ts";
-import { acquireRunnerLease, runSerializedLane } from "../scripts/custom-settle.ts";
+import { classifyPushFailure, DEVNET_GENESIS_HASH } from "../scripts/lib/oracle-feed.ts";
+import { acquireRunnerLease, runSerializedLane } from "../scripts/lib/lane.ts";
 import idl from "../target/idl/vsol.json" with { type: "json" };
 
 test("duplicate source timestamps are harmless and RPC URLs are redacted", () => {
@@ -37,7 +37,7 @@ test("runner lease rejects overlap and releases cleanly", async () => {
 
 test("runner lease is released by the OS after a process crash", async () => {
   const port = 49_000 + Math.floor(Math.random() * 1_000);
-  const moduleUrl = new URL("../scripts/custom-settle.ts", import.meta.url).href;
+  const moduleUrl = new URL("../scripts/lib/lane.ts", import.meta.url).href;
   const child = spawn(process.execPath, [
     "--import", "tsx",
     "--input-type=module",
@@ -56,7 +56,7 @@ test("runner lease is released by the OS after a process crash", async () => {
   await release();
 });
 
-test("a stalled symbol lane cannot starve another symbol's capture", async () => {
+test("a stalled lane cannot starve another lane (boundary/heartbeat/cleanup run independently)", async () => {
   let releaseStalled!: () => void;
   const stalledGate = new Promise<void>((resolve) => { releaseStalled = resolve; });
   let stopStalled = false;
