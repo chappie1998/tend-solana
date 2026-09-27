@@ -5,11 +5,23 @@ import { decodeSignedTransaction, getVsolConnection, inspectVsolFillTransaction,
 import { ensureDb, getDb } from "../../../../db";
 import { rfqQuotes, transactionSimulations } from "../../../../db/schema";
 import { boundedLogs, hashHex, resolveUserKey, safeJson, sameOrigin } from "../../../lib/session";
+import { enforceInMemoryRateLimit } from "../../../lib/in-memory-rate-limit";
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return Response.json({ error: "Cross-site transaction requests are not allowed." }, { status: 403 });
   const owner = await resolveUserKey(request);
   if (!owner) return Response.json({ error: "Sign in to submit transactions." }, { status: 401 });
+  // Best-effort burst dampener only -- see
+  // app/lib/in-memory-rate-limit.ts's doc comment. The signature/simulation
+  // checks below are what actually keep this route safe; this just keeps a
+  // scripted burst from one instance off the devnet RPC and the DB.
+  const rateLimit = enforceInMemoryRateLimit(request, "vsolSend", owner);
+  if (rateLimit.limited) {
+    return Response.json(
+      { error: "Too many transaction submissions. Wait a moment and try again." },
+      { status: 429, headers: { "Retry-After": String(rateLimit.retryAfterSeconds) } },
+    );
+  }
   await ensureDb();
   const input = await request.json().catch(() => null) as { transaction?: unknown; quoteId?: unknown; walletAddress?: unknown } | null;
   if (typeof input?.transaction !== "string" || typeof input.quoteId !== "string" || typeof input.walletAddress !== "string") {

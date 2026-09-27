@@ -11,13 +11,26 @@ import { LAMPORTS_PER_SOL, SystemProgram, Transaction, sendAndConfirmTransaction
 import { getVsolConnection, parsePublicKey, vsolFaucet } from "../../../lib/vsol-server";
 import { VSOL_SETTLEMENT_MINT } from "../../../lib/vsol";
 import { resolveUserKey, sameOrigin } from "../../../lib/session";
+import { enforceInMemoryRateLimit } from "../../../lib/in-memory-rate-limit";
 
 const TARGET_TOKENS = 25_000n * 1_000_000n;
 const TARGET_LAMPORTS = 20_000_000;
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return Response.json({ error: "Cross-site faucet requests are not allowed." }, { status: 403 });
-  if (!(await resolveUserKey(request))) return Response.json({ error: "Sign in to use the devnet faucet." }, { status: 401 });
+  const owner = await resolveUserKey(request);
+  if (!owner) return Response.json({ error: "Sign in to use the devnet faucet." }, { status: 401 });
+  // Best-effort burst dampener only -- mints real devnet SOL/tokens, the most
+  // directly costly route this file protects. See
+  // app/lib/in-memory-rate-limit.ts's doc comment for why this alone is not
+  // sufficient (per-instance, resets on redeploy, IP is spoofable).
+  const rateLimit = enforceInMemoryRateLimit(request, "faucet", owner);
+  if (rateLimit.limited) {
+    return Response.json(
+      { error: "Too many faucet requests. Wait a moment and try again." },
+      { status: 429, headers: { "Retry-After": String(rateLimit.retryAfterSeconds) } },
+    );
+  }
   const input = await request.json().catch(() => null) as { walletAddress?: unknown } | null;
   const wallet = parsePublicKey(input?.walletAddress);
   if (!wallet) return Response.json({ error: "Connect a valid Solana wallet first." }, { status: 422 });
