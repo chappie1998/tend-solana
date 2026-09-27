@@ -648,6 +648,7 @@
             ]
           },
           "relations": [
+            "pool_market",
             "position"
           ]
         },
@@ -655,6 +656,7 @@
           "name": "market",
           "relations": [
             "oracle",
+            "pool_market",
             "position"
           ]
         },
@@ -682,6 +684,10 @@
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "pool_market",
+          "writable": true
         },
         {
           "name": "position",
@@ -1048,6 +1054,7 @@
         },
         {
           "name": "pool_market",
+          "writable": true,
           "optional": true
         },
         {
@@ -1521,6 +1528,7 @@
         },
         {
           "name": "pool_market",
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -3351,6 +3359,10 @@
           ]
         },
         {
+          "name": "pool_market",
+          "writable": true
+        },
+        {
           "name": "nonce_record",
           "docs": [
             "Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety",
@@ -3792,6 +3804,17 @@
         },
         {
           "name": "pool_market",
+          "docs": [
+            "`init_if_needed` sugar -- see the handler's own doc comment for why",
+            "(that sugar's automatic `space == data_len()` equality check would",
+            "hard-reject every pre-existing, legacy 82-byte `LiquidityPoolMarket`",
+            "once the struct grew by `OpenPositionCount`'s 4 bytes). `seeds =`/",
+            "`bump` here still fully authenticates the address -- an account can",
+            "only ever exist at this exact PDA if THIS program created it (via",
+            "`invoke_signed` with these same seeds), or it doesn't exist yet",
+            "(owned by the System Program) -- the handler checks and handles",
+            "both cases explicitly."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -4203,6 +4226,10 @@
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "pool_market",
+          "writable": true
         },
         {
           "name": "nonce_record",
@@ -6553,6 +6580,14 @@
           {
             "name": "enabled",
             "type": "bool"
+          },
+          {
+            "name": "open_positions",
+            "type": {
+              "defined": {
+                "name": "OpenPositionCount"
+              }
+            }
           }
         ]
       }
@@ -6886,6 +6921,13 @@
             "type": "u64"
           }
         ]
+      }
+    },
+    {
+      "name": "OpenPositionCount",
+      "type": {
+        "kind": "type",
+        "alias": "u32"
       }
     },
     {

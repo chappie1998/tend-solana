@@ -654,6 +654,7 @@ export type Vsol = {
             ]
           },
           "relations": [
+            "poolMarket",
             "position"
           ]
         },
@@ -661,6 +662,7 @@ export type Vsol = {
           "name": "market",
           "relations": [
             "oracle",
+            "poolMarket",
             "position"
           ]
         },
@@ -688,6 +690,10 @@ export type Vsol = {
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "poolMarket",
+          "writable": true
         },
         {
           "name": "position",
@@ -1054,6 +1060,7 @@ export type Vsol = {
         },
         {
           "name": "poolMarket",
+          "writable": true,
           "optional": true
         },
         {
@@ -1527,6 +1534,7 @@ export type Vsol = {
         },
         {
           "name": "poolMarket",
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -3357,6 +3365,10 @@ export type Vsol = {
           ]
         },
         {
+          "name": "poolMarket",
+          "writable": true
+        },
+        {
           "name": "nonceRecord",
           "docs": [
             "Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety",
@@ -3798,6 +3810,17 @@ export type Vsol = {
         },
         {
           "name": "poolMarket",
+          "docs": [
+            "`init_if_needed` sugar -- see the handler's own doc comment for why",
+            "(that sugar's automatic `space == data_len()` equality check would",
+            "hard-reject every pre-existing, legacy 82-byte `LiquidityPoolMarket`",
+            "once the struct grew by `OpenPositionCount`'s 4 bytes). `seeds =`/",
+            "`bump` here still fully authenticates the address -- an account can",
+            "only ever exist at this exact PDA if THIS program created it (via",
+            "`invoke_signed` with these same seeds), or it doesn't exist yet",
+            "(owned by the System Program) -- the handler checks and handles",
+            "both cases explicitly."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -4209,6 +4232,10 @@ export type Vsol = {
           "relations": [
             "market"
           ]
+        },
+        {
+          "name": "poolMarket",
+          "writable": true
         },
         {
           "name": "nonceRecord",
@@ -6559,6 +6586,14 @@ export type Vsol = {
           {
             "name": "enabled",
             "type": "bool"
+          },
+          {
+            "name": "openPositions",
+            "type": {
+              "defined": {
+                "name": "openPositionCount"
+              }
+            }
           }
         ]
       }
@@ -6892,6 +6927,13 @@ export type Vsol = {
             "type": "u64"
           }
         ]
+      }
+    },
+    {
+      "name": "openPositionCount",
+      "type": {
+        "kind": "type",
+        "alias": "u32"
       }
     },
     {

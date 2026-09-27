@@ -23,6 +23,12 @@ custom-panic = []
 [dependencies]
 anchor-lang = { version = "=1.0.2", features = ["init-if-needed"] }
 anchor-spl = { version = "=1.0.2", features = ["token"] }
+# Pinned to the exact version anchor-lang 1.0.2 already resolves (see
+# Cargo.lock): needed directly (not just transitively) so
+# `OpenPositionCount`'s manual `AnchorSerialize`/`AnchorDeserialize` impls in
+# lib.rs can name `borsh::io::{Read, Write, ...}`, the same io types those
+# traits' own method signatures require.
+borsh = "=1.8.0"
 solana-ed25519-program = "=3.0.0"
 solana-instructions-sysvar = "=3.0.1"
 solana-sdk-ids = "=3.1.0"

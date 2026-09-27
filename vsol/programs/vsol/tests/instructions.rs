@@ -1953,6 +1953,7 @@ fn pooled_lifecycle_smoke_create_market_through_settle_pool_position() {
         pool: pool.pool,
         market: market.market,
         oracle: market.oracle,
+        pool_market,
         nonce_record: pool_nonce_record,
         position: pool_position,
         position_vault: pool_position_vault,
@@ -2128,6 +2129,7 @@ fn refund_pool_position_returns_funds_when_settlement_window_closes_unfinalized(
         pool: pool.pool,
         market: market.market,
         oracle: market.oracle,
+        pool_market,
         nonce_record: pool_nonce_record,
         position: pool_position,
         position_vault: pool_position_vault,
@@ -2256,6 +2258,7 @@ fn settle_pool_position_closes_nonce_and_original_quote_cannot_replay() {
         pool: pool.pool,
         market: market.market,
         oracle: market.oracle,
+        pool_market,
         nonce_record: pool_nonce_record,
         position: pool_position,
         position_vault: pool_position_vault,
@@ -2370,6 +2373,7 @@ fn refund_pool_position_closes_nonce_and_original_quote_cannot_replay() {
         pool: pool.pool,
         market: market.market,
         oracle: market.oracle,
+        pool_market,
         nonce_record: pool_nonce_record,
         position: pool_position,
         position_vault: pool_position_vault,
@@ -2702,6 +2706,7 @@ fn pool_total_assets_ledger_matches_token_balance_across_a_full_lifecycle_and_su
         pool: pool.pool,
         market: market_settle.market,
         oracle: market_settle.oracle,
+        pool_market: pool_market_settle,
         nonce_record: nonce_record_a,
         position: position_a,
         position_vault: position_vault_a,
@@ -2787,6 +2792,7 @@ fn pool_total_assets_ledger_matches_token_balance_across_a_full_lifecycle_and_su
         pool: pool.pool,
         market: market_refund.market,
         oracle: market_refund.oracle,
+        pool_market: pool_market_refund,
         nonce_record: nonce_record_b,
         position: position_b,
         position_vault: position_vault_b,
@@ -2968,6 +2974,7 @@ fn donation_does_not_change_a_later_depositors_share_price() {
 struct OpenPoolPositionFixture {
     pool: PoolFixture,
     market: MarketFixture,
+    pool_market: Pubkey,
     buyer: Keypair,
     quote: vsol::PoolQuoteArgs,
     position: Pubkey,
@@ -3047,6 +3054,7 @@ fn setup_open_pool_position(harness: &mut Harness, fixture: &ConfigFixture, nonc
     OpenPoolPositionFixture {
         pool,
         market,
+        pool_market,
         buyer,
         quote,
         position,
@@ -3074,6 +3082,7 @@ fn close_accounts_for(
         pool: opened.pool.pool,
         market: opened.market.market,
         oracle: opened.market.oracle,
+        pool_market: opened.pool_market,
         position: opened.position,
         position_vault: opened.position_vault,
         settlement_mint: opened.market.settlement_mint,
@@ -3203,6 +3212,7 @@ fn close_pool_position_rejects_a_quote_signed_for_a_different_position() {
             AccountMeta::new(opened.pool.pool, false),
             AccountMeta::new_readonly(opened.market.market, false),
             AccountMeta::new_readonly(opened.market.oracle, false),
+            AccountMeta::new(opened.pool_market, false),
             AccountMeta::new(opened.position, false),
             AccountMeta::new(opened.position_vault, false),
             AccountMeta::new_readonly(opened.market.settlement_mint, false),
@@ -5768,4 +5778,307 @@ fn redeem_unresolved_rejects_a_token_account_belonging_to_neither_mint() {
         &[],
     );
     assert_vsol_error(&failed, vsol::VsolError::InvalidConditionalTokenMint);
+}
+
+// =====================================================================
+// LiquidityPoolMarket::open_positions (OpenPositionCount): a per-market
+// counter that lets `close_settled_market` refuse to close a market while
+// a pool-backed position against it is still open. Legacy-tolerant: a
+// pre-existing 82-byte account (no trailing counter bytes at all) reads as
+// the `UNKNOWN` sentinel and re-serializes at exactly 82 bytes forever; a
+// newly created binding gets a real counter starting at 0.
+// =====================================================================
+
+#[test]
+fn legacy_pool_market_account_deserializes_to_unknown_and_round_trips_at_82_bytes() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let creator = harness.funded_keypair();
+    let market = setup_market(&mut harness, &fixture, &creator, pool.settlement_mint);
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+
+    // Simulate a pre-upgrade, 82-byte LiquidityPoolMarket: discriminator(8)
+    // + bump(1) + pool(32) + market(32) + last_trade_at(8) + enabled(1),
+    // with NO trailing bytes for the (not-yet-existing) counter field.
+    let mut legacy_data = Vec::with_capacity(82);
+    legacy_data.extend_from_slice(<vsol::LiquidityPoolMarket as anchor_lang::Discriminator>::DISCRIMINATOR);
+    legacy_data.push(255); // an arbitrary stored bump; never re-derived for an existing record
+    legacy_data.extend_from_slice(pool.pool.as_ref());
+    legacy_data.extend_from_slice(market.market.as_ref());
+    legacy_data.extend_from_slice(&(market.expiry - 30).to_le_bytes());
+    legacy_data.push(1); // enabled = true
+    assert_eq!(legacy_data.len(), 82);
+    harness.set_raw_account(pool_market, vsol::ID, legacy_data);
+
+    let loaded: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert_eq!(loaded.pool, pool.pool);
+    assert_eq!(loaded.market, market.market);
+    assert!(loaded.enabled);
+    assert_eq!(loaded.open_positions, vsol::OpenPositionCount::UNKNOWN);
+    assert_eq!(harness.get_account(&pool_market).data.len(), 82);
+
+    // Round-trips through a REAL instruction call (the mutate-existing
+    // path): disabling is allowed here since the pool has zero positions.
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: false,
+            },
+        )],
+        &[],
+    );
+    assert_eq!(harness.get_account(&pool_market).data.len(), 82);
+    let reloaded: vsol::LiquidityPoolMarket = harness.read_account(&pool_market);
+    assert_eq!(reloaded.open_positions, vsol::OpenPositionCount::UNKNOWN);
+    assert!(!reloaded.enabled);
+}
+
+#[test]
+fn pool_market_open_positions_counts_up_on_fill_and_down_on_settle() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    let after_fill: vsol::LiquidityPoolMarket = harness.read_account(&opened.pool_market);
+    assert_eq!(
+        after_fill.open_positions,
+        vsol::OpenPositionCount::ZERO.checked_increment().unwrap()
+    );
+
+    harness.warp_to_timestamp(opened.market.expiry);
+    finalize_oracle(&mut harness, &opened.market, 200 * ONE_TOKEN);
+    let buyer_destination =
+        harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let nonce_record = pool_nonce_pda(&opened.pool.pool, &opened.pool.quote_authority.pubkey(), opened.quote.nonce);
+    let settle_accounts = SettlePoolPositionAccounts {
+        cranker: opened.buyer.pubkey(),
+        config: fixture.config,
+        pool: opened.pool.pool,
+        market: opened.market.market,
+        oracle: opened.market.oracle,
+        pool_market: opened.pool_market,
+        nonce_record,
+        position: opened.position,
+        position_vault: opened.position_vault,
+        settlement_mint: opened.market.settlement_mint,
+        buyer_destination,
+        pool_token: opened.pool.pool_token,
+        treasury_destination,
+        rent_recipient: opened.buyer.pubkey(),
+    };
+    harness.send_ok(&opened.buyer, &[settle_pool_position_ix(&settle_accounts)], &[]);
+
+    let after_settle: vsol::LiquidityPoolMarket = harness.read_account(&opened.pool_market);
+    assert_eq!(after_settle.open_positions, vsol::OpenPositionCount::ZERO);
+}
+
+#[test]
+fn pool_market_open_positions_counts_down_on_refund() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    assert_eq!(
+        harness.read_account::<vsol::LiquidityPoolMarket>(&opened.pool_market).open_positions,
+        vsol::OpenPositionCount::ZERO.checked_increment().unwrap()
+    );
+
+    let deadline = opened.market.expiry
+        + i64::from(opened.market.observation_window_seconds)
+        + i64::from(opened.market.settlement_grace_seconds)
+        + 1;
+    harness.warp_to_timestamp(deadline);
+
+    let buyer_destination =
+        harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let nonce_record = pool_nonce_pda(&opened.pool.pool, &opened.pool.quote_authority.pubkey(), opened.quote.nonce);
+    let refund_accounts = RefundPoolPositionAccounts {
+        cranker: opened.buyer.pubkey(),
+        config: fixture.config,
+        pool: opened.pool.pool,
+        market: opened.market.market,
+        oracle: opened.market.oracle,
+        pool_market: opened.pool_market,
+        nonce_record,
+        position: opened.position,
+        position_vault: opened.position_vault,
+        settlement_mint: opened.market.settlement_mint,
+        buyer_destination,
+        pool_token: opened.pool.pool_token,
+        rent_recipient: opened.buyer.pubkey(),
+    };
+    harness.send_ok(&opened.buyer, &[refund_pool_position_ix(&refund_accounts)], &[]);
+
+    let after_refund: vsol::LiquidityPoolMarket = harness.read_account(&opened.pool_market);
+    assert_eq!(after_refund.open_positions, vsol::OpenPositionCount::ZERO);
+}
+
+#[test]
+fn pool_market_open_positions_counts_down_on_early_close() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    assert_eq!(
+        harness.read_account::<vsol::LiquidityPoolMarket>(&opened.pool_market).open_positions,
+        vsol::OpenPositionCount::ZERO.checked_increment().unwrap()
+    );
+
+    let buyer_destination =
+        harness.create_token_account(&opened.buyer, &opened.market.settlement_mint, &opened.buyer.pubkey());
+    let treasury_destination =
+        harness.create_token_account(&opened.pool.manager, &opened.market.settlement_mint, &fixture.treasury_owner);
+    let close_accounts = close_accounts_for(&fixture, &opened, buyer_destination, treasury_destination);
+    let args = default_buyback_args(harness.now() + 20, 3_000_000, 2_900_000);
+    let ixs = close_pool_position_ixs(&opened.pool.quote_authority, &close_accounts, &fixture.domain_separator, 1, args);
+    harness.send_ok(&opened.buyer, &ixs, &[]);
+
+    let after_close: vsol::LiquidityPoolMarket = harness.read_account(&opened.pool_market);
+    assert_eq!(after_close.open_positions, vsol::OpenPositionCount::ZERO);
+}
+
+#[test]
+fn close_settled_market_rejects_pool_market_with_open_positions_above_zero() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let opened = setup_open_pool_position(&mut harness, &fixture, 1);
+
+    // Directly force `enabled = false` (bypassing `set_liquidity_pool_market`,
+    // which would otherwise refuse this while the pool has an open position)
+    // so the test isolates the `open_positions` check specifically, proving
+    // it is a real, independent guard and not just a restatement of
+    // `!enabled`.
+    let mut pool_market_state: vsol::LiquidityPoolMarket = harness.read_account(&opened.pool_market);
+    assert_eq!(
+        pool_market_state.open_positions,
+        vsol::OpenPositionCount::ZERO.checked_increment().unwrap()
+    );
+    pool_market_state.enabled = false;
+    harness.write_account(opened.pool_market, &pool_market_state);
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&opened.market) + 1);
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: opened.pool.manager.pubkey(),
+        config: fixture.config,
+        market: opened.market.market,
+        oracle: opened.market.oracle,
+        collateral_vault: complete_set_vault_pda(&opened.market.market),
+        pool: Some(opened.pool.pool),
+        pool_market: Some(opened.pool_market),
+        rent_recipient: opened.pool.manager.pubkey(),
+    };
+    let failed = harness.send_err(&opened.pool.manager, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+    assert!(harness.svm.get_account(&opened.market.market).map(|a| a.lamports).unwrap_or(0) > 0);
+    assert!(harness.svm.get_account(&opened.pool_market).map(|a| a.lamports).unwrap_or(0) > 0);
+}
+
+#[test]
+fn close_settled_market_rejects_pool_market_reading_unknown() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let creator = harness.funded_keypair();
+    let market = setup_market(&mut harness, &fixture, &creator, pool.settlement_mint);
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+
+    let mut legacy_data = Vec::with_capacity(82);
+    legacy_data.extend_from_slice(<vsol::LiquidityPoolMarket as anchor_lang::Discriminator>::DISCRIMINATOR);
+    legacy_data.push(255);
+    legacy_data.extend_from_slice(pool.pool.as_ref());
+    legacy_data.extend_from_slice(market.market.as_ref());
+    legacy_data.extend_from_slice(&(market.expiry - 30).to_le_bytes());
+    legacy_data.push(0); // enabled = false
+    harness.set_raw_account(pool_market, vsol::ID, legacy_data);
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
+        pool: Some(pool.pool),
+        pool_market: Some(pool_market),
+        rent_recipient: creator.pubkey(),
+    };
+    let failed = harness.send_err(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+    assert_vsol_error(&failed, vsol::VsolError::MarketNotCloseable);
+    // Rent is stuck (accepted -- see `close_settled_market`'s own comment),
+    // but nothing was destroyed by the attempt.
+    assert!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0) > 0);
+    assert!(harness.svm.get_account(&pool_market).map(|a| a.lamports).unwrap_or(0) > 0);
+}
+
+#[test]
+fn close_settled_market_succeeds_at_zero_open_positions_and_reclaims_all_three_accounts() {
+    let mut harness = Harness::new();
+    let fixture = setup_config(&mut harness);
+    let pool = setup_pool(&mut harness, &fixture);
+    let creator = harness.funded_keypair();
+    let market = setup_market(&mut harness, &fixture, &creator, pool.settlement_mint);
+
+    let pool_market = pool_market_pda(&pool.pool, &market.market);
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: true,
+            },
+        )],
+        &[],
+    );
+    assert_eq!(
+        harness.read_account::<vsol::LiquidityPoolMarket>(&pool_market).open_positions,
+        vsol::OpenPositionCount::ZERO
+    );
+    // Disable: allowed, since the pool has never had any position at all.
+    harness.send_ok(
+        &pool.manager,
+        &[set_liquidity_pool_market_ix(
+            &pool.manager.pubkey(),
+            &fixture.config,
+            &pool.pool,
+            &market.market,
+            &pool_market,
+            vsol::SetLiquidityPoolMarketArgs {
+                last_trade_at: market.expiry - 30,
+                enabled: false,
+            },
+        )],
+        &[],
+    );
+
+    harness.warp_to_timestamp(market_cleanup_deadline(&market) + 1);
+    let close_accounts = CloseSettledMarketAccounts {
+        authority: creator.pubkey(),
+        config: fixture.config,
+        market: market.market,
+        oracle: market.oracle,
+        collateral_vault: complete_set_vault_pda(&market.market),
+        pool: Some(pool.pool),
+        pool_market: Some(pool_market),
+        rent_recipient: creator.pubkey(),
+    };
+    harness.send_ok(&creator, &[close_settled_market_ix(&close_accounts)], &[]);
+
+    assert_eq!(harness.svm.get_account(&market.market).map(|a| a.lamports).unwrap_or(0), 0);
+    assert_eq!(harness.svm.get_account(&market.oracle).map(|a| a.lamports).unwrap_or(0), 0);
+    assert_eq!(harness.svm.get_account(&pool_market).map(|a| a.lamports).unwrap_or(0), 0);
 }

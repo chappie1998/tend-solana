@@ -1056,20 +1056,20 @@ pub mod vsol {
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
 
-        // `pool_market` is `init_if_needed`: this call either creates a brand
-        // new authorization record or mutates one that already exists.
-        // Anchor zero-initializes an account on creation, and `pool` is only
-        // ever written to a non-default value right below in this same
-        // instruction (it is never left at `Pubkey::default()` once set), so
-        // "pool_market.pool is still the zero pubkey" is a sound signal that
-        // this account did not exist before this instruction ran. We check
-        // it before making any writes. We deliberately do not use
-        // `last_trade_at == 0` for this: `enabled == false` is a legitimate,
-        // reachable state for `last_trade_at` to be left at (or reset to)
-        // zero, so that field can't distinguish "never created" from
-        // "created and since disabled".
-        let is_first_time_enable =
-            ctx.accounts.pool_market.pool == Pubkey::default() && args.enabled;
+        // `pool_market` is created or mutated BY HAND here (not via Anchor's
+        // `init_if_needed` sugar) -- see `SetLiquidityPoolMarket::pool_market`'s
+        // own doc comment for why: that sugar's automatic
+        // `space == data_len()` equality check would hard-reject every
+        // pre-existing, legacy 82-byte `LiquidityPoolMarket` account the
+        // moment the struct grew by `OpenPositionCount`'s 4 bytes, breaking
+        // this instruction for every binding that already existed before
+        // this upgrade. A brand new (never-created) PDA is still owned by
+        // the System Program, which is what distinguishes the two cases --
+        // this is the same signal Anchor's own `init_if_needed` codegen uses
+        // internally, just applied by hand.
+        let pool_market_info = ctx.accounts.pool_market.to_account_info();
+        let needs_creation = pool_market_info.owner == &System::id();
+        let is_first_time_enable = needs_creation && args.enabled;
 
         // Authorizing a brand-new series is additive: it cannot change the
         // risk of any position that already exists, because per-position
@@ -1098,17 +1098,66 @@ pub mod vsol {
             );
         }
 
-        let pool_market = &mut ctx.accounts.pool_market;
-        pool_market.bump = ctx.bumps.pool_market;
-        pool_market.pool = ctx.accounts.pool.key();
-        pool_market.market = ctx.accounts.market.key();
-        pool_market.last_trade_at = args.last_trade_at;
-        pool_market.enabled = args.enabled;
+        let bump = ctx.bumps.pool_market;
+        let pool_key = ctx.accounts.pool.key();
+        let market_key = ctx.accounts.market.key();
+
+        if needs_creation {
+            let space = 8 + LiquidityPoolMarket::INIT_SPACE;
+            let lamports = Rent::get()?.minimum_balance(space);
+            let signer_seeds: &[&[u8]] =
+                &[POOL_MARKET_SEED, pool_key.as_ref(), market_key.as_ref(), &[bump]];
+            anchor_lang::system_program::create_account(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::CreateAccount {
+                        from: ctx.accounts.manager.to_account_info(),
+                        to: pool_market_info.clone(),
+                    },
+                )
+                .with_signer(&[signer_seeds]),
+                lamports,
+                space as u64,
+                &crate::ID,
+            )?;
+            let fresh = LiquidityPoolMarket {
+                bump,
+                pool: pool_key,
+                market: market_key,
+                last_trade_at: args.last_trade_at,
+                enabled: args.enabled,
+                open_positions: OpenPositionCount::ZERO,
+            };
+            let mut data = pool_market_info.try_borrow_mut_data()?;
+            let mut writer = anchor_lang::__private::BpfWriter::new(&mut data[..]);
+            fresh.try_serialize(&mut writer)?;
+        } else {
+            // Owned by us already (the only two possible owners of this
+            // exact PDA are the System Program, handled above, and this
+            // program -- see the doc comment above).
+            require_keys_eq!(
+                *pool_market_info.owner,
+                crate::ID,
+                VsolError::InvalidPoolMarket
+            );
+            let mut existing: LiquidityPoolMarket = {
+                let data = pool_market_info.try_borrow_data()?;
+                LiquidityPoolMarket::try_deserialize(&mut &data[..])?
+            };
+            require_keys_eq!(existing.pool, pool_key, VsolError::InvalidPoolMarket);
+            require_keys_eq!(existing.market, market_key, VsolError::InvalidPoolMarket);
+            existing.last_trade_at = args.last_trade_at;
+            existing.enabled = args.enabled;
+            let mut data = pool_market_info.try_borrow_mut_data()?;
+            let mut writer = anchor_lang::__private::BpfWriter::new(&mut data[..]);
+            existing.try_serialize(&mut writer)?;
+        }
+
         emit!(LiquidityPoolMarketUpdated {
-            pool: pool_market.pool,
-            market: pool_market.market,
-            last_trade_at: pool_market.last_trade_at,
-            enabled: pool_market.enabled,
+            pool: pool_key,
+            market: market_key,
+            last_trade_at: args.last_trade_at,
+            enabled: args.enabled,
         });
         Ok(())
     }
@@ -1617,6 +1666,11 @@ pub mod vsol {
             .total_assets
             .checked_sub(quote.max_payout)
             .ok_or(VsolError::MathOverflow)?;
+        // Per-market counter used by `close_settled_market` to refuse
+        // closing this market while it still has an open pool position --
+        // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_increment()?;
         emit!(PoolQuoteFilled {
             position: position.key(),
             pool: pool_key,
@@ -1634,6 +1688,19 @@ pub mod vsol {
         let position = &ctx.accounts.position;
         let market = &ctx.accounts.market;
         let oracle = &ctx.accounts.oracle;
+        // See `SettlePoolPosition::pool_market`'s doc comment: this replaces
+        // a `has_one` constraint that would have exceeded the BPF stack
+        // frame limit in `try_accounts`.
+        require_keys_eq!(
+            ctx.accounts.pool_market.pool,
+            ctx.accounts.pool.key(),
+            VsolError::InvalidPoolMarket
+        );
+        require_keys_eq!(
+            ctx.accounts.pool_market.market,
+            market.key(),
+            VsolError::InvalidPoolMarket
+        );
         require!(
             position.status == PositionStatus::Open as u8,
             VsolError::PositionNotOpen
@@ -1697,6 +1764,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         ctx.accounts.pool.cumulative_premium = ctx
             .accounts
             .pool
@@ -1782,6 +1851,19 @@ pub mod vsol {
         let now = Clock::get()?.unix_timestamp;
         let position = &ctx.accounts.position;
         let market = &ctx.accounts.market;
+        // See `SettlePoolPosition::pool_market`'s doc comment: this replaces
+        // a `has_one` constraint that would have exceeded the BPF stack
+        // frame limit in `try_accounts`.
+        require_keys_eq!(
+            ctx.accounts.pool_market.pool,
+            ctx.accounts.pool.key(),
+            VsolError::InvalidPoolMarket
+        );
+        require_keys_eq!(
+            ctx.accounts.pool_market.market,
+            market.key(),
+            VsolError::InvalidPoolMarket
+        );
         require!(
             position.status == PositionStatus::Open as u8,
             VsolError::PositionNotOpen
@@ -1816,6 +1898,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         // `position.max_payout` is what actually lands back in `pool_token`
         // below (the premium goes to the buyer, not the pool) -- see
         // `total_assets`'s doc comment on `LiquidityPool`.
@@ -1968,6 +2052,8 @@ pub mod vsol {
             .open_positions
             .checked_sub(1)
             .ok_or(VsolError::MathOverflow)?;
+        ctx.accounts.pool_market.open_positions =
+            ctx.accounts.pool_market.open_positions.checked_decrement()?;
         // `pool_amount` is what actually lands back in `pool_token` below --
         // see `total_assets`'s doc comment on `LiquidityPool`.
         ctx.accounts.pool.total_assets = ctx
@@ -2177,9 +2263,30 @@ pub mod vsol {
                 require_keys_eq!(pool_market.pool, pool.key(), VsolError::InvalidPoolMarket);
                 require_keys_eq!(pool_market.market, market.key(), VsolError::InvalidPoolMarket);
                 require!(!pool_market.enabled, VsolError::MarketNotCloseable);
+                // Direct, robust invariant on top of the `!enabled` check
+                // above -- see `OpenPositionCount`'s own doc comment on
+                // `LiquidityPoolMarket`. A legacy (pre-upgrade) binding reads
+                // `UNKNOWN` here and can therefore NEVER satisfy this, so it
+                // can never be closed on chain going forward: only ITS rent
+                // is stuck forever, never any position's escrowed funds
+                // (those live in independent per-position vaults, always
+                // settleable or refundable on their own regardless of
+                // whether the market itself is ever closed).
+                require!(
+                    pool_market.open_positions == OpenPositionCount::ZERO,
+                    VsolError::MarketNotCloseable
+                );
             }
             (None, None) => {}
             _ => return err!(VsolError::InvalidPoolMarket),
+        }
+
+        // Reclaim the pool authorization record's rent too, to the same
+        // recipient as the market/oracle above, once it has passed every
+        // check in the match above. A caller who omitted both accounts
+        // (the `(None, None)` arm) has nothing here to close.
+        if let Some(pool_market) = ctx.accounts.pool_market.as_ref() {
+            pool_market.close(ctx.accounts.rent_recipient.to_account_info())?;
         }
 
         emit!(MarketClosed {
@@ -3104,8 +3211,18 @@ pub struct SetLiquidityPoolMarket<'info> {
     pub pool: Account<'info, LiquidityPool>,
     #[account(has_one = config @ VsolError::InvalidMarket)]
     pub market: Account<'info, Market>,
-    #[account(init_if_needed, payer = manager, space = 8 + LiquidityPoolMarket::INIT_SPACE, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump)]
-    pub pool_market: Account<'info, LiquidityPoolMarket>,
+    /// CHECK: created or loaded BY HAND in the handler, not via Anchor's
+    /// `init_if_needed` sugar -- see the handler's own doc comment for why
+    /// (that sugar's automatic `space == data_len()` equality check would
+    /// hard-reject every pre-existing, legacy 82-byte `LiquidityPoolMarket`
+    /// once the struct grew by `OpenPositionCount`'s 4 bytes). `seeds =`/
+    /// `bump` here still fully authenticates the address -- an account can
+    /// only ever exist at this exact PDA if THIS program created it (via
+    /// `invoke_signed` with these same seeds), or it doesn't exist yet
+    /// (owned by the System Program) -- the handler checks and handles
+    /// both cases explicitly.
+    #[account(mut, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump)]
+    pub pool_market: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -3187,7 +3304,9 @@ pub struct FillPoolQuote<'info> {
     pub pool: Box<Account<'info, LiquidityPool>>,
     #[account(has_one = config @ VsolError::InvalidMarket, has_one = settlement_mint @ VsolError::InvalidMarket)]
     pub market: Box<Account<'info, Market>>,
-    #[account(seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump = pool_market.bump, has_one = pool, has_one = market)]
+    // `mut`: `fill_pool_quote` increments `open_positions` on this record --
+    // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    #[account(mut, seeds = [POOL_MARKET_SEED, pool.key().as_ref(), market.key().as_ref()], bump = pool_market.bump, has_one = pool, has_one = market)]
     pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     pub settlement_mint: Box<Account<'info, Mint>>,
     #[account(mut, seeds = [POOL_TOKEN_SEED, pool.key().as_ref()], bump = pool.token_bump, token::mint = settlement_mint, token::authority = pool)]
@@ -3220,6 +3339,24 @@ pub struct SettlePoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
+    // `mut`: settlement decrements `open_positions` on this record -- see
+    // `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =`/`has_one =` here (unlike
+    // `FillPoolQuote::pool_market`): this instruction's `try_accounts` is
+    // right at the BPF stack frame limit, and each of those constraints'
+    // codegen was enough to push it over (measured: 120 bytes over with
+    // `seeds =`/`bump =`; still 8 bytes over with only `has_one =` left).
+    // Verified instead by `require_keys_eq!` first thing in the handler body
+    // (a separate function, so it does not count against `try_accounts`'s
+    // own frame). Safe for the same reason `has_one` would have been: the
+    // only instruction that can ever create an account with this
+    // discriminator is `set_liquidity_pool_market`, always at the canonical
+    // `[POOL_MARKET_SEED, pool, market]` PDA, so an account that
+    // deserializes AND matches `pool`/`market` is necessarily that canonical
+    // account for THIS exact (pool, market) pair.
+    #[account(mut)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     /// Closed here (rent to `rent_recipient`, i.e. the buyer -- see that
     /// field's own doc comment) rather than left to rot forever. Replay
     /// safety: `fill_pool_quote` only accepts a quote while
@@ -3266,6 +3403,16 @@ pub struct RefundPoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
+    // `mut`: refund decrements `open_positions` on this record -- see
+    // `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =`/`has_one =` -- see
+    // `SettlePoolPosition::pool_market`'s own comment for why the equality
+    // check is instead a manual `require_keys_eq!` in the handler body, and
+    // why that is both safe and required to stay under the BPF stack frame
+    // limit.
+    #[account(mut)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     /// Closed here (rent to `rent_recipient`, i.e. the buyer). Replay safety
     /// argument is identical to `SettlePoolPosition::nonce_record`'s own doc
     /// comment: this instruction also only runs once `now >= market.expiry`
@@ -3319,6 +3466,15 @@ pub struct ClosePoolPosition<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(seeds = [ORACLE_SEED, market.key().as_ref()], bump = oracle.bump, has_one = market @ VsolError::InvalidOracle)]
     pub oracle: Box<Account<'info, SettlementOracle>>,
+    // `mut`: an early close also decrements `open_positions` on this record --
+    // see `OpenPositionCount`'s doc comment on `LiquidityPoolMarket`.
+    //
+    // No `seeds =`/`bump =` -- see `SettlePoolPosition::pool_market`'s own
+    // comment for why it is both unnecessary (safety is fully carried by
+    // `has_one = pool, has_one = market` given the discriminator argument
+    // there) and required to stay under the BPF stack frame limit.
+    #[account(mut, has_one = pool, has_one = market)]
+    pub pool_market: Box<Account<'info, LiquidityPoolMarket>>,
     #[account(mut, close = rent_recipient, seeds = [POOL_POSITION_SEED, position.nonce_record.as_ref()], bump = position.bump, has_one = pool @ VsolError::InvalidPosition, has_one = market @ VsolError::InvalidPosition, has_one = settlement_mint @ VsolError::InvalidPosition, constraint = position.buyer == buyer.key() @ VsolError::Unauthorized)]
     pub position: Box<Account<'info, PoolPosition>>,
     #[account(mut, seeds = [POOL_POSITION_VAULT_SEED, position.key().as_ref()], bump = position.vault_bump, token::mint = settlement_mint, token::authority = position)]
@@ -3344,10 +3500,30 @@ pub struct ClosePoolPosition<'info> {
 ///
 /// `pool`/`pool_market` are optional and must be supplied together (both
 /// `Some` or both `None`): they let the caller demonstrate that a specific
-/// pool authorization for this market has been disabled, but omitting them
-/// is accepted too (see point 3/5 of the safety argument -- this cannot be
-/// made a hard on-chain requirement because positions/authorizations are not
-/// cheaply enumerable from the market alone).
+/// pool authorization for this market carries zero open positions, but
+/// omitting them is still accepted (see point 3/5 of the safety argument).
+///
+/// DEVIATION from an unconditional "always require pool/pool_market" design:
+/// making these two accounts strictly mandatory (no `(None, None)` path at
+/// all) was considered and rejected. Pools are permissionless and not
+/// indexed by market (any pool's manager may call `set_liquidity_pool_market`
+/// against any market whose settlement mint matches), so there is no cheap
+/// on-chain way to enumerate "every pool ever authorized against this
+/// market" -- the exact same unenumerability point 3 already accepts for
+/// individual positions. Forcing a mandatory account here would not close
+/// that gap (a caller could still trivially satisfy "a valid, idle
+/// pool_market" by authorizing and immediately disabling a brand-new,
+/// never-traded pool of their own -- exactly as cheap as omitting the
+/// accounts today), while permanently breaking the legitimate, already-
+/// supported "this market never had a pool involved at all" lifecycle. What
+/// actually was a fixable, real bug -- and is fixed below -- is that the
+/// check performed WHEN a pool/pool_market pair IS supplied was too weak
+/// (only `!enabled`, not the market's actual open-position count); an
+/// enabled-but-unchecked or a `(None, None)`-omitted call could otherwise
+/// close a market whose pool genuinely still had funds locked in an open
+/// position. `open_positions == 0` (backed by `OpenPositionCount`, not just
+/// the `enabled` flag) is now a hard, direct requirement whenever the pair
+/// is supplied.
 #[derive(Accounts)]
 pub struct CloseSettledMarket<'info> {
     #[account(
@@ -3401,6 +3577,10 @@ pub struct CloseSettledMarket<'info> {
     #[account(seeds = [COMPLETE_SET_VAULT_SEED, market.key().as_ref()], bump)]
     pub collateral_vault: UncheckedAccount<'info>,
     pub pool: Option<Box<Account<'info, LiquidityPool>>>,
+    // `mut`: when supplied, the handler closes this record too (rent to
+    // `rent_recipient`) once it has proven `open_positions == 0` -- see
+    // `close_settled_market`'s own comment.
+    #[account(mut)]
     pub pool_market: Option<Box<Account<'info, LiquidityPoolMarket>>>,
     /// CHECK: Receives the market's and oracle's reclaimed rent. Address-
     /// constrained to the market's own creator so rent can never be
@@ -3916,6 +4096,139 @@ pub struct LiquidityProvider {
     pub total_withdrawn: u64,
 }
 
+/// A per-`LiquidityPoolMarket` counter of that binding's own currently-open
+/// `PoolPosition`s. `close_settled_market` uses it to refuse closing a
+/// market while a pool-backed position against it is still unsettled or
+/// unrefunded -- see that instruction's own doc comment for the full
+/// argument, and this field's doc comment on `LiquidityPoolMarket` for why
+/// it is a legacy-tolerant appended field rather than a plain `u32`.
+///
+/// Backward-compatible by construction with the pre-existing 82-byte
+/// `LiquidityPoolMarket` layout already live on devnet: this type's manual
+/// (de)serialization makes the field OPTIONAL on the wire, not fixed-width.
+///   * Deserialize: reads 4 little-endian bytes if the buffer still has
+///     them; if the buffer is already exhausted (a legacy 82-byte account,
+///     which has none), yields the sentinel `UNKNOWN` (`u32::MAX`) instead
+///     of erroring.
+///   * Serialize: writes NOTHING for `UNKNOWN`, and 4 bytes otherwise.
+/// A legacy account therefore deserializes to `UNKNOWN` and re-serializes
+/// back to exactly its original 82 bytes forever -- Anchor's `exit` writes
+/// back only as many bytes as `serialize` produces, never more or less. A
+/// newly created binding (`LiquidityPoolMarket::INIT_SPACE` now includes
+/// this field's 4-byte `Space` contribution, so `init_if_needed` always
+/// allocates 86 bytes for a brand new record) deserializes its
+/// zero-initialized trailing bytes as a real `0` and stays a real, tracked
+/// counter from then on -- see `set_liquidity_pool_market`'s handler, which
+/// deliberately never overwrites this field on an already-existing record.
+///
+/// `UNKNOWN` is a sentinel, not a valid count. `close_settled_market`
+/// requires the count to be exactly zero to close, so a legacy binding
+/// (which can only ever read `UNKNOWN`) can never satisfy that check: only
+/// ITS rent is permanently stuck, never any position's escrowed funds
+/// (those live in independent per-position vaults, always settleable or
+/// refundable on their own regardless of whether the market itself is ever
+/// closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenPositionCount(u32);
+
+impl OpenPositionCount {
+    pub const ZERO: OpenPositionCount = OpenPositionCount(0);
+    pub const UNKNOWN: OpenPositionCount = OpenPositionCount(u32::MAX);
+
+    pub fn is_unknown(self) -> bool {
+        self == Self::UNKNOWN
+    }
+
+    /// No-op on `UNKNOWN`: a legacy binding never tracks a real count, in
+    /// either direction.
+    pub fn checked_increment(self) -> Result<Self> {
+        if self.is_unknown() {
+            return Ok(self);
+        }
+        let next = self.0.checked_add(1).ok_or(VsolError::MathOverflow)?;
+        // Never let a real, growing count collide with the UNKNOWN sentinel.
+        require!(next != u32::MAX, VsolError::MathOverflow);
+        Ok(OpenPositionCount(next))
+    }
+
+    /// No-op on `UNKNOWN`: a legacy binding never tracks a real count, in
+    /// either direction.
+    pub fn checked_decrement(self) -> Result<Self> {
+        if self.is_unknown() {
+            return Ok(self);
+        }
+        let next = self.0.checked_sub(1).ok_or(VsolError::MathOverflow)?;
+        Ok(OpenPositionCount(next))
+    }
+}
+
+impl anchor_lang::Space for OpenPositionCount {
+    const INIT_SPACE: usize = 4;
+}
+
+impl AnchorSerialize for OpenPositionCount {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        if self.is_unknown() {
+            // Write nothing: a legacy 82-byte account must round-trip at
+            // exactly 82 bytes forever, never gaining these 4 bytes back.
+            Ok(())
+        } else {
+            writer.write_all(&self.0.to_le_bytes())
+        }
+    }
+}
+
+impl AnchorDeserialize for OpenPositionCount {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let mut buf = [0u8; 4];
+        let mut filled = 0usize;
+        while filled < 4 {
+            let n = reader.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        match filled {
+            // Buffer was already exhausted: a legacy account with no
+            // trailing bytes for this field at all.
+            0 => Ok(OpenPositionCount::UNKNOWN),
+            4 => Ok(OpenPositionCount(u32::from_le_bytes(buf))),
+            // Neither "nothing left" nor "a full 4 bytes": not a shape any
+            // real account layout (82 or 86 bytes) can produce. Fail closed
+            // rather than silently guessing.
+            _ => Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::UnexpectedEof,
+                "OpenPositionCount: truncated trailing bytes",
+            )),
+        }
+    }
+}
+
+// Only compiled during `anchor build`'s separate IDL-generation pass (the
+// `idl-build` feature). Anchor's `#[account]`/`InitSpace` macros require
+// every field type to implement `IdlBuild` under that pass; the default
+// (empty) impl would compile but silently drop the field from the
+// generated IDL, so a client could never see or decode `open_positions`.
+// Representing it as a plain type alias to `u32` is accurate: on the wire
+// it either IS a little-endian u32 (present) or entirely absent (a legacy
+// account) -- there is no richer shape to describe.
+#[cfg(feature = "idl-build")]
+impl anchor_lang::idl::build::IdlBuild for OpenPositionCount {
+    fn create_type() -> Option<anchor_lang::idl::types::IdlTypeDef> {
+        Some(anchor_lang::idl::types::IdlTypeDef {
+            name: "OpenPositionCount".to_string(),
+            docs: vec![],
+            serialization: anchor_lang::idl::types::IdlSerialization::default(),
+            repr: None,
+            generics: vec![],
+            ty: anchor_lang::idl::types::IdlTypeDefTy::Type {
+                alias: anchor_lang::idl::types::IdlType::U32,
+            },
+        })
+    }
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct LiquidityPoolMarket {
@@ -3924,6 +4237,11 @@ pub struct LiquidityPoolMarket {
     pub market: Pubkey,
     pub last_trade_at: i64,
     pub enabled: bool,
+    // Appended after launch: keep at the end so existing byte offsets stay
+    // valid. See `OpenPositionCount`'s own doc comment for the legacy-
+    // tolerant (de)serialization that keeps a pre-existing 82-byte account
+    // reading this as `UNKNOWN` and re-serializing at exactly 82 bytes.
+    pub open_positions: OpenPositionCount,
 }
 
 #[account]
