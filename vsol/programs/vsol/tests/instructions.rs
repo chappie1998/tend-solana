@@ -4817,3 +4817,4 @@ fn refund_pool_position_fails_after_its_market_is_closed() {
         u32::from(anchor_lang::error::ErrorCode::AccountNotInitialized)
     );
 }
+

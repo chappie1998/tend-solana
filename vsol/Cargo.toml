@@ -6,6 +6,22 @@ resolver = "2"
 overflow-checks = true
 lto = "fat"
 codegen-units = 1
+# Measured (task: binary-size/CU tradeoff), .so size / CU for fill_pool_quote
+# and settle_pool_position (LiteSVM, this program's own integration harness):
+#   opt-level 3 (this setting, Cargo's release default): 814,344 bytes --
+#     52,094 / 35,984 CU (baseline).
+#   opt-level "s": 746,944 bytes (-8.3%) -- 69,623 / 43,920 CU (+33.6% / +22.1%).
+#   opt-level "z": 700,568 bytes (-14.0%) -- 75,791 / 54,611 CU (+45.5% / +51.8%).
+# Both "s" and "z" shrink the binary but push at least one instruction's CU
+# growth past the 30% budget, even though the absolute CU stays nowhere near
+# the 200,000 compute-unit ceiling either way (75,791 is 38% of it at worst).
+# Kept at 3: it is the only level meeting "grows by <30%" (trivially, as the
+# baseline), and shipping ~114KB smaller is not worth a 22-46% CU tax on the
+# two hottest instructions when this program's actual constraint has been the
+# 1232-byte transaction packet limit (see the strike-ladder note in
+# CLAUDE.md), not the 3MB Solana program-size ceiling this .so is nowhere
+# close to regardless of level.
+opt-level = 3
 
 [profile.release.build-override]
 opt-level = 3
