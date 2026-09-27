@@ -369,6 +369,15 @@ export function decodeConfigAccount(data: Buffer) {
   return {
     oracleAuthority: publicKeyAt(data, 105),
     treasuryOwner: publicKeyAt(data, 169),
+    // u16 at byte 201: bump(1) + admin(32) + pending_admin(32) +
+    // pause_authority(32) + oracle_authority(32) + eligibility_authority(32)
+    // + treasury_owner(32) = 193, +8-byte discriminator = 201. Verified
+    // against the IDL's Config struct (vsol/target/idl/vsol.json) and the
+    // existing paused/domainVersion offsets below, which this must stay
+    // consistent with. This is the SAME value `netWinning`'s callers mirror
+    // by hand as PROTOCOL_WIN_FEE_BPS (app/lib/options.ts) -- reading it here
+    // lets the quote route return the live on-chain figure instead.
+    feeBps: data.readUInt16LE(201),
     paused: data[203] === 1,
     eligibilityRequired: data[204] === 1,
     domainSeparator: data.subarray(205, 237),
