@@ -72,6 +72,16 @@ type MakerQuote = {
   probabilityItm: number;
   /** The gap-risk-adjusted annualized vol actually priced into `premium` (can run above `pricingVolatility` when the reference is stale). */
   impliedVolatility: number;
+  /**
+   * True only for a quote fetched with `intent: "execute"` (see
+   * app/api/quotes/route.ts) -- a real server-signed transaction backs it,
+   * and it consumed the per-wallet executable-quote rate limit. False for the
+   * default `intent: "indicative"` auto-quote: a preview only, never signed,
+   * never persisted. `confirmPreviewPosition` below refuses to sign anything
+   * where this is not true, even if a `vsolQuote` transaction were somehow
+   * present.
+   */
+  executable: boolean;
 };
 
 type SeriesState = {
@@ -196,6 +206,8 @@ function QuotePanel({
   readiness,
   inputIssue,
   catalogSettled,
+  reviewState,
+  reviewError,
   onQuote,
   onSelect,
   onExecute,
@@ -210,6 +222,9 @@ function QuotePanel({
   readiness: QuoteReadiness;
   inputIssue: string | null;
   catalogSettled: boolean;
+  /** Fetching an EXECUTABLE quote for the currently-shown indicative price (see requestExecutableQuote). */
+  reviewState: "idle" | "loading" | "error";
+  reviewError: string;
   onQuote: () => void;
   onSelect: (quoteId: string) => void;
   onExecute: () => void;
@@ -217,9 +232,22 @@ function QuotePanel({
   onSignIn: () => void | Promise<void>;
 }) {
   if (state === "success") {
+    // Honest labelling: this branch renders BOTH an indicative preview (the
+    // common case -- every auto-quote) and, once "Review & execute" has
+    // actually fetched one, a real signed quote. `quotes[0].executable` is
+    // the same flag the signing path itself checks (see
+    // confirmPreviewPosition) -- never inferred separately here, so the copy
+    // and the signing gate can't drift apart.
+    const executable = quotes[0]?.executable ?? false;
     return (
       <div className="quote-results">
-        <div className="quote-results-head"><div><span className="eyebrow">Executable for {secondsLeft}s</span><h3>Signed devnet quote</h3></div><span className="live-dot">Onchain</span></div>
+        <div className="quote-results-head">
+          <div>
+            <span className="eyebrow">{executable ? `Executable for ${secondsLeft}s` : `Refreshes in ${secondsLeft}s`}</span>
+            <h3>{executable ? "Signed devnet quote" : "Indicative price"}</h3>
+          </div>
+          <span className="live-dot">{executable ? "Onchain" : "Preview"}</span>
+        </div>
         <div className="quote-list">
           {quotes.map((maker, index) => (
             <button type="button" className={maker.id === selectedQuoteId ? "quote-row selected" : "quote-row"} key={maker.id} onClick={() => onSelect(maker.id)} aria-pressed={maker.id === selectedQuoteId}>
@@ -230,7 +258,15 @@ function QuotePanel({
             </button>
           ))}
         </div>
-        <button type="button" className="button primary full" onClick={onExecute}>Review & execute <ArrowUpRight size={16} aria-hidden="true" /></button>
+        {/* Clicking this ALWAYS asks the server for a fresh, executable quote
+            (see requestExecutableQuote) -- it never just opens the review
+            modal on numbers that were only ever indicative. */}
+        <button type="button" className="button primary full" onClick={onExecute} disabled={reviewState === "loading"} aria-busy={reviewState === "loading"}>
+          {reviewState === "loading"
+            ? <><LoaderCircle size={16} className="spin" aria-hidden="true" /> Preparing executable quote…</>
+            : <>Review & execute <ArrowUpRight size={16} aria-hidden="true" /></>}
+        </button>
+        {reviewState === "error" && reviewError && <p className="execution-error" role="alert">{reviewError}</p>}
       </div>
     );
   }
@@ -507,6 +543,19 @@ function TradeView({
   const [showPricing, setShowPricing] = useState(false);
   const [executionState, setExecutionState] = useState<"idle" | "loading" | "error">("idle");
   const [executionError, setExecutionError] = useState("");
+  // Fetching an EXECUTABLE quote (intent: "execute") for the "Review &
+  // execute" click, distinct from executionState (which covers signing and
+  // sending the transaction AFTER the review modal is already open with real
+  // data) and from quoteState (which drives the ordinary indicative
+  // auto-quote). See requestExecutableQuote.
+  const [reviewState, setReviewState] = useState<"idle" | "loading" | "error">("idle");
+  const [reviewError, setReviewError] = useState("");
+  // The live on-chain protocol fee (config.fee_bps), read fresh from whichever
+  // quote last loaded (indicative or executable -- both return it, see
+  // app/api/quotes/route.ts). Null before any quote has ever loaded, which is
+  // the ONLY time PROTOCOL_WIN_FEE_BPS's hand-maintained fallback value
+  // (app/lib/options.ts) is used for display.
+  const [protocolFeeBps, setProtocolFeeBps] = useState<number | null>(null);
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [seriesStates, setSeriesStates] = useState<SeriesState[]>([]);
   const [seriesError, setSeriesError] = useState(CHECKING_SERIES);
@@ -584,6 +633,10 @@ function TradeView({
   const maxPayout = bestQuote?.maxPayout ?? null;
   const premium = bestQuote?.premium ?? 0;
   const target = bestQuote?.strike ?? null;
+  // PROTOCOL_WIN_FEE_BPS (app/lib/options.ts) is an explicitly-labelled
+  // fallback for the window before any quote has ever loaded -- once one has,
+  // the live on-chain figure from that quote's response always wins.
+  const feeBpsForDisplay = protocolFeeBps ?? PROTOCOL_WIN_FEE_BPS;
   // Two-sided "cents on the dollar" display (Split's framing: UP + DOWN
   // premiums at one strike sum to the payout). Derived client-side, purely
   // from numbers this quote already returned (maxPayout, probabilityItm) --
@@ -698,7 +751,12 @@ function TradeView({
     const update = () => {
       const remaining = Math.max(0, Math.ceil((bestQuote.expiresAt - Date.now()) / 1000));
       setSecondsLeft(remaining);
-      if (remaining === 0 && executionState !== "loading") {
+      // Also holds off while requestExecutableQuote is in flight (fetching a
+      // real quote for the numbers currently on screen): letting the
+      // indicative countdown reset out from under it would land the
+      // executable response into a ticket state this effect has already
+      // cleared.
+      if (remaining === 0 && executionState !== "loading" && reviewState !== "loading") {
         // The review modal always closes on expiry, whether or not this
         // expiry goes on to auto-refresh -- a stale signed quote must never
         // sit behind an open "Execute" button.
@@ -728,7 +786,7 @@ function TradeView({
     update();
     const timer = window.setInterval(update, 250);
     return () => window.clearInterval(timer);
-  }, [quoteState, bestQuote, executionState, complete]);
+  }, [quoteState, bestQuote, executionState, complete, reviewState]);
 
   // Reset to this category's default asset the moment `category` itself
   // changes -- e.g. switching from Crypto to Stocks in the nav. Mirrors the
@@ -748,6 +806,8 @@ function TradeView({
     setComplete(false);
     setExecutionState("idle");
     setExecutionError("");
+    setReviewState("idle");
+    setReviewError("");
     setQuoteState("idle");
     setQuotes([]);
     setSelectedQuoteId("");
@@ -765,6 +825,8 @@ function TradeView({
     setComplete(false);
     setExecutionState("idle");
     setExecutionError("");
+    setReviewState("idle");
+    setReviewError("");
   }
 
   // Refs are read/written outside render (event handlers, effects) only --
@@ -793,6 +855,11 @@ function TradeView({
     setQuotes([]);
     setSelectedQuoteId("");
     setVsolQuote(null);
+    // An in-flight "Review & execute" fetch (if any) was for a ticket that no
+    // longer exists -- requestExecutableQuote's own seq check will discard
+    // its result, but the panel shouldn't keep showing a stale error either.
+    setReviewState("idle");
+    setReviewError("");
   }
 
   async function runQuote({ manual }: { manual: boolean }) {
@@ -816,12 +883,19 @@ function TradeView({
     setQuoteState("loading");
     setQuotes([]);
     try {
+      // ALWAYS "indicative" here: this function backs both the auto-quote
+      // debounce and the manual Enter/Retry/Refresh actions, none of which
+      // may ever list a series onchain, sign anything, or spend the
+      // per-wallet executable-quote budget. Only requestExecutableQuote (the
+      // "Review & execute" click) ever sends intent: "execute" -- see its own
+      // comment for why that has to be a separate request rather than this
+      // one reusing its result.
       const response = await fetch("/api/quotes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: asset.ticker, direction, stake, expiryCode: expiry, payoff, walletAddress }),
+        body: JSON.stringify({ symbol: asset.ticker, direction, stake, expiryCode: expiry, payoff, walletAddress, intent: "indicative" }),
       });
-      const result = await response.json() as { quotes?: MakerQuote[]; vsol?: VsolQuotePayload; error?: string };
+      const result = await response.json() as { quotes?: MakerQuote[]; vsol?: VsolQuotePayload; protocolFeeBps?: number; error?: string };
       // Inputs (or the wallet) moved on while this request was in flight --
       // invalidateQuote() or a newer runQuote() already bumped the
       // sequence, so this response is for a ticket that no longer exists.
@@ -834,11 +908,14 @@ function TradeView({
         return;
       }
       if (!response.ok || !result.quotes?.length) {
-        setQuoteError(result.error ?? "Market makers did not return an executable price. Try again.");
+        setQuoteError(result.error ?? "The pricing engine did not return a price. Try again.");
         setQuoteState("error");
         return;
       }
+      if (typeof result.protocolFeeBps === "number") setProtocolFeeBps(result.protocolFeeBps);
       setQuotes(result.quotes);
+      // Indicative responses never carry a `vsol` transaction -- this stays
+      // null in the ordinary case; defensive fallback only.
       setVsolQuote(result.vsol ?? null);
       setSelectedQuoteId(result.quotes[0].id);
       setQuoteState("success");
@@ -846,6 +923,64 @@ function TradeView({
       if (seq !== requestSeqRef.current) return;
       setQuoteError("The quote service is unreachable. Check your connection and retry.");
       setQuoteState("error");
+    }
+  }
+
+  /**
+   * "Review & execute" always fetches a FRESH executable quote rather than
+   * promoting the indicative one already on screen: only intent: "execute"
+   * resolves-and-lists the series, asks the pool authority to sign, and
+   * consumes this wallet's executable-quote rate-limit budget (see
+   * app/api/quotes/route.ts and app/lib/rate-limit.ts). Reusing the
+   * indicative response here would mean signing a transaction the server
+   * never actually built -- there isn't one to sign.
+   */
+  async function requestExecutableQuote() {
+    if (readiness.kind !== "ready" || inputIssue || reviewState === "loading") return;
+    // Bumped exactly like invalidateQuote()/runQuote() so a response that
+    // lands after the ticket has moved on (or after this same click's
+    // in-flight indicative auto-quote) is discarded rather than applied.
+    const seq = ++requestSeqRef.current;
+    setReviewState("loading");
+    setReviewError("");
+    try {
+      const response = await fetch("/api/quotes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: asset.ticker, direction, stake, expiryCode: expiry, payoff, walletAddress, intent: "execute" }),
+      });
+      const result = await response.json() as { quotes?: MakerQuote[]; vsol?: VsolQuotePayload; protocolFeeBps?: number; error?: string };
+      if (seq !== requestSeqRef.current) return;
+      if (response.status === 401) {
+        onSessionExpired();
+        setReviewState("idle");
+        return;
+      }
+      if (response.status === 429) {
+        setReviewError(result.error ?? "Too many executable quotes requested. Wait a moment and try again.");
+        setReviewState("error");
+        return;
+      }
+      // `quotes[0].executable` is checked here too (not just relied on
+      // server-side): a response missing it, or missing `vsol`, is treated as
+      // a failure rather than opening the review modal on numbers that
+      // cannot actually be signed.
+      if (!response.ok || !result.quotes?.length || !result.vsol || !result.quotes[0].executable) {
+        setReviewError(result.error ?? "Could not prepare an executable quote. Try again.");
+        setReviewState("error");
+        return;
+      }
+      if (typeof result.protocolFeeBps === "number") setProtocolFeeBps(result.protocolFeeBps);
+      setQuotes(result.quotes);
+      setVsolQuote(result.vsol);
+      setSelectedQuoteId(result.quotes[0].id);
+      setQuoteState("success");
+      setReviewState("idle");
+      setComplete(true);
+    } catch {
+      if (seq !== requestSeqRef.current) return;
+      setReviewError("The quote service is unreachable. Check your connection and retry.");
+      setReviewState("error");
     }
   }
 
@@ -877,6 +1012,16 @@ function TradeView({
 
   async function confirmPreviewPosition() {
     if (!bestQuote || !walletAddress || !vsolQuote) return;
+    // Defense in depth: `vsolQuote` is only ever populated from an
+    // intent: "execute" response (see requestExecutableQuote), but this
+    // makes the invariant explicit and independently checkable rather than
+    // relying solely on `vsolQuote`'s mere presence -- the signing path must
+    // never be reachable from an indicative quote.
+    if (!bestQuote.executable) {
+      setExecutionError("This price is indicative only and was never signed. Click \"Review & execute\" to get an executable quote.");
+      setExecutionState("error");
+      return;
+    }
     setExecutionState("loading");
     setExecutionError("");
     try {
@@ -1079,7 +1224,7 @@ function TradeView({
             {/* The fee is charged on the payout, so the amount that actually
                 reaches the wallet is a different number from the headline
                 and has to be shown, not implied. */}
-            <div className={bestQuote ? undefined : "econ-row--empty"}><span>You net after the {PROTOCOL_WIN_FEE_BPS / 100}% fee</span><strong>{bestQuote ? `$${netWinning(bestQuote.maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
+            <div className={bestQuote ? undefined : "econ-row--empty"}><span>You net after the {feeBpsForDisplay / 100}% fee</span><strong>{bestQuote ? `$${netWinning(bestQuote.maxPayout, feeBpsForDisplay).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</strong></div>
             {/* The price the buyer needs to hit for the FULL payout, stated
                 as its own headline number rather than only the small
                 annotation above -- direction-aware. For a binary, this IS
@@ -1115,7 +1260,7 @@ function TradeView({
             </details>
           </div>
 
-          <QuotePanel state={quoteState} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => setComplete(true)} onConnect={onConnect} onSignIn={onSignIn} />
+          <QuotePanel state={quoteState} quotes={quotes} errorMessage={quoteError} secondsLeft={secondsLeft} selectedQuoteId={selectedQuoteId} readiness={readiness} inputIssue={inputIssue} catalogSettled={catalogSettled} reviewState={reviewState} reviewError={reviewError} onSelect={setSelectedQuoteId} onQuote={() => requestQuote()} onExecute={() => void requestExecutableQuote()} onConnect={onConnect} onSignIn={onSignIn} />
         </form>
         <p className="risk-note" id="risk">Devnet only: mock tokens, real market reference data, no real asset value. Options can lose their full premium.</p>
       </aside>
@@ -1130,14 +1275,14 @@ function TradeView({
             <span className="eyebrow">Best quote secured</span><h2 id="review-title">Review your {asset.ticker} {direction.toUpperCase()}</h2>
             <p>{bestQuote?.maker ?? "The best maker"}’s quote stays executable for {secondsLeft}s. Your maximum loss is fixed before you sign.</p>
             {vsolQuote?.mintOnDemand && <p className="expiry-policy"><ShieldCheck size={13} aria-hidden="true" /> {MINT_ON_DEMAND_FULL_NOTE}</p>}
-            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div><div><span>You net if you win</span><strong>{maxPayout === null ? "—" : `$${netWinning(maxPayout).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}<small>after the {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee</small></strong></div></div>
+            <div className="review-grid"><div><span>Premium</span><strong>${premium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div><div><span>Strike</span><strong>{target === null ? "—" : `$${target.toFixed(2)}`}</strong></div><div><span>Expiry</span><strong>{expiryDefinition.shortLabel} · {expiryDefinition.detail}</strong></div><div><span>Max winning</span><strong>{maxPayout === null ? "—" : `$${maxPayout.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}</strong></div><div><span>You net if you win</span><strong>{maxPayout === null ? "—" : `$${netWinning(maxPayout, feeBpsForDisplay).toLocaleString(undefined, { maximumFractionDigits: 2 })}`}<small>after the {feeBpsForDisplay / 100}% protocol fee</small></strong></div></div>
             {executionError && <p className="execution-error" role="alert">{executionError}</p>}
             {walletAddress ? (
               <button type="button" className="button primary full" onClick={confirmPreviewPosition} disabled={executionState === "loading" || !bestQuote || !vsolQuote} aria-busy={executionState === "loading"}><ShieldCheck size={16} aria-hidden="true" /> {executionState === "loading" ? "Signing & confirming…" : "Execute on Solana devnet"}</button>
             ) : (
               <button type="button" className="button primary full" onClick={onConnect}><Wallet size={16} aria-hidden="true" /> Connect wallet to continue</button>
             )}
-            <p className="preview-disclaimer">A winning position pays a {PROTOCOL_WIN_FEE_BPS / 100}% protocol fee out of its payout; a losing one pays no fee. Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
+            <p className="preview-disclaimer">A winning position pays a {feeBpsForDisplay / 100}% protocol fee out of its payout; a losing one pays no fee. Your wallet signs a real devnet transaction using mock tUSDC. Settlement uses a centrally signed Coinbase or Hyperliquid reference retained during the expiry window. Hyperliquid timestamps record Tend&apos;s HTTP fetch, and stock markets do not represent native share ownership. VSOL remains unaudited and must not receive mainnet funds.{category === "pre-ipo" && " Pre-IPO markets price off live Solana DEX pools thinner than Tend's crypto or equity venues, so the settlement reference is cheaper to move at expiry."}</p>
             <button type="button" className="button ghost full" onClick={() => setComplete(false)}>Back to edit</button>
           </div>
         </div>
